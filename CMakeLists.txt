@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(VoxelEngine C CXX)
+project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,7 +43,7 @@ add_library(unofficial::stb ALIAS stb)
 
 target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
-add_executable(VoxelEngine
+add_executable(BlockSmith
     main.cpp
     Player.cpp
     World.cpp
@@ -75,6 +75,8 @@ add_executable(VoxelEngine
     WorldRenderer.h
     ChunkData.cpp
     ChunkData.h
+    ChunkGenerator.cpp
+    ChunkGenerator.h
     Net.cpp
     Net.h
     PlayerMovement.cpp
@@ -86,13 +88,13 @@ add_executable(VoxelEngine
     deps/glad.c
 )
 
-target_include_directories(VoxelEngine PRIVATE
+target_include_directories(BlockSmith PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )
 
-target_link_libraries(VoxelEngine PRIVATE
+target_link_libraries(BlockSmith PRIVATE
     glfw
     glm::glm
     sol2::sol2
@@ -106,22 +108,23 @@ target_link_libraries(VoxelEngine PRIVATE
 
 # ENet needs the Windows socket and timer libraries
 if (WIN32)
-    target_link_libraries(VoxelEngine PRIVATE ws2_32 winmm)
+    target_link_libraries(BlockSmith PRIVATE ws2_32 winmm)
 endif()
 
 if (TARGET unofficial::lua::lua)
-    target_link_libraries(VoxelEngine PRIVATE unofficial::lua::lua)
+    target_link_libraries(BlockSmith PRIVATE unofficial::lua::lua)
 else()
-    target_link_libraries(VoxelEngine PRIVATE ${LUA_LIBRARY})
+    target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
 endif()
 
 # ---------------------------------------------------------------------------
-# CraftRuinServer: the dedicated (headless) server. No window, no graphics -
+# BlockSmithServer: the dedicated (headless) server. No window, no graphics -
 # just the world, the mods and the networking.
-# Build it with:  cmake --build build --config Release --target CraftRuinServer
+# Build it with:  cmake --build build --config Release --target BlockSmithServer
 # ---------------------------------------------------------------------------
-add_executable(CraftRuinServer
+add_executable(BlockSmithServer
     ServerMain.cpp
+    ChunkGenerator.cpp
     World.cpp
     ChunkData.cpp
     CaveGenerator.cpp
@@ -131,13 +134,13 @@ add_executable(CraftRuinServer
     PlayerMovement.cpp
 )
 
-target_include_directories(CraftRuinServer PRIVATE
+target_include_directories(BlockSmithServer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )
 
-target_link_libraries(CraftRuinServer PRIVATE
+target_link_libraries(BlockSmithServer PRIVATE
     glm::glm
     sol2::sol2
     ${VOXEL_LUA_TARGET}
@@ -145,10 +148,10 @@ target_link_libraries(CraftRuinServer PRIVATE
 )
 
 if (WIN32)
-    target_link_libraries(CraftRuinServer PRIVATE ws2_32 winmm)
+    target_link_libraries(BlockSmithServer PRIVATE ws2_32 winmm)
 endif()
 
 if (NOT WIN32)
     find_package(Threads REQUIRED)
-    target_link_libraries(CraftRuinServer PRIVATE Threads::Threads)
+    target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
 endif()

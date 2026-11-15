@@ -16,6 +16,9 @@ public:
     static void setSeed(uint32_t seed);
     static void setEnabled(bool enabled);
     static bool isEnabled();
+    // Looks up the block types caves use. carveChunk does this itself the first time, but
+    // call it once before generating on several threads so they don't all do it at once.
+    static void prepare();
 
     // Carves caves into a freshly generated chunk. Never carves through water,
     // tree trunks/leaves, or the bottom bedrock layers.

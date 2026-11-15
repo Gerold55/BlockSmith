@@ -35,4 +35,5 @@ loadScript("texture_packs.lua") -- texture pack picker
 loadScript("settings_menu.lua") -- settings (controls, video)
 loadScript("world_select.lua")  -- world selection
 loadScript("multiplayer.lua")   -- multiplayer server list
+loadScript("server_manager.lua") -- My Servers (dedicated servers)
 loadScript("player_list.lua")   -- player list (hold Tab)

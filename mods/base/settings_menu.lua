@@ -159,6 +159,10 @@ local function refresh()
     state.player = {
         { id = "name", kind = "text", label = "Player Name", max = 16, allowed = "^[%w_%-]$",
           value = (engine and engine.get_player_name and engine.get_player_name()) or "" },
+        -- Protects your name on servers. Never shown or stored - only a hash of it is kept.
+        { id = "password", kind = "text", label = "Server Password", max = 64, allowed = "^[ -~]$",
+          secret = true, value = "",
+          is_set = engine and engine.has_player_password and engine.has_player_password() or false },
     }
     local sv = (engine and engine.get_server_settings and engine.get_server_settings()) or {}
     state.server = {
@@ -291,6 +295,10 @@ end
 -- Saves a setting (text box, +/- or toggle) through the right engine function.
 local function set_value(item, value)
     if item.id == "name" then return engine.set_player_name(value) end
+    if item.id == "password" then
+        if value == "" then return true end   -- empty = keep the current password
+        return engine.set_player_password(value)
+    end
     if state.tab == "server" then return engine.set_server_setting(item.id, tostring(value)) end
     return engine.set_video_setting(item.id, value)
 end
@@ -318,6 +326,11 @@ local function draw_text_field(f, item, S, fs)
     rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
     rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
     local value = focused and state.edit_text or tostring(item.value)
+    if item.secret then
+        -- Never show a password: stars while typing, and whether one is set otherwise
+        if focused then value = string.rep("*", #state.edit_text)
+        else value = item.is_set and "********" or "Not set" end
+    end
     -- Show the end of long text (where you're typing)
     local max_chars = math.max(1, math.floor((f.w - 8 * S) / (Theme.font.char_w * fs)) - 1)
     if #value > max_chars then value = value:sub(#value - max_chars + 1) end
@@ -409,7 +422,7 @@ function render_settings(W, H)
     elseif state.tab == "controls" then
         note = "Click a control, then press a key. Red keys are used more than once."
     elseif state.tab == "player" then
-        note = "Your name in multiplayer and chat: 1-16 letters, numbers, _ or -"
+        note = "Name: 1-16 letters, numbers, _ or -. The password protects your name on servers."
     elseif state.tab == "server" then
         note = engine.has_server_icon and engine.has_server_icon()
             and "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Icon: server_icon.png found."
@@ -470,7 +483,7 @@ function handle_settings_click(mx, my, W, H)
 
         if wdg.field and inside(mx, my, wdg.field.x, wdg.field.y, wdg.field.w, wdg.field.h) then
             state.editing = item
-            state.edit_text = tostring(item.value)
+            state.edit_text = item.secret and "" or tostring(item.value)
             state.waiting = nil
             return true
         elseif wdg.key and inside(mx, my, wdg.key.x, wdg.key.y, wdg.key.w, wdg.key.h) then

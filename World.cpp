@@ -3,6 +3,7 @@
 #include "Block.h"
 #include "Types.h"
 #include "CaveGenerator.h"
+#include "ChunkGenerator.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -209,6 +210,7 @@ void World::setRenderDistance(int chunks) {
 void World::ensureLuaSeeded(sol::state& lua) {
     if (m_luaSeeded) return;
     CaveGenerator::setSeed(m_seed);
+    if (m_generator) CaveGenerator::prepare();   // before the threads carve caves
     sol::protected_function setSeed = lua["set_world_seed"];
     if (setSeed.valid()) {
         auto result = setSeed(m_seed);
@@ -273,6 +275,31 @@ void World::loadQueuedChunks(sol::state& lua) {
     const auto start = Clock::now();
     size_t consumed = 0;
 
+    if (m_generator) {
+        // Saved chunks are read here (fast); new ones are handed to the generator's threads,
+        // nearest first, a few at a time so the closest are always next in line.
+        collectGenerated();
+        const size_t maxInFlight = static_cast<size_t>(m_generator->threadCount()) * 3;
+        std::vector<ChunkCoord> notYet;
+        while (consumed < m_loadQueue.size()) {
+            const ChunkCoord c = m_loadQueue[consumed++];
+            if (chunks.count(c) || m_generating.count(c)) continue;
+            auto chunk = std::make_shared<ChunkData>();
+            if (loadChunkFromDisk(c.first, c.second, *chunk)) {
+                addLoadedChunk(c.first, c.second, std::move(chunk));
+                if (elapsedMs(start) >= m_loadBudgetMs) break;
+            } else if (m_generating.size() < maxInFlight) {
+                m_generator->request(c.first, c.second, m_resetCount, m_seed);
+                m_generating.insert(c);
+            } else {
+                notYet.push_back(c);   // generator busy: ask again next update
+            }
+        }
+        m_loadQueue.erase(m_loadQueue.begin(), m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
+        m_loadQueue.insert(m_loadQueue.begin(), notYet.begin(), notYet.end());
+        return;
+    }
+
     while (consumed < m_loadQueue.size()) {
         const ChunkCoord c = m_loadQueue[consumed++];
         if (chunks.find(c) == chunks.end()) {
@@ -283,6 +310,33 @@ void World::loadQueuedChunks(sol::state& lua) {
 
     m_loadQueue.erase(m_loadQueue.begin(),
                       m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
+}
+
+// Finished chunks from the generator's threads: keep the ones still needed.
+void World::collectGenerated() {
+    for (auto& r : m_generator->takeFinished()) {
+        const ChunkCoord c{r.cx, r.cz};
+        if (r.epoch != m_resetCount) continue;          // from before a reset (another world)
+        m_generating.erase(c);
+        if (chunks.count(c) || !wantedChunk(c)) continue;   // already there / player went away
+        addLoadedChunk(r.cx, r.cz, std::move(r.chunk));
+    }
+    // Requests for places nobody is near any more: drop them if they haven't started
+    for (auto it = m_generating.begin(); it != m_generating.end();) {
+        if (!wantedChunk(*it) && m_generator->cancel(it->first, it->second)) it = m_generating.erase(it);
+        else ++it;
+    }
+}
+
+void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
+    chunks[ChunkCoord{cx, cz}] = std::move(chunk);
+    linkChunk(cx, cz);
+    // The new chunk and its neighbors need (re)meshing so border faces cull correctly.
+    markDirty(cx, cz);
+    markDirty(cx - 1, cz);
+    markDirty(cx + 1, cz);
+    markDirty(cx, cz - 1);
+    markDirty(cx, cz + 1);
 }
 
 void World::update(const glm::vec3& playerPos, sol::state& lua) {
@@ -304,19 +358,21 @@ void World::update(const glm::vec3& playerPos, sol::state& lua) {
 }
 
 // Unloads chunks that are too far from the player and from every other load center.
-void World::unloadDistantChunks() {
-    auto wanted = [this](const ChunkCoord& c) {
-        auto isNear = [&c](const ChunkCoord& center, int radius) {
-            const int dx = c.first - center.first;
-            const int dz = c.second - center.second;
-            return std::max(std::abs(dx), std::abs(dz)) <= radius + kUnloadMargin;
-        };
-        if (isNear(m_playerChunk, m_renderDistance)) return true;
-        for (const auto& center : m_extraCenters) {
-            if (isNear(center.chunk, center.radius)) return true;
-        }
-        return false;
+bool World::wantedChunk(const ChunkCoord& c) const {
+    auto isNear = [&c](const ChunkCoord& center, int radius) {
+        const int dx = c.first - center.first;
+        const int dz = c.second - center.second;
+        return std::max(std::abs(dx), std::abs(dz)) <= radius + kUnloadMargin;
     };
+    if (isNear(m_playerChunk, m_renderDistance)) return true;
+    for (const auto& center : m_extraCenters) {
+        if (isNear(center.chunk, center.radius)) return true;
+    }
+    return false;
+}
+
+void World::unloadDistantChunks() {
+    auto wanted = [this](const ChunkCoord& c) { return wantedChunk(c); };
 
     for (auto it = chunks.begin(); it != chunks.end();) {
         const int cx = it->first.first;
@@ -348,33 +404,26 @@ void World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
     // 2. Otherwise generate it (Lua mapgen, or the C++ fallback).
     if (!fromDisk) {
         chunk = std::make_shared<ChunkData>();   // fresh, in case a broken file half-filled it
-
-        sol::protected_function genFunc = lua["generate_chunk"];
-        if (genFunc.valid()) {
-            auto result = genFunc(chunk.get(), chunkX, chunkZ);
-            if (!result.valid()) {
-                sol::error err = result;
-                std::cerr << "[Mapgen Error]: " << err.what() << std::endl;
-            }
-        } else {
-            generateFallbackTerrain(*chunk, chunkX, chunkZ,
-                                    static_cast<float>(m_seed % 100000) * 0.001f);
-        }
-
-        // 3. Carve caves into the new terrain (seeded, so the same seed gives the same caves).
-        //    Saved chunks skip this - their caves are already in the file.
-        CaveGenerator::carveChunk(*chunk, chunkX, chunkZ);
+        generateNewChunk(*chunk, chunkX, chunkZ, &lua, m_seed);
     }
+    addLoadedChunk(chunkX, chunkZ, std::move(chunk));
+}
 
-    chunks[ChunkCoord{chunkX, chunkZ}] = chunk;
-    linkChunk(chunkX, chunkZ);
-
-    // The new chunk and its neighbors need (re)meshing so border faces cull correctly.
-    markDirty(chunkX, chunkZ);
-    markDirty(chunkX - 1, chunkZ);
-    markDirty(chunkX + 1, chunkZ);
-    markDirty(chunkX, chunkZ - 1);
-    markDirty(chunkX, chunkZ + 1);
+void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed) {
+    sol::protected_function genFunc;
+    if (lua) genFunc = (*lua)["generate_chunk"];
+    if (lua && genFunc.valid()) {
+        auto result = genFunc(&chunk, cx, cz);
+        if (!result.valid()) {
+            sol::error err = result;
+            std::cerr << "[Mapgen Error]: " << err.what() << std::endl;
+        }
+    } else {
+        generateFallbackTerrain(chunk, cx, cz, static_cast<float>(seed % 100000) * 0.001f);
+    }
+    // Carve caves into the new terrain (seeded, so the same seed gives the same caves).
+    // Saved chunks skip this - their caves are already in the file.
+    CaveGenerator::carveChunk(chunk, cx, cz);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +435,8 @@ void World::reset() {
     m_loadQueue.clear();
     m_dirty.clear();
     m_unloaded.clear();
+    m_generating.clear();   // results still on their way carry the old reset count: ignored
+    if (m_generator) m_generator->clearQueue();
     ++m_resetCount;
     m_remote = false;
     m_recordChanges = false;

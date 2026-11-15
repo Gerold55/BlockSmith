@@ -30,7 +30,7 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 4;   // 4: clients send inputs, the server moves them (prediction)
+constexpr uint32_t kProtocolVersion  = 5;   // 5: passwords and chat commands run by the server
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -68,12 +68,16 @@ struct ChatLine {
 float clockSeconds();
 
 // Shown in the server list (and checked against the server's version).
-constexpr const char* kVersionName = "Craft & Ruin 0.1";
+constexpr const char* kVersionName = "BlockSmith 0.1";   // the engine
 // ENet "connect data" meaning "just tell me your status, I'm not joining".
 constexpr uint32_t kStatusQuery = 0x53544154;   // "STAT"
 constexpr int kMaxMotdLength = 200;       // the description may contain {colour} tags
 constexpr size_t kMaxIconBytes = 64 * 1024;   // server_icon.png (64x64 recommended)
 constexpr uint16_t kLanPort = 30001;          // LAN games announce themselves on this UDP port
+
+// What the game stores and sends instead of the player's password (SHA-256 of it).
+// The server then stores a salted hash of this, so neither side keeps the password.
+std::string passwordToken(const std::string& password);
 
 // "host", "host:port" -> host + port (kDefaultPort if none). False if empty/invalid.
 bool parseAddress(const std::string& text, std::string& host, uint16_t& port);
@@ -136,8 +140,11 @@ public:
     std::function<bool(const std::string& name, glm::vec3& pos)> spawnFor;
     std::function<void(const std::string& name, const glm::vec3& pos)> onLeave;
     // Asked before someone joins: return "" to let them in, or the reason they can't
-    // (banned, not on the whitelist...). Optional.
-    std::function<std::string(const std::string& name)> canJoin;
+    // (banned, not on the whitelist, wrong password...). `passwordToken` is a hash of the
+    // player's password ("" if they haven't set one) - never the password itself. Optional.
+    std::function<std::string(const std::string& name, const std::string& passwordToken)> canJoin;
+    // A "/command" a player typed (without the slash). Reply with messagePlayer. Optional.
+    std::function<void(const std::string& name, const std::string& command)> onCommand;
     // Called once someone has joined (e.g. to send them a welcome message). Optional.
     std::function<void(const std::string& name)> onJoin;
     // A chat line to one player only. False if they're not online.
@@ -201,7 +208,7 @@ private:
     bool m_hasHost = true;
     int m_maxView = net::kMaxViewDistance;
     std::string m_gameTitle;
-    std::string m_motd = "A Craft & Ruin server";
+    std::string m_motd = "A BlockSmith server";
     int m_maxPlayers = 20;
     std::vector<uint8_t> m_icon;
     uint16_t m_nextId = 1;
@@ -240,8 +247,10 @@ public:
 
     // Starts connecting (returns straight away; watch takeWelcome / takeDisconnect).
     // When the server accepts, `world` is reset and switched to remote mode.
+    // passwordToken: net::passwordToken(password) from the player's settings, or "".
     bool connect(World& world, const std::string& address, const std::string& playerName,
-                 const std::string& gameFolder, int viewDistance, std::string& error);
+                 const std::string& gameFolder, int viewDistance, std::string& error,
+                 const std::string& passwordToken = "");
     // Leaves the server (no-op when not connected).
     void disconnect();
 
@@ -275,6 +284,8 @@ public:
     std::vector<std::string> statsLines() const;
 
     void sendChat(const std::string& text);
+    // A "/command" (without the slash) for the server to run; it answers in chat.
+    void sendCommand(const std::string& command);
     std::vector<net::ChatLine> takeChat();
 
 private:
@@ -288,6 +299,7 @@ private:
     State m_state = State::Idle;
     std::string m_addressText;
     std::string m_name;
+    std::string m_password;   // token, not the password
     std::string m_game;
     int m_viewDistance = 8;
     double m_connectStarted = 0.0;

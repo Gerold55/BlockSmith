@@ -27,7 +27,7 @@ public:
 
     bool init(const std::string& fontPath);
 
-    // x, y: pixels from the top-left; y is the text BASELINE.
+    // x, y: pixels from the top-left; y is the text BASELINE. Text is UTF-8.
     void renderText(GLuint fontShader, const std::string& text,
                     float x, float y, float scaleX, float scaleY, glm::vec4 color,
                     Dimensions2D resolution);
@@ -47,5 +47,9 @@ private:
     GLuint vao = 0;
     GLuint vbo = 0;
     GLuint fontTextureID = 0;
-    stbtt_bakedchar cdata[96] = {};   // ASCII 32..127, baked at 32 px into a 512x512 bitmap
+    // Characters 32..255 (ASCII + Latin-1: ³ ² é ü ñ © ...), baked at 32 px into a 512x512
+    // bitmap. Text is UTF-8; anything outside this range is drawn as '?'.
+    static constexpr int kFirstChar = 32;
+    static constexpr int kNumChars = 224;
+    stbtt_bakedchar cdata[kNumChars] = {};
 };

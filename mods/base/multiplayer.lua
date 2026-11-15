@@ -347,6 +347,8 @@ local function list_layout(W, H)
             { label = "Direct Connect", enabled = can_play(), action = function()
                 open_edit(nil); state.mode = "direct" end },
             { label = "Add Server", action = function() open_edit(nil) end },
+            { label = "My Servers", action = function()
+                if server_manager_open then server_manager_open() end end },
         },
         {
             { label = "Edit", enabled = has_sel, action = function() open_edit(state.selected) end },
@@ -453,6 +455,20 @@ local function draw_rich_line(segs, cx, y, scale, max_w, S)
         if seg.bold then text(seg.text, x + S * 0.5, y, scale, c, false, S) end
         x = x + text_width(seg.text, scale) + (seg.bold and S * 0.5 or 0)
     end
+end
+
+-- Shared with server_manager.lua: draws a description ({gold}... {n} ...) as up to two
+-- centred lines, the same way the server list shows it.
+function mp_draw_description(desc, cx, y, scale, max_w, S)
+    local lines = parse_description(desc or "", C.detail)
+    if lines[1] then draw_rich_line(lines[1], cx, y, scale, max_w, S) end
+    if lines[2] then draw_rich_line(lines[2], cx, y + text_height(scale) + 3 * S, scale, max_w, S) end
+end
+
+-- Shared with server_manager.lua: join a server (shows the Connecting screen).
+function mp_join_address(address)
+    state.mode = "list"
+    join(address)
 end
 
 -- Five ping bars. Grey while pinging (animated), red when offline.
@@ -811,6 +827,7 @@ end
 -- ===========================================================================
 
 function on_multiplayer_opened()
+    if server_manager_close then server_manager_close() end
     refresh()
     ping_all()
     state.selected_lan = nil
@@ -828,6 +845,7 @@ end
 
 function render_multiplayer(W, H)
     if not ui or not ui.draw_rect then return end
+    if server_manager_is_open and server_manager_is_open() then return render_server_manager(W, H) end
     if not state.servers then refresh() end
     if state.mode == "edit" or state.mode == "direct" then render_edit(W, H)
     elseif state.mode == "delete" then render_delete(W, H)
@@ -836,6 +854,7 @@ function render_multiplayer(W, H)
 end
 
 function handle_multiplayer_click(mx, my, W, H)
+    if server_manager_is_open and server_manager_is_open() then return handle_server_manager_click(mx, my, W, H) end
     if state.mode == "edit" or state.mode == "direct" then click_edit(mx, my, W, H)
     elseif state.mode == "delete" then click_buttons(delete_layout(W, H).buttons, mx, my)
     elseif state.mode == "connecting" then click_buttons(connecting_layout(W, H).buttons, mx, my)
@@ -844,12 +863,14 @@ function handle_multiplayer_click(mx, my, W, H)
 end
 
 function handle_multiplayer_scroll(dy)
+    if server_manager_is_open and server_manager_is_open() then return handle_server_manager_scroll(dy) end
     if state.mode ~= "list" then return end
     if dy > 0 then state.scroll = state.scroll - 1 elseif dy < 0 then state.scroll = state.scroll + 1 end
     if state.scroll < 0 then state.scroll = 0 end
 end
 
 function handle_multiplayer_key(key, action, mods)
+    if server_manager_is_open and server_manager_is_open() then return handle_server_manager_key(key, action, mods) end
     local press = action == ui.actions.PRESS or action == ui.actions.REPEAT
     if not press then return true end
     local enter = key == ui.keys.ENTER or key == ui.keys.KP_ENTER
@@ -895,6 +916,7 @@ function handle_multiplayer_key(key, action, mods)
 end
 
 function handle_multiplayer_char(codepoint, ch)
+    if server_manager_is_open and server_manager_is_open() then return handle_server_manager_char(codepoint, ch) end
     if not ch or ch == "" or codepoint < 32 or codepoint >= 127 then return false end
     if state.mode == "edit" or state.mode == "direct" then
         if state.focus == "name" and state.mode == "edit" then

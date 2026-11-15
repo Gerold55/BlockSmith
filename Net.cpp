@@ -10,6 +10,7 @@
 #include <enet/enet.h>
 
 #include "Net.h"
+#include "Sha256.h"
 #include "ChunkData.h"
 #include "Block.h"
 #include "Types.h"
@@ -35,10 +36,11 @@ namespace {
 
 enum Msg : uint8_t {
     // client -> server
-    C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance
+    C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance, str passwordToken
     C_INPUTS  = 2,    // u32 firstSeq, u16 count, { u8 keys, f32 yaw, f32 pitch, f32 dt }
     C_BLOCKS  = 3,    // u16 count, { i32 x y z, str block, u8 meta }
     C_CHAT    = 4,    // str text
+    C_COMMAND = 5,    // str command (no slash) - run by the server, answered with S_CHAT
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -272,6 +274,11 @@ const std::vector<std::pair<int, int>>& ringOffsets() {
 float net::clockSeconds() {
     static const double start = nowSeconds();
     return static_cast<float>(nowSeconds() - start);
+}
+
+std::string net::passwordToken(const std::string& password) {
+    if (password.empty()) return "";
+    return sha256Hex("craft-and-ruin-password:" + password);
 }
 
 bool net::parseAddress(const std::string& text, std::string& host, uint16_t& port) {
@@ -573,6 +580,19 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         broadcastChat("<" + c.name + "> " + text, kChatColor);
         break;
     }
+    case C_COMMAND: {
+        Reader r(data, size);
+        std::string command = r.str();
+        if (!r.ok || command.empty()) return;
+        if (command.size() > 256) command.resize(256);
+        if (onCommand) {
+            const std::string name = c.name;   // the command may kick this player (c gone after)
+            onCommand(name, command);
+        } else {
+            messagePlayer(c.name, "This server doesn't run commands", glm::vec3(1.0f, 0.55f, 0.55f));
+        }
+        break;
+    }
     default:
         break;
     }
@@ -585,6 +605,8 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     const std::string game = r.str();
     const int view = r.u8();
     if (!r.ok) { kick(c, "Bad hello packet"); return; }
+    std::string token = r.str();
+    if (!r.ok || token.size() > 128) token.clear();
 
     if (protocol != net::kProtocolVersion) {
         kick(c, protocol < net::kProtocolVersion ? "Your game is older than the server - please update"
@@ -598,7 +620,7 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
         return;
     }
     if (canJoin) {
-        const std::string reason = canJoin(name);   // banned, not whitelisted...
+        const std::string reason = canJoin(name, token);   // banned, not whitelisted, wrong password...
         if (!reason.empty()) { kick(c, reason); return; }
     }
     if (m_hasHost && name == m_hostName) { kick(c, "Someone called '" + name + "' is already playing"); return; }
@@ -965,7 +987,8 @@ GameClient::~GameClient() {
 }
 
 bool GameClient::connect(World& world, const std::string& address, const std::string& playerName,
-                         const std::string& gameFolder, int viewDistance, std::string& error) {
+                         const std::string& gameFolder, int viewDistance, std::string& error,
+                         const std::string& passwordToken) {
     disconnect();
     m_ended = false;
     m_endReason.clear();
@@ -1004,6 +1027,7 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_world = &world;
     m_addressText = hostText + ":" + std::to_string(port);
     m_name = playerName;
+    m_password = passwordToken;
     m_game = gameFolder;
     m_viewDistance = std::clamp(viewDistance, 2, net::kMaxViewDistance);
     m_connectStarted = nowSeconds();
@@ -1047,7 +1071,9 @@ void GameClient::finish(const std::string& reason) {
     m_ended = true;
     if (!m_kickReason.empty()) m_endReason = m_kickReason;
     else m_endReason = wasJoined ? reason : "Could not connect to " + m_addressText +
-                                            " (is the server running and the port open?)";
+                                            ". Is it running? If it's on another PC, that PC's firewall"
+                                            " may be blocking the game (allow UDP port " +
+                                            m_addressText.substr(m_addressText.rfind(':') + 1) + ").";
     std::cout << "[Client] " << m_endReason << std::endl;
 }
 
@@ -1066,6 +1092,7 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             w.str(m_name);
             w.str(m_game);
             w.u8(static_cast<uint8_t>(m_viewDistance));
+            w.str(m_password);
             sendTo(m_peer, w);
             break;
         }
@@ -1313,6 +1340,13 @@ bool GameClient::takeDisconnect(std::string& reason) {
     m_ended = false;
     reason = m_endReason;
     return true;
+}
+
+void GameClient::sendCommand(const std::string& command) {
+    if (m_state != State::Joined || command.empty()) return;
+    Writer w(C_COMMAND);
+    w.str(command);
+    sendTo(m_peer, w);
 }
 
 void GameClient::sendChat(const std::string& text) {

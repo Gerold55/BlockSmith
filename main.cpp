@@ -62,6 +62,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "MainMenu.h"
 #include "Inventory.h" // Include your new dedicated Inventory module
 #include "CaveGenerator.h"
+#include "ChunkGenerator.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
 
@@ -1300,7 +1301,7 @@ bool changePlayerName(const std::string& name, std::string& error) {
 // Server settings (Settings > Server): what other players see in their server list.
 std::string serverMotd() {
     const auto it = g_Settings.find("server_motd");
-    return it != g_Settings.end() ? it->second : std::string("A Craft & Ruin server");
+    return it != g_Settings.end() ? it->second : std::string("A BlockSmith server");
 }
 int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 20), 2, 200); }
 int serverPort() {
@@ -1394,6 +1395,262 @@ void drawUITexture(GLuint program, GLuint tex, float x, float y, float w, float 
 }
 
 fs::path serversFile() { return settingsFile().parent_path() / "servers.txt"; }
+
+// ===========================================================================
+// My Servers: dedicated servers set up from the game (servers/<name>/server.conf),
+// run by BlockSmithServer in their own window.
+// ===========================================================================
+fs::path g_ExeDir;   // folder of the game's .exe (set in main)
+
+// ---------------------------------------------------------------------------
+// World generator threads (see ChunkGenerator.h): each gets its own Lua with the same
+// mod files, but only what a world generator needs. Drawing, sound, chat, the world and
+// the player belong to the main thread, so everything else is a harmless no-op there.
+// ---------------------------------------------------------------------------
+const char* kWorkerNoopLua = R"(
+local function noop_table()
+    return setmetatable({}, {
+        __index = function(_, _) return noop_table() end,
+        __call = function() return nil end,
+    })
+end
+for _, name in ipairs({ "ui", "hotbar", "sky", "clouds", "fog", "underwater", "menu", "chat",
+                        "player", "inventory", "audio", "sound", "input", "settings", "net" }) do
+    if _G[name] == nil then _G[name] = noop_table() end
+end
+local function fallback(t)
+    return setmetatable(t, { __index = function(_, _) return function() return nil end end })
+end
+fallback(engine)
+fallback(world)
+)";
+
+std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFiles) {
+    auto lua = std::make_unique<sol::state>();
+    lua->open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table);
+    (*lua)["print"] = [](sol::variadic_args) {};
+    lua->new_usertype<ChunkData>("Chunk",
+        "set_block", &ChunkData::setBlock, "setBlock", &ChunkData::setBlock,
+        "get_block", &ChunkData::getLocalBlock, "getBlock", &ChunkData::getLocalBlock,
+        "set_block_with_meta", &ChunkData::setBlockWithMeta,
+        "set_metadata", &ChunkData::setMetadata, "get_metadata", &ChunkData::getLocalMetadata
+    );
+    auto engine = lua->create_named_table("engine");
+    engine["register_block"] = [](sol::variadic_args) {};   // the main thread already did it
+    engine["get_block_id"] = [](const std::string& name) { return BlockRegistry::getInstance().getBlockId(name); };
+    engine["set_block"] = [](sol::variadic_args) {};
+    engine["get_block_name"] = [](sol::variadic_args) { return std::string("air"); };
+    engine["is_server"] = []() { return false; };
+    engine["is_world_generator"] = []() { return true; };
+    auto world = lua->create_named_table("world");
+    world["get_caves_enabled"] = []() { return CaveGenerator::isEnabled(); };
+    world["set_caves_enabled"] = [](sol::variadic_args) {};   // the main thread's setting wins
+    lua->script(kWorkerNoopLua);
+    for (const auto& file : modFiles) {
+        (*lua)["g_CurrentModPath"] = file.parent_path().string();
+        try { lua->script_file(file.string()); } catch (const std::exception&) {}   // errors shown by the main thread
+    }
+    return lua;
+}
+
+fs::path serverProfilesRoot() { return settingsFile().parent_path() / "servers"; }
+
+int settingIntFrom(const std::map<std::string, std::string>& kv, const std::string& key, int fallback) {
+    const auto it = kv.find(key);
+    if (it == kv.end()) return fallback;
+    try { return std::stoi(it->second); } catch (...) { return fallback; }
+}
+
+std::vector<std::string> listServerProfiles() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(serverProfilesRoot(), ec)) {
+        if (e.is_directory() && fs::exists(e.path() / "server.conf")) out.push_back(e.path().filename().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Same settings, defaults and comments as BlockSmithServer's own server.conf.
+struct ServerSettingInfo { const char* key; const char* defaultValue; const char* comment; };
+const std::vector<ServerSettingInfo>& serverSettingInfo() {
+    static const std::vector<ServerSettingInfo> info = {
+        {"name", "My Server", "Shown on the LAN list"},
+        {"motd", "{gold}{b}A BlockSmith server{/b}", "Description in server lists. {gold} {#ff8800} {b}bold{/b} {n} = 2nd line"},
+        {"icon", "server_icon.png", "Icon file in this folder (PNG, 64x64)"},
+        {"game", "craft_and_ruin", "Game to run (folder in games/)"},
+        {"world", "server_world", "World folder in saves/"},
+        {"seed", "", "Seed for a new world (empty = random)"},
+        {"port", "30000", "UDP port players connect to"},
+        {"max_players", "20", ""},
+        {"view_distance", "8", "Furthest players may see, in chunks"},
+        {"spawn", "8 8", "Where new players appear (x z)"},
+        {"welcome", "Welcome to the server, {player}!", "Sent to each player who joins"},
+        {"whitelist", "false", "Only players in whitelist.txt may join"},
+        {"disabled_mods", "", "Mods this server doesn't load (comma separated mod folder names)"},
+        {"tick_rate", "30", "Updates per second (20-60)"},
+        {"autosave_seconds", "60", ""},
+    };
+    return info;
+}
+
+std::map<std::string, std::string> readServerProfile(const std::string& profile) {
+    auto kv = readConfFile(serverProfilesRoot() / profile / "server.conf");
+    for (const auto& s : serverSettingInfo()) {
+        if (!kv.count(s.key)) kv[s.key] = s.defaultValue;
+    }
+    return kv;
+}
+
+bool writeServerProfile(const std::string& profile, const std::map<std::string, std::string>& values,
+                        std::string& error) {
+    const fs::path dir = serverProfilesRoot() / profile;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::ofstream out(dir / "server.conf", std::ios::trunc);
+    if (!out) { error = "Could not write " + (dir / "server.conf").string(); return false; }
+    out << "# BlockSmith dedicated server - set up from the game's My Servers screen.\n"
+        << "# You can also edit this file by hand (then type 'reload' in the server window).\n\n";
+    for (const auto& s : serverSettingInfo()) {
+        auto it = values.find(s.key);
+        std::string v = it != values.end() ? it->second : s.defaultValue;
+        v.erase(std::remove_if(v.begin(), v.end(), [](char c) { return c == '\n' || c == '\r'; }), v.end());
+        if (s.comment[0]) out << "# " << s.comment << "\n";
+        out << s.key << " = " << v << "\n";
+    }
+    return true;
+}
+
+// A safe folder name for a new server ("My Server!" -> "My Server")
+std::string serverProfileFolder(const std::string& raw) {
+    std::string out;
+    for (unsigned char c : raw) {
+        if (std::isalnum(c) || c == ' ' || c == '-' || c == '_') out.push_back(static_cast<char>(c));
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    if (out.size() > 32) out.resize(32);
+    return out;
+}
+
+fs::path findGameDir(const std::string& game) {
+    for (const std::string& base : {std::string("games/"), std::string("../../games/")}) {
+        std::error_code ec;
+        if (fs::is_directory(base + game, ec)) return fs::path(base + game);
+    }
+    return {};
+}
+
+// Every mod a server running `game` could load: the game's own mods and the global mods/ folder.
+struct ServerModEntry {
+    std::string id, title, description, source;
+    bool required = false;
+};
+std::vector<ServerModEntry> listModsForGame(const std::string& game) {
+    std::vector<ServerModEntry> out;
+    std::set<std::string> seen;
+    auto scan = [&](const fs::path& root, const std::string& source) {
+        std::error_code ec;
+        if (root.empty() || !fs::is_directory(root, ec)) return;
+        std::vector<fs::directory_entry> entries;
+        for (const auto& e : fs::directory_iterator(root, ec)) entries.push_back(e);
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.path().filename() < b.path().filename(); });
+        for (const auto& e : entries) {
+            ServerModEntry m;
+            if (e.is_directory()) m.id = e.path().filename().string();
+            else if (e.path().extension() == ".lua") m.id = e.path().stem().string();
+            else continue;
+            if (!seen.insert(m.id).second) continue;
+            m.source = source;
+            m.title = m.id;
+            if (e.is_directory()) {
+                auto conf = readConfFile(e.path() / "mod.conf");
+                if (!conf["title"].empty()) m.title = conf["title"];
+                else if (!conf["name"].empty()) m.title = conf["name"];
+                m.description = conf["description"];
+                m.required = modIsRequired(e.path(), m.id);
+            } else {
+                m.required = (m.id == "base");
+            }
+            out.push_back(m);
+        }
+    };
+    const fs::path gameDir = findGameDir(game);
+    if (!gameDir.empty()) scan(gameDir / "mods", "Game");
+    scan(globalModsFolder(), "Global");
+    return out;
+}
+
+// BlockSmithServer.exe is built next to the game's .exe; also check the usual build folders
+// (and the server's old name, CraftRuinServer, from before the engine was named).
+fs::path findServerExe() {
+#ifdef _WIN32
+    const std::vector<std::string> names = {"BlockSmithServer.exe", "CraftRuinServer.exe"};
+#else
+    const std::vector<std::string> names = {"BlockSmithServer", "CraftRuinServer"};
+#endif
+    std::vector<fs::path> places = {g_ExeDir, ".", "build/Release", "build/Debug", "build", "../Release", "../Debug"};
+    for (const auto& exe : names) {
+        for (const auto& p : places) {
+            std::error_code ec;
+            if (!p.empty() && fs::exists(p / exe, ec)) return fs::absolute(p / exe, ec);
+        }
+    }
+    return {};
+}
+
+// Starts a server in its own console window (it keeps running if the game is closed).
+bool startServerProfile(const std::string& profile, std::string& error) {
+    const fs::path exe = findServerExe();
+    if (exe.empty()) {
+        error = "BlockSmithServer isn't built yet - build the BlockSmithServer target";
+        return false;
+    }
+    std::error_code ec;
+    const fs::path dir = fs::absolute(serverProfilesRoot() / profile, ec);
+    const fs::path conf = dir / "server.conf";
+    if (!fs::exists(conf, ec)) { error = "That server has no settings file"; return false; }
+    fs::remove(dir / "stop.request", ec);
+    auto quoted = [](std::string s) {
+        s.erase(std::remove(s.begin(), s.end(), '"'), s.end());
+        return "\"" + s + "\"";
+    };
+    const std::string cwd = fs::current_path(ec).string();   // where games/ mods/ saves/ are found
+#if defined(_WIN32)
+    const std::string cmd = "start " + quoted("BlockSmith Server - " + profile) + " /D " + quoted(cwd) + " " +
+                            quoted(exe.string()) + " --config " + quoted(conf.string());
+#else
+    const std::string cmd = quoted(exe.string()) + " --config " + quoted(conf.string()) + " > " +
+                            quoted((dir / "server.log").string()) + " 2>&1 < /dev/null &";
+#endif
+    std::cout << "[Servers] Starting '" << profile << "': " << cmd << std::endl;
+    if (std::system(cmd.c_str()) != 0) {
+        error = "Couldn't start the server program";
+        return false;
+    }
+    return true;
+}
+
+// Asks a running server to save and stop (it checks for this file every second).
+void stopServerProfile(const std::string& profile) {
+    std::ofstream(serverProfilesRoot() / profile / "stop.request") << "stop\n";
+}
+
+void openFolderInExplorer(const fs::path& folder) {
+    std::error_code ec;
+    fs::create_directories(folder, ec);
+    std::string abs = fs::absolute(folder, ec).string();
+    abs.erase(std::remove(abs.begin(), abs.end(), '"'), abs.end());
+#if defined(_WIN32)
+    const std::string cmd = "explorer \"" + abs + "\"";
+#elif defined(__APPLE__)
+    const std::string cmd = "open \"" + abs + "\"";
+#else
+    const std::string cmd = "xdg-open \"" + abs + "\" &";
+#endif
+    std::system(cmd.c_str());
+}
 
 struct SavedServer { std::string name, address; };
 
@@ -2063,7 +2320,13 @@ void drawLoadingScreen(GLuint uiProgram, GLuint fontProgram, float progress, int
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // Remember where the game's .exe is: BlockSmithServer is built next to it (My Servers screen)
+    if (argc > 0 && argv[0]) {
+        std::error_code exeEc;
+        const fs::path exe = fs::absolute(fs::path(argv[0]), exeEc);
+        if (!exeEc) g_ExeDir = exe.parent_path();
+    }
     try {
         if (!glfwInit()) return -1;
 
@@ -2071,7 +2334,12 @@ int main() {
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-        GLFWwindow* window = glfwCreateWindow(1280, 720, "Craft & Ruin - Voxel Engine", NULL, NULL);
+        // Window title: the game being played, on the BlockSmith engine
+        std::string windowTitle = "BlockSmith";
+        for (const auto& g : getAvailableGames()) {
+            if (g.folderName == g_ActiveGameFolder) windowTitle = g.title + " - BlockSmith";
+        }
+        GLFWwindow* window = glfwCreateWindow(1280, 720, windowTitle.c_str(), NULL, NULL);
         if (!window) { glfwTerminate(); return -1; }
         glfwMakeContextCurrent(window);
         glfwSwapInterval(1); // vsync (1 = once per screen refresh)
@@ -2570,16 +2838,30 @@ int main() {
                 else g_ChatSystem->addMessage(error, glm::vec3(1.0f, 0.55f, 0.55f));
                 return true;
             }
+            bool handledByLua = false;
             try {
                 sol::protected_function fn = lua["on_chat_command"];
-                if (!fn.valid()) return false;
-                sol::protected_function_result result = fn(command);
-                if (!result.valid()) return false;
-                if (result.get_type() == sol::type::boolean) return result.get<bool>();
-                return false;
-            } catch (...) {
-                return false;
+                if (fn.valid()) {
+                    sol::protected_function_result result = fn(command);
+                    if (result.valid() && result.get_type() == sol::type::boolean) handledByLua = result.get<bool>();
+                }
+            } catch (...) {}
+            if (handledByLua) return true;
+
+            // Online: the server runs everything else (/list, /msg, and for operators /kick,
+            // /ban, /save, /mods...). It answers in chat.
+            if (g_Client.state() == GameClient::State::Joined) {
+                const std::string word = command.substr(0, command.find(' '));
+                if (word == "help") {
+                    g_Client.sendCommand(command);   // the server's commands...
+                    return false;                     // ...and this game's /help as well
+                }
+                if (word != "clear") {
+                    g_Client.sendCommand(command);
+                    return true;
+                }
             }
+            return false;
         });
 
         auto worldTable = lua.create_named_table("world");
@@ -2898,6 +3180,18 @@ int main() {
         };
         engineTable["get_player_name"] = []() { return playerName(); };
         // engine.set_player_name(name) -> true, or false + error
+        // engine.set_player_password(password) - "" removes it. Only a hash is stored (settings.txt)
+        // and sent to servers; servers use it to protect your name (Settings > Player).
+        engineTable["set_player_password"] = [](const std::string& password) {
+            if (password.empty()) g_Settings.erase("player_password_token");
+            else g_Settings["player_password_token"] = net::passwordToken(password);
+            saveSettings();
+            return true;
+        };
+        engineTable["has_player_password"] = []() {
+            const auto it = g_Settings.find("player_password_token");
+            return it != g_Settings.end() && !it->second.empty();
+        };
         engineTable["set_player_name"] = [](const std::string& name) {
             std::string error;
             const bool ok = changePlayerName(name, error);
@@ -2912,7 +3206,8 @@ int main() {
             std::string error;
             g_NetError.clear();
             const int view = g_WorldInstance ? g_WorldInstance->renderDistance() : 8;
-            if (!g_Client.connect(*g_WorldInstance, address, playerName(), g_LoadedGameFolder, view, error)) {
+            const std::string token = g_Settings.count("player_password_token") ? g_Settings["player_password_token"] : "";
+            if (!g_Client.connect(*g_WorldInstance, address, playerName(), g_LoadedGameFolder, view, error, token)) {
                 return std::make_tuple(false, error);
             }
             return std::make_tuple(true, std::string());
@@ -3038,6 +3333,110 @@ int main() {
             t["names"] = names;
             return t;
         };
+
+        // ---- My Servers (server_manager.lua): dedicated servers set up from the game ----
+        // engine.list_games() -> { { folder, title, description }, ... }
+        engineTable["list_games"] = [&lua]() {
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (const auto& g : getAvailableGames()) {
+                sol::table e = lua.create_table();
+                e["folder"] = g.folderName;
+                e["title"] = g.title;
+                e["description"] = g.description;
+                t[i++] = e;
+            }
+            return t;
+        };
+        // engine.list_server_profiles() -> { "Survival", "Skyblock", ... }   (folders in servers/)
+        engineTable["list_server_profiles"] = [&lua]() {
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (const auto& p : listServerProfiles()) t[i++] = p;
+            return t;
+        };
+        // engine.get_server_profile(name) -> { name=..., motd=..., game=..., port=..., ... } (all strings)
+        engineTable["get_server_profile"] = [&lua](const std::string& profile) {
+            sol::table t = lua.create_table();
+            for (const auto& [k, v] : readServerProfile(profile)) t[k] = v;
+            return t;
+        };
+        // engine.save_server_profile(name, settings) -> true, or false + error
+        engineTable["save_server_profile"] = [](const std::string& profile, sol::table settings) {
+            std::map<std::string, std::string> values = readServerProfile(profile);
+            for (const auto& s : serverSettingInfo()) {
+                sol::object v = settings[s.key];
+                if (v.is<std::string>()) values[s.key] = v.as<std::string>();
+                else if (v.is<double>()) values[s.key] = std::to_string(static_cast<long long>(v.as<double>()));
+                else if (v.is<bool>()) values[s.key] = v.as<bool>() ? "true" : "false";
+            }
+            std::string error;
+            const bool ok = writeServerProfile(profile, values, error);
+            return std::make_tuple(ok, error);
+        };
+        // engine.create_server_profile(displayName) -> folder name, or nil + error
+        engineTable["create_server_profile"] = [&lua](const std::string& displayName) {
+            const std::string folder = serverProfileFolder(displayName);
+            if (folder.empty()) {
+                return std::make_tuple(sol::make_object(lua, sol::lua_nil), std::string("Type a name with letters or numbers"));
+            }
+            std::error_code ec;
+            if (fs::exists(serverProfilesRoot() / folder, ec)) {
+                return std::make_tuple(sol::make_object(lua, sol::lua_nil), std::string("There's already a server called '" + folder + "'"));
+            }
+            // Defaults: this game, a world named after the server, the next free port
+            std::map<std::string, std::string> values;
+            values["name"] = displayName;
+            values["game"] = g_LoadedGameFolder;
+            values["world"] = folder;
+            int port = net::kDefaultPort;
+            for (const auto& other : listServerProfiles()) {
+                port = std::max(port, settingIntFrom(readServerProfile(other), "port", net::kDefaultPort) + 1);
+            }
+            if (port == static_cast<int>(net::kLanPort)) ++port;   // the LAN list uses 30001
+            values["port"] = std::to_string(port);
+            std::string error;
+            if (!writeServerProfile(folder, values, error)) {
+                return std::make_tuple(sol::make_object(lua, sol::lua_nil), error);
+            }
+            return std::make_tuple(sol::make_object(lua, folder), std::string());
+        };
+        // engine.delete_server_profile(name) -> true, or false + error (its world in saves/ is kept)
+        engineTable["delete_server_profile"] = [](const std::string& profile) {
+            if (serverProfileFolder(profile) != profile || profile.empty()) {
+                return std::make_tuple(false, std::string("Invalid server name"));
+            }
+            std::error_code ec;
+            fs::remove_all(serverProfilesRoot() / profile, ec);
+            if (ec) return std::make_tuple(false, "Couldn't delete it: " + ec.message());
+            return std::make_tuple(true, std::string());
+        };
+        // engine.list_mods_for_game(game) -> { { id, title, description, source = "Game"|"Global", required }, ... }
+        engineTable["list_mods_for_game"] = [&lua](const std::string& game) {
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (const auto& m : listModsForGame(game)) {
+                sol::table e = lua.create_table();
+                e["id"] = m.id;
+                e["title"] = m.title;
+                e["description"] = m.description;
+                e["source"] = m.source;
+                e["required"] = m.required;
+                t[i++] = e;
+            }
+            return t;
+        };
+        // engine.start_server_profile(name) -> true, or false + error (opens the server's window)
+        engineTable["start_server_profile"] = [](const std::string& profile) {
+            std::string error;
+            const bool ok = startServerProfile(profile, error);
+            return std::make_tuple(ok, error);
+        };
+        engineTable["stop_server_profile"] = [](const std::string& profile) { stopServerProfile(profile); };
+        engineTable["open_server_profile_folder"] = [](const std::string& profile) {
+            openFolderInExplorer(serverProfilesRoot() / profile);
+        };
+        engineTable["has_server_build"] = []() { return !findServerExe().empty(); };
 
         // engine.get_lan_games() -> { { address, host, motd, players, max_players }, ... }
         engineTable["get_lan_games"] = [&lua]() {
@@ -3277,6 +3676,18 @@ int main() {
             "set_block_with_meta", &ChunkData::setBlockWithMeta,
             "set_metadata", &ChunkData::setMetadata, "get_metadata", &ChunkData::getLocalMetadata
         );
+
+        // New chunks are generated on background threads (singleplayer and LAN hosting alike),
+        // so exploring never makes the game - or the players connected to it - stutter.
+        // Two cores stay free: this thread and the graphics driver.
+        CaveGenerator::prepare();
+        std::vector<fs::path> genModFiles;
+        for (const auto& f : modFiles) if (f.filename() == "init.lua") genModFiles.push_back(f);
+        for (const auto& f : modFiles) if (f.filename() != "init.lua" && !isInsideInitFolder(f)) genModFiles.push_back(f);
+        ChunkGenerator chunkGenerator(0, [genModFiles]() { return makeWorldGenLua(genModFiles); }, world.seed(), 2);
+        world.setGenerator(&chunkGenerator);
+        std::cout << "[World] Generating chunks on " << chunkGenerator.threadCount() << " background thread"
+                  << (chunkGenerator.threadCount() == 1 ? "" : "s") << std::endl;
 
         GLuint shaderProgram = glCreateProgram();
         glAttachShader(shaderProgram, compileShader(GL_VERTEX_SHADER, vertexShaderSource));
@@ -4144,6 +4555,7 @@ int main() {
         if (g_CurrentGameState == GameState::PLAYING) saveCurrentWorld();
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
+        world.setGenerator(nullptr);   // the generator's threads stop at the end of this block
         g_Pinger.clear();
         g_Lan.stop();
         for (auto& [addr, t] : g_ServerIcons) if (t.tex) glDeleteTextures(1, &t.tex);

@@ -31,6 +31,8 @@ struct IVec3Hash {
     }
 };
 
+class ChunkGenerator;
+
 class World {
 public:
     using ChunkCoord = std::pair<int, int>;
@@ -94,6 +96,16 @@ public:
     void setRecordChanges(bool on) { m_recordChanges = on; if (!on) m_changes.clear(); }
     std::vector<BlockChange> takeBlockChanges();
 
+    // Background world generation (the dedicated server uses this): new chunks are made on
+    // the generator's threads instead of inside update(), so ticks never stall. nullptr =
+    // generate on the calling thread (the old way). The generator must outlive its use here.
+    void setGenerator(ChunkGenerator* generator) { m_generator = generator; }
+    size_t generatingCount() const { return m_generating.size(); }
+
+    // Makes a brand-new chunk: the Lua world generator (generate_chunk) if `lua` has one,
+    // else the built-in terrain, then caves. Safe to call from any thread with its own lua.
+    static void generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed);
+
     // Chunk <-> bytes, using the save file format (block names, run-length encoded).
     static std::vector<uint8_t> encodeChunk(const ChunkData& chunk);
     static bool decodeChunk(const std::vector<uint8_t>& bytes, ChunkData& chunk);
@@ -136,6 +148,9 @@ private:
     void rebuildLoadQueue();
     void loadQueuedChunks(sol::state& lua);
     void unloadDistantChunks();
+    bool wantedChunk(const ChunkCoord& c) const;   // inside some player's area (+ margin)
+    void collectGenerated();
+    void addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk);
     void recordChange(const glm::ivec3& loc);
     void ensureLuaSeeded(sol::state& lua);
 
@@ -157,6 +172,10 @@ private:
     float m_loadBudgetMs = 4.0f;
 
     std::vector<ChunkCoord> m_loadQueue;
+
+    // Background generation
+    ChunkGenerator* m_generator = nullptr;
+    std::unordered_set<ChunkCoord, PairHash> m_generating;   // requested, not back yet
 
     // Multiplayer
     bool m_remote = false;

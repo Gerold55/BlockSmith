@@ -1,4 +1,4 @@
-// CraftRuinServer - dedicated (headless) multiplayer server for any game made with the engine.
+// BlockSmithServer - the BlockSmith engine's dedicated (headless) multiplayer server, for any game made with it.
 //
 // No window, no graphics card: it loads a game's mods, opens a world, and runs it at a
 // fixed tick rate, sleeping in between, so it uses very little CPU while nobody is moving.
@@ -11,9 +11,9 @@
 //   - welcome message, spawn point, view distance limit, whitelist and bans
 //
 // Several servers (even for different games) can run from one install:
-//   CraftRuinServer --game skyblock --world sky --port 30001
-//   CraftRuinServer --config survival.conf
-//   CraftRuinServer --list-games
+//   BlockSmithServer --game skyblock --world sky --port 30001
+//   BlockSmithServer --config survival.conf
+//   BlockSmithServer --list-games
 
 #include "World.h"
 #include "ChunkData.h"
@@ -21,8 +21,11 @@
 #include "Block.h"
 #include "BlockDefs.h"
 #include "Net.h"
+#include "Sha256.h"
+#include "ChunkGenerator.h"
 
 #include <sol/sol.hpp>
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -184,8 +187,8 @@ void printGames() {
 // Settings (server.conf)
 // ===========================================================================
 struct ServerConfig {
-    std::string name = "Craft & Ruin Server";
-    std::string motd = "{gold}{b}A Craft & Ruin server{/b}{n}{gray}Running on a dedicated server";
+    std::string name = "BlockSmith Server";
+    std::string motd = "{gold}{b}A BlockSmith server{/b}{n}{gray}Running on a dedicated server";
     std::string icon = "server_icon.png";
     std::string game = "craft_and_ruin";
     std::string world = "world";
@@ -196,13 +199,16 @@ struct ServerConfig {
     int spawnX = 8, spawnZ = 8;
     std::string welcome = "{gold}Welcome to the server, {player}!";
     bool whitelist = false;
+    bool requirePassword = false;
+    int generatorThreads = 0;   // 0 = automatic (CPU cores - 1)
+    std::set<std::string> disabledMods;
     int tickRate = 30;
     int autosaveSeconds = 60;
 };
 
 void writeDefaultConfig(const fs::path& file, const ServerConfig& c) {
     std::ofstream out(file);
-    out << "# Craft & Ruin dedicated server settings.\n"
+    out << "# BlockSmith dedicated server settings.\n"
         << "# Most of these can be changed while the server runs: edit this file, then type\n"
         << "# 'reload' in the server window. (game, world, seed and port need a restart.)\n"
         << "\n"
@@ -235,10 +241,21 @@ void writeDefaultConfig(const fs::path& file, const ServerConfig& c) {
         << "welcome = " << c.welcome << "\n"
         << "# Only players listed in whitelist.txt may join ('whitelist add <name>' in the console)\n"
         << "whitelist = " << (c.whitelist ? "true" : "false") << "\n"
+        << "# Players must set a password (Settings > Player in the game) to join. Either way, a\n"
+        << "# name that joined once with a password can only be used with that password again.\n"
+        << "# Recommended for public servers.\n"
+        << "require_password = " << (c.requirePassword ? "true" : "false") << "\n"
+        << "\n"
+        << "# --- Mods ---\n"
+        << "# The server loads the game's mods and everything in mods/, except these\n"
+        << "# (comma separated mod folder names). Players need the same mods.\n"
+        << "disabled_mods = \n"
         << "\n"
         << "# --- Performance ---\n"
         << "# Updates per second (20-60). Higher = smoother, more CPU.\n"
         << "tick_rate = " << c.tickRate << "\n"
+        << "# Threads that generate new terrain (0 = automatic: CPU cores - 1)\n"
+        << "generator_threads = 0\n"
         << "autosave_seconds = " << c.autosaveSeconds << "\n";
 }
 
@@ -261,6 +278,16 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     }
     if (kv.count("welcome")) c.welcome = kv["welcome"];
     c.whitelist = toBool(kv["whitelist"], c.whitelist);
+    c.requirePassword = toBool(kv["require_password"], c.requirePassword);
+    c.generatorThreads = std::clamp(toInt(kv["generator_threads"], 0), 0, 32);
+    {
+        std::istringstream mods(kv["disabled_mods"]);
+        std::string id;
+        while (std::getline(mods, id, ',')) {
+            id = trim(id);
+            if (!id.empty()) c.disabledMods.insert(id);
+        }
+    }
     c.tickRate = std::clamp(toInt(kv["tick_rate"], c.tickRate), 10, 120);
     c.autosaveSeconds = std::clamp(toInt(kv["autosave_seconds"], c.autosaveSeconds), 10, 3600);
     return c;
@@ -341,6 +368,99 @@ struct NameList {
         return out.empty() ? "(nobody)" : out;
     }
 };
+
+// ===========================================================================
+// Accounts (accounts.txt next to server.conf): a name belongs to whoever first joined
+// with a password. Stored as "name | salt | sha256(salt:token)" - the token is already a
+// hash of the password, so the password itself never reaches the server.
+// ===========================================================================
+struct Accounts {
+    fs::path file;
+    struct Entry { std::string name, salt, hash; };
+    std::map<std::string, Entry> entries;   // lower-case name -> entry
+
+    void load() {
+        entries.clear();
+        std::ifstream in(file);
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            Entry e;
+            std::string part;
+            std::vector<std::string> parts;
+            while (std::getline(ss, part, '|')) parts.push_back(trim(part));
+            if (parts.size() != 3) continue;
+            e.name = parts[0]; e.salt = parts[1]; e.hash = parts[2];
+            entries[lower(e.name)] = e;
+        }
+    }
+    void save() const {
+        std::ofstream out(file, std::ios::trunc);
+        out << "# Player accounts: name | salt | password hash. Delete a line to reset that password.\n";
+        for (const auto& [k, e] : entries) out << e.name << " | " << e.salt << " | " << e.hash << "\n";
+    }
+    bool has(const std::string& name) const { return entries.count(lower(name)) > 0; }
+    bool check(const std::string& name, const std::string& token) const {
+        auto it = entries.find(lower(name));
+        return it != entries.end() && !token.empty() && sha256Hex(it->second.salt + ":" + token) == it->second.hash;
+    }
+    void set(const std::string& name, const std::string& token) {
+        std::random_device rd;
+        char salt[17];
+        std::snprintf(salt, sizeof(salt), "%08x%08x", rd(), rd());
+        entries[lower(name)] = Entry{name, salt, sha256Hex(std::string(salt) + ":" + token)};
+        save();
+    }
+    bool remove(const std::string& name) {
+        const bool had = entries.erase(lower(name)) > 0;
+        if (had) save();
+        return had;
+    }
+};
+
+// ===========================================================================
+// Mods available to a game (its own mods + the global mods/ folder)
+// ===========================================================================
+bool modIsRequired(const fs::path& modFolder, const std::string& id);
+
+struct ModEntry { std::string id, title, source; bool required = false; };
+
+std::vector<ModEntry> listServerMods(const std::string& game) {
+    std::vector<ModEntry> out;
+    std::set<std::string> seen;
+    auto scan = [&](const fs::path& root, const std::string& source) {
+        std::error_code ec;
+        if (!fs::is_directory(root, ec)) return;
+        std::vector<fs::path> paths;
+        for (const auto& e : fs::directory_iterator(root, ec)) paths.push_back(e.path());
+        std::sort(paths.begin(), paths.end());
+        for (const auto& p : paths) {
+            ModEntry m;
+            if (fs::is_directory(p, ec)) m.id = p.filename().string();
+            else if (p.extension() == ".lua") m.id = p.stem().string();
+            else continue;
+            if (!seen.insert(m.id).second) continue;
+            m.source = source;
+            m.title = m.id;
+            auto conf = readConfFile(p / "mod.conf");
+            if (!conf["title"].empty()) m.title = conf["title"];
+            else if (!conf["name"].empty()) m.title = conf["name"];
+            m.required = modIsRequired(p, m.id);
+            out.push_back(m);
+        }
+    };
+    scan(findFolder("games/" + game) / "mods", "game");
+    scan(findFolder("mods"), "global");
+    return out;
+}
+
+std::string joinIds(const std::set<std::string>& ids) {
+    std::string out;
+    for (const auto& id : ids) out += (out.empty() ? "" : ", ") + id;
+    return out;
+}
 
 // ===========================================================================
 // World files (same layout as the game, so worlds can be copied either way)
@@ -436,7 +556,9 @@ bool modIsRequired(const fs::path& modFolder, const std::string& id) {
     return readConfFile(conf)["required"] == "true";
 }
 
-std::vector<fs::path> findModFiles(const std::string& game) {
+// Which mods load is up to the server's owner: everything in the game's mods and the
+// global mods/ folder, except the ones listed in disabled_mods (required mods always load).
+std::vector<fs::path> findModFiles(const std::string& game, const std::set<std::string>& disabled) {
     std::vector<fs::path> modFiles;
     std::set<std::string> initFolders, seenRoots;
     const std::vector<std::string> searchPaths = {"mods", "../mods", "../../mods", "games/" + game + "/mods"};
@@ -450,26 +572,21 @@ std::vector<fs::path> findModFiles(const std::string& game) {
         if (!seenRoots.insert((ec ? fs::path(resolved) : canon).string()).second) continue;
         std::cout << "[Mod] Mod folder: " << resolved << std::endl;
 
-        const bool isGlobal = searchPath.rfind("games/", 0) != 0;
-        const auto settings = isGlobal ? readConfFile(fs::path(resolved) / "mod_settings.txt")
-                                       : std::map<std::string, std::string>{};
         std::set<std::string> reported;
 
         for (const auto& entry : fs::recursive_directory_iterator(resolved)) {
             if (!entry.is_regular_file() || entry.path().extension() != ".lua") continue;
-            if (isGlobal) {
-                std::error_code relEc;
-                const fs::path rel = fs::relative(entry.path(), resolved, relEc);
-                const std::string id = (relEc || rel.empty()) ? "" : rel.begin()->string();
-                if (!id.empty()) {
-                    const auto it = settings.find(id);
-                    const bool off = it != settings.end() && it->second == "false" &&
-                                     !modIsRequired(fs::path(resolved) / id, id);
-                    if (off) {
-                        if (reported.insert(id).second) std::cout << "[Mod] Skipping disabled mod: " << id << std::endl;
-                        continue;
-                    }
+            std::error_code relEc;
+            const fs::path rel = fs::relative(entry.path(), resolved, relEc);
+            std::string id = (relEc || rel.empty()) ? "" : rel.begin()->string();
+            if (!id.empty() && std::next(rel.begin()) == rel.end()) id = fs::path(id).stem().string();   // single-file mod
+            if (!id.empty() && disabled.count(id)) {
+                const bool required = modIsRequired(fs::path(resolved) / id, id);
+                if (!required) {
+                    if (reported.insert(id).second) std::cout << "[Mod] Not loading (disabled_mods): " << id << std::endl;
+                    continue;
                 }
+                if (reported.insert(id).second) std::cout << "[Mod] " << id << " is required - loading it anyway" << std::endl;
             }
             if (entry.path().filename() == "init.lua") initFolders.insert(entry.path().parent_path().string());
             modFiles.push_back(entry.path());
@@ -550,8 +667,11 @@ struct ServerContext {
     GameInfo game;
 };
 
-void setupLua(sol::state& lua, ServerContext& ctx) {
+// worker = true: a Lua state for a world generator thread. Same mods, but nothing in it
+// may touch the world or the block list (the main thread owns those), and it stays quiet.
+void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table);
+    if (worker) lua["print"] = [](sol::variadic_args) {};
 
     lua.new_usertype<ChunkData>("Chunk",
         "set_block", &ChunkData::setBlock, "setBlock", &ChunkData::setBlock,
@@ -561,18 +681,27 @@ void setupLua(sol::state& lua, ServerContext& ctx) {
     );
 
     auto engine = lua.create_named_table("engine");
-    engine["register_block"] = [](const std::string& name, float r, float g, float b, sol::object tex,
-                                  sol::object overlay, sol::optional<sol::table> props) {
-        registerBlockDefinition(name, r, g, b, tex, overlay, props, [](const std::string&) { return -1; });
-    };
+    if (worker) {
+        engine["register_block"] = [](sol::variadic_args) {};   // already registered by the main thread
+    } else {
+        engine["register_block"] = [](const std::string& name, float r, float g, float b, sol::object tex,
+                                      sol::object overlay, sol::optional<sol::table> props) {
+            registerBlockDefinition(name, r, g, b, tex, overlay, props, [](const std::string&) { return -1; });
+        };
+    }
     engine["get_block_id"] = [](const std::string& name) { return BlockRegistry::getInstance().getBlockId(name); };
-    engine["set_block"] = [&ctx](int x, int y, int z, const std::string& name) {
-        ctx.world->setBlockAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name));
-    };
-    engine["get_block_name"] = [&ctx](int x, int y, int z) -> std::string {
-        const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
-        return id == 0 ? std::string("air") : BlockRegistry::getInstance().getBlock(id).name;
-    };
+    if (worker) {
+        engine["set_block"] = [](sol::variadic_args) {};
+        engine["get_block_name"] = [](sol::variadic_args) { return std::string("air"); };
+    } else {
+        engine["set_block"] = [&ctx](int x, int y, int z, const std::string& name) {
+            ctx.world->setBlockAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name));
+        };
+        engine["get_block_name"] = [&ctx](int x, int y, int z) -> std::string {
+            const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
+            return id == 0 ? std::string("air") : BlockRegistry::getInstance().getBlock(id).name;
+        };
+    }
     engine["is_server"] = []() { return true; };
     engine["get_player_name"] = [&ctx]() { return ctx.config->name; };
     engine["send_chat"] = [&ctx](const std::string& text) {
@@ -605,16 +734,99 @@ void setupLua(sol::state& lua, ServerContext& ctx) {
         ctx.server->broadcastMessage(text, glm::vec3(r.value_or(1.0f), g.value_or(1.0f), b.value_or(0.6f)));
     };
 
+    if (worker) {
+        // Generator threads must not touch the network either (only the main thread may)
+        engine["send_chat"] = [](sol::variadic_args) { return false; };
+        chat["send"] = [](sol::variadic_args) {};
+    }
     lua.script(kNoopLua);
 }
 
 void printUsage() {
-    std::cout << "Usage: CraftRuinServer [options]\n"
+    std::cout << "Usage: BlockSmithServer [options]\n"
+              << "  --setup           answer a few questions to set up (or change) the server\n"
               << "  --config <file>   settings file (default server.conf, created if missing)\n"
               << "  --game <folder>   game to run (overrides 'game' in the settings)\n"
               << "  --world <name>    world folder in saves/ (overrides 'world')\n"
               << "  --port <number>   port (overrides 'port')\n"
               << "  --list-games      show installed games and exit\n";
+}
+
+// ===========================================================================
+// --setup: set up the server by answering questions in the console (for machines
+// without the game - the console version of the game's My Servers screen)
+// ===========================================================================
+std::string ask(const std::string& question, const std::string& current) {
+    std::cout << question << (current.empty() ? "" : " [" + current + "]") << ": " << std::flush;
+    std::string answer;
+    if (!std::getline(std::cin, answer)) return current;
+    answer = trim(answer);
+    return answer.empty() ? current : answer;
+}
+
+void runSetup(const fs::path& configFile) {
+    std::error_code ec;
+    if (!fs::exists(configFile, ec)) writeDefaultConfig(configFile, ServerConfig{});
+    ServerConfig c = parseConfig(readConfFile(configFile));
+
+    std::cout << "\n=== Server setup === (press Enter to keep the value in [brackets])\n\n";
+    c.name = ask("Server name", c.name);
+    std::cout << "Description colours: {gold} {red} {aqua} {#ff8800}, {b}bold{/b}, {n} = second line\n";
+    c.motd = ask("Description", c.motd);
+
+    const auto games = listGames();
+    if (!games.empty()) {
+        std::cout << "\nGames installed:\n";
+        for (size_t i = 0; i < games.size(); ++i) {
+            std::cout << "  " << (i + 1) << ") " << games[i].title << " (" << games[i].folder << ")"
+                      << (games[i].folder == c.game ? "  <- current" : "") << "\n";
+        }
+        const std::string pick = ask("Game (number or folder name)", c.game);
+        const int n = toInt(pick, 0);
+        if (n >= 1 && n <= static_cast<int>(games.size())) c.game = games[n - 1].folder;
+        else c.game = pick;
+    }
+    c.world = ask("World name", c.world);
+    c.seed = ask("Seed for a new world (empty = random)", c.seed);
+    c.port = std::clamp(toInt(ask("Port", std::to_string(c.port)), c.port), 1024, 65535);
+    c.maxPlayers = std::clamp(toInt(ask("Max players", std::to_string(c.maxPlayers)), c.maxPlayers), 1, 4000);
+    c.requirePassword = toBool(ask("Require players to have a password? (yes/no) - recommended for public servers",
+                                   c.requirePassword ? "yes" : "no"), c.requirePassword);
+    c.whitelist = toBool(ask("Whitelist only? (yes/no)", c.whitelist ? "yes" : "no"), c.whitelist);
+
+    // Mods: show them all, let the owner switch some off by number
+    const auto mods = listServerMods(c.game);
+    if (!mods.empty()) {
+        std::cout << "\nMods for this game (x = on):\n";
+        for (size_t i = 0; i < mods.size(); ++i) {
+            const bool on = mods[i].required || !c.disabledMods.count(mods[i].id);
+            std::cout << "  " << (i + 1) << ") [" << (on ? "x" : " ") << "] " << mods[i].title << " (" << mods[i].id
+                      << ", " << mods[i].source << (mods[i].required ? ", required" : "") << ")\n";
+        }
+        const std::string toggle = ask("Numbers to switch on/off, comma separated (Enter = keep)", "");
+        std::istringstream ss(toggle);
+        std::string part;
+        while (std::getline(ss, part, ',')) {
+            const int n = toInt(trim(part), 0);
+            if (n < 1 || n > static_cast<int>(mods.size())) continue;
+            const auto& m = mods[n - 1];
+            if (m.required) { std::cout << "  " << m.id << " is required - it stays on\n"; continue; }
+            if (c.disabledMods.count(m.id)) c.disabledMods.erase(m.id); else c.disabledMods.insert(m.id);
+        }
+    }
+
+    updateConfValue(configFile, "name", c.name);
+    updateConfValue(configFile, "motd", c.motd);
+    updateConfValue(configFile, "game", c.game);
+    updateConfValue(configFile, "world", c.world);
+    updateConfValue(configFile, "seed", c.seed);
+    updateConfValue(configFile, "port", std::to_string(c.port));
+    updateConfValue(configFile, "max_players", std::to_string(c.maxPlayers));
+    updateConfValue(configFile, "require_password", c.requirePassword ? "true" : "false");
+    updateConfValue(configFile, "whitelist", c.whitelist ? "true" : "false");
+    updateConfValue(configFile, "disabled_mods", joinIds(c.disabledMods));
+    std::cout << "\nSaved to " << configFile.string() << ". Put a 64x64 server_icon.png next to it for an icon.\n"
+              << "Tip: after joining, type 'op <your name>' here to manage the server from the game.\n\n";
 }
 
 }  // namespace
@@ -623,29 +835,33 @@ void printUsage() {
 // main
 // ===========================================================================
 int main(int argc, char** argv) {
-    std::cout << "Craft & Ruin dedicated server (" << net::kVersionName << ")" << std::endl;
+    std::cout << "BlockSmith dedicated server (" << net::kVersionName << ")" << std::endl;
 
     // ---- Command line ----
     fs::path configFile = "server.conf";
     std::map<std::string, std::string> overrides;
+    bool setup = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if (a == "--help" || a == "-h") { printUsage(); return 0; }
         else if (a == "--list-games") { printGames(); return 0; }
+        else if (a == "--setup") setup = true;
         else if (a == "--config") configFile = next();
         else if (a == "--game") overrides["game"] = next();
         else if (a == "--world") overrides["world"] = next();
         else if (a == "--port") overrides["port"] = next();
-        else if (i == 1 && a.rfind("--", 0) != 0) configFile = a;   // old style: CraftRuinServer my.conf
+        else if (i == 1 && a.rfind("--", 0) != 0) configFile = a;   // old style: BlockSmithServer my.conf
         else { std::cerr << "Unknown option '" << a << "'\n"; printUsage(); return 1; }
     }
 
     std::error_code ec;
-    if (!fs::exists(configFile, ec)) {
+    if (setup) {
+        runSetup(configFile);
+    } else if (!fs::exists(configFile, ec)) {
         writeDefaultConfig(configFile, ServerConfig{});
-        std::cout << "[Server] Created " << configFile.string() << " with default settings - edit it to "
-                  << "set the name, description, icon and game" << std::endl;
+        std::cout << "[Server] Created " << configFile.string() << " with default settings. Edit it, or run "
+                  << "BlockSmithServer --setup to answer a few questions instead." << std::endl;
     }
     const fs::path confDir = configFile.has_parent_path() ? configFile.parent_path() : fs::path(".");
     auto readSettings = [&]() {
@@ -693,7 +909,7 @@ int main(int argc, char** argv) {
     sol::state lua;
     setupLua(lua, ctx);
     int failed = 0;
-    for (const auto& file : findModFiles(config.game)) {
+    for (const auto& file : findModFiles(config.game, config.disabledMods)) {
         lua["g_CurrentModPath"] = file.parent_path().string();
         try {
             lua.script_file(file.string());
@@ -704,6 +920,26 @@ int main(int argc, char** argv) {
     }
     if (failed) std::cerr << "[Mod] " << failed << " mod file(s) failed to load (see above)" << std::endl;
 
+    // ---- World generation on background threads ----
+    // The main thread only ticks; new chunks are generated by worker threads, each with its
+    // own copy of the mods' world generator. So exploring players never slow the server down.
+    const auto modFiles = findModFiles(config.game, config.disabledMods);
+    world.setSeed(meta.seed);
+    CaveGenerator::setSeed(meta.seed);
+    CaveGenerator::prepare();   // before several threads carve caves at once
+    ChunkGenerator generator(config.generatorThreads, [&ctx, modFiles]() {
+        auto workerLua = std::make_unique<sol::state>();
+        setupLua(*workerLua, ctx, true);
+        for (const auto& file : modFiles) {
+            (*workerLua)["g_CurrentModPath"] = file.parent_path().string();
+            try { workerLua->script_file(file.string()); } catch (const std::exception&) {}
+        }
+        return workerLua;
+    }, meta.seed);
+    world.setGenerator(&generator);
+    std::cout << "[Server] World generation: " << generator.threadCount() << " background thread"
+              << (generator.threadCount() == 1 ? "" : "s") << std::endl;
+
     // ---- Spawn area ----
     const glm::vec3 spawnCenter(config.spawnX + 0.5f, 80.0f, config.spawnZ + 0.5f);
     world.setRenderDistance(3);
@@ -711,15 +947,20 @@ int main(int argc, char** argv) {
     const auto loadStart = Clock::now();
     while (world.areaLoadProgress(spawnCenter, 2) < 1.0f && Clock::now() - loadStart < std::chrono::seconds(60)) {
         world.update(spawnCenter, lua);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));   // the threads do the work
     }
-    world.setLoadBudgetMs(1000.0f / config.tickRate * 0.5f);
+    world.setLoadBudgetMs(1000.0f / config.tickRate * 0.25f);   // reading saved chunks: at most 1/4 of a tick
     std::cout << "[Server] Spawn ready at " << config.spawnX << ", " << config.spawnZ << std::endl;
 
-    // ---- Players: whitelist, bans, positions, welcome ----
+    // ---- Players: whitelist, bans, operators, accounts, positions, welcome ----
     NameList whitelist{confDir / "whitelist.txt", {}};
     NameList banned{confDir / "banned.txt", {}};
+    NameList ops{confDir / "ops.txt", {}};
+    Accounts accounts{confDir / "accounts.txt", {}};
     whitelist.load();
     banned.load();
+    ops.load();
+    accounts.load();
 
     auto spawnPoint = [&]() {
         const int ground = world.groundHeightAt(config.spawnX, config.spawnZ);
@@ -731,19 +972,43 @@ int main(int argc, char** argv) {
         return true;
     };
     server.onLeave = [&worldDir](const std::string& name, const glm::vec3& pos) { savePlayer(worldDir, name, pos); };
-    server.canJoin = [&](const std::string& name) -> std::string {
+    std::set<std::string> newAccounts;   // registered while joining (told about it once they're in)
+    server.canJoin = [&](const std::string& name, const std::string& token) -> std::string {
         if (banned.has(name)) {
             const std::string why = banned.reason(name);
             return "You are banned from this server" + (why.empty() ? std::string() : ": " + why);
         }
         if (config.whitelist && !whitelist.has(name)) return "You are not on this server's whitelist";
+        // Accounts: a name that joined with a password before needs that password
+        if (accounts.has(name)) {
+            if (token.empty()) return "The name '" + name + "' is protected on this server. Set your password in Settings > Player.";
+            if (!accounts.check(name, token)) return "Wrong password for '" + name + "'";
+            return "";
+        }
+        if (token.empty()) {
+            if (config.requirePassword) return "This server needs a password: set one in Settings > Player, then join again";
+            return "";
+        }
+        accounts.set(name, token);   // first time with a password: this name is now theirs
+        newAccounts.insert(name);
+        std::cout << "[Server] New account: " << name << std::endl;
         return "";
     };
     server.onJoin = [&](const std::string& name) {
-        if (config.welcome.empty()) return;
-        std::string msg = config.welcome;
-        for (size_t p; (p = msg.find("{player}")) != std::string::npos;) msg.replace(p, 8, name);
-        server.messagePlayer(name, stripTags(msg), glm::vec3(1.0f, 0.85f, 0.3f));
+        if (!config.welcome.empty()) {
+            std::string msg = config.welcome;
+            for (size_t p; (p = msg.find("{player}")) != std::string::npos;) msg.replace(p, 8, name);
+            server.messagePlayer(name, stripTags(msg), glm::vec3(1.0f, 0.85f, 0.3f));
+        }
+        if (newAccounts.erase(name)) {
+            server.messagePlayer(name, "Your name is now protected by your password on this server.",
+                                 glm::vec3(0.6f, 0.9f, 1.0f));
+        } else if (!accounts.has(name)) {
+            server.messagePlayer(name, "Tip: set a password in Settings > Player so nobody else can use your name here.",
+                                 glm::vec3(0.6f, 0.9f, 1.0f));
+        }
+        if (ops.has(name)) server.messagePlayer(name, "You are an operator here: type /help for server commands.",
+                                                glm::vec3(0.6f, 0.9f, 1.0f));
     };
 
     // ---- Network ----
@@ -761,7 +1026,11 @@ int main(int argc, char** argv) {
     }
     std::cout << "[Server] '" << config.name << "' is listening on port " << config.port << " (max "
               << config.maxPlayers << " players" << (config.whitelist ? ", whitelist on" : "")
-              << "). Type 'help' for commands." << std::endl;
+              << (config.requirePassword ? ", passwords required" : "") << "). Type 'help' for commands." << std::endl;
+    if (ops.entries.empty()) {
+        std::cout << "[Server] No operators yet: join, then type 'op <your name>' here to manage the server "
+                  << "from inside the game" << std::endl;
+    }
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -774,8 +1043,15 @@ int main(int argc, char** argv) {
         return chunks;
     };
 
-    // ---- Console commands ----
-    auto handleCommand = [&](const std::string& line) {
+    double tps = config.tickRate;
+    double slowestTickMs = 0.0, slowestThisWindow = 0.0;   // for 'tps'
+
+    // ---- Commands: from the console (everything), or typed in the game as /command
+    // (operators: everything except the console-only ones; everyone: help, list, msg) ----
+    using Reply = std::function<void(const std::string&)>;
+    auto handleCommand = [&](const std::string& line, const Reply& reply, const std::string& from) {
+        const bool console = from.empty();
+        const bool op = console || ops.has(from);
         std::istringstream ss(line);
         std::string cmd;
         ss >> cmd;
@@ -791,104 +1067,184 @@ int main(int argc, char** argv) {
             after = trim(after);
             return word;
         };
+        const std::set<std::string> everyone = {"help", "list", "msg"};
+        if (!op && !everyone.count(cmd)) {
+            reply("You need to be an operator to use /" + cmd + ". Commands: /help, /list, /msg");
+            return;
+        }
+        const std::string by = console ? "" : " (by " + from + ")";
 
         if (cmd == "help") {
-            std::cout << "Server:   stop, save, reload, tps, seed, games\n"
-                      << "Look:     motd [text], name [text]\n"
-                      << "Players:  list, say <message>, msg <name> <message>, kick <name> [reason]\n"
-                      << "          ban <name> [reason], unban <name>, banlist\n"
-                      << "          whitelist on|off|add <name>|remove <name>|list" << std::endl;
+            if (!op) { reply("Commands: /list, /msg <name> <message>"); return; }
+            reply("Server:  stop, save, reload, tps, seed, games, mods [enable|disable <id>]");
+            reply("Look:    motd [text], name [text]");
+            reply("Players: list, say, msg, kick, ban, unban, banlist, whitelist on|off|add|remove|list");
+            reply("Admins:  op <name>, deop <name>, ops, password reset <name>");
         } else if (cmd == "stop") {
+            reply("Stopping the server...");
+            std::cout << "[Server] Stop" << by << std::endl;
             g_Running = false;
         } else if (cmd == "save") {
-            std::cout << "[Server] Saved (" << saveAll() << " changed chunks)" << std::endl;
+            reply("Saved (" + std::to_string(saveAll()) + " changed chunks)");
+        } else if (cmd == "tps") {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "Ticks per second: %.1f (target %d), slowest tick %.0f ms",
+                          tps, config.tickRate, slowestTickMs);
+            reply(buf);
+            std::snprintf(buf, sizeof(buf), "World generation: %d threads, %.1f chunks/s, %zu waiting, %zu chunks loaded",
+                          generator.threadCount(), generator.chunksPerSecond(), world.generatingCount(),
+                          world.loadedChunkCount());
+            reply(buf);
+        } else if (cmd == "seed") {
+            reply("Seed: " + std::to_string(meta.seed));
         } else if (cmd == "reload") {
             const ServerConfig fresh = readSettings();
-            if (fresh.game != config.game || fresh.world != config.world || fresh.port != config.port) {
-                std::cout << "[Server] game, world and port changes need a restart" << std::endl;
+            if (fresh.game != config.game || fresh.world != config.world || fresh.port != config.port ||
+                fresh.disabledMods != config.disabledMods) {
+                reply("game, world, port and mod changes need a restart");
             }
             const std::string game = config.game, worldName = config.world;
             const int port = config.port;
+            const auto mods = config.disabledMods;
             config = fresh;
-            config.game = game;
-            config.world = worldName;
-            config.port = port;
-            whitelist.load();
-            banned.load();
+            config.game = game; config.world = worldName; config.port = port; config.disabledMods = mods;
+            whitelist.load(); banned.load(); ops.load(); accounts.load();
             applyLiveSettings();
-            std::cout << "[Server] Reloaded settings, whitelist and bans" << std::endl;
+            reply("Reloaded settings, whitelist, bans, ops and accounts");
         } else if (cmd == "motd") {
             if (rest.empty()) {
-                std::cout << "Description: " << config.motd << "\n(set it with: motd <text>, using {gold}, {b}, {n}...)" << std::endl;
+                reply("Description: " + config.motd + "  (set it with: motd <text>, using {gold}, {b}, {n}...)");
             } else {
                 config.motd = rest;
                 server.setInfo(config.motd, config.maxPlayers);
                 updateConfValue(configFile, "motd", rest);
-                std::cout << "[Server] Description changed (and saved)" << std::endl;
+                reply("Description changed (and saved)");
             }
         } else if (cmd == "name") {
-            if (rest.empty()) std::cout << "Name: " << config.name << std::endl;
+            if (rest.empty()) reply("Name: " + config.name);
             else {
                 config.name = rest;
                 updateConfValue(configFile, "name", rest);
-                std::cout << "[Server] Name saved - shown on the LAN list after a restart" << std::endl;
+                reply("Name saved - shown on the LAN list after a restart");
             }
         } else if (cmd == "games") {
-            printGames();
-            std::cout << "Running: " << ctx.game.folder << std::endl;
+            for (const auto& g : listGames()) reply("  " + g.folder + " - " + g.title + (g.folder == config.game ? "  (running)" : ""));
+        } else if (cmd == "mods") {
+            std::string id;
+            const std::string sub = lower(firstWord(rest, id));
+            const auto mods = listServerMods(config.game);
+            auto find = [&](const std::string& want) -> const ModEntry* {
+                for (const auto& m : mods) if (m.id == want) return &m;
+                return nullptr;
+            };
+            if (sub.empty() || sub == "list") {
+                // What's on now (from server.conf - changes since the start need a restart)
+                const auto saved = parseConfig(readConfFile(configFile)).disabledMods;
+                for (const auto& m : mods) {
+                    const bool on = m.required || !saved.count(m.id);
+                    reply(std::string(on ? "  [x] " : "  [ ] ") + m.id + " - " + m.title + " (" + m.source +
+                          (m.required ? ", required" : "") + ")");
+                }
+                reply("mods enable <id> / mods disable <id>, then restart the server");
+            } else if ((sub == "enable" || sub == "disable") && !id.empty()) {
+                const ModEntry* m = find(id);
+                if (!m) { reply("No mod called '" + id + "'. Type 'mods' to list them."); return; }
+                if (m->required && sub == "disable") { reply(id + " is required - it can't be turned off"); return; }
+                auto saved = parseConfig(readConfFile(configFile)).disabledMods;
+                if (sub == "disable") saved.insert(id); else saved.erase(id);
+                updateConfValue(configFile, "disabled_mods", joinIds(saved));
+                reply("Mod " + id + " " + sub + "d - restart the server to apply (players need the same mods)");
+            } else {
+                reply("Usage: mods [list] | mods enable <id> | mods disable <id>");
+            }
         } else if (cmd == "list") {
             const auto names = server.playerNames();
             std::string all;
-            for (const auto& n : names) all += (all.empty() ? "" : ", ") + n;
-            std::cout << names.size() << "/" << config.maxPlayers << " players online"
-                      << (names.empty() ? "" : ": " + all) << std::endl;
+            for (const auto& n : names) all += (all.empty() ? "" : ", ") + n + (ops.has(n) ? " (op)" : "");
+            reply(std::to_string(names.size()) + "/" + std::to_string(config.maxPlayers) + " players online" +
+                  (names.empty() ? "" : ": " + all));
         } else if (cmd == "say") {
-            server.broadcastMessage("[Server] " + rest, glm::vec3(1.0f, 0.4f, 1.0f));
-            std::cout << "[Chat] [Server] " << rest << std::endl;
-        } else if (cmd == "msg") {
+            const std::string who = console ? "Server" : from;
+            server.broadcastMessage("[" + who + "] " + rest, glm::vec3(1.0f, 0.4f, 1.0f));
+            std::cout << "[Chat] [" << who << "] " << rest << std::endl;
+        } else if (cmd == "msg" || cmd == "tell") {
             std::string text;
             const std::string name = firstWord(rest, text);
-            std::cout << (server.messagePlayer(name, "[Server -> you] " + text, glm::vec3(1.0f, 0.4f, 1.0f))
-                          ? "[Server] Sent" : "[Server] No player called '" + name + "' online") << std::endl;
+            const std::string sender = console ? "Server" : from;
+            if (server.messagePlayer(name, "[" + sender + " -> you] " + text, glm::vec3(1.0f, 0.4f, 1.0f))) {
+                reply("[you -> " + name + "] " + text);
+            } else {
+                reply("No player called '" + name + "' online");
+            }
         } else if (cmd == "kick") {
             std::string reason;
             const std::string name = firstWord(rest, reason);
-            std::cout << (server.kickPlayer(name, reason) ? "[Server] Kicked " + name
-                                                          : "[Server] No player called '" + name + "' online") << std::endl;
+            if (server.kickPlayer(name, reason)) { reply("Kicked " + name); std::cout << "[Server] Kicked " << name << by << std::endl; }
+            else reply("No player called '" + name + "' online");
         } else if (cmd == "ban") {
             std::string reason;
             const std::string name = firstWord(rest, reason);
-            if (!net::validPlayerName(name)) { std::cout << "Usage: ban <name> [reason]" << std::endl; return; }
+            if (!net::validPlayerName(name)) { reply("Usage: ban <name> [reason]"); return; }
+            if (!console && lower(name) == lower(from)) { reply("You can't ban yourself"); return; }
             banned.add(name, reason);
             server.kickPlayer(name, "You are banned from this server" + (reason.empty() ? "" : ": " + reason));
-            std::cout << "[Server] Banned " << name << std::endl;
+            reply("Banned " + name);
+            std::cout << "[Server] Banned " << name << by << std::endl;
         } else if (cmd == "unban" || cmd == "pardon") {
-            std::cout << (banned.remove(rest) ? "[Server] Unbanned " + rest : "[Server] '" + rest + "' wasn't banned") << std::endl;
+            reply(banned.remove(rest) ? "Unbanned " + rest : "'" + rest + "' wasn't banned");
         } else if (cmd == "banlist") {
-            std::cout << "Banned: " << banned.names() << std::endl;
+            reply("Banned: " + banned.names());
         } else if (cmd == "whitelist") {
             std::string arg;
             const std::string sub = lower(firstWord(rest, arg));
             if (sub == "on" || sub == "off") {
                 config.whitelist = (sub == "on");
                 updateConfValue(configFile, "whitelist", config.whitelist ? "true" : "false");
-                std::cout << "[Server] Whitelist " << sub << std::endl;
+                reply("Whitelist " + sub);
             } else if (sub == "add" && net::validPlayerName(arg)) {
                 whitelist.add(arg);
-                std::cout << "[Server] Added " << arg << " to the whitelist" << std::endl;
+                reply("Added " + arg + " to the whitelist");
             } else if (sub == "remove") {
-                std::cout << (whitelist.remove(arg) ? "[Server] Removed " + arg : "[Server] '" + arg + "' isn't on it") << std::endl;
+                reply(whitelist.remove(arg) ? "Removed " + arg : "'" + arg + "' isn't on it");
             } else if (sub == "list") {
-                std::cout << "Whitelist (" << (config.whitelist ? "on" : "off") << "): " << whitelist.names() << std::endl;
+                reply("Whitelist (" + std::string(config.whitelist ? "on" : "off") + "): " + whitelist.names());
             } else {
-                std::cout << "Usage: whitelist on|off|add <name>|remove <name>|list" << std::endl;
+                reply("Usage: whitelist on|off|add <name>|remove <name>|list");
             }
-        } else if (cmd == "seed") {
-            std::cout << "Seed: " << meta.seed << std::endl;
+        } else if (cmd == "op") {
+            if (!net::validPlayerName(rest)) { reply("Usage: op <name>"); return; }
+            ops.add(rest);
+            reply(rest + " is now an operator");
+            server.messagePlayer(rest, "You are now an operator: type /help for server commands.", glm::vec3(0.6f, 0.9f, 1.0f));
+            if (!accounts.has(rest)) {
+                reply("Tip: " + rest + " should set a password (Settings > Player) and rejoin, so nobody else can use the name");
+            }
+        } else if (cmd == "deop") {
+            reply(ops.remove(rest) ? rest + " is no longer an operator" : "'" + rest + "' isn't an operator");
+        } else if (cmd == "ops") {
+            reply("Operators: " + ops.names());
+        } else if (cmd == "password") {
+            std::string name;
+            const std::string sub = lower(firstWord(rest, name));
+            if (sub == "reset" && !name.empty()) {
+                reply(accounts.remove(name) ? "Password for " + name + " removed - the next person to join with a password gets the name"
+                                            : "'" + name + "' has no password here");
+            } else {
+                reply("Usage: password reset <name>");
+            }
         } else {
-            std::cout << "Unknown command '" << cmd << "'. Type 'help'." << std::endl;
+            reply("Unknown command '" + cmd + "'. Type " + std::string(console ? "help" : "/help") + ".");
         }
     };
+
+    // Commands typed in the game (/kick Bob ...) arrive here
+    server.onCommand = [&](const std::string& name, const std::string& command) {
+        std::cout << "[Command] " << name << ": /" << command << std::endl;
+        handleCommand(command, [&server, name](const std::string& text) {
+            server.messagePlayer(name, text, glm::vec3(0.75f, 0.85f, 1.0f));
+        }, name);
+    };
+    const Reply consoleReply = [](const std::string& text) { std::cout << text << std::endl; };
 
     // ---- Main loop: fixed ticks, sleeping in between ----
     const auto tick = std::chrono::microseconds(1000000 / config.tickRate);
@@ -898,10 +1254,25 @@ int main(int argc, char** argv) {
     auto lastLagWarning = Clock::now() - std::chrono::seconds(60);
     float fluidTimer = 0.0f;
     int ticksThisSecond = 0;
-    double tps = config.tickRate;
     auto tpsWindow = Clock::now();
 
+    // The game's My Servers screen stops a server by creating stop.request next to its
+    // server.conf (works even though the server runs in its own window).
+    const fs::path stopRequest = confDir / "stop.request";
+    fs::remove(stopRequest, ec);
+    auto lastStopCheck = Clock::now();
+
     while (g_Running) {
+        const auto tickStart = Clock::now();
+        if (Clock::now() - lastStopCheck >= std::chrono::seconds(1)) {
+            lastStopCheck = Clock::now();
+            if (fs::exists(stopRequest, ec)) {
+                fs::remove(stopRequest, ec);
+                std::cout << "[Server] Stop requested from the game" << std::endl;
+                g_Running = false;
+                break;
+            }
+        }
         world.update(spawnCenter, lua);   // spawn + every player's surroundings stay loaded
         server.update(spawnCenter, 0.0f, 0.0f, tickDt);
         fluidTimer += tickDt;
@@ -915,12 +1286,7 @@ int main(int argc, char** argv) {
             lines.swap(g_ConsoleLines);
         }
         for (const std::string& line : lines) {
-            if (trim(line) == "tps") {
-                std::cout << "Ticks per second: " << std::fixed << std::setprecision(1) << tps
-                          << " (target " << config.tickRate << ")" << std::endl;
-            } else if (!trim(line).empty()) {
-                handleCommand(line);
-            }
+            if (!trim(line).empty()) handleCommand(trim(line), consoleReply, "");
         }
 
         if (Clock::now() - lastSave >= std::chrono::seconds(config.autosaveSeconds)) {
@@ -931,8 +1297,11 @@ int main(int argc, char** argv) {
 
         ++ticksThisSecond;
         const auto now = Clock::now();
+        slowestThisWindow = std::max(slowestThisWindow, std::chrono::duration<double, std::milli>(now - tickStart).count());
         if (now - tpsWindow >= std::chrono::seconds(1)) {
             tps = ticksThisSecond / std::chrono::duration<double>(now - tpsWindow).count();
+            slowestTickMs = slowestThisWindow;
+            slowestThisWindow = 0.0;
             ticksThisSecond = 0;
             tpsWindow = now;
         }
