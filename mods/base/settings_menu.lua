@@ -66,7 +66,7 @@ local Theme = {
     },
 
     -- Font metrics at scale 1.0 (PixeloidSans is about 20px tall at scale 1)
-    font = { char_w = 13, char_h = 20, base_scale = 0.5, y_offset = 0.75 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
     line_gap = 4,
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
@@ -126,12 +126,18 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -156,7 +162,7 @@ local function refresh()
     }
     local sv = (engine and engine.get_server_settings and engine.get_server_settings()) or {}
     state.server = {
-        { id = "motd", kind = "text", label = "Description", max = 120, allowed = "^[ -~]$", wide = true,
+        { id = "motd", kind = "text", label = "Description", max = 200, allowed = "^[ -~]$", wide = true,
           value = sv.motd or "" },
         { id = "max_players", kind = "number", label = "Max Players",
           value = sv.max_players or 20, min = 2, max = 200, step = 1 },
@@ -405,7 +411,9 @@ function render_settings(W, H)
     elseif state.tab == "player" then
         note = "Your name in multiplayer and chat: 1-16 letters, numbers, _ or -"
     elseif state.tab == "server" then
-        note = "Shown in other players' server lists when you host (Esc > Host Game)."
+        note = engine.has_server_icon and engine.has_server_icon()
+            and "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Icon: server_icon.png found."
+            or "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Add server_icon.png for an icon."
     end
     text_centered(note, W / 2, L.noteY, fs * 0.8, note_color, S)
 

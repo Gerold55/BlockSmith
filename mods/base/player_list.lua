@@ -28,7 +28,7 @@ local Theme = {
         detail     = { 0.70, 0.70, 0.70, 1.00 },
     },
     -- Keep in sync with settings_menu.lua
-    font = { char_w = 13, char_h = 20, base_scale = 0.5, y_offset = 0.75 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
     min_width = 160,
@@ -50,11 +50,17 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 local function text(str, x, y, scale, c, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     ui.draw_text(str, x + S * 0.5, y + S * 0.5, scale, 0, 0, 0, 0.8)   -- shadow
     ui.draw_text(str, x, y, scale, c[1], c[2], c[3], c[4] or 1)
 end

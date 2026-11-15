@@ -13,11 +13,15 @@
 #include <glm/glm.hpp>
 #include <cstdint>
 #include <deque>
+#include <algorithm>
+#include <functional>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "World.h"
+#include "PlayerMovement.h"
 
 typedef struct _ENetHost ENetHost;
 typedef struct _ENetPeer ENetPeer;
@@ -26,20 +30,24 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 3;   // 2: positions carry the sender's time, 3: pings for the player list
+constexpr uint32_t kProtocolVersion  = 4;   // 4: clients send inputs, the server moves them (prediction)
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
 // Another player as this game sees them (positions are smoothed between updates).
+// Another player as this game sees them. Drawn 100 ms in the past, smoothly between the
+// two snapshots around that moment (entity interpolation), so they never stutter or guess.
 struct PlayerView {
+    struct Snapshot {
+        double time;          // server clock
+        glm::vec3 position;
+        float yaw, pitch;
+    };
     std::string name;
-    glm::vec3 position{0.0f};
-    glm::vec3 target{0.0f};
+    glm::vec3 position{0.0f};     // where to draw them this frame
     float yaw = 0.0f, pitch = 0.0f;
-    float targetYaw = 0.0f, targetPitch = 0.0f;
-    glm::vec3 velocity{0.0f};     // estimated from the last two updates (blocks/second)
-    double lastUpdate = 0.0;      // when the last update arrived (seconds, steady clock)
-    float lastSenderTime = 0.0f;  // the sender's clock in that update (orders packets, gives speed)
+    std::deque<Snapshot> snapshots;   // oldest first
+    double lastUpdate = 0.0;      // when the last snapshot arrived (local steady clock)
     // For /netstats: position updates received per second
     int updatesCounted = 0;
     double rateWindowStart = 0.0;
@@ -63,7 +71,9 @@ float clockSeconds();
 constexpr const char* kVersionName = "Craft & Ruin 0.1";
 // ENet "connect data" meaning "just tell me your status, I'm not joining".
 constexpr uint32_t kStatusQuery = 0x53544154;   // "STAT"
-constexpr int kMaxMotdLength = 120;
+constexpr int kMaxMotdLength = 200;       // the description may contain {colour} tags
+constexpr size_t kMaxIconBytes = 64 * 1024;   // server_icon.png (64x64 recommended)
+constexpr uint16_t kLanPort = 30001;          // LAN games announce themselves on this UDP port
 
 // "host", "host:port" -> host + port (kDefaultPort if none). False if empty/invalid.
 bool parseAddress(const std::string& text, std::string& host, uint16_t& port);
@@ -84,8 +94,10 @@ public:
     GameServer& operator=(const GameServer&) = delete;
 
     // Starts listening on `port`. `world` must stay alive until stop().
+    // hasHostPlayer = false for a dedicated (headless) server: nobody is "the host", and
+    // hostName is only the server's display name (e.g. on the LAN list).
     bool start(World& world, uint16_t port, const std::string& gameFolder,
-               const std::string& hostName, std::string& error);
+               const std::string& hostName, std::string& error, bool hasHostPlayer = true);
     // Kicks everyone with `reason` and closes the port.
     void stop(const std::string& reason = "The host closed the server");
 
@@ -105,11 +117,37 @@ public:
     // What the server list shows (the owner sets these in Settings > Server).
     // Can be changed while running; maxPlayers counts the host too.
     void setInfo(const std::string& motd, int maxPlayers);
+    // PNG bytes shown next to the server in other players' lists (empty = none).
+    void setIcon(std::vector<uint8_t> png);
     const std::string& motd() const { return m_motd; }
     int maxPlayers() const { return m_maxPlayers; }
 
     // Chat from the host to everyone.
     void sendChat(const std::string& text);
+    // A line to everyone as-is (server messages, "[Server] ...").
+    void broadcastMessage(const std::string& text, const glm::vec3& color = glm::vec3(1.0f, 1.0f, 0.4f));
+
+    // Dedicated server helpers
+    std::vector<std::string> playerNames() const;                              // joined players
+    std::vector<std::pair<std::string, glm::vec3>> playerPositions() const;   // for saving
+    bool kickPlayer(const std::string& name, const std::string& reason);
+    // Where a returning player should appear (return true + set pos), and a hook for
+    // when a player leaves (to save their position). Optional.
+    std::function<bool(const std::string& name, glm::vec3& pos)> spawnFor;
+    std::function<void(const std::string& name, const glm::vec3& pos)> onLeave;
+    // Asked before someone joins: return "" to let them in, or the reason they can't
+    // (banned, not on the whitelist...). Optional.
+    std::function<std::string(const std::string& name)> canJoin;
+    // Called once someone has joined (e.g. to send them a welcome message). Optional.
+    std::function<void(const std::string& name)> onJoin;
+    // A chat line to one player only. False if they're not online.
+    bool messagePlayer(const std::string& name, const std::string& text,
+                       const glm::vec3& color = glm::vec3(1.0f, 1.0f, 0.4f));
+    // The furthest any player may see, in chunks (they can choose less).
+    void setMaxViewDistance(int chunks) { m_maxView = std::clamp(chunks, 2, net::kMaxViewDistance); }
+    // The game's title from its game.conf, shown in server lists ("Plays Skyblock").
+    void setGameTitle(const std::string& title) { m_gameTitle = title; }
+    const std::string& game() const { return m_game; }
     // Lines the host should see in chat (joins, leaves, other players' messages).
     std::vector<net::ChatLine> takeChat();
 
@@ -120,10 +158,23 @@ private:
         bool joined = false;
         std::string name;
         int viewDistance = 8;
-        glm::vec3 position{0.0f};
+        glm::vec3 position{0.0f};     // = sim.position (kept for reach checks, chunk loading...)
         float yaw = 0.0f, pitch = 0.0f;
-        float sentTime = 0.0f;   // client's clock in its last position update
         bool hasPosition = false;
+        MoveState sim;                // the server's own copy of this player's movement
+        uint32_t lastSeq = 0;         // last input applied (sent back so the client can reconcile)
+        float moveBudget = 0.2f;      // seconds of movement they may still send (stops speed hacks)
+        // Timeline of their movement: each input moves simClock on by its dt. simOffset turns
+        // that into server time, so snapshots are evenly spaced even when inputs arrive in bursts.
+        double simClock = 0.0;
+        double simOffset = 0.0;
+        bool simOffsetSet = false;
+        double lastSnapTime = 0.0;    // server time of their newest snapshot
+        // For F3 / netstats
+        int inputsThisSecond = 0, inputsPerSecond = 0;
+        int droppedInputs = 0;        // refused because they sent more movement than time allowed
+        float movedThisSecond = 0.0f, speed = 0.0f;   // horizontal blocks/second on the server
+        double statsWindow = 0.0;
         std::unordered_set<World::ChunkCoord, PairHash> sentChunks;
     };
 
@@ -131,6 +182,7 @@ private:
     void sendStatus(ENetPeer* peer);
     void handleHello(Client& c, const uint8_t* data, size_t size);
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
+    void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
     void dropClient(uint16_t id);
 
@@ -146,9 +198,17 @@ private:
     uint16_t m_port = 0;
     std::string m_game;
     std::string m_hostName;
+    bool m_hasHost = true;
+    int m_maxView = net::kMaxViewDistance;
+    std::string m_gameTitle;
     std::string m_motd = "A Craft & Ruin server";
     int m_maxPlayers = 20;
-    uint16_t m_nextId = 1;           // 0 is the host
+    std::vector<uint8_t> m_icon;
+    uint16_t m_nextId = 1;
+    // LAN announcements ("Scanning for games on your local network" on other PCs)
+    void announceLan();
+    intptr_t m_lanSocket = -1;   // ENetSocket, -1 = none
+    float m_lanTimer = 0.0f;           // 0 is the host
     std::unordered_map<uint16_t, Client> m_clients;
     net::PlayerMap m_views;
     std::vector<net::ChatLine> m_chat;
@@ -189,8 +249,16 @@ public:
     bool active() const { return m_state != State::Idle; }
     const std::string& address() const { return m_addressText; }
 
-    // Call every frame while connecting or joined.
-    void update(const glm::vec3& pos, float yaw, float pitch, float dt);
+    // Call every frame while connecting or joined (before the player moves). `local` is
+    // the player's current movement state, used to check the server's corrections against.
+    void update(const MoveState& local, float yaw, float pitch, float dt);
+
+    // Client-side prediction: call right after moving the player with this input, so the
+    // server can apply the same input. Inputs are numbered and kept until the server confirms.
+    void recordInput(const MoveInput& input, float dt);
+    // True when the server's position for us disagreed with ours: `out` is the corrected
+    // state (server's answer with our newer inputs replayed on top). Apply it to the player.
+    bool takeCorrection(MoveState& out);
 
     // True once, when the server has accepted us.
     bool takeWelcome(Welcome& out);
@@ -235,6 +303,22 @@ private:
     net::PlayerMap m_views;
     std::vector<net::ChatLine> m_chat;
     float m_posTimer = 0.0f;
+
+    // Prediction & reconciliation
+    struct PendingInput { uint32_t seq; MoveInput input; float dt; };
+    void sendInputs();
+    void reconcile(uint32_t ackSeq, const MoveState& server);
+    std::deque<PendingInput> m_pending;   // sent but not yet confirmed by the server
+    uint32_t m_nextSeq = 1;
+    uint32_t m_lastAck = 0;
+    MoveState m_local;
+    MoveState m_correction;
+    bool m_haveCorrection = false;
+    int m_corrections = 0;                // for /netstats
+
+    // Server clock estimate (for interpolating other players)
+    double m_clockOffset = 0.0;           // server clock - our clock
+    bool m_clockSynced = false;
 };
 
 // ===========================================================================
@@ -245,8 +329,10 @@ struct ServerStatus {
     std::string motd;
     std::string version;         // the server's kVersionName
     std::string game;            // game folder the server is playing
+    std::string gameTitle;       // that game's title (from its game.conf), "" from older servers
     int players = 0, maxPlayers = 0;
     std::vector<std::string> names;   // up to 20 player names (hover in the list)
+    std::vector<uint8_t> icon;        // PNG bytes (empty = no icon)
     int ping = -1;               // ms
     bool compatible = true;      // same protocol version
     std::string error;           // why it's offline
@@ -273,4 +359,29 @@ private:
     };
     void finish(Query& q);
     std::unordered_map<std::string, Query> m_queries;
+};
+
+// ===========================================================================
+// LAN games: hosts broadcast a small "I'm here" message every 1.5 s on kLanPort;
+// the Multiplayer screen listens and lists them.
+// ===========================================================================
+struct LanGame {
+    std::string address;    // "192.168.1.20:30000"
+    std::string hostName;
+    std::string motd;
+    int players = 0, maxPlayers = 0;
+    double lastSeen = 0.0;
+};
+
+class LanScanner {
+public:
+    ~LanScanner();
+    void start();    // opens the listening socket (call when the Multiplayer screen opens)
+    void stop();
+    void update();   // reads announcements, forgets games not heard from for 5 s
+    bool running() const { return m_socket != -1; }
+    std::vector<LanGame> games() const;
+private:
+    intptr_t m_socket = -1;
+    std::unordered_map<std::string, LanGame> m_games;
 };

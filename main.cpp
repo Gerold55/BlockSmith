@@ -4,6 +4,18 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+// Use the best graphics card. On PCs and laptops with both a built-in (integrated) GPU and
+// a dedicated NVIDIA/AMD one, Windows starts programs on the built-in one unless the
+// program asks otherwise. The NVIDIA and AMD drivers look for these two values in the
+// game's .exe and switch to the dedicated GPU when they find them. (They must be in the
+// .exe itself, not a DLL - which is why they're here in main.cpp.)
+#ifdef _WIN32
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
@@ -18,9 +30,11 @@
 #include <map>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <exception>
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include <cstdlib>
 #include <iomanip>
@@ -31,6 +45,8 @@
 #include "ChunkData.h"
 #include "WorldRenderer.h"
 #include "Net.h"
+#include "BlockDefs.h"
+#include "PlayerMovement.h"
 #include "PlayerAvatars.h"
 #include "World.h"
 #include "Player.h"
@@ -95,7 +111,10 @@ WorldRenderer* g_WorldRenderer = nullptr;   // client-side drawing of g_WorldIns
 GameServer g_Server;
 GameClient g_Client;
 ServerPinger g_Pinger;    // server list: online? description? players?
+LanScanner g_Lan;         // games hosted on the local network (Multiplayer screen)
 std::string g_NetError;
+bool g_ShowDebugInfo = false;   // F3: FPS, ping and multiplayer info in the top-left corner
+std::string g_GpuName;          // graphics card in use (shown on F3)
 float g_Fps = 0.0f;       // frames per second, updated twice a second (shown by /netstats)   // why the last connection failed/ended (shown on the Multiplayer screen)
 MainMenu* g_MainMenu = nullptr;
 InventorySystem g_Inventory; // Dedicated C++ inventory system instance
@@ -1184,6 +1203,7 @@ const std::vector<KeyAction>& keyActions() {
         { "chat",      "Open Chat",      GLFW_KEY_T },
         { "command",   "Open Command",   GLFW_KEY_SLASH },
         { "third_person", "Toggle Camera View", GLFW_KEY_F5 },
+        { "debug_info",  "Show FPS / Network Info", GLFW_KEY_F3 },
         { "player_list", "List Players",  GLFW_KEY_TAB },
         { "hotbar1",   "Hotbar Slot 1",  GLFW_KEY_1 },
         { "hotbar2",   "Hotbar Slot 2",  GLFW_KEY_2 },
@@ -1286,6 +1306,91 @@ int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 20),
 int serverPort() {
     const int p = settingInt("server_port", net::kDefaultPort);
     return (p > 0 && p <= 65535) ? p : net::kDefaultPort;
+}
+
+// server_icon.png next to settings.txt: shown beside your server in other players' lists.
+fs::path serverIconFile() { return settingsFile().parent_path() / "server_icon.png"; }
+
+std::vector<uint8_t> loadServerIcon() {
+    std::vector<uint8_t> bytes;
+    std::error_code ec;
+    const fs::path file = serverIconFile();
+    if (!fs::exists(file, ec)) return bytes;
+    if (fs::file_size(file, ec) > net::kMaxIconBytes) {
+        std::cerr << "[Server] server_icon.png is too big (max " << net::kMaxIconBytes / 1024
+                  << " KB - use a 64x64 image)" << std::endl;
+        return bytes;
+    }
+    std::ifstream in(file, std::ios::binary);
+    bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return bytes;
+}
+
+// Server icons received from other servers, uploaded as textures (keyed by address).
+struct ServerIconTexture { GLuint tex = 0; size_t bytes = 0; uint32_t hash = 0; bool failed = false; };
+std::map<std::string, ServerIconTexture> g_ServerIcons;
+
+uint32_t hashBytes(const std::vector<uint8_t>& b) {
+    uint32_t h = 2166136261u;
+    for (uint8_t c : b) { h ^= c; h *= 16777619u; }
+    return h;
+}
+
+// Texture for a server's icon, or 0 if it has none / it couldn't be read.
+GLuint serverIconTexture(const std::string& address, const std::vector<uint8_t>& png) {
+    ServerIconTexture& t = g_ServerIcons[address];
+    const uint32_t h = hashBytes(png);
+    if (t.bytes == png.size() && t.hash == h) return t.failed ? 0 : t.tex;   // unchanged
+
+    if (t.tex) glDeleteTextures(1, &t.tex);
+    t = ServerIconTexture{};
+    t.bytes = png.size();
+    t.hash = h;
+    if (png.empty()) { t.failed = true; return 0; }
+
+    int w = 0, hgt = 0, n = 0;
+    stbi_set_flip_vertically_on_load(false);
+    unsigned char* d = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &hgt, &n, 4);
+    if (!d) { t.failed = true; return 0; }
+    glGenTextures(1, &t.tex);
+    glBindTexture(GL_TEXTURE_2D, t.tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, hgt, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);   // keep pixel art crisp
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    stbi_image_free(d);
+    return t.tex;
+}
+
+// Draws a texture at pixel position (top-left x, y) with the textured UI shader.
+void drawUITexture(GLuint program, GLuint tex, float x, float y, float w, float h, int fbW, int fbH) {
+    static GLuint vao = 0, vbo = 0;
+    if (vao == 0) {
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, 24 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+    }
+    const float x0 = x / fbW * 2.0f - 1.0f, x1 = (x + w) / fbW * 2.0f - 1.0f;
+    const float y0 = 1.0f - y / fbH * 2.0f, y1 = 1.0f - (y + h) / fbH * 2.0f;   // y0 = top
+    const float v[24] = { x0, y0, 0, 0,  x1, y0, 1, 0,  x1, y1, 1, 1,
+                          x0, y0, 0, 0,  x1, y1, 1, 1,  x0, y1, 0, 1 };
+    glUseProgram(program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(glGetUniformLocation(program, "u_Texture"), 0);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
 }
 
 fs::path serversFile() { return settingsFile().parent_path() / "servers.txt"; }
@@ -1448,99 +1553,12 @@ void closeSettings() {
     g_SettingsInGame = false;   // in-game: back to the pause menu
 }
 
-static uint8_t g_NextBlockId = 1;
 
+// engine.register_block(...): the shared definition (BlockDefs.cpp), with textures
+// uploaded to the GPU here.
 void registerBlockFromLua(const std::string& name, float r, float g, float b, sol::object texObj, sol::object overlayObj, sol::optional<sol::table> propsTable) {
-    if (r > 1.0f || g > 1.0f || b > 1.0f) {
-        r = glm::clamp(r / 255.0f, 0.0f, 1.0f);
-        g = glm::clamp(g / 255.0f, 0.0f, 1.0f);
-        b = glm::clamp(b / 255.0f, 0.0f, 1.0f);
-    }
-
-    BlockProperty block;
-    block.id = g_NextBlockId++;
-    block.name = name;
-    block.defaultTint = glm::vec3(r, g, b);
-
-    bool shouldTint = (name == "grass" || name == "short_grass");
-
-    if (propsTable.has_value()) {
-        sol::table props = propsTable.value();
-        block.isTransparent = props.get_or("transparent", false);
-        block.isCutout      = props.get_or("cutout", false);
-        block.isWalkable    = props.get_or("walkable", (name != "air" && name != "water" && name != "flowing_water" && name != "short_grass" && name != "flower_red"));
-        block.isSelectable  = props.get_or("selectable", (name != "water" && name != "flowing_water" && name != "air" && name != "short_grass" && name != "flower_red"));
-        block.hasGravity    = props.get_or("gravity", false);
-        block.pattern       = props.get_or("pattern", std::string("cube"));
-        shouldTint          = props.get_or("tint", shouldTint);
-        // in_creative = false hides the block from the creative inventory (it still exists in the world)
-        block.in_creative   = props.get_or("in_creative", true);
-
-        // inventory_image = "stick.png" shows a flat picture in the inventory/hotbar instead of a cube
-        sol::optional<std::string> invImage = props["inventory_image"];
-        if (invImage.has_value() && !invImage.value().empty()) {
-            block.inventoryImage = invImage.value();
-            block.inventoryLayer = loadTextureToLayer(block.inventoryImage);
-        }
-    } else {
-        block.isTransparent = (name == "water" || name == "flowing_water" || name == "leaves" || name == "birch_leaves" || name == "short_grass" || name == "flower_red");
-        block.isCutout      = (name.find("leaves") != std::string::npos);
-        block.isWalkable    = (name != "air" && name != "water" && name != "flowing_water" && name != "short_grass" && name != "flower_red");
-        block.isSelectable  = (name != "water" && name != "flowing_water" && name != "air" && name != "short_grass" && name != "flower_red");
-        block.hasGravity    = (name == "sand" || name == "gravel");
-        block.pattern       = (name == "short_grass" || name == "flower_red") ? "plantlike" : "cube";
-    }
-
-    if (texObj.is<std::string>()) {
-        int layer = loadTextureToLayer(texObj.as<std::string>());
-        for (int f = 0; f < 6; ++f) block.faces[f].baseLayer = layer;
-        if (shouldTint) {
-            if (name == "grass") block.faces[2].tintBase = true;
-            else { for (int f = 0; f < 6; ++f) block.faces[f].tintBase = true; }
-        }
-    } else if (texObj.is<sol::table>()) {
-        sol::table t = texObj.as<sol::table>();
-        sol::optional<std::string> top = t["top"];
-        sol::optional<std::string> bottom = t["bottom"];
-        sol::optional<std::string> sides = t["sides"];
-
-        int topL = top.has_value() ? loadTextureToLayer(top.value()) : -1;
-        int botL = bottom.has_value() ? loadTextureToLayer(bottom.value()) : -1;
-        int sideL = sides.has_value() ? loadTextureToLayer(sides.value()) : -1;
-
-        block.faces[2].baseLayer = topL;
-        block.faces[3].baseLayer = botL;
-        block.faces[0].baseLayer = block.faces[1].baseLayer = block.faces[4].baseLayer = block.faces[5].baseLayer = sideL;
-
-        if (shouldTint) {
-            if (name == "grass") block.faces[2].tintBase = true;
-            else { for (int f = 0; f < 6; ++f) block.faces[f].tintBase = true; }
-        }
-    }
-
-    if (overlayObj.is<std::string>()) {
-        int overlayLayer = loadTextureToLayer(overlayObj.as<std::string>());
-        for (int f = 0; f < 6; ++f) {
-            if (f != 2 && f != 3) {
-                block.faces[f].overlayLayer = overlayLayer;
-                block.faces[f].tintOverlay = true;
-            }
-        }
-    } else if (overlayObj.is<sol::table>()) {
-        sol::table ot = overlayObj.as<sol::table>();
-        sol::optional<std::string> sideOverlay = ot["sides"];
-        if (sideOverlay.has_value()) {
-            int sideL = loadTextureToLayer(sideOverlay.value());
-            for (int f = 0; f < 6; ++f) {
-                if (f != 2 && f != 3) {
-                    block.faces[f].overlayLayer = sideL;
-                    block.faces[f].tintOverlay = true;
-                }
-            }
-        }
-    }
-
-    BlockRegistry::getInstance().registerBlock(block);
+    registerBlockDefinition(name, r, g, b, texObj, overlayObj, propsTable,
+                            [](const std::string& path) { return loadTextureToLayer(path); });
 }
 
 uint8_t getBlockIdLua(const std::string& name) {
@@ -1975,6 +1993,19 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
 }
 
 // Puts OpenGL into a clean state for 2D UI and text (menus, loading screen, chat).
+// Lua menu text (ui.draw_text / ui.text_width / ui.text_height) should follow the menus' own
+// scale, not the window size. FontRenderer stretches text with the window (relative to its
+// 1920x1080 base), so cancel that out here. kUiTextSize = how big scale 1.0 looks: the font
+// is baked at 32 px, so 2/3 gives ~21 px text (capitals ~14 px, letters ~10 px wide).
+constexpr float kUiTextSize = 2.0f / 3.0f;
+constexpr float kFontBaseW = 1920.0f, kFontBaseH = 1080.0f;   // FontRenderer's base resolution
+
+glm::vec2 uiTextScale(float scale, const Dimensions2D& fb) {
+    const float w = fb.width > 0 ? static_cast<float>(fb.width) : kFontBaseW;
+    const float h = fb.height > 0 ? static_cast<float>(fb.height) : kFontBaseH;
+    return glm::vec2(scale * kUiTextSize * kFontBaseW / w, scale * kUiTextSize * kFontBaseH / h);
+}
+
 void resetUIRenderState() {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -2048,6 +2079,16 @@ int main() {
         if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
             std::cerr << "[Error] Failed to initialize GLAD\n";
             return -1;
+        }
+
+        // Which graphics card we actually got (see NvOptimusEnablement at the top of this file)
+        {
+            const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+            const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+            const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+            g_GpuName = renderer ? renderer : "unknown";
+            std::cout << "[Graphics] GPU: " << g_GpuName << " (" << (vendor ? vendor : "?") << ", OpenGL "
+                      << (version ? version : "?") << ")" << std::endl;
         }
 
         glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -2193,6 +2234,11 @@ int main() {
                     return;
                 }
 
+                if (key == keyForAction("debug_info")) {
+                    g_ShowDebugInfo = !g_ShowDebugInfo;
+                    return;
+                }
+
                 if (key == keyForAction("inventory")) {
                     // Use native C++ inventory toggle & cursor update
                     g_Inventory.toggleCreative();
@@ -2297,7 +2343,39 @@ int main() {
 
             resetUIRenderState();
             glUseProgram(fontProgram);
-            g_FontRenderer->renderText(fontProgram, text, x, y, scale, scale, glm::vec4(r, g, b, a), windowSize);
+            const glm::vec2 s = uiTextScale(scale, windowSize);   // same size at any window size
+            g_FontRenderer->renderText(fontProgram, text, x, y, s.x, s.y, glm::vec4(r, g, b, a), windowSize);
+        };
+
+        // ui.text_width(text, scale) -> exact width in pixels that ui.draw_text will use.
+        // ui.text_height(scale)     -> height of capital letters above the baseline, in pixels.
+        // Menus should measure with these instead of guessing letter sizes.
+        uiTable["text_width"] = [window](const std::string& text, sol::optional<float> scale) -> float {
+            if (!g_FontRenderer) return 0.0f;
+            Dimensions2D windowSize;
+            glfwGetFramebufferSize(window, &windowSize.width, &windowSize.height);
+            return g_FontRenderer->textWidth(text, uiTextScale(scale.value_or(1.0f), windowSize).x, windowSize);
+        };
+        uiTable["text_height"] = [window](sol::optional<float> scale) -> float {
+            if (!g_FontRenderer) return 0.0f;
+            Dimensions2D windowSize;
+            glfwGetFramebufferSize(window, &windowSize.width, &windowSize.height);
+            return g_FontRenderer->capHeight(uiTextScale(scale.value_or(1.0f), windowSize).y, windowSize);
+        };
+
+        // ui.draw_server_icon(address, x, y, size) -> true if drawn, false if that server has no icon
+        uiTable["draw_server_icon"] = [window, texturedUIProgram](const std::string& address,
+                                                                  float x, float y, float size) {
+            const ServerStatus* st = g_Pinger.status(address);
+            if (!st || st->icon.empty()) return false;
+            const GLuint tex = serverIconTexture(address, st->icon);
+            if (!tex) return false;
+            int fbW = 0, fbH = 0;
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            if (fbW <= 0 || fbH <= 0) return false;
+            resetUIRenderState();
+            drawUITexture(texturedUIProgram, tex, x, y, size, size, fbW, fbH);
+            return true;
         };
 
         // ui.get_mouse() -> x, y, left_down, right_down   (framebuffer pixels, same as clicks)
@@ -2864,6 +2942,10 @@ int main() {
             const int p = port.value_or(serverPort());
             if (p <= 0 || p > 65535) return std::make_tuple(false, std::string("Invalid port"));
             g_Server.setInfo(serverMotd(), serverMaxPlayers());
+            g_Server.setIcon(loadServerIcon());
+            for (const auto& g : getAvailableGames()) {   // "Plays <title>" in other players' lists
+                if (g.folderName == g_LoadedGameFolder) g_Server.setGameTitle(g.title);
+            }
             std::string error;
             if (!g_Server.start(*g_WorldInstance, static_cast<uint16_t>(p), g_LoadedGameFolder, playerName(), error)) {
                 return std::make_tuple(false, error);
@@ -2943,6 +3025,11 @@ int main() {
             t["ping"] = st->ping;
             t["version"] = st->version;
             t["game"] = st->game;
+            t["game_title"] = st->gameTitle.empty() ? st->game : st->gameTitle;
+            // Is that game installed here? (then the player only needs to select it)
+            bool installed = false;
+            for (const auto& g : getAvailableGames()) if (g.folderName == st->game) installed = true;
+            t["game_installed"] = installed;
             t["same_game"] = st->game.empty() || st->game == g_LoadedGameFolder;
             t["compatible"] = st->compatible;
             t["error"] = st->error;
@@ -2950,6 +3037,29 @@ int main() {
             for (size_t i = 0; i < st->names.size(); ++i) names[i + 1] = st->names[i];
             t["names"] = names;
             return t;
+        };
+
+        // engine.get_lan_games() -> { { address, host, motd, players, max_players }, ... }
+        engineTable["get_lan_games"] = [&lua]() {
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (const auto& g : g_Lan.games()) {
+                sol::table e = lua.create_table();
+                e["address"] = g.address;
+                e["host"] = g.hostName;
+                e["motd"] = g.motd;
+                e["players"] = g.players;
+                e["max_players"] = g.maxPlayers;
+                t[i++] = e;
+            }
+            return t;
+        };
+        // engine.is_scanning_lan() -> true while listening for LAN games
+        engineTable["is_scanning_lan"] = []() { return g_Lan.running(); };
+        // engine.has_server_icon() -> true if server_icon.png exists (Settings > Server)
+        engineTable["has_server_icon"] = []() {
+            std::error_code ec;
+            return fs::exists(serverIconFile(), ec);
         };
 
         // engine.get_player_list() -> { title = "...", players = { { name, ping, host, you }, ... } }
@@ -3324,7 +3434,13 @@ int main() {
             bool isCursorDisabled = (glfwGetInputMode(window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED);
 
             // ---- Multiplayer networking (every frame, also while paused or loading) ----
-            if (g_CurrentGameState == GameState::MULTIPLAYER) g_Pinger.update();
+            if (g_CurrentGameState == GameState::MULTIPLAYER) {
+                g_Pinger.update();
+                if (!g_Lan.running()) g_Lan.start();   // "Scanning for games on your local network"
+                g_Lan.update();
+            } else if (g_Lan.running()) {
+                g_Lan.stop();
+            }
             if (g_Server.running()) {
                 g_Server.update(player.position, player.yaw, player.pitch, deltaTime);
                 for (const auto& line : g_Server.takeChat()) {
@@ -3332,7 +3448,16 @@ int main() {
                 }
             }
             if (g_Client.active()) {
-                g_Client.update(player.position, player.yaw, player.pitch, deltaTime);
+                g_Client.update(MoveState{player.position, player.velocity, player.isGrounded},
+                                player.yaw, player.pitch, deltaTime);
+                // The server disagreed with where we moved ourselves: take its answer
+                // (with our newer inputs already replayed on top)
+                MoveState corrected;
+                if (g_Client.takeCorrection(corrected)) {
+                    player.position = corrected.position;
+                    player.velocity = corrected.velocity;
+                    player.isGrounded = corrected.grounded;
+                }
                 for (const auto& line : g_Client.takeChat()) {
                     if (g_ChatSystem) g_ChatSystem->addMessage(line.text, line.color);
                 }
@@ -3433,6 +3558,11 @@ int main() {
                         }
                     }
                     player.update(deltaTime, world, window, lua);
+                    // Online: tell the server exactly what we just did, so it can do the same
+                    // (client-side prediction - see Net.h)
+                    if (g_Client.state() == GameClient::State::Joined) {
+                        g_Client.recordInput(readMoveInput(window, player.yaw, player.pitch), deltaTime);
+                    }
 
                     try {
                         sol::function updateAnimFunc = lua["update_player_animation"];
@@ -3886,6 +4016,77 @@ int main() {
                                                 uiProgram, texturedUIProgram);
                 }
 
+                // F3 info: stays on screen even when this window isn't focused, so you can see
+                // whether a background window is being slowed down
+                if (g_ShowDebugInfo && g_FontRenderer) {
+                    resetUIRenderState();
+                    glUseProgram(fontProgram);
+                    const Dimensions2D screen{width, height};
+                    std::vector<std::string> lines;
+                    lines.push_back("FPS: " + std::to_string(static_cast<int>(g_Fps)) +
+                                    (glfwGetWindowAttrib(window, GLFW_FOCUSED) ? "" : "  (window not focused)"));
+                    lines.push_back("GPU: " + g_GpuName);
+                    if (g_Server.running()) lines.push_back("Hosting");
+                    for (const auto& l : g_Server.running() ? g_Server.statsLines() : g_Client.statsLines()) {
+                        if (g_Server.running() || g_Client.active()) lines.push_back(l);
+                    }
+                    char pos[96];
+                    std::snprintf(pos, sizeof(pos), "XYZ: %.1f %.1f %.1f", player.position.x,
+                                  player.position.y, player.position.z);
+                    lines.push_back(pos);
+
+                    // What the crosshair is on, straight from the world's block data
+                    if (rayResult.hit) {
+                        const glm::ivec3 b(rayResult.blockPos.x, rayResult.blockPos.y, rayResult.blockPos.z);
+                        const uint8_t id = world.getBlockAt(b);
+                        const uint8_t meta = world.getMetadataAt(b);
+                        const BlockProperty& prop = BlockRegistry::getInstance().getBlock(id);
+                        char buf[200];
+
+                        lines.push_back("");
+                        std::snprintf(buf, sizeof(buf), "Looking at: %s (id %d)", prop.name.c_str(), static_cast<int>(id));
+                        lines.push_back(buf);
+
+                        const glm::ivec3 n(rayResult.faceNormal);
+                        const char* face = n.y > 0 ? "top" : n.y < 0 ? "bottom" : n.x > 0 ? "east (+X)"
+                                         : n.x < 0 ? "west (-X)" : n.z > 0 ? "south (+Z)" : n.z < 0 ? "north (-Z)" : "?";
+                        const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+                        const float dist = glm::distance(eye, glm::vec3(b) + glm::vec3(0.5f));
+                        std::snprintf(buf, sizeof(buf), "  Block %d %d %d, %s face, %.1f blocks away",
+                                      b.x, b.y, b.z, face, dist);
+                        lines.push_back(buf);
+
+                        auto floorDiv16 = [](int v) { return v >= 0 ? v / 16 : -((-v + 15) / 16); };
+                        const int cx = floorDiv16(b.x), cz = floorDiv16(b.z);
+                        std::snprintf(buf, sizeof(buf), "  Chunk %d, %d (inside it: %d %d %d)  metadata %d",
+                                      cx, cz, b.x - cx * 16, b.y, b.z - cz * 16, static_cast<int>(meta));
+                        lines.push_back(buf);
+
+                        std::string flags;
+                        auto flag = [&flags](bool on, const char* name) {
+                            if (on) flags += (flags.empty() ? "" : ", ") + std::string(name);
+                        };
+                        flag(prop.isWalkable, "solid");
+                        flag(!prop.isWalkable, "walk-through");
+                        flag(prop.isTransparent, "transparent");
+                        flag(prop.isCutout, "cutout");
+                        flag(prop.hasGravity, "falls");
+                        flag(!prop.isSelectable, "not selectable");
+                        flag(!prop.in_creative, "hidden from creative");
+                        lines.push_back("  " + flags + "  (shape: " + (prop.pattern.empty() ? "cube" : prop.pattern) + ")");
+                    } else {
+                        lines.push_back("");
+                        lines.push_back("Looking at: nothing in reach");
+                    }
+                    const glm::vec2 sc = uiTextScale(0.8f, screen);
+                    float y = 24.0f;
+                    for (const auto& l : lines) {
+                        g_FontRenderer->renderText(fontProgram, l, 11.0f, y + 1.0f, sc.x, sc.y, glm::vec4(0, 0, 0, 0.8f), screen);
+                        g_FontRenderer->renderText(fontProgram, l, 10.0f, y, sc.x, sc.y, glm::vec4(1.0f), screen);
+                        y += 20.0f;
+                    }
+                }
+
                 // 5. Chat always on top
                 resetUIRenderState();
                 if (g_ChatSystem) g_ChatSystem->renderChatOverlay(g_FontRenderer, fontProgram, width, height);
@@ -3944,6 +4145,9 @@ int main() {
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
         g_Pinger.clear();
+        g_Lan.stop();
+        for (auto& [addr, t] : g_ServerIcons) if (t.tex) glDeleteTextures(1, &t.tex);
+        g_ServerIcons.clear();
 
         glfwDestroyWindow(window);
         glfwTerminate();

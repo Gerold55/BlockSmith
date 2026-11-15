@@ -14,6 +14,7 @@
 #include <iostream>
 #include <iterator>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -555,8 +556,12 @@ bool World::decodeChunk(const std::vector<uint8_t>& d, ChunkData& chunk) {
         const std::string name(d.begin() + p, d.begin() + p + len);
         p += len;
         remap[savedId] = registry.getBlockId(name);
-        if (remap[savedId] == 0) {
-            std::cerr << "[Load] Unknown block '" << name << "' - replaced with air" << std::endl;
+        if (remap[savedId] == 0 && name != "air") {
+            // Once per name, not once per chunk (a missing mod would otherwise flood the log)
+            static std::set<std::string> warned;
+            if (warned.insert(name).second) {
+                std::cerr << "[Load] Unknown block '" << name << "' (is a mod missing?) - replaced with air" << std::endl;
+            }
         }
     }
 

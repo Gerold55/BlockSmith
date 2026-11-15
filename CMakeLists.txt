@@ -77,6 +77,10 @@ add_executable(VoxelEngine
     ChunkData.h
     Net.cpp
     Net.h
+    PlayerMovement.cpp
+    PlayerMovement.h
+    BlockDefs.cpp
+    BlockDefs.h
     PlayerAvatars.cpp
     PlayerAvatars.h
     deps/glad.c
@@ -109,4 +113,42 @@ if (TARGET unofficial::lua::lua)
     target_link_libraries(VoxelEngine PRIVATE unofficial::lua::lua)
 else()
     target_link_libraries(VoxelEngine PRIVATE ${LUA_LIBRARY})
+endif()
+
+# ---------------------------------------------------------------------------
+# CraftRuinServer: the dedicated (headless) server. No window, no graphics -
+# just the world, the mods and the networking.
+# Build it with:  cmake --build build --config Release --target CraftRuinServer
+# ---------------------------------------------------------------------------
+add_executable(CraftRuinServer
+    ServerMain.cpp
+    World.cpp
+    ChunkData.cpp
+    CaveGenerator.cpp
+    Block.cpp
+    BlockDefs.cpp
+    Net.cpp
+    PlayerMovement.cpp
+)
+
+target_include_directories(CraftRuinServer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps
+    ${enet_SOURCE_DIR}/include
+)
+
+target_link_libraries(CraftRuinServer PRIVATE
+    glm::glm
+    sol2::sol2
+    ${VOXEL_LUA_TARGET}
+    enet
+)
+
+if (WIN32)
+    target_link_libraries(CraftRuinServer PRIVATE ws2_32 winmm)
+endif()
+
+if (NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(CraftRuinServer PRIVATE Threads::Threads)
 endif()

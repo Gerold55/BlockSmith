@@ -8,6 +8,12 @@
 --
 -- Your name is shown at the top; change it in Settings > Player.
 --
+-- Server descriptions (set by the owner in Settings > Server) can use tags:
+--   {red} {orange} {gold} {yellow} {green} {aqua} {blue} {purple} {pink} {white} {gray}
+--   {dark_gray} {black}, any colour as {#ff8800}, {b} bold on, {/b} bold off,
+--   {r} back to normal, {n} new line (two lines are shown).
+--   Example: {gold}{b}MY SERVER{/b} {gray}>> {aqua}Survival{n}{yellow}Season 1 - join us!
+--
 -- Engine functions used:
 --   engine.list_servers()                 -> { { name = "Home", address = "192.168.1.20" }, ... }
 --   engine.save_servers(list)             -- same shape as list_servers
@@ -72,13 +78,13 @@ local Theme = {
         field_focus    = { 1.00, 1.00, 1.00, 1.00 },
     },
 
-    -- Font metrics at scale 1.0, measured from the game's PixeloidSans text:
+    -- Font metrics at scale 1.0, measured from a true-size screenshot of the game:
     --   char_w   average letter width (only used if the engine has no ui.text_width)
     --   char_h   height of capital letters
     --   y_offset where the text baseline sits, as a fraction of char_h below the top
-    font = { char_w = 18, char_h = 20, base_scale = 0.5, y_offset = 1.05 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
 
-    list_w = 330, row_h = 36,
+    list_w = 360, row_h = 38,
     button_w = 100, button_h = 20, button_gap = 4,
     button_pad = 12,          -- buttons grow to fit their text plus this much space
     field_w = 200, field_h = 20,
@@ -107,6 +113,8 @@ local state = {
     edit_address = "",
     message = nil,          -- error line
     game = nil,
+    selected_lan = nil,     -- address of the selected LAN game (instead of a saved server)
+    lan_pinged = {},        -- LAN games we've asked for their icon / ping
 }
 
 -- ===========================================================================
@@ -126,10 +134,13 @@ local function text_width(str, scale)
     if ui.text_width then return ui.text_width(str, scale) end
     return #str * Theme.font.char_w * scale
 end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -190,6 +201,7 @@ local function join(address)
 end
 
 local function join_selected()
+    if state.selected_lan then join(state.selected_lan) return end
     local s = selected_server()
     if s then join(s.address) end
 end
@@ -327,10 +339,11 @@ local function list_layout(W, H)
     local S = gui_scale(W, H)
     local fs = Theme.font.base_scale * S
     local has_sel = selected_server() ~= nil
+    local can_join = (has_sel or state.selected_lan ~= nil) and can_play()
 
     local buttons, top = bottom_buttons(W, H, S, {
         {
-            { label = "Join Server", enabled = has_sel and can_play(), action = join_selected },
+            { label = "Join Server", enabled = can_join, action = join_selected },
             { label = "Direct Connect", enabled = can_play(), action = function()
                 open_edit(nil); state.mode = "direct" end },
             { label = "Add Server", action = function() open_edit(nil) end },
@@ -350,7 +363,7 @@ local function list_layout(W, H)
     L.messageY = L.nameY + text_height(fs) + 5 * S
     L.listW = math.min(Theme.list_w * S, W - 20 * S)
     L.listX = math.floor((W - L.listW) / 2)
-    L.listY = L.messageY + text_height(fs) + 5 * S
+    L.listY = L.messageY + text_height(fs) + 6 * S
     L.listH = top - 8 * S - L.listY
     L.rowH = Theme.row_h * S
     L.visible = math.max(1, math.floor(L.listH / L.rowH))
@@ -365,7 +378,84 @@ local function fit(str, width, scale)
     return #cut > 0 and (cut .. "...") or ""
 end
 
--- Five ping bars (Minecraft style). ping < 0 / nil = grey. offline = red cross look.
+-- ---------------------------------------------------------------------------
+-- Coloured descriptions: "{gold}{b}MY SERVER{/b}{n}{gray}line two"
+-- ---------------------------------------------------------------------------
+local NAMED_COLORS = {
+    red = { 1.00, 0.33, 0.33 }, orange = { 1.00, 0.60, 0.20 }, gold = { 1.00, 0.67, 0.00 },
+    yellow = { 1.00, 1.00, 0.33 }, green = { 0.33, 1.00, 0.33 }, aqua = { 0.33, 1.00, 1.00 },
+    blue = { 0.40, 0.55, 1.00 }, purple = { 0.75, 0.40, 1.00 }, pink = { 1.00, 0.45, 0.80 },
+    white = { 1.00, 1.00, 1.00 }, gray = { 0.67, 0.67, 0.67 }, dark_gray = { 0.40, 0.40, 0.40 },
+    black = { 0.10, 0.10, 0.10 },
+}
+
+-- -> { line1_segments, line2_segments }, each segment = { text, color, bold }
+local function parse_description(str, default_color)
+    local lines = { {} }
+    local color, bold = default_color, false
+    local pos = 1
+    while pos <= #str do
+        local open = str:find("{", pos, true)
+        local close = open and str:find("}", open, true)
+        local tag = close and str:sub(open + 1, close - 1):lower()
+        local known = tag and (NAMED_COLORS[tag] or tag:match("^#%x%x%x%x%x%x$")
+                               or tag == "b" or tag == "/b" or tag == "r" or tag == "n")
+        local stop = known and (open - 1) or #str
+        if not known and open then stop = open end   -- not a tag: keep the "{" as text
+        if stop >= pos then
+            local cur = lines[#lines]
+            cur[#cur + 1] = { text = str:sub(pos, stop), color = color, bold = bold }
+        end
+        if not known then
+            pos = stop + 1
+        else
+            if NAMED_COLORS[tag] then color = NAMED_COLORS[tag]
+            elseif tag:sub(1, 1) == "#" then
+                color = { tonumber(tag:sub(2, 3), 16) / 255, tonumber(tag:sub(4, 5), 16) / 255,
+                          tonumber(tag:sub(6, 7), 16) / 255 }
+            elseif tag == "b" then bold = true
+            elseif tag == "/b" then bold = false
+            elseif tag == "r" then color, bold = default_color, false
+            elseif tag == "n" then
+                if #lines >= 2 then break end
+                lines[#lines + 1] = {}
+            end
+            pos = close + 1
+        end
+    end
+    return lines
+end
+
+local function segments_width(segs, scale, S)
+    local w = 0
+    for _, seg in ipairs(segs) do w = w + text_width(seg.text, scale) + (seg.bold and S * 0.5 or 0) end
+    return w
+end
+
+-- Draws one line of segments centred on cx, cut with "..." if wider than max_w
+local function draw_rich_line(segs, cx, y, scale, max_w, S)
+    local out, used = {}, 0
+    for _, seg in ipairs(segs) do
+        local w = text_width(seg.text, scale) + (seg.bold and S * 0.5 or 0)
+        if used + w > max_w then
+            local room = max_w - used
+            local cut = fit(seg.text, room, scale)
+            if cut ~= "" then out[#out + 1] = { text = cut, color = seg.color, bold = seg.bold } end
+            break
+        end
+        out[#out + 1] = seg
+        used = used + w
+    end
+    local x = cx - segments_width(out, scale, S) / 2
+    for _, seg in ipairs(out) do
+        local c = { seg.color[1], seg.color[2], seg.color[3], 1 }
+        text(seg.text, x, y, scale, c, true, S)
+        if seg.bold then text(seg.text, x + S * 0.5, y, scale, c, false, S) end
+        x = x + text_width(seg.text, scale) + (seg.bold and S * 0.5 or 0)
+    end
+end
+
+-- Five ping bars. Grey while pinging (animated), red when offline.
 local function draw_ping_bars(x, y, h, st, S)
     local bars, color = 0, C.bar_off
     if st and st.state == "online" then
@@ -373,9 +463,7 @@ local function draw_ping_bars(x, y, h, st, S)
         bars = p < 150 and 5 or p < 300 and 4 or p < 600 and 3 or p < 1000 and 2 or 1
         color = bars >= 4 and C.bar_good or (bars >= 3 and C.bar_ok or C.bar_bad)
     elseif st and st.state == "pinging" then
-        -- Animated while waiting
         bars = math.floor(ui.get_time() * 6) % 6
-        color = C.bar_off
     end
     for i = 1, 5 do
         local bh = math.floor(h * (0.25 + 0.15 * i))
@@ -386,90 +474,165 @@ local function draw_ping_bars(x, y, h, st, S)
     end
 end
 
+-- Placeholder icon: a coloured tile with the server's first letter
+local function draw_letter_icon(name, x, y, size, S, fs)
+    local h = 0
+    for i = 1, #name do h = (h * 31 + name:byte(i)) % 360 end
+    local hue = h / 60
+    local f = 1 - math.abs(hue % 2 - 1)
+    local rgb = ({ { 1, f, 0 }, { f, 1, 0 }, { 0, 1, f }, { 0, f, 1 }, { f, 0, 1 }, { 1, 0, f } })[math.floor(hue) + 1]
+    local c = { rgb[1] * 0.5 + 0.15, rgb[2] * 0.5 + 0.15, rgb[3] * 0.5 + 0.15, 1 }
+    rect(x, y, size, size, { c[1] * 0.6, c[2] * 0.6, c[3] * 0.6, 1 })
+    rect(x + S, y + S, size - 2 * S, size - 2 * S, c)
+    local letter = (name:match("%w") or "?"):upper()
+    local ls = fs * 1.6
+    text(letter, x + (size - text_width(letter, ls)) / 2, y + (size - text_height(ls)) / 2, ls, C.name, true, S)
+end
+
+-- One server row (saved or LAN). Returns tooltip info when the player count is hovered.
+local function draw_server_row(entry, rx, ry, rw, rh, mx, my, L, selected)
+    local S, fs = L.S, L.fs
+    local small = fs * 0.85
+    local st = engine.get_server_status and engine.get_server_status(entry.address) or nil
+    local tooltip = nil
+
+    if selected then
+        rect(rx, ry, rw, rh, C.row_selected)
+        rect(rx + S, ry + S, rw - 2 * S, rh - 2 * S, C.row_selected_bg)
+    elseif inside(mx, my, rx, ry, rw, rh) then
+        rect(rx, ry, rw, rh, C.row_hover)
+    end
+
+    -- Icon
+    local isize = rh - 4 * S
+    local ix, iy = rx + 2 * S, ry + 2 * S
+    if not (ui.draw_server_icon and ui.draw_server_icon(entry.address, ix, iy, isize)) then
+        draw_letter_icon(entry.name, ix, iy, isize, S, fs)
+    end
+
+    -- Top line: name on the left, players + ping bars on the right
+    local left = ix + isize + 5 * S
+    local right = rx + rw - 5 * S
+    local lineH = text_height(fs)
+    local smallH = text_height(small)
+    local gap = 3 * S
+    local top = ry + math.floor((rh - (lineH + 2 * (smallH + gap))) / 2)
+
+    local barsW = 10 * S
+    draw_ping_bars(right - barsW, top, lineH, st, S)
+    local countW = 0
+    local players = st and st.state == "online" and st.players or entry.players
+    local maxp = st and st.state == "online" and st.max_players or entry.max_players
+    if players and maxp then
+        local count = players .. "/" .. maxp
+        countW = text_width(count, fs)
+        local cx = right - barsW - 8 * S - countW
+        text(count, cx, top, fs, C.detail, false, S)
+        if st and inside(mx, my, cx, top, countW, lineH) and st.names and #st.names > 0 then
+            tooltip = { names = st.names, more = st.players - #st.names }
+        end
+    end
+    local nameW = right - barsW - 8 * S - countW - 8 * S - left
+    text(fit(entry.name, nameW, fs), left, top, fs, C.name, true, S)
+
+    -- Two description lines, centred in the space right of the icon
+    local descW = right - left
+    local cx = left + descW / 2
+    local y1 = top + lineH + gap
+    local y2 = y1 + smallH + gap
+    if st and st.state == "offline" then
+        text_centered(st.error ~= "" and st.error or "Can't connect to server", cx, y1, small, C.warning, S)
+    elseif st and st.state == "online" and not st.compatible then
+        text_centered("Different version: " .. (st.version or "?"), cx, y1, small, C.warning, S)
+    elseif st and st.state == "online" and not st.same_game then
+        -- The server runs another game made with the engine
+        local title = st.game_title or st.game or "?"
+        local hint = st.game_installed and "select it on the title screen to join"
+                                        or "you don't have this game installed"
+        text_centered("Plays " .. title .. " - " .. hint, cx, y1, small, C.warning, S)
+    elseif st and st.state == "pinging" and not entry.motd then
+        text_centered("Pinging...", cx, y1, small, C.detail, S)
+    else
+        local desc = (st and st.state == "online" and st.motd) or entry.motd or ""
+        if desc == "" then desc = "{gray}" .. entry.address end
+        local lines = parse_description(desc, C.detail)
+        if lines[1] then draw_rich_line(lines[1], cx, y1, small, descW, S) end
+        if lines[2] then draw_rich_line(lines[2], cx, y2, small, descW, S) end
+    end
+    return tooltip
+end
+
+-- Everything in the list, top to bottom: saved servers, the LAN heading, LAN games
+local function list_entries()
+    local entries = {}
+    for i, s in ipairs(state.servers or {}) do
+        entries[#entries + 1] = { kind = "saved", index = i, name = s.name, address = s.address }
+    end
+    entries[#entries + 1] = { kind = "lan_header" }
+    local lan = engine.get_lan_games and engine.get_lan_games() or {}
+    for _, g in ipairs(lan) do
+        if not state.lan_pinged[g.address] and engine.ping_server then
+            engine.ping_server(g.address)   -- for its icon and ping
+            state.lan_pinged[g.address] = true
+        end
+        entries[#entries + 1] = { kind = "lan", name = g.host .. "'s world", address = g.address,
+                                  motd = g.motd, players = g.players, max_players = g.max_players }
+    end
+    return entries
+end
+
 local function render_list(W, H)
     local L = list_layout(W, H)
     local S, fs = L.S, L.fs
     local mx, my = ui.get_mouse()
-    local servers = state.servers
     local tooltip = nil
+    local small = fs * 0.85
 
     rect(0, 0, W, H, C.background)
     text_centered("Play Multiplayer", W / 2, L.titleY, fs, C.title, S)
-
     text_centered("Playing as " .. state.player_name .. "  (change it in Settings > Player)",
-                  W / 2, L.nameY, fs * 0.85, C.detail, S)
+                  W / 2, L.nameY, small, C.detail, S)
 
     local warning = state.message
     if not warning and not can_play() then
         warning = "This game isn't loaded. Restart with it selected to join its servers."
     end
     if warning then
-        text_centered(warning, W / 2, L.messageY, fs * 0.85, C.warning, S)
+        text_centered(warning, W / 2, L.messageY, small, C.warning, S)
     else
-        text_centered("To host: open a world, press Esc, click Host Game", W / 2, L.messageY,
-                      fs * 0.85, C.detail, S)
+        text_centered("To host: open a world, press Esc, click Host Game", W / 2, L.messageY, small, C.detail, S)
     end
 
     rect(L.listX, L.listY, L.listW, L.listH, C.list_bg)
-    if #servers == 0 then
-        text_centered("No servers yet - click Add Server", W / 2,
-                      L.listY + L.listH / 2 - text_height(fs) / 2, fs, C.detail, S)
-    end
 
-    state.scroll = clamp(state.scroll, 0, math.max(0, #servers - L.visible))
-    local small = fs * 0.85
+    local entries = list_entries()
+    state.scroll = clamp(state.scroll, 0, math.max(0, #entries - L.visible))
     for row = 1, L.visible do
-        local i = row + state.scroll
-        local s = servers[i]
-        if not s then break end
+        local e = entries[row + state.scroll]
+        if not e then break end
         local rx, ry = L.listX + 2 * S, L.listY + (row - 1) * L.rowH + S
         local rw, rh = L.listW - 4 * S, L.rowH - 2 * S
-        if i == state.selected then
-            rect(rx, ry, rw, rh, C.row_selected)
-            rect(rx + S, ry + S, rw - 2 * S, rh - 2 * S, C.row_selected_bg)
-        elseif inside(mx, my, rx, ry, rw, rh) then
-            rect(rx, ry, rw, rh, C.row_hover)
-        end
 
-        local st = server_status(s)
-
-        -- Right side: ping bars, and "players / max" to their left
-        local barsW = 10 * S
-        local barsX = rx + rw - barsW - 6 * S
-        -- Two lines (name, then description), centred in the row
-        local line1Y = ry + math.floor((rh - (text_height(fs) + 3 * S + text_height(small))) / 2)
-        local line2Y = line1Y + text_height(fs) + 3 * S
-        draw_ping_bars(barsX, line1Y + S, text_height(fs) - 2 * S, st, S)
-        local countW = 0
-        if st and st.state == "online" then
-            local count = st.players .. "/" .. st.max_players
-            countW = text_width(count, fs)
-            local cx = barsX - 10 * S - countW
-            text(count, cx, line1Y, fs, C.detail, false, S)
-            if inside(mx, my, cx, line1Y, countW, text_height(fs)) and st.names and #st.names > 0 then
-                tooltip = { names = st.names, more = st.players - #st.names }
+        if e.kind == "lan_header" then
+            local lanCount = #entries - #(state.servers or {}) - 1
+            local label = lanCount > 0 and "Games on your local network" or "Scanning for games on your local network"
+            local cy = ry + rh / 2 - text_height(fs)
+            text_centered(label, W / 2, cy, fs, C.name, S)
+            if lanCount == 0 then
+                -- Three dots, one at a time growing - our own take on the "o o O"
+                local t = math.floor(ui.get_time() * 3) % 3
+                local d = 3 * S
+                for i = 0, 2 do
+                    local size = (i == t) and d * 1.6 or d
+                    rect(W / 2 + (i - 1) * 8 * S - size / 2, cy + text_height(fs) + 6 * S - size / 2,
+                         size, size, (i == t) and C.name or C.detail)
+                end
             end
+        else
+            local selected = (e.kind == "saved" and e.index == state.selected and not state.selected_lan)
+                          or (e.kind == "lan" and e.address == state.selected_lan)
+            tooltip = draw_server_row(e, rx, ry, rw, rh, mx, my, L, selected) or tooltip
         end
-
-        -- Left side: server name, then the description or what's wrong
-        local leftW = barsX - 10 * S - countW - (rx + 6 * S) - 6 * S
-        text(fit(s.name, leftW, fs), rx + 6 * S, line1Y, fs, C.name, true, S)
-
-        local line2, color = s.address, C.detail
-        if st and st.state == "online" then
-            if not st.compatible then
-                line2, color = "Different version: " .. (st.version or "?"), C.warning
-            elseif not st.same_game then
-                line2, color = "Plays a different game: " .. (st.game or "?"), C.warning
-            else
-                line2 = (st.motd ~= "" and st.motd) or s.address
-            end
-        elseif st and st.state == "offline" then
-            line2, color = st.error ~= "" and st.error or "Can't connect to server", C.warning
-        elseif st and st.state == "pinging" then
-            line2 = "Pinging..."
-        end
-        text(fit(line2, rw - 12 * S, small), rx + 6 * S, line2Y, small, color, false, S)
     end
 
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
@@ -481,8 +644,8 @@ local function render_list(W, H)
         if tooltip.more > 0 then lines[#lines + 1] = "...and " .. tooltip.more .. " more" end
         local w = 0
         for _, l in ipairs(lines) do w = math.max(w, text_width(l, small)) end
-        local lh = text_height(small) + 2 * S
-        local tw, th = w + 8 * S, #lines * lh + 6 * S
+        local lh = text_height(small) + 3 * S
+        local tw, th = w + 8 * S, #lines * lh + 5 * S
         local tx = math.min(mx + 10 * S, W - tw - 2 * S)
         local ty = math.min(my + 10 * S, H - th - 2 * S)
         rect(tx - S, ty - S, tw + 2 * S, th + 2 * S, C.tooltip_border)
@@ -498,17 +661,22 @@ local function click_list(mx, my, W, H)
     if click_buttons(L.buttons, mx, my) then return end
 
     if inside(mx, my, L.listX, L.listY, L.listW, L.listH) then
-        local i = math.floor((my - L.listY) / L.rowH) + 1 + state.scroll
-        if state.servers[i] then
-            local now = ui.get_time()
-            local double = state.selected == i and state.last_click_row == i
-                           and (now - state.last_click_time) < Theme.double_click
-            state.selected = i
-            state.last_click_row = i
-            state.last_click_time = now
-            state.message = nil
-            if double and can_play() then join_selected() end
+        local entries = list_entries()
+        local e = entries[math.floor((my - L.listY) / L.rowH) + 1 + state.scroll]
+        if not e or e.kind == "lan_header" then return end
+        local key = e.kind == "saved" and ("s" .. e.index) or ("l" .. e.address)
+        local now = ui.get_time()
+        local double = state.last_click_row == key and (now - state.last_click_time) < Theme.double_click
+        if e.kind == "saved" then
+            state.selected = e.index
+            state.selected_lan = nil
+        else
+            state.selected_lan = e.address
         end
+        state.last_click_row = key
+        state.last_click_time = now
+        state.message = nil
+        if double and can_play() then join_selected() end
     end
 end
 
@@ -645,6 +813,8 @@ end
 function on_multiplayer_opened()
     refresh()
     ping_all()
+    state.selected_lan = nil
+    state.lan_pinged = {}
     state.scroll = 0
     local status = engine.get_connection_status and engine.get_connection_status() or {}
     if status.state == "connecting" then

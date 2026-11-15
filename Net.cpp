@@ -36,7 +36,7 @@ namespace {
 enum Msg : uint8_t {
     // client -> server
     C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance
-    C_POS     = 2,    // f32 x y z yaw pitch time
+    C_INPUTS  = 2,    // u32 firstSeq, u16 count, { u8 keys, f32 yaw, f32 pitch, f32 dt }
     C_BLOCKS  = 3,    // u16 count, { i32 x y z, str block, u8 meta }
     C_CHAT    = 4,    // str text
 
@@ -48,17 +48,20 @@ enum Msg : uint8_t {
     S_BLOCKS  = 68,   // u16 count, { i32 x y z, str block, u8 meta }
     S_ADD     = 69,   // u16 id, str name
     S_REMOVE  = 70,   // u16 id
-    S_PLAYERS = 71,   // u16 count, { u16 id, f32 x y z yaw pitch time }
+    S_PLAYERS = 71,   // f32 serverTime, u16 count, { u16 id, f32 time, f32 x y z yaw pitch }
     S_CHAT    = 72,   // str text, f32 r g b
     S_PINGS   = 73,   // u16 count, { u16 id, u16 ping ms }   (for the player list)
     S_STATUS  = 74,   // u32 protocol, str version, str game, str motd, u16 online, u16 max,
                       // u16 nameCount, { str name }    (server list; sent instead of joining)
+    S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
 constexpr int   kChunksPerUpdate     = 4;            // per client per frame
 constexpr size_t kMaxChunkBytesInFlight = 512 * 1024; // don't queue more than this per client
 constexpr float kPositionInterval    = 1.0f / 30.0f; // 30 position updates a second
 constexpr float kMaxReach            = 10.0f;        // blocks a player may edit from
+constexpr double kInterpDelay        = 0.1;          // other players are drawn this far in the past
+constexpr size_t kMaxInputsPerPacket = 100;
 constexpr double kConnectTimeoutSec  = 10.0;
 
 const glm::vec3 kInfoColor(1.0f, 1.0f, 0.4f);
@@ -157,58 +160,73 @@ glm::vec3 colorForName(const std::string& name) {
     return c * 0.65f + glm::vec3(0.2f);
 }
 
-// Moves smoothed player views toward their latest known position.
-// Where another player probably is now: their last known position, moved on by their
-// recent speed for a short while (so they don't trail behind between updates), then
-// eased toward smoothly.
-void smoothPlayers(net::PlayerMap& views, float dt) {
-    const double now = nowSeconds();
-    const float t = 1.0f - std::exp(-dt * 20.0f);
-    for (auto& [id, v] : views) {
-        if (!v.hasPosition) continue;
-        const float age = static_cast<float>(now - v.lastUpdate);
-        const glm::vec3 predicted = v.target + v.velocity * std::min(age, 0.12f);
-        if (glm::distance(v.position, predicted) > 8.0f) v.position = predicted;   // teleported
-        v.position += (predicted - v.position) * t;
-        const float dy = std::fmod(v.targetYaw - v.yaw + 540.0f, 360.0f) - 180.0f;   // shortest turn
-        v.yaw += dy * t;
-        v.pitch += (v.targetPitch - v.pitch) * t;
-    }
-}
-
-// A new position for another player. `senderTime` is the sender's own clock when it was
-// recorded, so speed is worked out from when they really moved, not from when the packets
-// happened to arrive (several can arrive in one frame on a slow or busy PC).
-void setTarget(net::PlayerView& v, const glm::vec3& p, float yaw, float pitch, float senderTime) {
-    const double now = nowSeconds();
-    if (v.hasPosition) {
-        const float gap = senderTime - v.lastSenderTime;
-        if (gap <= 0.0f && gap > -5.0f) return;   // older than what we have (arrived out of order)
-        if (gap > 0.0f && gap < 0.5f) {
-            const glm::vec3 vel = (p - v.target) / gap;
-            // Blend with the previous estimate so one odd packet doesn't cause a jump
-            v.velocity = glm::length(vel) > 40.0f ? glm::vec3(0.0f) : glm::mix(v.velocity, vel, 0.6f);
-        } else {
-            v.velocity = glm::vec3(0.0f);   // long gap, or the sender restarted
-        }
-    } else {
+// Adds a snapshot of another player (time on the server's clock).
+void pushSnapshot(net::PlayerView& v, double time, const glm::vec3& p, float yaw, float pitch) {
+    if (!v.snapshots.empty() && time <= v.snapshots.back().time) return;   // old / duplicate
+    v.snapshots.push_back({time, p, yaw, pitch});
+    while (v.snapshots.size() > 512) v.snapshots.pop_front();
+    if (!v.hasPosition) {
         v.position = p;
         v.yaw = yaw;
         v.pitch = pitch;
         v.hasPosition = true;
     }
-    v.target = p;
-    v.targetYaw = yaw;
-    v.targetPitch = pitch;
+    const double now = nowSeconds();
     v.lastUpdate = now;
-    v.lastSenderTime = senderTime;
-
     // Updates per second, for /netstats
     ++v.updatesCounted;
     if (now - v.rateWindowStart >= 1.0) {
         v.updateRate = static_cast<float>(v.updatesCounted / (now - v.rateWindowStart));
         v.updatesCounted = 0;
         v.rateWindowStart = now;
+    }
+}
+
+float lerpAngle(float a, float b, float t) {
+    const float d = std::fmod(b - a + 540.0f, 360.0f) - 180.0f;   // shortest way round
+    return a + d * t;
+}
+
+// Entity interpolation: place every player where they were at `renderTime` (server clock),
+// between the two snapshots around it. If the newest snapshot is late, carry on briefly
+// in the direction they were going, then wait.
+void interpolatePlayers(net::PlayerMap& views, double renderTime) {
+    for (auto& [id, v] : views) {
+        auto& snaps = v.snapshots;
+        if (snaps.empty()) continue;
+        // Forget snapshots we'll never need again (keep one before renderTime)
+        while (snaps.size() > 2 && snaps[1].time < renderTime - 0.5) snaps.pop_front();
+
+        if (renderTime <= snaps.front().time || snaps.size() == 1) {
+            const auto& s = (renderTime <= snaps.front().time) ? snaps.front() : snaps.back();
+            v.position = s.position; v.yaw = s.yaw; v.pitch = s.pitch;
+            continue;
+        }
+        if (renderTime >= snaps.back().time) {
+            // Past the newest: extrapolate up to 0.1 s from the last two, then hold still
+            const auto& b = snaps.back();
+            const auto& a = snaps[snaps.size() - 2];
+            const double span = b.time - a.time;
+            const double ahead = std::min(renderTime - b.time, 0.1);
+            glm::vec3 p = b.position;
+            if (span > 1e-4 && glm::distance(a.position, b.position) < 8.0f) {
+                p += (b.position - a.position) * static_cast<float>(ahead / span);
+            }
+            v.position = p; v.yaw = b.yaw; v.pitch = b.pitch;
+            continue;
+        }
+        size_t i = 1;
+        while (i < snaps.size() && snaps[i].time < renderTime) ++i;
+        const auto& a = snaps[i - 1];
+        const auto& b = snaps[i];
+        const float t = static_cast<float>((renderTime - a.time) / std::max(b.time - a.time, 1e-6));
+        if (glm::distance(a.position, b.position) > 8.0f) {
+            v.position = (t < 0.5f) ? a.position : b.position;   // teleported: don't slide across the map
+        } else {
+            v.position = glm::mix(a.position, b.position, t);
+        }
+        v.yaw = lerpAngle(a.yaw, b.yaw, t);
+        v.pitch = a.pitch + (b.pitch - a.pitch) * t;
     }
 }
 
@@ -292,10 +310,11 @@ bool net::validPlayerName(const std::string& name) {
 // (call stop() first for a clean shutdown).
 GameServer::~GameServer() {
     if (m_host) enet_host_destroy(m_host);
+    if (m_lanSocket != -1) enet_socket_destroy(static_cast<ENetSocket>(m_lanSocket));
 }
 
 bool GameServer::start(World& world, uint16_t port, const std::string& gameFolder,
-                       const std::string& hostName, std::string& error) {
+                       const std::string& hostName, std::string& error, bool hasHostPlayer) {
     if (running()) { error = "Already hosting"; return false; }
     if (!ensureEnet()) { error = "Networking could not be started"; return false; }
 
@@ -315,6 +334,7 @@ bool GameServer::start(World& world, uint16_t port, const std::string& gameFolde
     m_port = port;
     m_game = gameFolder;
     m_hostName = hostName;
+    m_hasHost = hasHostPlayer;
     m_nextId = 1;
     m_clients.clear();
     m_views.clear();
@@ -346,6 +366,10 @@ void GameServer::stop(const std::string& reason) {
     m_host = nullptr;
     m_clients.clear();
     m_views.clear();
+    if (m_lanSocket != -1) {
+        enet_socket_destroy(static_cast<ENetSocket>(m_lanSocket));
+        m_lanSocket = -1;
+    }
     if (m_world) {
         m_world->setRecordChanges(false);
         m_world->setExtraLoadCenters({});
@@ -355,7 +379,7 @@ void GameServer::stop(const std::string& reason) {
 }
 
 int GameServer::playerCount() const {
-    int n = 1;
+    int n = m_hasHost ? 1 : 0;
     for (const auto& [id, c] : m_clients) if (c.joined) ++n;
     return n;
 }
@@ -428,6 +452,13 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         sendPositions();
     }
 
+    // Let LAN players see this game, every 1.5 seconds
+    m_lanTimer -= dt;
+    if (m_lanTimer <= 0.0f) {
+        m_lanTimer = 1.5f;
+        announceLan();
+    }
+
     // Pings for the player list (Tab), every 2 seconds
     m_pingTimer += dt;
     if (m_pingTimer >= 2.0f) {
@@ -435,7 +466,7 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         Writer w(S_PINGS);
         uint16_t n = 0;
         w.u16(0);
-        w.u16(0); w.u16(0); ++n;   // the host
+        if (m_hasHost) { w.u16(0); w.u16(0); ++n; }   // the host
         for (const auto& [id, c] : m_clients) {
             if (!c.joined) continue;
             const int ping = static_cast<int>(std::min<enet_uint32>(c.peer->roundTripTime, 65535));
@@ -450,8 +481,72 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         }
     }
 
-    smoothPlayers(m_views, dt);
+    // Host view of the other players: a snapshot of the server's simulation every frame,
+    // drawn 100 ms behind so bursts of inputs arriving together still look smooth.
+    for (auto& [id, c] : m_clients) {
+        if (c.joined) c.moveBudget = std::min(c.moveBudget + dt, 0.5f);
+    }
+    interpolatePlayers(m_views, net::clockSeconds() - kInterpDelay);
     enet_host_flush(m_host);
+}
+
+// Movement inputs from a client: run each one through the same movement code the client
+// used, in order. Inputs already applied are skipped (the client resends unconfirmed ones).
+void GameServer::handleInputs(Client& c, const uint8_t* data, size_t size) {
+    Reader r(data, size);
+    const uint32_t first = r.u32();
+    const uint16_t count = r.u16();
+    if (!r.ok || count > 400) return;
+    for (uint16_t i = 0; i < count; ++i) {
+        MoveInput in;
+        in.keys = r.u8();
+        in.yaw = r.f32();
+        in.pitch = std::clamp(r.f32(), -90.0f, 90.0f);
+        float dt = r.f32();
+        if (!r.ok) break;
+        const uint32_t seq = first + i;
+        if (seq <= c.lastSeq) continue;
+        dt = std::clamp(dt, 0.0f, kMaxMoveStep);
+        // Only as much movement as real time allows (a speed hack would run out of budget)
+        const glm::vec3 before = c.sim.position;
+        if (c.moveBudget + 0.001f >= dt) {
+            c.moveBudget -= dt;
+            stepMovement(c.sim, in, dt, *m_world);
+        } else {
+            ++c.droppedInputs;
+        }
+        ++c.inputsThisSecond;
+        c.movedThisSecond += glm::length(glm::vec2(c.sim.position.x - before.x, c.sim.position.z - before.z));
+        c.lastSeq = seq;
+        c.yaw = in.yaw;
+        c.pitch = in.pitch;
+
+        // One snapshot per input, spaced by the input's own dt
+        c.simClock += dt;
+        if (!c.simOffsetSet) {
+            c.simOffset = net::clockSeconds() - c.simClock;
+            c.simOffsetSet = true;
+        }
+        const double t = c.simClock + c.simOffset;
+        pushSnapshot(m_views[c.id], t, c.sim.position, c.yaw, c.pitch);
+        c.lastSnapTime = t;
+    }
+    // Keep the timeline in step with real time, gently: a sudden jump would bunch up or
+    // stretch the snapshots and the player would visibly speed up or slow down.
+    const double sample = net::clockSeconds() - c.simClock;
+    c.simOffset += (sample - c.simOffset) * 0.05;
+    c.position = c.sim.position;
+    c.hasPosition = true;
+
+    const double now = nowSeconds();
+    if (now - c.statsWindow >= 1.0) {
+        const float span = static_cast<float>(now - c.statsWindow);
+        c.inputsPerSecond = static_cast<int>(c.inputsThisSecond / span);
+        c.speed = c.movedThisSecond / span;
+        c.inputsThisSecond = 0;
+        c.movedThisSecond = 0.0f;
+        c.statsWindow = now;
+    }
 }
 
 void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
@@ -464,22 +559,9 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
     }
 
     switch (type) {
-    case C_POS: {
-        Reader r(data, size);
-        glm::vec3 p = r.vec3f();
-        const float yaw = r.f32();
-        const float pitch = r.f32();
-        const float time = r.f32();
-        if (!r.ok) return;
-        p.y = std::clamp(p.y, -64.0f, static_cast<float>(CHUNK_HEIGHT) + 64.0f);
-        c.position = p;
-        c.yaw = yaw;
-        c.pitch = pitch;
-        c.sentTime = time;
-        c.hasPosition = true;
-        setTarget(m_views[c.id], p, yaw, pitch, time);
+    case C_INPUTS:
+        handleInputs(c, data, size);
         break;
-    }
     case C_BLOCKS:
         handleBlocks(c, data, size);
         break;
@@ -510,24 +592,36 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
         return;
     }
     if (!net::validPlayerName(name)) { kick(c, "Invalid name (use 1-16 letters, numbers, _ or -)"); return; }
-    if (game != m_game) { kick(c, "This server is playing '" + m_game + "' - select that game first"); return; }
-    if (name == m_hostName) { kick(c, "Someone called '" + name + "' is already playing"); return; }
+    if (game != m_game) {
+        const std::string title = m_gameTitle.empty() ? m_game : m_gameTitle;
+        kick(c, "This server plays " + title + " (" + m_game + "). Select that game on the title screen first.");
+        return;
+    }
+    if (canJoin) {
+        const std::string reason = canJoin(name);   // banned, not whitelisted...
+        if (!reason.empty()) { kick(c, reason); return; }
+    }
+    if (m_hasHost && name == m_hostName) { kick(c, "Someone called '" + name + "' is already playing"); return; }
+    for (const auto& [id, other] : m_clients) {
+        if (other.joined && other.name == name) { kick(c, "Someone called '" + name + "' is already playing"); return; }
+    }
     if (playerCount() >= m_maxPlayers) {
         kick(c, "The server is full (" + std::to_string(m_maxPlayers) + " players)");
         return;
     }
-    for (const auto& [id, other] : m_clients) {
-        if (other.joined && other.name == name) { kick(c, "Someone called '" + name + "' is already playing"); return; }
-    }
 
     c.name = name;
-    c.viewDistance = std::clamp(view, 2, net::kMaxViewDistance);
+    c.viewDistance = std::clamp(view, 2, m_maxView);
     c.joined = true;
 
-    // Spawn: on the ground at the world spawn if it's loaded, else next to the host
+    // Spawn: where they were last time (dedicated server), else on the ground at the world
+    // spawn if it's loaded, else next to the host
     glm::vec3 spawn = m_hostPos + glm::vec3(1.0f, 0.0f, 1.0f);
     const int ground = m_world->groundHeightAt(8, 8);
     if (ground >= 0) spawn = glm::vec3(8.5f, static_cast<float>(ground), 8.5f);
+    else if (!m_hasHost) spawn = glm::vec3(8.5f, 100.0f, 8.5f);
+    glm::vec3 saved;
+    if (spawnFor && spawnFor(name, saved)) spawn = saved;
     c.position = spawn;
     c.hasPosition = true;
 
@@ -539,7 +633,7 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     sendTo(c.peer, w);
 
     // Tell the newcomer who's here, and everyone else about the newcomer
-    {
+    if (m_hasHost) {
         Writer host(S_ADD);
         host.u16(0);
         host.str(m_hostName);
@@ -554,10 +648,29 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     net::PlayerView& v = m_views[c.id];
     v.name = name;
     v.color = colorForName(name);
-    setTarget(v, spawn, 0.0f, 0.0f, 0.0f);
+    c.sim = MoveState{spawn, glm::vec3(0.0f), false};
+    c.lastSeq = 0;
+    c.moveBudget = 0.2f;
+    c.simClock = 0.0;
+    c.simOffsetSet = false;
+    c.lastSnapTime = net::clockSeconds();
+    pushSnapshot(v, c.lastSnapTime, spawn, 0.0f, 0.0f);
 
     std::cout << "[Server] " << name << " joined" << std::endl;
     broadcastChat(name + " joined the game", kInfoColor);
+    if (onJoin) onJoin(name);
+}
+
+bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        Writer w(S_CHAT);
+        w.str(text);
+        w.f32(color.r); w.f32(color.g); w.f32(color.b);
+        sendTo(c.peer, w);
+        return true;
+    }
+    return false;
 }
 
 void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
@@ -604,6 +717,10 @@ void GameServer::kick(Client& c, const std::string& reason) {
     sendTo(c.peer, w);
     enet_peer_disconnect_later(c.peer, 0);
     std::cout << "[Server] Kicked " << (c.name.empty() ? "a player" : c.name) << ": " << reason << std::endl;
+    // Out of the game straight away (they'd otherwise count as online until their
+    // connection timed out, and couldn't rejoin). ENet still finishes the disconnect.
+    // Callers must not use `c` after this.
+    dropClient(c.id);
 }
 
 void GameServer::dropClient(uint16_t id) {
@@ -611,6 +728,7 @@ void GameServer::dropClient(uint16_t id) {
     if (it == m_clients.end()) return;
     const bool wasJoined = it->second.joined;
     const std::string name = it->second.name;
+    if (wasJoined && onLeave) onLeave(name, it->second.position);   // e.g. save where they were
     m_clients.erase(it);
     m_views.erase(id);
 
@@ -688,17 +806,32 @@ void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes
 }
 
 void GameServer::sendPositions() {
-    struct Entry { uint16_t id; glm::vec3 p; float yaw, pitch, time; };
+    struct Entry { uint16_t id; float time; glm::vec3 p; float yaw, pitch; };
+    const float serverTime = net::clockSeconds();
     std::vector<Entry> all;
-    all.push_back({0, m_hostPos, m_hostYaw, m_hostPitch, net::clockSeconds()});
+    if (m_hasHost) all.push_back({0, serverTime, m_hostPos, m_hostYaw, m_hostPitch});
     for (const auto& [id, c] : m_clients) {
-        if (c.joined && c.hasPosition) all.push_back({id, c.position, c.yaw, c.pitch, c.sentTime});
+        if (c.joined && c.hasPosition) {
+            all.push_back({id, static_cast<float>(c.lastSnapTime), c.position, c.yaw, c.pitch});
+        }
     }
 
     for (auto& [id, c] : m_clients) {
         if (!c.joined) continue;
+
+        // Your own real position, and the last input it includes (for reconciliation)
+        Writer ack(S_ACK);
+        ack.u32(c.lastSeq);
+        ack.f32(c.sim.position.x); ack.f32(c.sim.position.y); ack.f32(c.sim.position.z);
+        ack.f32(c.sim.velocity.x); ack.f32(c.sim.velocity.y); ack.f32(c.sim.velocity.z);
+        ack.u8(c.sim.grounded ? 1 : 0);
+        sendTo(c.peer, ack, false);
+
+        // Everyone else you can see
         const float range = (c.viewDistance + 1) * static_cast<float>(CHUNK_WIDTH);
         Writer w(S_PLAYERS);
+        w.f32(serverTime);
+        const size_t countAt = w.d.size();
         w.u16(0);   // count, filled in below
         uint16_t n = 0;
         for (const Entry& e : all) {
@@ -706,14 +839,14 @@ void GameServer::sendPositions() {
             const glm::vec2 d(e.p.x - c.position.x, e.p.z - c.position.z);
             if (glm::length(d) > range) continue;   // too far to see
             w.u16(e.id);
+            w.f32(e.time);
             w.f32(e.p.x); w.f32(e.p.y); w.f32(e.p.z);
             w.f32(e.yaw); w.f32(e.pitch);
-            w.f32(e.time);
             ++n;
         }
         if (n == 0) continue;
-        w.d[1] = n & 0xFF;
-        w.d[2] = n >> 8;
+        w.d[countAt] = n & 0xFF;
+        w.d[countAt + 1] = n >> 8;
         sendTo(c.peer, w, false);
     }
 }
@@ -742,18 +875,80 @@ void GameServer::sendStatus(ENetPeer* peer) {
     w.str(m_motd);
     w.u16(static_cast<uint16_t>(playerCount()));
     w.u16(static_cast<uint16_t>(m_maxPlayers));
-    std::vector<std::string> names{m_hostName};
+    std::vector<std::string> names;
+    if (m_hasHost) names.push_back(m_hostName);
     for (const auto& [id, c] : m_clients) {
         if (c.joined && names.size() < 20) names.push_back(c.name);
     }
     w.u16(static_cast<uint16_t>(names.size()));
     for (const auto& n : names) w.str(n);
+    // Icon, then the game's title: added last, so older clients that stop reading earlier still work
+    w.u32(static_cast<uint32_t>(m_icon.size()));
+    w.bytes(m_icon);
+    w.str(m_gameTitle);
     sendTo(peer, w);
+}
+
+void GameServer::setIcon(std::vector<uint8_t> png) {
+    if (png.size() > net::kMaxIconBytes) png.clear();
+    m_icon = std::move(png);
+}
+
+// Tells everyone on the local network that this game is open to join.
+// Message: "CRLAN1\n<port>\n<host name>\n<players>\n<max>\n<description>"
+void GameServer::announceLan() {
+    if (m_lanSocket == -1) {
+        ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+        if (sock == ENET_SOCKET_NULL) return;
+        enet_socket_set_option(sock, ENET_SOCKOPT_BROADCAST, 1);
+        enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
+        m_lanSocket = static_cast<intptr_t>(sock);
+    }
+    const std::string msg = "CRLAN1\n" + std::to_string(m_port) + "\n" + m_hostName + "\n" +
+                            std::to_string(playerCount()) + "\n" + std::to_string(m_maxPlayers) + "\n" + m_motd;
+    ENetBuffer buf;
+    buf.data = const_cast<char*>(msg.data());
+    buf.dataLength = msg.size();
+    ENetAddress to;
+    to.port = net::kLanPort;
+    to.host = ENET_HOST_BROADCAST;                       // every PC on the network
+    enet_socket_send(static_cast<ENetSocket>(m_lanSocket), &to, &buf, 1);
+    enet_address_set_host(&to, "127.0.0.1");             // and this PC (some systems don't loop broadcasts back)
+    to.port = net::kLanPort;
+    enet_socket_send(static_cast<ENetSocket>(m_lanSocket), &to, &buf, 1);
 }
 
 void GameServer::sendChat(const std::string& text) {
     if (!running() || text.empty()) return;
     broadcastChat("<" + m_hostName + "> " + text, kChatColor);
+}
+
+void GameServer::broadcastMessage(const std::string& text, const glm::vec3& color) {
+    if (!running() || text.empty()) return;
+    broadcastChat(text, color);
+}
+
+std::vector<std::string> GameServer::playerNames() const {
+    std::vector<std::string> out;
+    for (const auto& [id, c] : m_clients) if (c.joined) out.push_back(c.name);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<std::pair<std::string, glm::vec3>> GameServer::playerPositions() const {
+    std::vector<std::pair<std::string, glm::vec3>> out;
+    for (const auto& [id, c] : m_clients) if (c.joined) out.push_back({c.name, c.position});
+    return out;
+}
+
+bool GameServer::kickPlayer(const std::string& name, const std::string& reason) {
+    for (auto& [id, c] : m_clients) {
+        if (c.joined && c.name == name) {
+            kick(c, reason.empty() ? std::string("Kicked by the server") : reason);
+            return true;
+        }
+    }
+    return false;
 }
 
 std::vector<net::ChatLine> GameServer::takeChat() {
@@ -856,8 +1051,10 @@ void GameClient::finish(const std::string& reason) {
     std::cout << "[Client] " << m_endReason << std::endl;
 }
 
-void GameClient::update(const glm::vec3& pos, float yaw, float pitch, float dt) {
+void GameClient::update(const MoveState& local, float yaw, float pitch, float dt) {
+    (void)yaw; (void)pitch;
     if (!m_host) return;
+    m_local = local;
 
     ENetEvent ev;
     while (m_host && enet_host_service(m_host, &ev, 0) > 0) {
@@ -895,13 +1092,10 @@ void GameClient::update(const glm::vec3& pos, float yaw, float pitch, float dt) 
         m_posTimer += dt;
         if (m_posTimer >= kPositionInterval) {
             m_posTimer = std::fmod(m_posTimer, kPositionInterval);
-            Writer w(C_POS);
-            w.f32(pos.x); w.f32(pos.y); w.f32(pos.z);
-            w.f32(yaw); w.f32(pitch);
-            w.f32(net::clockSeconds());
-            sendTo(m_peer, w, false);
+            sendInputs();
         }
-        smoothPlayers(m_views, dt);
+        // Other players: 100 ms behind the server's clock
+        if (m_clockSynced) interpolatePlayers(m_views, net::clockSeconds() + m_clockOffset - kInterpDelay);
     }
     if (m_host) enet_host_flush(m_host);
 }
@@ -942,6 +1136,12 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_world->setRemote(true);
         m_welcome = wel;
         m_haveWelcome = true;
+        m_pending.clear();
+        m_nextSeq = 1;
+        m_lastAck = 0;
+        m_haveCorrection = false;
+        m_corrections = 0;
+        m_clockSynced = false;
         m_state = State::Joined;
         std::cout << "[Client] Joined " << m_addressText << std::endl;
         break;
@@ -994,17 +1194,34 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         break;
     }
     case S_PLAYERS: {
+        const float serverTime = r.f32();
         const uint16_t count = r.u16();
+        if (!r.ok) return;
+        // Estimate the server's clock. A packet can't arrive before it was sent, so the
+        // largest (server time - our time) seen is the best estimate; drift down slowly.
+        const double sample = serverTime - net::clockSeconds();
+        if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
+        else m_clockOffset += (sample - m_clockOffset) * 0.01;
+        m_clockSynced = true;
         for (uint16_t i = 0; i < count && r.ok; ++i) {
             const uint16_t id = r.u16();
+            const float time = r.f32();
             const glm::vec3 p = r.vec3f();
             const float yaw = r.f32();
             const float pitch = r.f32();
-            const float time = r.f32();
             if (!r.ok) break;
             auto it = m_views.find(id);
-            if (it != m_views.end()) setTarget(it->second, p, yaw, pitch, time);
+            if (it != m_views.end()) pushSnapshot(it->second, time, p, yaw, pitch);
         }
+        break;
+    }
+    case S_ACK: {
+        const uint32_t seq = r.u32();
+        MoveState server;
+        server.position = r.vec3f();
+        server.velocity = r.vec3f();
+        server.grounded = r.u8() != 0;
+        if (r.ok && m_state == State::Joined) reconcile(seq, server);
         break;
     }
     case S_PINGS: {
@@ -1028,6 +1245,60 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
     default:
         break;
     }
+}
+
+void GameClient::recordInput(const MoveInput& input, float dt) {
+    if (m_state != State::Joined) return;
+    dt = std::min(dt, kMaxMoveStep);
+    if (dt <= 0.0f) return;
+    m_pending.push_back({m_nextSeq++, input, dt});
+    while (m_pending.size() > 2000) m_pending.pop_front();   // server unreachable for a long time
+}
+
+// Sends every input the server hasn't confirmed yet (up to a limit). Resending them each
+// time means a lost packet costs nothing - the next one carries the same inputs.
+void GameClient::sendInputs() {
+    if (m_pending.empty()) return;
+    const size_t n = std::min(m_pending.size(), kMaxInputsPerPacket);
+    Writer w(C_INPUTS);
+    w.u32(m_pending.front().seq);
+    w.u16(static_cast<uint16_t>(n));
+    for (size_t i = 0; i < n; ++i) {
+        const auto& p = m_pending[i];
+        w.u8(p.input.keys);
+        w.f32(p.input.yaw);
+        w.f32(p.input.pitch);
+        w.f32(p.dt);
+    }
+    sendTo(m_peer, w, false);
+}
+
+// The server says: "after your input #ackSeq you were at `server`". Start from there,
+// replay the inputs it hasn't seen yet, and correct our player only if we ended up
+// somewhere different (another player pushed a block in the way, lag, cheating...).
+void GameClient::reconcile(uint32_t ackSeq, const MoveState& server) {
+    if (ackSeq < m_lastAck) return;   // older than one we already used
+    m_lastAck = ackSeq;
+    while (!m_pending.empty() && m_pending.front().seq <= ackSeq) m_pending.pop_front();
+
+    MoveState s = server;
+    for (const auto& p : m_pending) stepMovement(s, p.input, p.dt, *m_world);
+
+    const float posError = glm::distance(s.position, m_local.position);
+    const float velError = glm::length(s.velocity - m_local.velocity);
+    if (posError > 0.02f || velError > 0.5f) {
+        m_correction = s;
+        m_haveCorrection = true;
+        m_local = s;
+        ++m_corrections;
+    }
+}
+
+bool GameClient::takeCorrection(MoveState& out) {
+    if (!m_haveCorrection) return false;
+    m_haveCorrection = false;
+    out = m_correction;
+    return true;
 }
 
 bool GameClient::takeWelcome(Welcome& out) {
@@ -1076,10 +1347,18 @@ std::vector<std::string> GameServer::statsLines() const {
     out.push_back("Hosting on port " + std::to_string(m_port) + ", " + std::to_string(playerCount()) + " players");
     for (const auto& [id, c] : m_clients) {
         if (!c.joined) continue;
-        std::string line = c.name + ": ping " + std::to_string(c.peer->roundTripTime) + " ms";
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "%s: ping %u ms, %d inputs/s, moving %.1f blocks/s, refused %d",
+                      c.name.c_str(), c.peer->roundTripTime, c.inputsPerSecond, c.speed, c.droppedInputs);
+        out.push_back(buf);
         auto it = m_views.find(id);
-        if (it != m_views.end()) line += ", " + rateText(it->second) + " (expect ~30)";
-        out.push_back(line);
+        if (it != m_views.end()) {
+            const auto& v = it->second;
+            const double behind = v.snapshots.empty() ? 0.0
+                                : (net::clockSeconds() - v.snapshots.back().time) * 1000.0;
+            std::snprintf(buf, sizeof(buf), "   drawn from %s, newest %.0f ms old", rateText(v).c_str(), behind);
+            out.push_back(buf);
+        }
     }
     return out;
 }
@@ -1096,8 +1375,15 @@ std::vector<std::string> GameClient::statsLines() const {
         return out;
     }
     out.push_back("Server " + m_addressText + ": ping " + std::to_string(m_peer->roundTripTime) + " ms");
+    out.push_back("Your position corrected by the server " + std::to_string(m_corrections) +
+                  " times, " + std::to_string(m_pending.size()) + " inputs waiting");
     for (const auto& [id, v] : m_views) {
-        out.push_back(v.name + ": " + rateText(v) + " (expect ~30)");
+        const double behind = v.snapshots.empty() ? 0.0
+                            : (net::clockSeconds() + m_clockOffset - v.snapshots.back().time) * 1000.0;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s: drawn from %s, newest %.0f ms old", v.name.c_str(),
+                      rateText(v).c_str(), behind);
+        out.push_back(buf);
     }
     return out;
 }
@@ -1175,6 +1461,17 @@ void ServerPinger::update() {
                     const uint16_t n = r.u16();
                     for (uint16_t i = 0; i < n && r.ok; ++i) st.names.push_back(r.str());
                     if (r.ok) {
+                        // Optional extras (older servers don't send them): icon, then game title
+                        Reader extra = r;
+                        const uint32_t len = extra.u32();
+                        if (extra.ok && len <= net::kMaxIconBytes && extra.need(len)) {
+                            if (len > 0) st.icon.assign(ev.packet->data + extra.p, ev.packet->data + extra.p + len);
+                            extra.p += len;
+                            const std::string title = extra.str();
+                            if (extra.ok) st.gameTitle = title;
+                        }
+                    }
+                    if (r.ok) {
                         st.state = ServerStatus::State::Online;
                         st.compatible = protocol == net::kProtocolVersion;
                         // The server answers the moment the handshake finishes: one round trip
@@ -1204,4 +1501,93 @@ void ServerPinger::update() {
 const ServerStatus* ServerPinger::status(const std::string& address) const {
     auto it = m_queries.find(address);
     return it != m_queries.end() ? &it->second.result : nullptr;
+}
+
+// ===========================================================================
+// LanScanner
+// ===========================================================================
+LanScanner::~LanScanner() { stop(); }
+
+void LanScanner::start() {
+    if (m_socket != -1 || !ensureEnet()) return;
+    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+    if (sock == ENET_SOCKET_NULL) return;
+    enet_socket_set_option(sock, ENET_SOCKOPT_REUSEADDR, 1);   // several games on one PC can all listen
+    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
+    enet_socket_set_option(sock, ENET_SOCKOPT_BROADCAST, 1);
+    ENetAddress addr;
+    addr.host = ENET_HOST_ANY;
+    addr.port = net::kLanPort;
+    if (enet_socket_bind(sock, &addr) != 0) {
+        std::cerr << "[LAN] Could not listen on UDP port " << net::kLanPort << std::endl;
+        enet_socket_destroy(sock);
+        return;
+    }
+    m_socket = static_cast<intptr_t>(sock);
+}
+
+void LanScanner::stop() {
+    if (m_socket != -1) enet_socket_destroy(static_cast<ENetSocket>(m_socket));
+    m_socket = -1;
+    m_games.clear();
+}
+
+void LanScanner::update() {
+    if (m_socket == -1) return;
+    const double now = nowSeconds();
+    char data[1024];
+    for (int guard = 0; guard < 64; ++guard) {
+        ENetAddress from;
+        ENetBuffer buf;
+        buf.data = data;
+        buf.dataLength = sizeof(data) - 1;
+        const int n = enet_socket_receive(static_cast<ENetSocket>(m_socket), &from, &buf, 1);
+        if (n <= 0) break;
+        const std::string msg(data, static_cast<size_t>(n));
+
+        // Split into lines; the description is everything after the 5th line break
+        std::vector<std::string> parts;
+        size_t start = 0;
+        while (parts.size() < 5) {
+            const size_t nl = msg.find('\n', start);
+            if (nl == std::string::npos) break;
+            parts.push_back(msg.substr(start, nl - start));
+            start = nl + 1;
+        }
+        if (parts.size() < 5 || parts[0] != "CRLAN1") continue;
+
+        char ip[64] = {};
+        if (enet_address_get_host_ip(&from, ip, sizeof(ip)) != 0) continue;
+        LanGame g;
+        try {
+            g.address = std::string(ip) + ":" + std::to_string(std::stoi(parts[1]));
+            g.players = std::stoi(parts[3]);
+            g.maxPlayers = std::stoi(parts[4]);
+        } catch (...) { continue; }
+        g.hostName = parts[2].substr(0, 32);
+        g.motd = msg.substr(start, net::kMaxMotdLength);
+        g.lastSeen = now;
+        m_games[g.address] = g;
+    }
+    for (auto it = m_games.begin(); it != m_games.end();) {
+        if (now - it->second.lastSeen > 5.0) it = m_games.erase(it); else ++it;
+    }
+}
+
+std::vector<LanGame> LanScanner::games() const {
+    std::vector<LanGame> out;
+    auto portOf = [](const std::string& a) { return a.substr(a.rfind(':') + 1); };
+    for (const auto& [addr, g] : m_games) {
+        // A game on this PC can arrive twice (broadcast + 127.0.0.1): keep the network address
+        if (addr.rfind("127.0.0.1:", 0) == 0) {
+            bool dup = false;
+            for (const auto& [other, og] : m_games) {
+                if (other != addr && portOf(other) == portOf(addr) && og.hostName == g.hostName) dup = true;
+            }
+            if (dup) continue;
+        }
+        out.push_back(g);
+    }
+    std::sort(out.begin(), out.end(), [](const LanGame& a, const LanGame& b) { return a.address < b.address; });
+    return out;
 }

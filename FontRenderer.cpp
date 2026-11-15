@@ -121,6 +121,31 @@ void FontRenderer::renderText(GLuint fontShader, const std::string& text,
     this->drawGLFontQuads(fontShader, color, resolution, vertices);
 }
 
+// Same scaling as generateFontVertices, so the numbers match what is drawn.
+float FontRenderer::textWidth(std::string_view text, float scaleX, Dimensions2D resolution) const {
+    if (this->baseResolution.width <= 0) return 0.0f;
+    const float scaleWidth = scaleX * static_cast<float>(resolution.width)
+                           / static_cast<float>(this->baseResolution.width);
+    float rx = 0.0f, ry = 0.0f;
+    for (char ch : text) {
+        const int charIndex = static_cast<unsigned char>(ch);
+        if (charIndex < 32 || charIndex >= 128) continue;
+        stbtt_aligned_quad q;
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, charIndex - 32, &rx, &ry, &q, 1);
+    }
+    return rx * scaleWidth;
+}
+
+float FontRenderer::capHeight(float scaleY, Dimensions2D resolution) const {
+    if (this->baseResolution.height <= 0) return 0.0f;
+    const float scaleHeight = scaleY * static_cast<float>(resolution.height)
+                            / static_cast<float>(this->baseResolution.height);
+    float rx = 0.0f, ry = 0.0f;
+    stbtt_aligned_quad q;
+    stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, 'H' - 32, &rx, &ry, &q, 1);
+    return -q.y0 * scaleHeight;   // y0 is negative: how far the top of 'H' is above the baseline
+}
+
 std::vector<float> FontRenderer::generateFontVertices(float x, float y,
         float scaleX, float scaleY, Dimensions2D resolution,
         std::string_view text) const
