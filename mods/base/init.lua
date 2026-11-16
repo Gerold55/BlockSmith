@@ -33,3 +33,7 @@ loadScript("mods_menu.lua")     -- mods menu
 loadScript("texture_packs.lua") -- texture pack picker
 loadScript("settings_menu.lua") -- settings (controls, video)
 loadScript("world_select.lua")  -- world selection
+loadScript("multiplayer.lua")  
+loadScript("pause_menu.lua")  
+loadScript("player_list.lua")  
+loadScript("server_manager.lua")  

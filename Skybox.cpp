@@ -27,6 +27,8 @@ out vec4 FragColor;
 in vec3 FragPos;
 
 uniform float u_SunPosY; // ranges from -1.0 (midnight) to +1.0 (noon)
+uniform float u_StarDensity;    // 0..1: chance that a sky cell has a star
+uniform float u_StarBrightness; // 0 = no stars, 1 = normal
 
 void main() {
     vec3 normalizedDir = normalize(FragPos);
@@ -76,17 +78,25 @@ void main() {
         skyColor += horizonColor * horizonGlow * 0.25f;
     }
 
-    // Procedural Stars visible during night and deep twilight
-    if (y > 0.0f && sunFactor < 0.15f) {
-        // Scale coordinate space for star density
-        vec2 starUV = normalizedDir.xz / (y + 0.1f);
-        float starNoise = fract(sin(dot(starUV * 180.0f, vec2(12.9898f, 78.233f))) * 43758.5453f);
-        
-        if (starNoise > 0.988f) {
-            float starAlpha = (starNoise - 0.988f) / 0.012f;
-            // Fade stars in smoothly as night approaches
+    // Stars: one possible star per cell of a fixed grid on the sky sphere. Each star is a small
+    // soft dot of a fixed size, so it stays put and steady when the camera moves or turns
+    // (no per-pixel noise, which flickers). Count and brightness come from sky.set_stars in Lua.
+    if (y > 0.0f && sunFactor < 0.15f && u_StarDensity > 0.0f && u_StarBrightness > 0.0f) {
+        const float cells = 90.0f;                        // grid resolution around the sky
+        vec3 p = normalizedDir * cells;
+        vec3 cell = floor(p);
+        float h = fract(sin(dot(cell, vec3(127.1f, 311.7f, 74.7f))) * 43758.5453f);
+        if (h < u_StarDensity) {
+            // Where in the cell the star sits (kept away from the edges), and how bright it is
+            vec3 jitter = vec3(fract(h * 17.13f), fract(h * 31.71f), fract(h * 57.37f));
+            vec3 starPos = cell + 0.25f + 0.5f * jitter;
+            float d = length(p - starPos);
+            float size = 0.15f + 0.08f * fract(h * 91.3f); // in cells (a few pixels: big enough not to shimmer)
+            float dotShape = 1.0f - smoothstep(size * 0.4f, size, d);
+            float brightness = 0.45f + 0.55f * fract(h * 7.77f);
             float nightIntensity = clamp((-sunFactor + 0.15f) * 2.5f, 0.0f, 1.0f);
-            skyColor += vec3(starAlpha * nightIntensity * y); // Slightly dimmer near the horizon
+            float horizonFade = smoothstep(0.0f, 0.25f, y);   // fewer, dimmer stars near the horizon
+            skyColor += vec3(dotShape * brightness * nightIntensity * horizonFade * u_StarBrightness);
         }
     }
 
@@ -153,6 +163,8 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection, float su
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
     glUniform1f(glGetUniformLocation(shaderProgram, "u_SunPosY"), sunPosY);
+    glUniform1f(glGetUniformLocation(shaderProgram, "u_StarDensity"), starDensity);
+    glUniform1f(glGetUniformLocation(shaderProgram, "u_StarBrightness"), starBrightness);
 
     glBindVertexArray(VAO);
     glDrawArrays(GL_TRIANGLES, 0, 36);

@@ -3296,6 +3296,15 @@ int main(int argc, char** argv) {
         auto skyTable = lua.create_named_table("sky");
         skyTable["set_time"] = [](float time) { if (g_LightingSystem) g_LightingSystem->customTimeOfDay = time; };
         skyTable["get_time"] = []() { return g_LightingSystem ? g_LightingSystem->getTimeOfDay() : 0.0f; };
+        // Stars: sky.set_stars(density, brightness). density 0..1 (default 0.06), brightness 0 = off (default 0.9)
+        skyTable["set_stars"] = [](float density, sol::optional<float> brightness) {
+            if (!g_Skybox) return;
+            g_Skybox->starDensity = std::max(0.0f, std::min(1.0f, density));
+            if (brightness) g_Skybox->starBrightness = std::max(0.0f, *brightness);
+        };
+        skyTable["get_stars"] = []() -> std::tuple<float, float> {
+            return g_Skybox ? std::make_tuple(g_Skybox->starDensity, g_Skybox->starBrightness) : std::make_tuple(0.0f, 0.0f);
+        };
         skyTable["set_moon_phase"] = [](int phase) { if (g_LightingSystem) g_LightingSystem->forcedMoonPhase = phase; };
         skyTable["get_moon_phase"] = []() { return g_LightingSystem ? g_LightingSystem->getMoonPhase() : 0; };
         skyTable["set_moon_textures"] = [](sol::table paths) {
