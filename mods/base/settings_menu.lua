@@ -73,11 +73,16 @@ local VIDEO_LABELS = {
     fov             = "Field of View",
     render_distance = "Render Distance",
     vsync           = "VSync",
+    volume_master   = "Master Volume",
+    volume_music    = "Music",
+    volume_effects  = "Blocks & Effects",
+    volume_ambient  = "Weather & Ambience",
 }
 
 local function video_value_text(s)
     if s.id == "vsync" then return (s.value ~= 0) and "On" or "Off" end
     if s.id == "render_distance" then return s.value .. " chunks" end
+    if s.id:find("^volume_") then return (s.value == 0) and "Off" or (s.value .. "%") end
     return tostring(s.value)
 end
 
@@ -177,8 +182,15 @@ local function layout(W, H)
     local tabsY = L.noteY + text_height(fs * 0.8) + 6 * S
     local tx = math.floor((W - (tw * 2 + gap)) / 2)
     L.tabs = {
+<<<<<<< Updated upstream
         { id = "controls", label = "Controls", x = tx,            y = tabsY, w = tw, h = bh },
         { id = "video",    label = "Video",    x = tx + tw + gap, y = tabsY, w = tw, h = bh },
+=======
+        { id = "controls", label = "Controls", x = tx,                  y = tabsY, w = tw, h = bh },
+        { id = "video",    label = "Video & Sound",    x = tx + tw + gap,       y = tabsY, w = tw, h = bh },
+        { id = "player",   label = "Player",   x = tx + (tw + gap) * 2, y = tabsY, w = tw, h = bh },
+        { id = "server",   label = "Server",   x = tx + (tw + gap) * 3, y = tabsY, w = tw, h = bh },
+>>>>>>> Stashed changes
     }
 
     -- Panel with the rows

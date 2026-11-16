@@ -31,7 +31,15 @@ engine.register_block("grass", 120, 200, 85, {
     transparent = false,
     walkable = true,
     behavior = "solid",
-    tint = true
+    tint = true,
+
+    -- Sounds the engine plays by itself
+    sounds = {
+        footstep = { name = "default_dirt_footstep", gain = 0.45, pitch = 1.1 },  -- walking / landing on it
+        dig      = { name = "default_dirt_dig",      gain = 0.6 },               -- each hit while digging (survival)
+        dug      = { name = "default_dirt_dug",      gain = 0.9 },               -- when it breaks
+        place    = { name = "default_place",         gain = 0.8 },               -- when it's placed
+    },
 })
 
 -- Oak Log

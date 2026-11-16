@@ -1,6 +1,11 @@
 #include "ChunkMesh.h"
 #include "Block.h"
 #include "Types.h"
+<<<<<<< Updated upstream
+=======
+#include "Fluids.h"
+#include <cmath>
+>>>>>>> Stashed changes
 #include <cstddef>
 #include <cstring>
 #include <vector>
@@ -228,6 +233,33 @@ void ChunkMesh::generateMeshData() {
     auto& registry = BlockRegistry::getInstance();
     const uint8_t waterId = registry.getBlockId("water");
 
+    // Biome colours (ChunkData's column tints): a vertex takes the average colour of the up to
+    // 4 columns around its corner, so colours blend smoothly from block to block
+    auto applyBiomeTint = [&](Vertex* verts, int count, int channel) {
+        if (channel < 0 || !data.hasTint(channel)) return;
+        for (int i = 0; i < count; ++i) {
+            const int cx = static_cast<int>(std::lround(verts[i].posX));
+            const int cz = static_cast<int>(std::lround(verts[i].posZ));
+            float r = 0, g = 0, b = 0;
+            int n = 0;
+            for (int dx = -1; dx <= 0; ++dx) {
+                for (int dz = -1; dz <= 0; ++dz) {
+                    const uint32_t t = data.getColumnTint(cx + dx, cz + dz, channel);
+                    if (t == ChunkData::kNoTint) continue;
+                    r += static_cast<float>((t >> 16) & 0xFF);
+                    g += static_cast<float>((t >> 8) & 0xFF);
+                    b += static_cast<float>(t & 0xFF);
+                    ++n;
+                }
+            }
+            if (n == 0) continue;
+            const float k = 1.0f / (255.0f * static_cast<float>(n));
+            verts[i].tintR = r * k;
+            verts[i].tintG = g * k;
+            verts[i].tintB = b * k;
+        }
+    };
+
     auto emitPlant = [&](int x, int y, int z, const BlockProperty& prop) {
         const FaceStyle style{
             prop.defaultTint.r, prop.defaultTint.g, prop.defaultTint.b,
@@ -246,19 +278,21 @@ void ChunkMesh::generateMeshData() {
         const float minZ = fz + kPlantInset, maxZ = fz + 1.0f - kPlantInset;
         const float minY = fy, maxY = fy + 1.0f;
 
-        const Vertex p1[4] = {
+        Vertex p1[4] = {
             makeVertex(minX, minY, minZ, 0.0f, 1.0f, style),
             makeVertex(maxX, minY, maxZ, 1.0f, 1.0f, style),
             makeVertex(maxX, maxY, maxZ, 1.0f, 0.0f, style),
             makeVertex(minX, maxY, minZ, 0.0f, 0.0f, style),
         };
-        const Vertex p2[4] = {
+        Vertex p2[4] = {
             makeVertex(minX, minY, maxZ, 0.0f, 1.0f, style),
             makeVertex(maxX, minY, minZ, 1.0f, 1.0f, style),
             makeVertex(maxX, maxY, minZ, 1.0f, 0.0f, style),
             makeVertex(minX, maxY, maxZ, 0.0f, 0.0f, style),
         };
 
+        applyBiomeTint(p1, 4, prop.biomeTint);
+        applyBiomeTint(p2, 4, prop.biomeTint);
         pushDoubleSided(cpuOpaqueVertices, p1);
         pushDoubleSided(cpuOpaqueVertices, p2);
     };
@@ -312,7 +346,7 @@ void ChunkMesh::generateMeshData() {
             float fv[4][3];
             faceCorners(f, fx, fy, fz, topY, fv);
 
-            const Vertex q[4] = {
+            Vertex q[4] = {
                 makeVertex(fv[0][0], fv[0][1], fv[0][2], 0.0f, 1.0f, style),
                 makeVertex(fv[1][0], fv[1][1], fv[1][2], 1.0f, 1.0f, style),
                 makeVertex(fv[2][0], fv[2][1], fv[2][2], 1.0f, 0.0f, style),
@@ -321,6 +355,7 @@ void ChunkMesh::generateMeshData() {
 
             const bool blended = renderProp.isTransparent && !isCutout(renderProp);
             auto& buf = blended ? cpuTransparentVertices : cpuOpaqueVertices;
+            if (!renderingWater) applyBiomeTint(q, 4, renderProp.biomeTint);
             pushQuad(buf, q);
         }
     };

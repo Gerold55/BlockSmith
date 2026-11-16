@@ -1,6 +1,8 @@
 #include "MainMenu.h"
 #include "FontRenderer.h"
 #include "Types.h"
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -374,47 +376,68 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
         }
     }
 
-    // Tuning values for button labels, in pixels. Change these to nudge the text.
-    constexpr float kLabelCharWidth = 14.0f;   // approximate advance per character at scale 1.0
-    constexpr float kLabelNudgeX    = 0.0f;    // positive moves right
-    constexpr float kLabelNudgeY    = 0.0f;    // positive moves down
+    // Text is sized by the height of its capital letters, in pixels, and measured with the
+    // font itself, so it stays centred and in proportion at any window size.
+    const Dimensions2D screenRes{screenWidth, screenHeight};
+    const Dimensions2D fontBase = fontRenderer.baseSize();
+    const float rawCap = std::max(fontRenderer.capHeight(1.0f, fontBase), 0.001f);   // at scale 1
+    // Font scales (x, y) that make capitals `capPx` pixels tall, with square letters
+    auto scalesFor = [&](float capPx) {
+        const float f = capPx / rawCap;
+        return glm::vec2(f * fontBase.width / std::max(1, screenWidth),
+                         f * fontBase.height / std::max(1, screenHeight));
+    };
 
-    // Centered button labels. NDC spans 2 units across the screen, so sizes convert with * 0.5 * screen size.
-    auto renderCenteredButtonText = [&](const ButtonInfo& btn, float fontScale) {
+    // Button labels: capitals 38% of the button's height, centred both ways on the
+    // measured text. NDC spans 2 units across the screen, so sizes convert with * 0.5 * size.
+    constexpr float kLabelCapOfButton = 0.38f;
+    auto renderCenteredButtonText = [&](const ButtonInfo& btn) {
         if (btn.label.empty()) return;
-
-        const float textWidth  = static_cast<float>(btn.label.length()) * kLabelCharWidth * fontScale;
-        const float textHeight = 16.0f * fontScale;
 
         const float btnX = ((btn.x + 1.0f) * 0.5f) * screenWidth;
         const float btnY = ((1.0f - (btn.y + btn.h)) * 0.5f) * screenHeight;
         const float btnW = btn.w * 0.5f * screenWidth;
         const float btnH = btn.h * 0.5f * screenHeight;
 
-        // Center the text box inside the button. pixelY is treated as the baseline.
-        const float pixelX = btnX + (btnW - textWidth) * 0.5f + kLabelNudgeX;
-        const float pixelY = btnY + (btnH - textHeight) * 0.5f + textHeight + kLabelNudgeY;
+        const float capPx = std::max(6.0f, btnH * kLabelCapOfButton);
+        const glm::vec2 sc = scalesFor(capPx);
+        const float textW = fontRenderer.textWidth(btn.label, sc.x, screenRes);
+
+        // renderText's y is the baseline: centre the capitals' height in the button
+        const float pixelX = std::round(btnX + (btnW - textW) * 0.5f);
+        const float pixelY = std::round(btnY + (btnH + capPx) * 0.5f);
 
         glm::vec4 textColor = btn.isHovered ? glm::vec4(1.0f, 1.0f, 0.6f, 1.0f)
                                             : glm::vec4(0.9f, 0.9f, 0.9f, 1.0f);
-        fontRenderer.renderText(fontShader, btn.label, pixelX, pixelY,
-                                fontScale, fontScale, textColor,
-                                Dimensions2D{screenWidth, screenHeight});
+        fontRenderer.renderText(fontShader, btn.label, pixelX, pixelY, sc.x, sc.y, textColor, screenRes);
     };
 
     // 4. Center button labels
-    for (const auto& btn : centerButtons) {
-        renderCenteredButtonText(btn, 0.9f);
-    }
+    for (const auto& btn : centerButtons) renderCenteredButtonText(btn);
 
     // 5. Top-right button labels
-    for (const auto& btn : topRightButtons) {
-        renderCenteredButtonText(btn, 0.85f);
-    }
+    for (const auto& btn : topRightButtons) renderCenteredButtonText(btn);
 
+<<<<<<< Updated upstream
     // 6. Version and copyright
     fontRenderer.renderText(fontShader, "Craft & Ruin 5.17.0-dev", 15.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
     fontRenderer.renderText(fontShader, "(c) 2010-2026 Developer Studio", static_cast<float>(screenWidth) - 260.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
+=======
+    // 6. Version (bottom left) and copyright (bottom right), sized to the window
+    {
+        const float capPx = std::max(6.0f, screenHeight * 0.011f);
+        const glm::vec2 sc = scalesFor(capPx);
+        const float margin = std::round(capPx * 1.5f);
+        const float baseline = std::round(screenHeight - margin);
+        const glm::vec4 grey(0.8f, 0.8f, 0.8f, 1.0f);
+        const std::string version = "BlockSmith 5.17.0-dev";
+        const std::string copyright = "(c) 2010-2026 Developer Studio";
+        fontRenderer.renderText(fontShader, version, margin, baseline, sc.x, sc.y, grey, screenRes);
+        const float cw = fontRenderer.textWidth(copyright, sc.x, screenRes);
+        fontRenderer.renderText(fontShader, copyright, std::round(screenWidth - margin - cw), baseline,
+                                sc.x, sc.y, grey, screenRes);
+    }
+>>>>>>> Stashed changes
 
     glEnable(GL_DEPTH_TEST);
 }
