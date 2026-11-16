@@ -2,6 +2,7 @@
 #include "Block.h"
 #include "Types.h"
 #include <glm/glm.hpp>
+#include <iostream>
 
 namespace {
 uint8_t g_NextBlockId = 1;   // 0 is air
@@ -18,8 +19,19 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         b = glm::clamp(b / 255.0f, 0.0f, 1.0f);
     }
 
+    // Registering a name twice keeps its first id (a second id would leave blocks in the
+    // world, and anything that looked the id up earlier, pointing at the wrong block).
+    // Ids are one byte: past 255 blocks a new one would overwrite block 0, 1, 2...
+    const uint8_t existing = BlockRegistry::getInstance().getBlockId(name);
+    if (existing != 0 || name == "air") {
+        std::cerr << "[Block] '" << name << "' is registered more than once - keeping id "
+                  << static_cast<int>(existing) << " and updating its settings" << std::endl;
+    } else if (g_NextBlockId == 0) {
+        std::cerr << "[Block] Too many blocks (255 max) - '" << name << "' was not registered" << std::endl;
+        return;
+    }
     BlockProperty block;
-    block.id = g_NextBlockId++;
+    block.id = (existing != 0 || name == "air") ? existing : g_NextBlockId++;
     block.name = name;
     block.defaultTint = glm::vec3(r, g, b);
 

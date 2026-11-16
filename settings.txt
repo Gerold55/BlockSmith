@@ -2,6 +2,7 @@
 fov = 70
 key_forward = 87
 player_name = Gerold55
+player_password_token = eafeae40a55d292b3847177ac876bbab77bb86e65a13733b949167d30c222d0a
 render_distance = 10
 server_max_players = 20
 vsync = 0

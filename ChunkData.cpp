@@ -30,12 +30,18 @@ uint8_t ChunkData::getLocalMetadata(int x, int y, int z) const {
     return inside(x, y, z) ? metadata[x][y][z] : 0;
 }
 
+// Steps through neighbours until (x, z) is inside a chunk, so diagonal cells
+// (e.g. x = -1 and z = -1) work too.
 const ChunkData* ChunkData::resolve(int& x, int& z) const {
-    if (x < 0)            { x += CHUNK_WIDTH; return neighbors[1]; }
-    if (x >= CHUNK_WIDTH) { x -= CHUNK_WIDTH; return neighbors[0]; }
-    if (z < 0)            { z += CHUNK_WIDTH; return neighbors[5]; }
-    if (z >= CHUNK_WIDTH) { z -= CHUNK_WIDTH; return neighbors[4]; }
-    return this;
+    const ChunkData* c = this;
+    while (c) {
+        if (x < 0)                 { x += CHUNK_WIDTH; c = c->neighbors[1]; }
+        else if (x >= CHUNK_WIDTH) { x -= CHUNK_WIDTH; c = c->neighbors[0]; }
+        else if (z < 0)            { z += CHUNK_WIDTH; c = c->neighbors[5]; }
+        else if (z >= CHUNK_WIDTH) { z -= CHUNK_WIDTH; c = c->neighbors[4]; }
+        else return c;
+    }
+    return nullptr;
 }
 
 uint8_t ChunkData::getBlock(int x, int y, int z) const {

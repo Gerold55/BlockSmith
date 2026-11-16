@@ -2,6 +2,7 @@
 #include "ChunkData.h"
 #include "Block.h"
 #include "Types.h"
+#include "Fluids.h"
 #include <cstddef>
 #include <vector>
 
@@ -9,8 +10,9 @@ namespace {
 
 constexpr float kPlantInset = 0.15f;
 
-// Water surface height for source water and waterlogged plants, 1 pixel below the block top.
-constexpr float kWaterSurfaceY = 15.0f / 16.0f;
+// Water surface height for source water and waterlogged plants: 8/9 of a block, and each
+// flow level 1/9 lower, the same heights as Minecraft.
+constexpr float kWaterSurfaceY = 8.0f / 9.0f;
 
 // Face order matches the neighbor slots: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
 constexpr float kFaceShading[6] = { 0.8f, 0.8f, 1.0f, 0.5f, 0.7f, 0.7f };
@@ -121,8 +123,9 @@ void uploadBuffer(GLuint& vao, GLuint& vbo, const std::vector<Vertex>& verts) {
     setupVertexAttributes();
 }
 
-inline bool isWaterProp(const BlockProperty& p) {
-    return p.name == "water" || p.name == "flowing_water";
+// The fluid a block belongs to (water, lava, modded fluids), or nullptr. See Fluids.h.
+inline const FluidDef* fluidOf(uint8_t id) {
+    return FluidRegistry::get().forBlock(id);
 }
 
 inline bool isPlantLike(const BlockProperty& p) {
@@ -134,20 +137,77 @@ inline bool isCutout(const BlockProperty& p) {
 }
 
 inline bool canWaterlog(const BlockProperty& p) {
-    return (isPlantLike(p) || p.isTransparent) && !isWaterProp(p);
+    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id);
 }
 
+// Fluids never hide what's next to them (even opaque ones like lava: their surface is
+// lower than a full block, so the faces behind must still be drawn)
 inline bool isOpaqueSolid(const BlockProperty& p) {
-    return !p.isTransparent && !isPlantLike(p) && !isCutout(p);
+    return !p.isTransparent && !isPlantLike(p) && !isCutout(p) && !fluidOf(p.id);
+}
+
+// A cell of `fluid` (local coords, may be in a neighbouring chunk): is it that fluid, and
+// how high is its surface (0..1)? Waterlogged plants count as water sources.
+bool fluidSurfaceAt(const ChunkData& data, const BlockRegistry& registry, const FluidDef& fluid,
+                    int x, int y, int z, float& height, bool& source) {
+    const uint8_t id = data.getBlock(x, y, z);
+    if (id == 0) return false;
+    const uint8_t meta = data.getMetadata(x, y, z);
+    if (const FluidDef* f = fluidOf(id)) {
+        if (f->name != fluid.name) return false;
+        const FluidCell c = FluidRegistry::get().cell(id, meta);
+        height = FluidRegistry::surfaceHeight(c);
+        source = c.source || c.falling;   // falling weighs like a source in the corner average
+        return true;
+    }
+    if (fluid.name == "water" && canWaterlog(registry.getBlock(id)) && (meta & 1) != 0) {
+        height = kWaterSurfaceY;
+        source = true;
+        return true;
+    }
+    return false;
+}
+
+// Height (0..1 above the block) of one top corner of a fluid block. Corner (cx, cz) is
+// shared by the 4 cells around it; their surfaces are averaged, sources weighted 10x and
+// open space pulling the corner down, as in Minecraft. Same fluid above any: full height.
+float fluidCornerHeight(const ChunkData& data, const BlockRegistry& registry, const FluidDef& fluid,
+                        int x, int y, int z, int cx, int cz) {
+    float sum = 0.0f, weight = 0.0f;
+    for (int dx = cx - 1; dx <= cx; ++dx) {
+        for (int dz = cz - 1; dz <= cz; ++dz) {
+            // A chunk that isn't loaded yet tells us nothing (it would read as air and make
+            // the surface dip); the corner is redrawn when it loads
+            if (!data.hasColumn(x + dx, z + dz)) continue;
+            float h = 0.0f, hAbove = 0.0f;
+            bool src = false, srcAbove = false;
+            if (fluidSurfaceAt(data, registry, fluid, x + dx, y + 1, z + dz, hAbove, srcAbove)) return 1.0f;
+            if (fluidSurfaceAt(data, registry, fluid, x + dx, y, z + dz, h, src)) {
+                const float w = src ? 10.0f : 1.0f;
+                sum += h * w;
+                weight += w;
+            } else if (data.getBlock(x + dx, y, z + dz) == 0) {
+                weight += 1.0f;   // open air beside it: the surface slopes down (shores, edges)
+            }
+            // Anything else (solid ground, a plant or other block standing in the water,
+            // another fluid) doesn't pull the surface down
+        }
+    }
+    return weight > 0.0f ? sum / weight : kWaterSurfaceY;
 }
 
 // Face culling rules preventing clipping artifacts between water and waterlogged foliage
-bool isFaceHidden(const BlockProperty& self, uint8_t selfId, bool renderingWater,
+bool isFaceHidden(const BlockProperty& self, uint8_t selfId, const FluidDef* renderingFluid,
                   const BlockProperty& nb, uint8_t nbId, bool nbWaterlogged) {
     if (isPlantLike(nb) && !nbWaterlogged) return false; // dry plants do not occlude
 
-    if (renderingWater) {
-        return isWaterProp(nb) || nbWaterlogged || isOpaqueSolid(nb);
+    if (renderingFluid) {
+        // Hidden against the same fluid (one surface) and solid blocks; a different fluid
+        // (water next to lava) shows its face
+        const FluidDef* nf = fluidOf(nbId);
+        return (nf && nf->name == renderingFluid->name)
+            || (nbWaterlogged && renderingFluid->name == "water")
+            || isOpaqueSolid(nb);
     }
     if (isCutout(self)) {
         return isOpaqueSolid(nb);
@@ -172,7 +232,8 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
     cpuTransparentVertices.clear();
 
     auto& registry = BlockRegistry::getInstance();
-    const uint8_t waterId = registry.getBlockId("water");
+    FluidRegistry::get().refresh();   // block ids by name: never stale
+    const FluidDef* waterFluid = FluidRegistry::get().byName("water");
 
     auto emitPlant = [&](int x, int y, int z, const BlockProperty& prop) {
         const FaceStyle style{
@@ -210,23 +271,23 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
     };
 
     auto emitCube = [&](int x, int y, int z, uint8_t blockId, const BlockProperty& selfProp,
-                        const BlockProperty& renderProp, bool renderingWater) {
+                        const BlockProperty& renderProp, const FluidDef* renderingFluid) {
+        const bool renderingWater = renderingFluid != nullptr;   // any fluid
         const float fx = static_cast<float>(x);
         const float fy = static_cast<float>(y);
         const float fz = static_cast<float>(z);
 
         // Water top height. Source water and waterlogged plants sit 1 pixel below the
-        // block top. Flowing water (levels 1-7) slopes down from there.
+        // block top. Flowing water (levels 1-7) is lower. Each top corner is the average of
+        // the water around that corner (sources count most), so neighbouring water blocks
+        // join into smooth slopes, like Minecraft. Water under water reaches the top.
         float topY = fy + 1.0f;
+        float cornerTop[2][2] = {{0, 0}, {0, 0}};   // [x side][z side], 0..1 above fy
         if (renderingWater) {
             topY = fy + kWaterSurfaceY;
-            if (isWaterProp(selfProp)) {
-                const uint8_t meta = data.getLocalMetadata(x, y, z);
-                const int waterLevel = meta & 0x07;
-                if (waterLevel > 0 && waterLevel < 8) {
-                    topY = fy + (8 - waterLevel) / 8.0f;
-                }
-            }
+            for (int cx = 0; cx < 2; ++cx)
+                for (int cz = 0; cz < 2; ++cz)
+                    cornerTop[cx][cz] = fluidCornerHeight(data, registry, *renderingFluid, x, y, z, cx, cz);
         }
 
         for (int f = 0; f < 6; ++f) {
@@ -240,12 +301,25 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 const uint8_t neighborMeta = data.getMetadata(nx, ny, nz);   // looks across chunk borders
                 const bool nWaterlogged = canWaterlog(nProp) && ((neighborMeta & 1) != 0);
 
-                if (isFaceHidden(selfProp, blockId, renderingWater, nProp, neighborId, nWaterlogged)) {
+                if (isFaceHidden(selfProp, blockId, renderingFluid, nProp, neighborId, nWaterlogged)) {
                     continue;
                 }
             }
 
-            const auto& faceProp = renderProp.faces[f];
+            // A face with no texture of its own uses the top's (or any face that has one),
+            // e.g. water whose game only gave it a top texture: its sides show in holes
+            // and waterfalls, and would otherwise be black
+            int texFace = f;
+            // Water: every face looks like the surface (as in Minecraft). A game's water
+            // side/bottom faces may have no texture, an overlay or a tint meant only for
+            // underwater views - those drew black in holes, waterfalls and along shores.
+            if (renderingWater && renderProp.faces[2].baseLayer >= 0) texFace = 2;
+            if (renderProp.faces[texFace].baseLayer < 0) {
+                for (int g : { 2, 4, 0, 1, 5, 3 }) {
+                    if (renderProp.faces[g].baseLayer >= 0) { texFace = g; break; }
+                }
+            }
+            const auto& faceProp = renderProp.faces[texFace];
             const FaceStyle style{
                 renderProp.defaultTint.r, renderProp.defaultTint.g, renderProp.defaultTint.b,
                 static_cast<float>(faceProp.baseLayer),
@@ -257,6 +331,12 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
 
             float fv[4][3];
             faceCorners(f, fx, fy, fz, topY, fv);
+            if (renderingWater) {
+                for (auto& v : fv) {
+                    if (v[1] != topY) continue;   // bottom corner
+                    v[1] = fy + cornerTop[v[0] > fx ? 1 : 0][v[2] > fz ? 1 : 0];
+                }
+            }
 
             const Vertex q[4] = {
                 makeVertex(fv[0][0], fv[0][1], fv[0][2], 0.0f, 1.0f, style),
@@ -285,9 +365,12 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                     if (!waterlogged) continue;
                 }
 
-                const bool useWater = waterlogged && waterId != 0;
-                const BlockProperty& renderProp = useWater ? registry.getBlock(waterId) : prop;
-                emitCube(x, y, z, blockId, prop, renderProp, isWaterProp(renderProp));
+                // Fluids are drawn with their source block's textures (games often give the
+                // flowing block none of its own); waterlogged plants with water's
+                const FluidDef* fluid = fluidOf(blockId);
+                if (!fluid && waterlogged) fluid = waterFluid;
+                const BlockProperty& renderProp = (fluid && fluid->sourceId != 0) ? registry.getBlock(fluid->sourceId) : prop;
+                emitCube(x, y, z, blockId, prop, renderProp, fluid);
             }
         }
     }

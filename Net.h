@@ -30,7 +30,7 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 5;   // 5: passwords and chat commands run by the server
+constexpr uint32_t kProtocolVersion  = 6;   // 6: shared values (weather etc. decided by the server)
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -158,7 +158,13 @@ public:
     // Lines the host should see in chat (joins, leaves, other players' messages).
     std::vector<net::ChatLine> takeChat();
 
+    // Shared values: small key -> text pairs the server decides and every player gets (now
+    // and when they join), e.g. the weather. Lua: engine.set_shared / get_shared.
+    void setShared(const std::string& key, const std::string& value);
+    const std::unordered_map<std::string, std::string>& shared() const { return m_shared; }
+
 private:
+    void sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values);
     struct Client {
         ENetPeer* peer = nullptr;
         uint16_t id = 0;
@@ -219,6 +225,7 @@ private:
     std::unordered_map<uint16_t, Client> m_clients;
     net::PlayerMap m_views;
     std::vector<net::ChatLine> m_chat;
+    std::unordered_map<std::string, std::string> m_shared;
 
     glm::vec3 m_hostPos{0.0f};
     float m_hostYaw = 0.0f, m_hostPitch = 0.0f;
@@ -288,11 +295,20 @@ public:
     void sendCommand(const std::string& command);
     std::vector<net::ChatLine> takeChat();
 
+    // Shared values from the server (see GameServer::setShared)
+    std::string getShared(const std::string& key) const {
+        const auto it = m_shared.find(key);
+        return it == m_shared.end() ? std::string() : it->second;
+    }
+    // Keys that changed since the last call (in order)
+    std::vector<std::string> takeSharedChanges() { std::vector<std::string> out; out.swap(m_sharedChanges); return out; }
+
 private:
     void handlePacket(const uint8_t* data, size_t size);
     void finish(const std::string& reason);
     void sendEdits();
 
+    std::vector<std::string> m_sharedChanges;
     ENetHost* m_host = nullptr;
     ENetPeer* m_peer = nullptr;
     World* m_world = nullptr;
@@ -314,6 +330,7 @@ private:
 
     net::PlayerMap m_views;
     std::vector<net::ChatLine> m_chat;
+    std::unordered_map<std::string, std::string> m_shared;
     float m_posTimer = 0.0f;
 
     // Prediction & reconciliation

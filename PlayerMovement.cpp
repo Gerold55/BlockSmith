@@ -1,6 +1,7 @@
 #include "PlayerMovement.h"
 #include "World.h"
 #include "Block.h"
+#include "Fluids.h"
 #include <cmath>
 
 // Moved here from Player::update unchanged, so singleplayer movement feels exactly the same.
@@ -11,18 +12,21 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     glm::vec3& velocity = state.velocity;
     bool& grounded = state.grounded;
 
-    // --- 1. CHECK IF PLAYER IS SUBMERGED IN WATER ---
+    // --- 1. CHECK IF PLAYER IS SUBMERGED IN A SWIMMABLE FLUID (water, lava, modded) ---
     bool inWater = false;
+    float swimSpeed = 2.2f;
     int headX = static_cast<int>(std::floor(position.x));
     int headY = static_cast<int>(std::floor(position.y + 1.0f));
     int headZ = static_cast<int>(std::floor(position.z));
     uint8_t blockAtHead = world.getBlockAt({headX, headY, headZ});
-    if (blockAtHead != 0) {
-        const auto& prop = BlockRegistry::getInstance().getBlock(blockAtHead);
-        if (prop.name == "water" || prop.name == "flowing_water") {
+    FluidRegistry::get().ensureFresh();
+    if (const FluidDef* fluid = FluidRegistry::get().forBlock(blockAtHead)) {
+        if (fluid->swimmable) {
             inWater = true;
+            swimSpeed = fluid->swimSpeed;
         }
     }
+    auto isFluidBlock = [](uint8_t id) { return FluidRegistry::get().forBlock(id) != nullptr; };
 
     // --- 2. HANDLE INPUT & MOVEMENT DIRECTION ---
     const bool keyForward = input.down(MoveInput::Forward);
@@ -49,7 +53,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     if (keyRight)   moveDir += right;
     if (keyLeft)    moveDir -= right;
 
-    float speed = inWater ? 2.2f : 4.3f;
+    float speed = inWater ? swimSpeed : 4.3f;
     if (!inWater && keySneak) {
         speed = 1.3f;                       // sneaking: slow walk
     } else if (!inWater && keySprint) {
@@ -108,7 +112,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     uint8_t blockId = world.getBlockAt({x, y, z});
                     if (blockId != 0) {
                         const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
-                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+                        if (isFluidBlock(blockId) || !prop.isWalkable) continue;
 
                         if (velocity.x > 0.0f) {
                             position.x = static_cast<float>(x) - halfWidth - 0.001f;
@@ -139,7 +143,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     uint8_t blockId = world.getBlockAt({x, y, z});
                     if (blockId != 0) {
                         const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
-                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+                        if (isFluidBlock(blockId) || !prop.isWalkable) continue;
 
                         if (velocity.z > 0.0f) {
                             position.z = static_cast<float>(z) - halfWidth - 0.001f;
@@ -171,7 +175,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     uint8_t blockId = world.getBlockAt({x, y, z});
                     if (blockId != 0) {
                         const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
-                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+                        if (isFluidBlock(blockId) || !prop.isWalkable) continue;
 
                         if (velocity.y < 0.0f) {
                             position.y = static_cast<float>(y) + 1.0f;

@@ -17,6 +17,9 @@ public:
     // getBlock / getMetadata also look into neighbouring chunks when x or z is just outside
     // this chunk (returns 0 if that neighbour isn't loaded). getLocal* never does.
     uint8_t getBlock(int x, int y, int z) const;
+    // Whether (x, z) - possibly in a neighbouring chunk - is loaded, i.e. getBlock there
+    // means something (an unloaded chunk reads as air)
+    bool hasColumn(int x, int z) const { return resolve(x, z) != nullptr; }
     uint8_t getMetadata(int x, int y, int z) const;
     uint8_t getLocalBlock(int x, int y, int z) const;
     uint8_t getLocalMetadata(int x, int y, int z) const;

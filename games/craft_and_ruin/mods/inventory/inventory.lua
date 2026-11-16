@@ -77,10 +77,13 @@ local Theme = {
 
 local function contains(s, sub) return string.find(s, sub, 1, true) ~= nil end
 
-local function is_fluid(name) return contains(name, "water") or contains(name, "lava") end
-
 local function is_item(name)
-    return name == "hoe" or name == "scythe" or name == "stick"
+    return name == "hoe" or name == "scythe" or name == "stick" or contains(name, "bucket")
+end
+
+-- Fluid blocks are hidden; the buckets that hold them aren't
+local function is_fluid(name)
+    return (contains(name, "water") or contains(name, "lava")) and not is_item(name)
 end
 
 local function is_nature(name, info)
@@ -103,7 +106,7 @@ local Tabs = {
       filter = function(name, info) return is_nature(name, info) end },
 
     { name = "Items",
-      icons = { "stick", "scythe", "hoe", "oak_log" },
+      icons = { "stick", "scythe", "hoe", "bucket", "oak_log" },
       filter = function(name, info) return is_item(name) end },
 }
 

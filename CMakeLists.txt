@@ -77,6 +77,10 @@ add_executable(BlockSmith
     ChunkData.h
     ChunkGenerator.cpp
     ChunkGenerator.h
+    Fluids.cpp
+    Fluids.h
+    WeatherEffects.cpp
+    WeatherEffects.h
     Net.cpp
     Net.h
     PlayerMovement.cpp
@@ -125,6 +129,7 @@ endif()
 add_executable(BlockSmithServer
     ServerMain.cpp
     ChunkGenerator.cpp
+    Fluids.cpp
     World.cpp
     ChunkData.cpp
     CaveGenerator.cpp

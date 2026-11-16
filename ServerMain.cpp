@@ -23,6 +23,7 @@
 #include "Net.h"
 #include "Sha256.h"
 #include "ChunkGenerator.h"
+#include "Fluids.h"
 
 #include <sol/sol.hpp>
 #include <cstdio>
@@ -665,6 +666,9 @@ struct ServerContext {
     GameServer* server = nullptr;
     ServerConfig* config = nullptr;
     GameInfo game;
+    std::vector<std::string> sharedChanged;   // for on_shared_changed
+    struct ModCommand { std::string name, usage, description; };
+    std::vector<ModCommand> modCommands;      // chat.register_command (listed by help)
 };
 
 // worker = true: a Lua state for a world generator thread. Same mods, but nothing in it
@@ -728,10 +732,38 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     world["set_caves_enabled"] = [](bool on) { CaveGenerator::setEnabled(on); };
 
     auto chat = lua.create_named_table("chat");
-    chat["register_command"] = [](const std::string&, sol::optional<std::string>, sol::optional<std::string>) {};
+    chat["register_command"] = [&ctx](const std::string& name, sol::optional<std::string> usage,
+                                      sol::optional<std::string> description) {
+        for (const auto& c : ctx.modCommands) if (c.name == name) return;
+        ctx.modCommands.push_back({name, usage.value_or("/" + name), description.value_or("")});
+    };
     chat["send"] = [&ctx](const std::string& text, sol::optional<float> r, sol::optional<float> g,
                           sol::optional<float> b) {
         ctx.server->broadcastMessage(text, glm::vec3(r.value_or(1.0f), g.value_or(1.0f), b.value_or(0.6f)));
+    };
+
+    // Fluids: engine.register_fluid etc. Not on generator threads: the fluid registry is
+    // shared, and the main state already registered everything.
+    if (!worker) addFluidLuaApi(lua, engine, [&ctx]() { return ctx.world; });
+
+    // Shared values: the server decides (e.g. the weather) and every player gets them
+    engine["is_authority"] = []() { return true; };
+    engine["set_shared"] = [&ctx](const std::string& key, const std::string& value) {
+        if (key.empty() || !ctx.server) return false;
+        const auto& now = ctx.server->shared();
+        const auto it = now.find(key);
+        if (it != now.end() && it->second == value) return true;
+        ctx.server->setShared(key, value);
+        ctx.sharedChanged.push_back(key);
+        return true;
+    };
+    engine["get_shared"] = [&ctx](const std::string& key) -> std::string {
+        if (!ctx.server) return "";
+        const auto it = ctx.server->shared().find(key);
+        return it == ctx.server->shared().end() ? std::string() : it->second;
+    };
+    engine["is_outdoors"] = [&ctx](int x, int y, int z) {
+        return ctx.world && ctx.world->hasSkyAbove(glm::ivec3(x, y, z));
     };
 
     if (worker) {
@@ -1067,6 +1099,24 @@ int main(int argc, char** argv) {
             after = trim(after);
             return word;
         };
+        // Commands from mods (chat.register_command + on_chat_command(text, player, is_operator,
+        // reply)): Lua decides who may use them
+        static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed",
+            "games", "mods", "motd", "name", "say", "kick", "ban", "unban", "banlist", "whitelist", "op", "deop",
+            "ops", "password"};
+        if (!builtIn.count(cmd)) {
+            sol::protected_function fn = lua["on_chat_command"];
+            if (fn.valid()) {
+                std::function<void(const std::string&)> luaReply = reply;
+                auto r = fn(line, console ? std::string("(console)") : from, op, luaReply);
+                if (!r.valid()) {
+                    sol::error err = r;
+                    std::cerr << "[Lua] on_chat_command: " << err.what() << std::endl;
+                } else if (r.get_type() == sol::type::boolean && r.get<bool>()) {
+                    return;   // a mod handled it
+                }
+            }
+        }
         const std::set<std::string> everyone = {"help", "list", "msg"};
         if (!op && !everyone.count(cmd)) {
             reply("You need to be an operator to use /" + cmd + ". Commands: /help, /list, /msg");
@@ -1080,6 +1130,7 @@ int main(int argc, char** argv) {
             reply("Look:    motd [text], name [text]");
             reply("Players: list, say, msg, kick, ban, unban, banlist, whitelist on|off|add|remove|list");
             reply("Admins:  op <name>, deop <name>, ops, password reset <name>");
+            for (const auto& c : ctx.modCommands) reply("Mods:    " + c.usage + (c.description.empty() ? "" : " - " + c.description));
         } else if (cmd == "stop") {
             reply("Stopping the server...");
             std::cout << "[Server] Stop" << by << std::endl;
@@ -1252,7 +1303,6 @@ int main(int argc, char** argv) {
     auto nextTick = Clock::now();
     auto lastSave = Clock::now();
     auto lastLagWarning = Clock::now() - std::chrono::seconds(60);
-    float fluidTimer = 0.0f;
     int ticksThisSecond = 0;
     auto tpsWindow = Clock::now();
 
@@ -1275,8 +1325,27 @@ int main(int argc, char** argv) {
         }
         world.update(spawnCenter, lua);   // spawn + every player's surroundings stay loaded
         server.update(spawnCenter, 0.0f, 0.0f, tickDt);
-        fluidTimer += tickDt;
-        if (fluidTimer >= 0.15f) { world.updateFluids(); fluidTimer = 0.0f; }
+        world.updateFluids(tickDt);   // each fluid at its own speed (Fluids.h)
+
+        // Lua every tick: shared values that changed, then on_update (weather etc.)
+        if (!ctx.sharedChanged.empty()) {
+            std::vector<std::string> changed;
+            changed.swap(ctx.sharedChanged);
+            sol::protected_function onShared = lua["on_shared_changed"];
+            for (const auto& k : changed) {
+                if (!onShared.valid()) break;
+                const auto it = server.shared().find(k);
+                auto r = onShared(k, it == server.shared().end() ? std::string() : it->second);
+                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_shared_changed: " << err.what() << std::endl; }
+            }
+        }
+        {
+            sol::protected_function onUpdate = lua["on_update"];
+            if (onUpdate.valid()) {
+                auto r = onUpdate(tickDt);
+                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_update: " << err.what() << std::endl; }
+            }
+        }
 
         for (const auto& line : server.takeChat()) std::cout << "[Chat] " << stripTags(line.text) << std::endl;
 

@@ -55,6 +55,7 @@ enum Msg : uint8_t {
     S_PINGS   = 73,   // u16 count, { u16 id, u16 ping ms }   (for the player list)
     S_STATUS  = 74,   // u32 protocol, str version, str game, str motd, u16 online, u16 max,
                       // u16 nameCount, { str name }    (server list; sent instead of joining)
+    S_SHARED  = 76,   // u16 count, { str key, str value }   shared values (weather...)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
@@ -346,6 +347,7 @@ bool GameServer::start(World& world, uint16_t port, const std::string& gameFolde
     m_clients.clear();
     m_views.clear();
     m_chat.clear();
+    m_shared.clear();
     m_world->setRecordChanges(true);
     std::cout << "[Server] Hosting on port " << port << std::endl;
     return true;
@@ -678,9 +680,31 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     c.lastSnapTime = net::clockSeconds();
     pushSnapshot(v, c.lastSnapTime, spawn, 0.0f, 0.0f);
 
+    // Everything shared so far (weather...), so they see the same world as everyone else
+    if (!m_shared.empty()) {
+        sendShared(c.peer, std::vector<std::pair<std::string, std::string>>(m_shared.begin(), m_shared.end()));
+    }
+
     std::cout << "[Server] " << name << " joined" << std::endl;
     broadcastChat(name + " joined the game", kInfoColor);
     if (onJoin) onJoin(name);
+}
+
+void GameServer::sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values) {
+    Writer w(S_SHARED);
+    w.u16(static_cast<uint16_t>(values.size()));
+    for (const auto& [k, v] : values) { w.str(k); w.str(v); }
+    sendTo(peer, w);
+}
+
+void GameServer::setShared(const std::string& key, const std::string& value) {
+    if (key.empty()) return;
+    const auto it = m_shared.find(key);
+    if (it != m_shared.end() && it->second == value) return;   // nothing new
+    m_shared[key] = value;
+    for (auto& [id, c] : m_clients) {
+        if (c.joined) sendShared(c.peer, {{key, value}});
+    }
 }
 
 bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
@@ -713,8 +737,7 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
 
         if (blockIdFromName(name, id) && inReach && loaded) {
-            m_world->setBlockAt(pos, id);
-            if (m_world->getMetadataAt(pos) != meta) m_world->setMetadataAt(pos, meta);
+            m_world->setBlockWithMetaAt(pos, id, meta);
         } else if (loaded) {
             // Undo the player's prediction: send them what's really there
             rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
@@ -1034,6 +1057,8 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_state = State::Connecting;
     m_views.clear();
     m_chat.clear();
+    m_shared.clear();
+    m_sharedChanges.clear();
     std::cout << "[Client] Connecting to " << m_addressText << " as " << m_name << std::endl;
     return true;
 }
@@ -1190,6 +1215,17 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
     case S_UNLOAD: {
         const int cx = r.i32(), cz = r.i32();
         if (r.ok && m_state == State::Joined) m_world->removeChunk(cx, cz);
+        break;
+    }
+    case S_SHARED: {
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            std::string key = r.str();
+            std::string value = r.str();
+            if (!r.ok) break;
+            m_shared[key] = value;
+            m_sharedChanges.push_back(key);
+        }
         break;
     }
     case S_BLOCKS: {

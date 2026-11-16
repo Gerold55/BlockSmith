@@ -4,6 +4,7 @@
 #include "Types.h"
 #include "CaveGenerator.h"
 #include "ChunkGenerator.h"
+#include "Fluids.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -26,7 +27,6 @@ using Clock = std::chrono::steady_clock;
 constexpr int kMinRenderDistance = 2;
 constexpr int kMaxRenderDistance = 16;
 constexpr int kUnloadMargin = 2;              // chunks beyond render distance before unloading
-constexpr int kMaxFluidUpdatesPerTick = 256;
 
 // Chunk save file format
 constexpr uint32_t kChunkMagic   = 0x32435856;  // "VXC2"
@@ -46,10 +46,6 @@ constexpr NeighborDir kNeighborDirs[] = {
     {-1,  0, 1, 0},
     { 0,  1, 4, 5},
     { 0, -1, 5, 4},
-};
-
-constexpr int kFluidOffsets[7][3] = {
-    {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}
 };
 
 inline int floorDiv(int a, int b) {
@@ -126,7 +122,7 @@ void generateFallbackTerrain(ChunkData& chunk, int chunkX, int chunkZ, float see
 
 } // namespace
 
-World::World() {
+World::World() : m_fluids(std::make_unique<FluidSimulator>(*this)) {
     std::random_device rd;
     m_seed = rd() ^ static_cast<uint32_t>(
                  std::chrono::system_clock::now().time_since_epoch().count());
@@ -164,6 +160,11 @@ void World::markBlockChanged(const glm::ivec3& loc) {
     if (lx == CHUNK_WIDTH - 1) markDirty(cx + 1, cz);
     if (lz == 0)               markDirty(cx, cz - 1);
     if (lz == CHUNK_WIDTH - 1) markDirty(cx, cz + 1);
+    // Corner blocks: the diagonal chunk's fluid surface corners average this block too
+    if (lx == 0 && lz == 0)                             markDirty(cx - 1, cz - 1);
+    if (lx == 0 && lz == CHUNK_WIDTH - 1)               markDirty(cx - 1, cz + 1);
+    if (lx == CHUNK_WIDTH - 1 && lz == 0)               markDirty(cx + 1, cz - 1);
+    if (lx == CHUNK_WIDTH - 1 && lz == CHUNK_WIDTH - 1) markDirty(cx + 1, cz + 1);
 }
 
 // Remembers that this chunk differs from its saved/generated state.
@@ -337,6 +338,11 @@ void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
     markDirty(cx + 1, cz);
     markDirty(cx, cz - 1);
     markDirty(cx, cz + 1);
+    // Diagonal chunks too: fluid surface corners at chunk corners look into this chunk
+    markDirty(cx - 1, cz - 1);
+    markDirty(cx + 1, cz - 1);
+    markDirty(cx - 1, cz + 1);
+    markDirty(cx + 1, cz + 1);
 }
 
 void World::update(const glm::vec3& playerPos, sol::state& lua) {
@@ -442,7 +448,7 @@ void World::reset() {
     m_recordChanges = false;
     m_changes.clear();
     m_extraCenters.clear();
-    m_activeFluids.clear();
+    m_fluids->clear();
     m_modified.clear();
     m_queueDirty = true;
     m_luaSeeded = false;
@@ -653,60 +659,12 @@ std::vector<World::ChunkCoord> World::takeUnloadedChunks() {
 }
 
 // ---------------------------------------------------------------------------
-// Fluids: only water near a change is simulated
+// Fluids: the simulation is in Fluids.cpp
 // ---------------------------------------------------------------------------
 
-void World::resolveFluidIds() {
-    if (m_waterId != 0) return;
-    auto& registry = BlockRegistry::getInstance();
-    m_waterId = registry.getBlockId("water");
-    m_flowingWaterId = registry.getBlockId("flowing_water");
-    if (m_flowingWaterId == 0) m_flowingWaterId = m_waterId;
-}
+void World::updateFluids(float dt) { m_fluids->update(dt); }
 
-// Water in the changed cell or its neighbors may now flow, so add it to the active set.
-void World::noteFluidChange(const glm::ivec3& loc) {
-    resolveFluidIds();
-    if (m_waterId == 0) return;
-
-    for (const auto& o : kFluidOffsets) {
-        const glm::ivec3 p(loc.x + o[0], loc.y + o[1], loc.z + o[2]);
-        const uint8_t id = getBlockAt(p);
-        if (id != 0 && (id == m_waterId || id == m_flowingWaterId)) {
-            m_activeFluids.insert(p);
-        }
-    }
-}
-
-void World::updateFluids() {
-    if (m_remote) return;   // the server runs water and sends the results
-    resolveFluidIds();
-    if (m_waterId == 0 || m_activeFluids.empty()) return;
-
-    std::vector<glm::ivec3> toFill;
-    int budget = kMaxFluidUpdatesPerTick;
-    auto it = m_activeFluids.begin();
-
-    while (it != m_activeFluids.end() && budget > 0) {
-        const glm::ivec3 p = *it;
-        it = m_activeFluids.erase(it);
-        --budget;
-
-        const uint8_t id = getBlockAt(p);
-        if (id != m_waterId && id != m_flowingWaterId) continue;
-        if (p.y <= 0) continue;
-
-        const glm::ivec3 below(p.x, p.y - 1, p.z);
-        if (chunkAt(below) && getBlockAt(below) == 0) {
-            toFill.push_back(below);
-        }
-    }
-
-    // Applied after the scan so one tick doesn't cascade down the whole column.
-    for (const glm::ivec3& b : toFill) {
-        setBlockAt(b, m_flowingWaterId);
-    }
-}
+void World::noteFluidChange(const glm::ivec3& loc) { m_fluids->noteChange(loc); }
 
 // ---------------------------------------------------------------------------
 // Block and metadata access
@@ -727,6 +685,11 @@ void World::setBlockAt(const glm::ivec3& loc, uint8_t blockId) {
 
     chunk->setBlock(positiveMod(loc.x, CHUNK_WIDTH), loc.y,
                     positiveMod(loc.z, CHUNK_WIDTH), blockId);
+    // A placed fluid source is a fresh source (old metadata would make it look like flowing)
+    const FluidDef* placedFluid = FluidRegistry::get().forBlock(blockId);
+    if (placedFluid && blockId == placedFluid->sourceId) {
+        chunk->setMetadata(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH), 0);
+    }
     markBlockChanged(loc);
     markModified(loc);
     noteFluidChange(loc);
@@ -739,6 +702,17 @@ uint8_t World::getMetadataAt(const glm::ivec3& loc) const {
     if (!chunk) return 0;
     return chunk->getMetadata(positiveMod(loc.x, CHUNK_WIDTH), loc.y,
                               positiveMod(loc.z, CHUNK_WIDTH));
+}
+
+void World::setBlockWithMetaAt(const glm::ivec3& loc, uint8_t blockId, uint8_t meta) {
+    if (loc.y < 0 || loc.y >= CHUNK_HEIGHT) return;
+    ChunkData* chunk = chunkAt(loc);
+    if (!chunk) return;
+    chunk->setBlockWithMeta(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH), blockId, meta);
+    markBlockChanged(loc);
+    markModified(loc);
+    noteFluidChange(loc);
+    recordChange(loc);
 }
 
 void World::setMetadataAt(const glm::ivec3& loc, uint8_t meta) {
@@ -780,6 +754,11 @@ void World::insertChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
     markDirty(cx + 1, cz);
     markDirty(cx, cz - 1);
     markDirty(cx, cz + 1);
+    // Diagonal chunks too: fluid surface corners at chunk corners look into this chunk
+    markDirty(cx - 1, cz - 1);
+    markDirty(cx + 1, cz - 1);
+    markDirty(cx - 1, cz + 1);
+    markDirty(cx + 1, cz + 1);
 }
 
 void World::removeChunk(int cx, int cz) {

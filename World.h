@@ -32,6 +32,7 @@ struct IVec3Hash {
 };
 
 class ChunkGenerator;
+class FluidSimulator;
 
 class World {
 public:
@@ -42,13 +43,25 @@ public:
 
     // Per tick: queues and loads chunks around the player, unloads distant ones.
     void update(const glm::vec3& playerPos, sol::state& lua);
-    void updateFluids();
+    // Fluids (water, lava, modded fluids - see Fluids.h). Call every frame/tick with the
+    // time passed; each fluid flows at its own speed.
+    void updateFluids(float dt);
+    FluidSimulator& fluids() { return *m_fluids; }
+    // Nothing above this block up to the top of the world (rain and snow reach it)
+    bool hasSkyAbove(const glm::ivec3& loc) const {
+        for (int y = loc.y + 1; y < CHUNK_HEIGHT; ++y) if (getBlockAt(glm::ivec3(loc.x, y, loc.z)) != 0) return false;
+        return true;
+    }
+    // Is the chunk holding this block loaded?
+    bool isLoaded(const glm::ivec3& loc) const { return chunkAt(loc) != nullptr; }
     void loadChunk(int chunkX, int chunkZ, sol::state& lua);
 
     uint8_t getBlockAt(const glm::ivec3& loc) const;
     void setBlockAt(const glm::ivec3& loc, uint8_t blockId);
     uint8_t getMetadataAt(const glm::ivec3& loc) const;
     void setMetadataAt(const glm::ivec3& loc, uint8_t meta);
+    // Block and metadata in one change (one network update, one remesh).
+    void setBlockWithMetaAt(const glm::ivec3& loc, uint8_t blockId, uint8_t meta);
 
     // The chunk at a chunk coordinate, or nullptr if it isn't loaded.
     const ChunkData* chunkData(const ChunkCoord& c) const;
@@ -154,7 +167,6 @@ private:
     void recordChange(const glm::ivec3& loc);
     void ensureLuaSeeded(sol::state& lua);
 
-    void resolveFluidIds();
     void noteFluidChange(const glm::ivec3& loc);
 
     // Chunk files: <saveDir>/chunks/c.<x>.<z>.bin
@@ -189,9 +201,7 @@ private:
     std::vector<ChunkCoord> m_unloaded;
     unsigned m_resetCount = 0;
 
-    uint8_t m_waterId = 0;
-    uint8_t m_flowingWaterId = 0;
-    std::unordered_set<glm::ivec3, IVec3Hash> m_activeFluids;
+    std::unique_ptr<FluidSimulator> m_fluids;
 
     // Saving
     std::string m_saveDir;

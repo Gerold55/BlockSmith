@@ -28,6 +28,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include <string>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -63,6 +64,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "Inventory.h" // Include your new dedicated Inventory module
 #include "CaveGenerator.h"
 #include "ChunkGenerator.h"
+#include "Fluids.h"
+#include "WeatherEffects.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
 
@@ -83,15 +86,19 @@ namespace {
     }
 }
 
+// Underwater look. Clear, Minecraft-like water by default: you can see a good distance,
+// with a light blue-green fog that only gets dark deep down. Games change these with
+// underwater.set_shallow_color / set_deep_color / set_visibility / set_tint_strength.
 struct UnderwaterSettings {
-    glm::vec3 shallowColor      = glm::vec3(0.16f, 0.38f, 0.72f);
-    glm::vec3 deepColor         = glm::vec3(0.02f, 0.07f, 0.20f);
-    float       shallowVisibility = 14.0f;
-    float       deepVisibility    = 7.0f;
-    float       fullDepth         = 40.0f;
+    glm::vec3 shallowColor      = glm::vec3(0.22f, 0.45f, 0.62f);   // soft blue-green, not deep blue
+    glm::vec3 deepColor         = glm::vec3(0.05f, 0.14f, 0.28f);
+    float       shallowVisibility = 48.0f;   // blocks until things fade fully into the fog
+    float       deepVisibility    = 20.0f;
+    float       fullDepth         = 48.0f;   // depth where it's fully "deep"
     float       fadeInSeconds     = 0.6f;
     float       fadeOutSeconds    = 0.4f;
-    float       tintStrength      = 0.45f;
+    float       tintStrength      = 0.15f;   // how much everything is coloured blue
+    float       fogStartFraction  = 0.2f;    // fog starts this far (of the visibility) away
 };
 
 std::string g_CurrentModPath = "";
@@ -105,6 +112,12 @@ ChatSystem* g_ChatSystem = nullptr;
 LightingSystem* g_LightingSystem = nullptr;
 Skybox* g_Skybox = nullptr;
 Clouds* g_Clouds = nullptr;
+WeatherEffects g_Weather;
+glm::vec3 g_PlayerPosition(0.0f);   // feet, updated every frame (engine.get_player_position)   // rain/snow/sky tint/flashes - decided in Lua (mods/weather)
+// Shared values (engine.set_shared): decided by whoever runs the world (singleplayer, the
+// host, or the server) and seen by every player. Here: this game's own copy.
+std::unordered_map<std::string, std::string> g_SharedValues;
+std::vector<std::string> g_SharedChanged;   // keys to report to on_shared_changed
 World* g_WorldInstance = nullptr;
 WorldRenderer* g_WorldRenderer = nullptr;   // client-side drawing of g_WorldInstance
 
@@ -404,6 +417,8 @@ bool openActiveWorld(World& world, Player& player) {
     fs::create_directories(dir / "chunks", ec);
 
     world.reset();
+    g_SharedValues.clear();   // shared values (weather...) belong to a world
+    g_SharedChanged.clear();
     world.setSaveDirectory(dir.string());
     world.setSeed(existing ? meta.seed : randomSeed());
 
@@ -1403,6 +1418,155 @@ fs::path serversFile() { return settingsFile().parent_path() / "servers.txt"; }
 fs::path g_ExeDir;   // folder of the game's .exe (set in main)
 
 // ---------------------------------------------------------------------------
+// lua_api.txt: what this build of the engine (with the mods that loaded) offers modders.
+// Written after the mods load, from what really exists in Lua, so it is never out of date.
+// The full guide with explanations is docs/MODDING.md.
+// ---------------------------------------------------------------------------
+// Custom end marker (LUA): the Lua below contains a closing bracket followed by a quote,
+// which would end a plain raw string early.
+const char* kApiReferenceLua = R"LUA(
+local out = {}
+local function add(s) out[#out + 1] = s end
+local function sorted_keys(t, want)
+    local k = {}
+    for name, v in pairs(t) do
+        if type(name) == "string" and want(v) then k[#k + 1] = name end
+    end
+    table.sort(k)
+    return k
+end
+local is_fn = function(v) return type(v) == "function" end
+local not_fn = function(v) return type(v) ~= "function" end
+
+add("BlockSmith - Lua API reference (written by the engine at startup)")
+add("Explanations and examples: docs/MODDING.md. Fluids: docs/FLUIDS.md")
+add("")
+
+-- 1. Engine tables
+local engine_tables = { "engine", "world", "ui", "hotbar", "chat", "sky", "clouds", "fog", "underwater", "menu" }
+local known = {}
+local total = 0
+add("=== Functions the engine gives you ===")
+for _, tname in ipairs(engine_tables) do
+    known[tname] = true
+    local t = rawget(_G, tname)
+    if type(t) == "table" then
+        local fns = sorted_keys(t, is_fn)
+        local vals = sorted_keys(t, not_fn)
+        add("")
+        add(tname .. " (" .. #fns .. " functions)")
+        for _, f in ipairs(fns) do add("  " .. tname .. "." .. f .. "(...)"); total = total + 1 end
+        for _, v in ipairs(vals) do add("  " .. tname .. "." .. v .. "  [" .. type(t[v]) .. "]") end
+    end
+end
+add("")
+add("Chunk (passed to generate_chunk): chunk:set_block(x, y, z, id), chunk:get_block(x, y, z),")
+add("  chunk:set_block_with_meta(x, y, z, id, meta), chunk:set_metadata(x, y, z, meta), chunk:get_metadata(x, y, z)")
+
+-- 2. Hooks: global functions the engine calls if a mod defines them
+local hooks = {
+    { "generate_chunk",           "(chunk, cx, cz)  build a new 16x16 chunk's terrain (runs on generator threads)" },
+    { "set_world_seed",           "(seed)  the world's seed, before any generate_chunk" },
+    { "on_update",                "(dt)  every frame" },
+    { "on_chat_command",          "(text, player, is_operator, reply) -> true if handled  a /command" },
+    { "on_shared_changed",        "(key, value)  a shared value changed (engine.set_shared; e.g. the weather)" },
+    { "on_right_click_block",     "(x, y, z, block, held_item) -> true if handled" },
+    { "on_use_hoe",               "(x, y, z, block)  right-click with a hoe" },
+    { "on_use_scythe",            "(x, y, z, block)  left-click with a scythe" },
+    { "update_player_animation",  "(dt, is_moving, pitch)" },
+    { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
+    { "on_char_input",            "(codepoint)  typed text (unicode)" },
+    { "on_scroll_input",          "(dx, dy)  mouse wheel" },
+    { "toggle_main_inventory",    "()  the inventory key was pressed" },
+    { "handle_inventory_click",   "(mx, my, W, H)  click while the inventory is open" },
+    { "render_pause_menu",        "(W, H)  draw the pause menu" },
+    { "handle_pause_click",       "(mx, my, W, H)" },
+    { "render_settings",          "(W, H)  settings screen (also handle_settings_click/_key/_char/_scroll)" },
+    { "render_world_select",      "(W, H)  world list (also handle_world_select_click/_key/_char/_scroll)" },
+    { "render_multiplayer",       "(W, H)  server list (also handle_multiplayer_click/_key/_char/_scroll)" },
+    { "render_mods",              "(W, H)  mods screen (also handle_mods_click/_key/_scroll)" },
+    { "render_texture_packs",     "(W, H)  texture packs (also handle_texture_packs_click/_key/_scroll)" },
+    { "render_player_list",       "(W, H)  player list (hold Tab)" },
+    { "render_creative_inventory","(W, H)  creative inventory (also handle_creative_click/_key/_char/_scroll)" },
+    { "render_inventory",         "(W, H)  survival inventory" },
+    { "on_settings_opened",       "()  also on_world_select_opened, on_multiplayer_opened, on_mods_opened," },
+    { "on_creative_opened",       "()  on_texture_packs_opened, on_creative_closed" },
+}
+add("")
+add("=== Hooks: functions YOU define; the engine calls them ===")
+add("  [x] = a loaded mod defines it")
+for _, h in ipairs(hooks) do
+    local used = type(rawget(_G, h[1])) == "function" and "[x]" or "[ ]"
+    add("  " .. used .. " " .. h[1] .. h[2])
+end
+
+-- 3. Tables mods made for other mods (e.g. buckets.register)
+local lua_std = { _G = true, string = true, table = true, math = true, package = true, io = true,
+                  os = true, coroutine = true, debug = true, utf8 = true, bit32 = true, jit = true }
+local mod_tables = sorted_keys(_G, function(v) return type(v) == "table" end)
+local any = false
+for _, tname in ipairs(mod_tables) do
+    if not known[tname] and not lua_std[tname] then
+        local fns = sorted_keys(_G[tname], is_fn)
+        if #fns > 0 then
+            if not any then add(""); add("=== APIs that loaded mods offer to other mods ==="); any = true end
+            for _, f in ipairs(fns) do add("  " .. tname .. "." .. f .. "(...)") end
+        end
+    end
+end
+
+-- 4. Fluids
+if engine and engine.list_fluids then
+    add("")
+    add("=== Fluids ===")
+    for _, f in ipairs(engine.list_fluids()) do
+        add(string.format("  %s: source %s, flowing %s, spreads %d, step %.2f s%s", f.name, f.source,
+            (f.flowing ~= "" and f.flowing) or "-", f.spread, f.tick, f.infinite and ", infinite" or ""))
+    end
+end
+return table.concat(out, "\n"), total
+)LUA";
+
+// Writes lua_api.txt next to the game (or in the working folder). Returns the path, "" on failure.
+std::string writeApiReference(sol::state& lua) {
+    try {
+        sol::protected_function_result r = lua.safe_script(kApiReferenceLua, sol::script_pass_on_error);
+        if (!r.valid()) {
+            sol::error err = r;
+            std::cerr << "[API] Couldn't build lua_api.txt: " << err.what() << std::endl;
+            return "";
+        }
+        std::string text = r.get<std::string>(0);
+        const int functions = r.get<int>(1);
+
+        // Every registered block (only C++ knows the full list)
+        std::string blockList;
+        int blocks = 0;
+        auto& reg = BlockRegistry::getInstance();
+        for (int id = 1; id < 256; ++id) {
+            const auto& b = reg.getBlock(static_cast<uint8_t>(id));
+            if (b.name.empty() || b.name == "air" || reg.getBlockId(b.name) != id) continue;
+            blockList += "  " + std::to_string(id) + "  " + b.name + "  (" + (b.pattern.empty() ? "cube" : b.pattern)
+                       + (b.isWalkable ? ", solid" : "") + (b.isTransparent ? ", transparent" : "")
+                       + (b.inventoryImage.empty() ? "" : ", item") + ")\n";
+            ++blocks;
+        }
+        text += "\n\n=== Blocks (" + std::to_string(blocks) + " of 255) ===\n" + blockList;
+
+        fs::path path = (g_ExeDir.empty() ? fs::path(".") : g_ExeDir) / "lua_api.txt";
+        std::ofstream f(path);
+        if (!f) { path = "lua_api.txt"; f.open(path); }
+        if (!f) return "";
+        f << text << "\n";
+        std::cout << "[API] " << functions << " Lua functions, " << blocks << " blocks - see " << path.string() << std::endl;
+        return path.string();
+    } catch (const std::exception& e) {
+        std::cerr << "[API] Couldn't write lua_api.txt: " << e.what() << std::endl;
+        return "";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // World generator threads (see ChunkGenerator.h): each gets its own Lua with the same
 // mod files, but only what a world generator needs. Drawing, sound, chat, the world and
 // the player belong to the main thread, so everything else is a harmless no-op there.
@@ -1826,6 +1990,45 @@ bool isWaterBlockName(const std::string& name) {
     return name == "water" || name == "flowing_water";
 }
 
+// engine.register_item_use(item, fn): what right-clicking with an item does (buckets etc.)
+std::unordered_map<std::string, sol::protected_function> g_ItemUseHandlers;
+
+// Is the block at p a full source of any fluid (water, lava, modded fluids)?
+bool isFluidSourceAt(const World& world, const glm::ivec3& p) {
+    FluidRegistry::get().ensureFresh();
+    return FluidRegistry::get().cell(world.getBlockAt(p), world.getMetadataAt(p)).source;
+}
+
+// Walks the ray block by block (the blocks the ray passes through, in order) and returns
+// the first fluid block, or nothing if a solid block or the distance comes first.
+struct FluidRayHit { bool hit = false; glm::ivec3 pos{0}; };
+FluidRayHit raycastFluid(const glm::vec3& origin, const glm::vec3& dir, float maxDist, const World& world) {
+    FluidRayHit out;
+    glm::ivec3 cell(static_cast<int>(std::floor(origin.x)), static_cast<int>(std::floor(origin.y)),
+                    static_cast<int>(std::floor(origin.z)));
+    glm::ivec3 step;
+    glm::vec3 tMax, tDelta;
+    for (int a = 0; a < 3; ++a) {
+        step[a] = dir[a] > 0 ? 1 : (dir[a] < 0 ? -1 : 0);
+        tDelta[a] = dir[a] != 0 ? std::abs(1.0f / dir[a]) : 1e30f;
+        const float edge = dir[a] > 0 ? std::floor(origin[a]) + 1.0f - origin[a] : origin[a] - std::floor(origin[a]);
+        tMax[a] = dir[a] != 0 ? edge * tDelta[a] : 1e30f;
+    }
+    for (float t = 0.0f; t <= maxDist;) {
+        const uint8_t id = world.getBlockAt(cell);
+        if (id != 0) {
+            const auto& prop = BlockRegistry::getInstance().getBlock(id);
+            if (FluidRegistry::get().forBlock(id)) { out.hit = true; out.pos = cell; return out; }
+            if (prop.isSelectable || prop.isWalkable) return out;   // something solid in the way
+        }
+        const int a = (tMax.x < tMax.y) ? (tMax.x < tMax.z ? 0 : 2) : (tMax.y < tMax.z ? 1 : 2);
+        t = tMax[a];
+        tMax[a] += tDelta[a];
+        cell[a] += step[a];
+    }
+    return out;
+}
+
 float underwaterDepth(const World& world, const glm::vec3& eye) {
     const int bx = static_cast<int>(std::floor(eye.x));
     const int bz = static_cast<int>(std::floor(eye.z));
@@ -1953,6 +2156,7 @@ uniform vec3  u_FogColor;
 
 uniform vec3  u_UnderwaterTint;
 uniform float u_UnderwaterAmount;
+uniform float u_WeatherLight;
 uniform float u_ChunkFade;
 
 void main() {
@@ -2001,6 +2205,7 @@ void main() {
     }
 
     vec3 shadedColor = finalColor.rgb * LightIntensity * currentSunLightColor;
+    if (u_Unlit == 0) shadedColor *= u_WeatherLight;   // weather: overcast / storm (sky.set_light)
 
     vec3 pointLightContribution = vec3(0.0f);
     for(int i = 0; i < u_NumPointLights && i < 16; i++) {
@@ -2186,6 +2391,7 @@ uniform sampler2D texture_diffuse1;
 uniform vec3 u_LightDir;
 uniform vec3  u_UnderwaterTint;
 uniform float u_UnderwaterAmount;
+uniform float u_WeatherLight;
 
 void main() {
     vec3 norm = normalize(Normal);
@@ -2193,7 +2399,7 @@ void main() {
     vec4 texColor = texture(texture_diffuse1, TexCoords);
     if(texColor.a < 0.1) discard;
 
-    vec3 litColor = texColor.rgb * diff * mix(vec3(1.0f), u_UnderwaterTint, u_UnderwaterAmount);
+    vec3 litColor = texColor.rgb * diff * u_WeatherLight * mix(vec3(1.0f), u_UnderwaterTint, u_UnderwaterAmount);
     FragColor = vec4(litColor, texColor.a);
 }
 )";
@@ -2371,6 +2577,7 @@ int main(int argc, char** argv) {
         g_Skybox->init();
         g_Clouds = new Clouds();
         g_Clouds->init();
+        if (!g_Weather.init()) std::cerr << "[Weather] Couldn't set up weather effects" << std::endl;
         g_MainMenu = new MainMenu();
 
         g_FontRenderer->init("fonts/PixeloidSans.ttf");
@@ -2570,6 +2777,8 @@ int main(int argc, char** argv) {
         glAttachShader(modelShaderProgram, compileShader(GL_VERTEX_SHADER, modelVertexShaderSource));
         glAttachShader(modelShaderProgram, compileShader(GL_FRAGMENT_SHADER, modelFragmentShaderSource));
         glLinkProgram(modelShaderProgram);
+        glUseProgram(modelShaderProgram);
+        glUniform1f(glGetUniformLocation(modelShaderProgram, "u_WeatherLight"), 1.0f);   // full light until weather says otherwise
 
         // ------------------------------------------------------------------
         // ui.* table
@@ -2743,6 +2952,68 @@ int main(int argc, char** argv) {
         skyTable["set_sun_intensity"] = [](float intensity) { if (g_LightingSystem) g_LightingSystem->setSunIntensity(intensity); };
         skyTable["set_ambient_intensity"] = [](float intensity) { if (g_LightingSystem) g_LightingSystem->setAmbientIntensity(intensity); };
         skyTable["reset"] = []() { if (g_LightingSystem) g_LightingSystem->resetToDefaults(); };
+        // ---- Weather effects (drawn by WeatherEffects; DECIDED by Lua, see mods/weather) ----
+        // sky.set_precipitation{ type = "rain"|"snow"|any, intensity = 0..1, fall_speed, size,
+        //     length, sway, wind_x, wind_z, color = {r,g,b,a}, texture = "ash.png", radius,
+        //     height, max_particles, streaks = bool }
+        //   `type` starts from that preset; other fields change only what you give, so
+        //   sky.set_precipitation{ intensity = 0.3 } just thins out the current rain.
+        skyTable["set_precipitation"] = [](sol::table t) {
+            static std::unordered_map<std::string, GLuint> textures;
+            PrecipitationSettings p = g_Weather.precipitation();
+            sol::optional<std::string> type = t["type"];
+            if (type) {
+                const float keep = p.intensity;
+                if (*type != p.type) p = WeatherEffects::preset(*type);
+                p.intensity = keep;
+            }
+            p.intensity = t.get_or("intensity", p.intensity);
+            p.fallSpeed = t.get_or("fall_speed", p.fallSpeed);
+            p.size = t.get_or("size", p.size);
+            p.length = t.get_or("length", p.length);
+            p.sway = t.get_or("sway", p.sway);
+            p.wind.x = t.get_or("wind_x", p.wind.x);
+            p.wind.y = t.get_or("wind_z", p.wind.y);
+            p.radius = t.get_or("radius", p.radius);
+            p.height = t.get_or("height", p.height);
+            p.maxParticles = t.get_or("max_particles", p.maxParticles);
+            p.streaks = t.get_or("streaks", p.streaks);
+            sol::optional<sol::table> color = t["color"];
+            if (color) {
+                p.color = glm::vec4(color->get_or(1, p.color.r), color->get_or(2, p.color.g),
+                                    color->get_or(3, p.color.b), color->get_or(4, p.color.a));
+            }
+            sol::optional<std::string> tex = t["texture"];
+            if (tex) {
+                if (tex->empty()) p.texture = 0;
+                else {
+                    auto it = textures.find(*tex);
+                    if (it == textures.end()) it = textures.emplace(*tex, loadStandardTexture(*tex)).first;
+                    p.texture = it->second;
+                }
+            }
+            g_Weather.setPrecipitation(p);
+        };
+        // sky.get_precipitation() -> { type, intensity }
+        skyTable["get_precipitation"] = [](sol::this_state ts) {
+            sol::state_view lv(ts);
+            sol::table t = lv.create_table();
+            t["type"] = g_Weather.precipitation().type;
+            t["intensity"] = g_Weather.precipitation().intensity;
+            return t;
+        };
+        // sky.set_sky_tint(r, g, b, a): colour laid over the sky (a = 0 off, 1 = all that colour)
+        skyTable["set_sky_tint"] = [](float r, float g, float b, float a) {
+            g_Weather.setSkyTint(glm::vec4(r, g, b, glm::clamp(a, 0.0f, 1.0f)));
+        };
+        // sky.set_light(level): sunlight on the world, 1 = normal, 0.5 = stormy, 0 = black
+        skyTable["set_light"] = [](float level) { g_Weather.setLight(level); };
+        skyTable["get_light"] = []() { return g_Weather.light(); };
+        // sky.flash(strength 0..1, seconds): a lightning flash
+        skyTable["flash"] = [](float strength, sol::optional<float> seconds) {
+            g_Weather.flash(strength, seconds.value_or(0.35f));
+        };
+
         skyTable["add_light"] = [](float x, float y, float z, float r, float g, float b, float radius, float intensity) {
             return g_LightingSystem ? g_LightingSystem->addPointLight(glm::vec3(x, y, z), glm::vec3(r, g, b), radius, intensity) : -1;
         };
@@ -2842,7 +3113,12 @@ int main(int argc, char** argv) {
             try {
                 sol::protected_function fn = lua["on_chat_command"];
                 if (fn.valid()) {
-                    sol::protected_function_result result = fn(command);
+                    // on_chat_command(text, player, is_operator, reply) - same arguments as on a
+                    // dedicated server, so one mod works in both places
+                    std::function<void(const std::string&)> reply = [](const std::string& t) {
+                        if (g_ChatSystem) g_ChatSystem->addMessage(t, glm::vec3(0.75f, 0.85f, 1.0f));
+                    };
+                    sol::protected_function_result result = fn(command, playerName(), true, reply);
                     if (result.valid() && result.get_type() == sol::type::boolean) handledByLua = result.get<bool>();
                 }
             } catch (...) {}
@@ -2911,6 +3187,8 @@ int main(int argc, char** argv) {
         engineTable["register_block"] = &registerBlockFromLua;
         engineTable["get_block_id"] = &getBlockIdLua;
         engineTable["set_fov"] = [](float fov) { g_FieldOfView = fov; };
+        // engine.is_server() -> false here, true on BlockSmithServer (for mods that run on both)
+        engineTable["is_server"] = []() { return false; };
         engineTable["set_sun_texture"] = [](std::string path) { if (g_LightingSystem) g_LightingSystem->setSunTexture(path); };
         engineTable["set_moon_texture"] = [](std::string path) { if (g_LightingSystem) g_LightingSystem->setMoonTexture(path); };
 
@@ -2977,6 +3255,82 @@ int main(int argc, char** argv) {
                 return BlockRegistry::getInstance().getBlock(id).name;
             }
             return "air";
+        };
+        // engine.get_metadata(x, y, z) -> 0..255 (water: flow level in the low 3 bits, 8 = falling)
+        engineTable["get_metadata"] = [](int x, int y, int z) -> int {
+            return g_WorldInstance ? g_WorldInstance->getMetadataAt(glm::ivec3(x, y, z)) : 0;
+        };
+        // engine.set_block_meta(x, y, z, name, meta): block and metadata in one change
+        engineTable["set_block_meta"] = [](int x, int y, int z, const std::string& blockName, int meta) {
+            if (!g_WorldInstance) return;
+            const uint8_t id = BlockRegistry::getInstance().getBlockId(blockName);
+            g_WorldInstance->setBlockWithMetaAt(glm::ivec3(x, y, z), id, static_cast<uint8_t>(meta & 0xFF));
+        };
+        // engine.register_fluid, register_fluid_reaction, get_fluid, is_fluid_source,
+        // list_fluids (Fluids.cpp)
+        addFluidLuaApi(lua, engineTable, []() { return g_WorldInstance; });
+        // engine.is_replaceable(x, y, z): air, a fluid or a plant - room to put something
+        engineTable["is_replaceable"] = [](int x, int y, int z) {
+            if (!g_WorldInstance) return false;
+            const uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
+            if (id == 0) return true;
+            const auto& prop = BlockRegistry::getInstance().getBlock(id);
+            return FluidRegistry::get().forBlock(id) != nullptr || prop.pattern == "plantlike";
+        };
+        // engine.register_item_use(item, function(pointed) ... end)
+        //   Right-clicking with `item` in the active hotbar slot calls fn instead of placing it.
+        //   pointed = { item, slot, count,
+        //               under = {x,y,z,name} (block looked at, or nil),
+        //               above = {x,y,z}      (the space in front of it),
+        //               fluid = {x,y,z,name,source} (water looked at first, or nil),
+        //               player = {x,y,z} (feet) }
+        //   Return true when the click was used (false lets the block be placed as normal).
+        engineTable["register_item_use"] = [](const std::string& item, sol::protected_function fn) {
+            g_ItemUseHandlers[item] = std::move(fn);
+        };
+        // ---- Shared values: decided by whoever runs the world, seen by every player ----
+        // engine.is_authority() -> true in singleplayer and when hosting; false when joined to
+        //   someone else's world/server (then their Lua decides, e.g. the weather)
+        engineTable["is_authority"] = []() { return g_Client.state() != GameClient::State::Joined; };
+        // engine.set_shared(key, value) -> true; false when joined (only the server sets them)
+        engineTable["set_shared"] = [](const std::string& key, const std::string& value) {
+            if (g_Client.state() == GameClient::State::Joined || key.empty()) return false;
+            const auto it = g_SharedValues.find(key);
+            if (it != g_SharedValues.end() && it->second == value) return true;
+            g_SharedValues[key] = value;
+            g_SharedChanged.push_back(key);
+            if (g_Server.running()) g_Server.setShared(key, value);   // LAN players get it too
+            return true;
+        };
+        // engine.get_shared(key) -> value, or "" if never set
+        engineTable["get_shared"] = [](const std::string& key) -> std::string {
+            if (g_Client.state() == GameClient::State::Joined) return g_Client.getShared(key);
+            const auto it = g_SharedValues.find(key);
+            return it == g_SharedValues.end() ? std::string() : it->second;
+        };
+        // engine.get_player_position() -> x, y, z (feet) of this game's player
+        engineTable["get_player_position"] = []() {
+            return std::make_tuple(g_PlayerPosition.x, g_PlayerPosition.y, g_PlayerPosition.z);
+        };
+        // engine.is_outdoors(x, y, z) -> true if nothing is above (rain reaches it)
+        engineTable["is_outdoors"] = [](int x, int y, int z) {
+            return g_WorldInstance && g_WorldInstance->hasSkyAbove(glm::ivec3(x, y, z));
+        };
+        // engine.give_item(name [, count]) -> true if it fit: into a slot holding the same item,
+        // else the first empty slot
+        engineTable["give_item"] = [](const std::string& name, sol::optional<int> count) {
+            if (!g_Hotbar) return false;
+            const uint8_t id = BlockRegistry::getInstance().getBlockId(name);
+            if (id == 0) return false;
+            const int n = std::max(1, count.value_or(1));
+            for (int i = 0; i < g_Hotbar->slotCount; ++i) {
+                HotbarSlot s = g_Hotbar->getSlot(i);
+                if (s.blockId == id && s.count + n <= 64) { g_Hotbar->setSlot(i, id, s.count + n); return true; }
+            }
+            for (int i = 0; i < g_Hotbar->slotCount; ++i) {
+                if (g_Hotbar->getSlot(i).blockId == 0) { g_Hotbar->setSlot(i, id, n); return true; }
+            }
+            return false;
         };
 
         engineTable["draw_text"] = [&](std::string text, float x, float y) {
@@ -3245,6 +3599,7 @@ int main(int argc, char** argv) {
             if (!g_Server.start(*g_WorldInstance, static_cast<uint16_t>(p), g_LoadedGameFolder, playerName(), error)) {
                 return std::make_tuple(false, error);
             }
+            for (const auto& [k, v] : g_SharedValues) g_Server.setShared(k, v);   // weather etc.
             if (g_ChatSystem) {
                 g_ChatSystem->addMessage("Hosting on port " + std::to_string(p) + ". Friends can join with your IP address.",
                                          glm::vec3(1.0f, 1.0f, 0.4f));
@@ -3670,6 +4025,10 @@ int main(int argc, char** argv) {
         // Saved video settings win over values set by mods during loading
         applyStoredVideoSettings();
 
+        // lua_api.txt: everything modders can use in this build (see writeApiReference)
+        writeApiReference(lua);
+        engineTable["write_api_reference"] = [&lua]() { return writeApiReference(lua); };
+
         lua.new_usertype<ChunkData>("Chunk",
             "set_block", &ChunkData::setBlock, "setBlock", &ChunkData::setBlock,
             "get_block", &ChunkData::getLocalBlock, "getBlock", &ChunkData::getLocalBlock,
@@ -3693,6 +4052,8 @@ int main(int argc, char** argv) {
         glAttachShader(shaderProgram, compileShader(GL_VERTEX_SHADER, vertexShaderSource));
         glAttachShader(shaderProgram, compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource));
         glLinkProgram(shaderProgram);
+        glUseProgram(shaderProgram);
+        glUniform1f(glGetUniformLocation(shaderProgram, "u_WeatherLight"), 1.0f);
 
         GLuint sunProgram = glCreateProgram();
         glAttachShader(sunProgram, compileShader(GL_VERTEX_SHADER, sunVertexShaderSource));
@@ -3815,7 +4176,6 @@ int main(int argc, char** argv) {
         });
 
         float lastFrameTime = static_cast<float>(glfwGetTime());
-        float fluidTimer = 0.0f;
         bool leftMousePressedLast = false;
         bool rightMousePressedLast = false;
 
@@ -3832,6 +4192,27 @@ int main(int argc, char** argv) {
             }
 
             glfwPollEvents();
+
+            g_PlayerPosition = player.position;
+
+            // Shared values that changed (set here, or sent by the server): on_shared_changed(key, value)
+            {
+                std::vector<std::string> changed;
+                changed.swap(g_SharedChanged);
+                if (g_Client.state() == GameClient::State::Joined) {
+                    for (auto& k : g_Client.takeSharedChanges()) changed.push_back(std::move(k));
+                }
+                if (!changed.empty()) {
+                    sol::protected_function fn = lua["on_shared_changed"];
+                    for (const auto& k : changed) {
+                        if (!fn.valid()) break;
+                        const std::string value = g_Client.state() == GameClient::State::Joined
+                            ? g_Client.getShared(k) : g_SharedValues[k];
+                        auto r = fn(k, value);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_shared_changed: " << err.what() << std::endl; }
+                    }
+                }
+            }
 
             try {
                 sol::function onUpdate = lua["on_update"];
@@ -3983,9 +4364,13 @@ int main(int argc, char** argv) {
                             updateAnimFunc(deltaTime, isMoving, player.pitch);
                         }
                     } catch (...) {}
+                }
 
-                    fluidTimer += deltaTime;
-                    if (fluidTimer >= 0.15f) { world.updateFluids(); fluidTimer = 0.0f; }
+                // Water flows while you play, chat or browse the inventory. Pausing stops it in
+                // singleplayer, but not while hosting (the other players are still playing).
+                // Each fluid keeps its own step timer (water 0.25 s, lava 1.5 s...), see Fluids.h
+                if (!g_Paused || g_Server.running()) {
+                    world.updateFluids(deltaTime);
                 }
             }
 
@@ -4031,7 +4416,52 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (rightPress && !rightMousePressedLast && rayResult.hit) {
+                // Items with a use (engine.register_item_use) get the click first, even when
+                // pointing at water or nothing at all
+                bool itemUsed = false;
+                if (rightPress && !rightMousePressedLast) {
+                    const auto handler = g_ItemUseHandlers.find(activeItemName);
+                    if (handler != g_ItemUseHandlers.end() && handler->second.valid()) {
+                        sol::table pointed = lua.create_table();
+                        const HotbarSlot held = g_Hotbar->getSlot(g_Hotbar->activeSlot);
+                        pointed["item"] = activeItemName;
+                        pointed["slot"] = g_Hotbar->activeSlot + 1;
+                        pointed["count"] = held.count;
+                        pointed["player"] = lua.create_table_with("x", player.position.x, "y", player.position.y, "z", player.position.z);
+                        if (rayResult.hit) {
+                            const glm::ivec3 u(rayResult.blockPos);
+                            const glm::ivec3 a = u + glm::ivec3(glm::round(glm::vec3(rayResult.faceNormal)));
+                            const uint8_t uid = world.getBlockAt(u);
+                            pointed["under"] = lua.create_table_with("x", u.x, "y", u.y, "z", u.z,
+                                "name", uid ? BlockRegistry::getInstance().getBlock(uid).name : std::string("air"));
+                            pointed["above"] = lua.create_table_with("x", a.x, "y", a.y, "z", a.z);
+                        }
+                        const FluidRayHit fluid = raycastFluid(rayOrigin, rayDir, 6.0f, world);
+                        const bool fluidFirst = fluid.hit && (!rayResult.hit ||
+                            glm::distance(glm::vec3(fluid.pos) + 0.5f, rayOrigin) <
+                            glm::distance(glm::vec3(rayResult.blockPos) + 0.5f, rayOrigin));
+                        if (fluidFirst) {
+                            const uint8_t fid = world.getBlockAt(fluid.pos);
+                            const FluidCell fc = FluidRegistry::get().cell(fid, world.getMetadataAt(fluid.pos));
+                            if (fc) {
+                                pointed["fluid"] = lua.create_table_with("x", fluid.pos.x, "y", fluid.pos.y, "z", fluid.pos.z,
+                                    "name", fc.fluid->name,                                   // "water", "lava"...
+                                    "block", BlockRegistry::getInstance().getBlock(fid).name,
+                                    "source", fc.source, "falling", fc.falling, "level", fc.level);
+                            }
+                        }
+                        auto res = handler->second(pointed);
+                        if (!res.valid()) {
+                            sol::error err = res;
+                            std::cerr << "[Mod] Item use for '" << activeItemName << "' failed: " << err.what() << std::endl;
+                            itemUsed = true;
+                        } else {
+                            itemUsed = res.get_type() == sol::type::boolean && res.get<bool>();
+                        }
+                    }
+                }
+
+                if (rightPress && !rightMousePressedLast && rayResult.hit && !itemUsed) {
                     const glm::ivec3 hitPos(rayResult.blockPos.x, rayResult.blockPos.y, rayResult.blockPos.z);
                     uint8_t targetBlockId = world.getBlockAt(hitPos);
                     if (targetBlockId != 0) {
@@ -4051,6 +4481,11 @@ int main(int argc, char** argv) {
 
                             if (!handled) {
                                 uint8_t selectedBlock = g_Hotbar->getActiveBlockId();
+                                // Items (anything with an inventory picture: sticks, tools, buckets)
+                                // are never put down as blocks
+                                if (selectedBlock != 0 && !BlockRegistry::getInstance().getBlock(selectedBlock).inventoryImage.empty()) {
+                                    selectedBlock = 0;
+                                }
                                 if (selectedBlock != 0) {
                                     bool replaceTarget = false;
                                     if (targetProp.name == "short_grass" || targetProp.name == "flower_red" || targetProp.pattern == "plantlike" || targetProp.name.find("farmland") != std::string::npos) {
@@ -4143,10 +4578,11 @@ int main(int argc, char** argv) {
             const glm::vec3 underwaterFog = glm::mix(water.shallow, water.deep, depthT);
             const float underwaterVis = glm::mix(g_Underwater.shallowVisibility, g_Underwater.deepVisibility, depthT);
 
+            // A gentle cool tint (white mixed with a little fog colour): colours stay readable
             const glm::vec3 underwaterTint = glm::mix(
-                glm::vec3(0.6f, 0.85f, 1.0f),
+                glm::vec3(0.85f, 0.95f, 1.0f),
                 glm::normalize(underwaterFog),
-                0.4f);
+                0.25f);
             const float tintAmount = blend * g_Underwater.tintStrength;
 
             const glm::vec3 skyClear(0.5f, 0.8f, 0.95f);
@@ -4161,7 +4597,7 @@ int main(int argc, char** argv) {
                 const float aboveStart     = effectiveFogStart(g_Fog, aboveEnd);
 
                 const glm::vec3 fogCol     = glm::mix(aboveFog, underwaterFog, blend);
-                const float     fogStart   = glm::mix(aboveStart, 0.0f, blend);
+                const float     fogStart   = glm::mix(aboveStart, underwaterVis * g_Underwater.fogStartFraction, blend);
                 const float     fogEnd     = glm::mix(aboveEnd, underwaterVis, blend);
                 const float     fogDensity = g_Fog.density;
                 const bool fogExp = g_Fog.exponential && blend <= 0.0f;
@@ -4217,6 +4653,9 @@ int main(int argc, char** argv) {
 
                     glBindVertexArray(0);
                     glDepthMask(GL_TRUE);
+
+                    // Weather: greys/darkens the sky, sun and moon (sky.set_sky_tint)
+                    g_Weather.drawSkyTint();
                 }
 
                 glUseProgram(shaderProgram);
@@ -4236,6 +4675,7 @@ int main(int argc, char** argv) {
                 glUniform3f(glGetUniformLocation(shaderProgram, "u_FogColor"), fogCol.r, fogCol.g, fogCol.b);
                 glUniform3f(glGetUniformLocation(shaderProgram, "u_UnderwaterTint"), underwaterTint.r, underwaterTint.g, underwaterTint.b);
                 glUniform1f(glGetUniformLocation(shaderProgram, "u_UnderwaterAmount"), tintAmount);
+                glUniform1f(glGetUniformLocation(shaderProgram, "u_WeatherLight"), g_Weather.worldLight());
 
                 const auto& pointLights = g_LightingSystem->getPointLights();
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_NumPointLights"), static_cast<int>(pointLights.size()));
@@ -4278,6 +4718,7 @@ int main(int argc, char** argv) {
                 glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LightDir"), sunDir.x, sunDir.y, sunDir.z);
                 glUniform3f(glGetUniformLocation(modelShaderProgram, "u_UnderwaterTint"), underwaterTint.r, underwaterTint.g, underwaterTint.b);
                 glUniform1f(glGetUniformLocation(modelShaderProgram, "u_UnderwaterAmount"), tintAmount);
+                glUniform1f(glGetUniformLocation(modelShaderProgram, "u_WeatherLight"), g_Weather.worldLight());
 
                 glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), player.position);
                 modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw + 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
@@ -4354,6 +4795,13 @@ int main(int argc, char** argv) {
                     glDisable(GL_CULL_FACE);
                     glEnable(GL_BLEND);
                 }
+
+                // Weather: rain/snow around the camera (not underwater), then lightning flashes
+                g_Weather.update(g_Paused ? 0.0f : deltaTime, eyePos, world);
+                if (blend < 0.5f) {
+                    g_Weather.drawPrecipitation(view, proj, eyePos, glm::clamp(sunDir.y * 2.0f + 0.5f, 0.0f, 1.0f));
+                }
+                g_Weather.drawFlash();
 
                 // ---------------- HUD ----------------
                 glDisable(GL_DEPTH_TEST);
@@ -4489,6 +4937,44 @@ int main(int argc, char** argv) {
                         lines.push_back("");
                         lines.push_back("Looking at: nothing in reach");
                     }
+                    // The first block of any kind on the crosshair ray (even ones that can't be
+                    // selected), to tell what an odd-looking block really is
+                    {
+                        glm::vec3 pnt = rayOrigin;
+                        for (float t = 0.0f; t <= 6.0f; t += 0.05f, pnt = rayOrigin + rayDir * t) {
+                            const glm::ivec3 c(static_cast<int>(std::floor(pnt.x)), static_cast<int>(std::floor(pnt.y)),
+                                               static_cast<int>(std::floor(pnt.z)));
+                            const uint8_t rid = world.getBlockAt(c);
+                            if (rid == 0) continue;
+                            const auto& rp = BlockRegistry::getInstance().getBlock(rid);
+                            char rbuf[200];
+                            std::snprintf(rbuf, sizeof(rbuf), "Ray hits: %s (id %d) at %d %d %d, metadata %d, water id %d",
+                                          rp.name.empty() ? "(no block with this id!)" : rp.name.c_str(),
+                                          static_cast<int>(rid), c.x, c.y, c.z, static_cast<int>(world.getMetadataAt(c)),
+                                          static_cast<int>(BlockRegistry::getInstance().getBlockId("water")));
+                            lines.push_back(rbuf);
+                            break;
+                        }
+                    }
+                    // Fluid in front of the block (fluids can't be selected, so they're listed apart)
+                    {
+                        const FluidRayHit fl = raycastFluid(rayOrigin, rayDir, 6.0f, world);
+                        if (fl.hit) {
+                            const uint8_t fid = world.getBlockAt(fl.pos);
+                            const uint8_t fmeta = world.getMetadataAt(fl.pos);
+                            const FluidCell fc = FluidRegistry::get().cell(fid, fmeta);
+                            const std::string state = !fc ? "?" : fc.source ? "source" : fc.falling ? "falling"
+                                : "flow level " + std::to_string(fc.level) + " of " + std::to_string(fc.fluid->spread);
+                            char fbuf[200];
+                            std::snprintf(fbuf, sizeof(fbuf), "Fluid: %s (block %s, id %d) at %d %d %d, %s, metadata %d",
+                                          fc ? fc.fluid->name.c_str() : "?",
+                                          BlockRegistry::getInstance().getBlock(fid).name.c_str(), static_cast<int>(fid),
+                                          fl.pos.x, fl.pos.y, fl.pos.z, state.c_str(), static_cast<int>(fmeta));
+                            lines.push_back(fbuf);
+                            std::snprintf(fbuf, sizeof(fbuf), "  Fluids flowing: %zu cells", world.fluids().activeCount());
+                            lines.push_back(fbuf);
+                        }
+                    }
                     const glm::vec2 sc = uiTextScale(0.8f, screen);
                     float y = 24.0f;
                     for (const auto& l : lines) {
@@ -4556,6 +5042,7 @@ int main(int argc, char** argv) {
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
         world.setGenerator(nullptr);   // the generator's threads stop at the end of this block
+        g_ItemUseHandlers.clear();     // Lua functions: must go before the Lua state does
         g_Pinger.clear();
         g_Lan.stop();
         for (auto& [addr, t] : g_ServerIcons) if (t.tex) glDeleteTextures(1, &t.tex);
