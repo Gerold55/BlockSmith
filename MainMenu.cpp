@@ -418,11 +418,6 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
     // 5. Top-right button labels
     for (const auto& btn : topRightButtons) renderCenteredButtonText(btn);
 
-<<<<<<< Updated upstream
-    // 6. Version and copyright
-    fontRenderer.renderText(fontShader, "Craft & Ruin 5.17.0-dev", 15.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
-    fontRenderer.renderText(fontShader, "(c) 2010-2026 Developer Studio", static_cast<float>(screenWidth) - 260.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
-=======
     // 6. Version (bottom left) and copyright (bottom right), sized to the window
     {
         const float capPx = std::max(6.0f, screenHeight * 0.011f);
@@ -437,7 +432,6 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
         fontRenderer.renderText(fontShader, copyright, std::round(screenWidth - margin - cw), baseline,
                                 sc.x, sc.y, grey, screenRes);
     }
->>>>>>> Stashed changes
 
     glEnable(GL_DEPTH_TEST);
 }

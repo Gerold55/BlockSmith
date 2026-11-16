@@ -1,36 +1,31 @@
-#ifndef FONTRENDERER_H
-#define FONTRENDERER_H
+#pragma once
+// TrueType text rendering (stb_truetype). The font is baked once at 32 px for the base
+// resolution (1920x1080) and scaled with the window: on a 1280-wide window text is drawn at
+// 1280/1920 of its size sideways and (window height / 1080) up and down.
+//
+// textWidth / capHeight use exactly the same maths as renderText, so menus can centre and
+// space text correctly at any window size (Lua: ui.text_width / ui.text_height).
 
 #include <glad/glad.h>
-#include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
-#include <string>
-#include <vector>
 #include <stb_truetype.h>
-
+#include <string>
 #include <string_view>
+#include <vector>
 
-struct Dimensions2D
-{
-    int width{};
-    int height{};
+struct Dimensions2D {
+    int width = 0;
+    int height = 0;
 };
 
 class FontRenderer {
 public:
-    GLuint vao = 0, vbo = 0;
-    GLuint fontTextureID = 0;
-    stbtt_bakedchar cdata[96];
-
-    FontRenderer(Dimensions2D resolution);
+    explicit FontRenderer(Dimensions2D resolution);
     ~FontRenderer();
+    FontRenderer(const FontRenderer&) = delete;
+    FontRenderer& operator=(const FontRenderer&) = delete;
 
     bool init(const std::string& fontPath);
-<<<<<<< Updated upstream
-    void renderText(GLuint fontShader, const std::string& text, float x,
-            float y, float scaleX, float scaleY, glm::vec4 color,
-            Dimensions2D resolution);
-=======
 
     // x, y: pixels from the top-left; y is the text BASELINE. Text is UTF-8.
     void renderText(GLuint fontShader, const std::string& text,
@@ -43,18 +38,20 @@ public:
     float capHeight(float scaleY, Dimensions2D resolution) const;
     // The resolution the scales are relative to (scale 1 = the font's size at this size)
     Dimensions2D baseSize() const { return baseResolution; }
->>>>>>> Stashed changes
 
 private:
+    std::vector<float> generateFontVertices(float x, float y, float scaleX, float scaleY,
+                                            Dimensions2D resolution, std::string_view text) const;
+    void drawGLFontQuads(GLuint fontShader, glm::vec4 color, Dimensions2D resolution,
+                         const std::vector<float>& vertices);
+
     Dimensions2D baseResolution;
-
-    std::vector<float> generateFontVertices(float x, float y, float scaleX,
-        float scaleY, Dimensions2D resolution,
-        std::string_view text) const;
-
-    void drawGLFontQuads(GLuint fontShader, glm::vec4 color,
-            Dimensions2D resolution,
-            const std::vector<float>& vertices);
+    GLuint vao = 0;
+    GLuint vbo = 0;
+    GLuint fontTextureID = 0;
+    // Characters 32..255 (ASCII + Latin-1: ³ ² é ü ñ © ...), baked at 32 px into a 512x512
+    // bitmap. Text is UTF-8; anything outside this range is drawn as '?'.
+    static constexpr int kFirstChar = 32;
+    static constexpr int kNumChars = 224;
+    stbtt_bakedchar cdata[kNumChars] = {};
 };
-
-#endif // FONTRENDERER_H

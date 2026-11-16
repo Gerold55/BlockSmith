@@ -574,9 +574,8 @@ function generate_chunk(chunk, chunk_x, chunk_z)
     end
 end
 
-<<<<<<< Updated upstream
 print("[Mapgen] Loaded Minecraft-Style Blended Biomes with swamps successfully.")
-=======
+
 -- ===========================================================================
 -- Biome colours (Minecraft-style). The engine asks these for every few blocks of each new
 -- chunk and blends in between; grass (and leaves, if tinted) take the colour of the place.
@@ -610,7 +609,3 @@ function get_foliage_color(x, z)
     local r, g, b = get_grass_color(x, z)
     return r * 0.8, g * 0.85, b * 0.8
 end
-
-
-print("[Mapgen] Loaded Minecraft-Style Blended Biomes with swamps successfully.")
->>>>>>> Stashed changes

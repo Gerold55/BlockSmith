@@ -12,6 +12,30 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+// Next character of a UTF-8 string as an index into the baked characters (0 = space),
+// or the index of '?' for characters the font texture doesn't have.
+int nextGlyph(std::string_view text, size_t& i) {
+    const unsigned char c = static_cast<unsigned char>(text[i++]);
+    uint32_t cp = c;
+    if (c >= 0x80) {
+        int extra = (c >= 0xF0) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC0) ? 1 : 0;
+        cp = (extra == 3) ? (c & 0x07) : (extra == 2) ? (c & 0x0F) : (c & 0x1F);
+        if (extra == 0) cp = '?';   // stray continuation byte
+        for (; extra > 0 && i < text.size(); --extra) {
+            const unsigned char cc = static_cast<unsigned char>(text[i]);
+            if ((cc & 0xC0) != 0x80) { cp = '?'; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+            ++i;
+        }
+    }
+    if (cp < 32) return -1;                                    // control characters: skip
+    if (cp >= 32 + static_cast<uint32_t>(224)) cp = '?';
+    if (cp >= 127 && cp < 160) cp = '?';                       // not printable
+    return static_cast<int>(cp) - 32;
+}
+}  // namespace
+
 FontRenderer::FontRenderer(Dimensions2D resolution)
     : baseResolution{resolution}
 {
@@ -82,7 +106,7 @@ bool FontRenderer::init(const std::string& fontPath) {
     int bitmapHeight = 512;
     std::vector<unsigned char> bitmap(bitmapWidth * bitmapHeight);
 
-    int bakeResult = stbtt_BakeFontBitmap(fontBuffer.data(), fontOffset, 32.0f, bitmap.data(), bitmapWidth, bitmapHeight, 32, 96, cdata);
+    int bakeResult = stbtt_BakeFontBitmap(fontBuffer.data(), fontOffset, 32.0f, bitmap.data(), bitmapWidth, bitmapHeight, kFirstChar, kNumChars, cdata);
     if (bakeResult <= 0) {
         std::cout << "[Font Error] stbtt_BakeFontBitmap failed (return code: " << bakeResult << ")." << std::endl;
         return false;
@@ -121,6 +145,31 @@ void FontRenderer::renderText(GLuint fontShader, const std::string& text,
     this->drawGLFontQuads(fontShader, color, resolution, vertices);
 }
 
+// Same scaling as generateFontVertices, so the numbers match what is drawn.
+float FontRenderer::textWidth(std::string_view text, float scaleX, Dimensions2D resolution) const {
+    if (this->baseResolution.width <= 0) return 0.0f;
+    const float scaleWidth = scaleX * static_cast<float>(resolution.width)
+                           / static_cast<float>(this->baseResolution.width);
+    float rx = 0.0f, ry = 0.0f;
+    for (size_t i = 0; i < text.size();) {
+        const int glyph = nextGlyph(text, i);
+        if (glyph < 0) continue;
+        stbtt_aligned_quad q;
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, glyph, &rx, &ry, &q, 1);
+    }
+    return rx * scaleWidth;
+}
+
+float FontRenderer::capHeight(float scaleY, Dimensions2D resolution) const {
+    if (this->baseResolution.height <= 0) return 0.0f;
+    const float scaleHeight = scaleY * static_cast<float>(resolution.height)
+                            / static_cast<float>(this->baseResolution.height);
+    float rx = 0.0f, ry = 0.0f;
+    stbtt_aligned_quad q;
+    stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, 'H' - 32, &rx, &ry, &q, 1);
+    return -q.y0 * scaleHeight;   // y0 is negative: how far the top of 'H' is above the baseline
+}
+
 std::vector<float> FontRenderer::generateFontVertices(float x, float y,
         float scaleX, float scaleY, Dimensions2D resolution,
         std::string_view text) const
@@ -134,12 +183,12 @@ std::vector<float> FontRenderer::generateFontVertices(float x, float y,
     float scaleHeight = scaleY * static_cast<float>(resolution.height)
                       / static_cast<float>(this->baseResolution.height);
 
-    for (size_t i = 0; i < text.length(); ++i) {
-        int charIndex = text[i];
-        if (charIndex < 32 || charIndex >= 128) continue;
+    for (size_t i = 0; i < text.length();) {
+        const int glyph = nextGlyph(text, i);
+        if (glyph < 0) continue;
 
         stbtt_aligned_quad q;
-        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, charIndex - 32, &rx, &ry, &q, 1);
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, glyph, &rx, &ry, &q, 1);
 
         float x0 = q.x0 * scaleWidth + x;
         float x1 = q.x1 * scaleWidth + x;

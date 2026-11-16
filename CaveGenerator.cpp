@@ -1,5 +1,6 @@
+#include <atomic>
 #include "CaveGenerator.h"
-#include "ChunkMesh.h"
+#include "ChunkData.h"
 #include "Block.h"
 #include "Types.h"
 #include <algorithm>
@@ -46,8 +47,9 @@ constexpr int kStepY  = 4;
 // State
 // ===========================================================================
 
-uint32_t g_seed = 0;
-bool     g_enabled = true;
+// Atomic: the world generator threads read these while the main thread may change them
+std::atomic<uint32_t> g_seed{0};
+std::atomic<bool>     g_enabled{true};
 
 // Derived per-field seeds so each noise field is independent
 uint32_t fieldSeed(int field) {
@@ -185,6 +187,7 @@ void CaveGenerator::init() {}
 void CaveGenerator::setSeed(uint32_t seed) { g_seed = seed; }
 void CaveGenerator::setEnabled(bool enabled) { g_enabled = enabled; }
 bool CaveGenerator::isEnabled() { return g_enabled; }
+void CaveGenerator::prepare() { classifyBlocks(); }
 
 bool CaveGenerator::isCarvedOut(int x, int y, int z) {
     if (!g_enabled || y <= kBedrockTop || y > 62) return false;
@@ -192,7 +195,7 @@ bool CaveGenerator::isCarvedOut(int x, int y, int z) {
     return tunnelField(fx, fy, fz) < 0.0f || (y < 40 && cheeseField(fx, fy, fz) < 0.0f);
 }
 
-void CaveGenerator::carveChunk(ChunkMesh& chunk, int chunkX, int chunkZ) {
+void CaveGenerator::carveChunk(ChunkData& chunk, int chunkX, int chunkZ) {
     if (!g_enabled) return;
     classifyBlocks();
 

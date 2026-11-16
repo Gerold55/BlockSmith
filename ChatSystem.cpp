@@ -337,8 +337,11 @@ void ChatSystem::sendCurrentInput(GLFWwindow* window) {
 
         if (text[0] == '/') {
             executeCommand(text.substr(1));
+        } else if (m_messageSender && m_messageSender(text)) {
+            // Online: the server sends it to everyone (including us), so nothing to add here
         } else {
-            addMessage("<Player> " + text, kPlayerColor);
+            const std::string name = m_playerName.empty() ? std::string("Player") : m_playerName;
+            addMessage("<" + name + "> " + text, kPlayerColor);
         }
     }
 
@@ -346,7 +349,10 @@ void ChatSystem::sendCurrentInput(GLFWwindow* window) {
 }
 
 // Lua gets the first look. Built-ins are the fallback.
-void ChatSystem::executeCommand(const std::string& cmd) {
+void ChatSystem::executeCommand(const std::string& rawCmd) {
+    // "/netstats " (Tab completion adds a space) must work the same as "/netstats"
+    std::string cmd = trimLeft(rawCmd);
+    while (!cmd.empty() && std::isspace(static_cast<unsigned char>(cmd.back()))) cmd.pop_back();
     if (m_commandHandler && m_commandHandler(cmd)) return;
 
     const size_t sp = cmd.find(' ');
@@ -440,8 +446,6 @@ void ChatSystem::renderChatOverlay(FontRenderer* fontRenderer, GLuint fontShader
 
     const float boxLeft  = W * 0.05f;
     const float boxWidth = W * 0.90f;
-
-    const float kPaddingY = 5.0f; // Extra vertical space top & bottom
 
     // The chat's bottom edge sits just above the hotbar.
     const float chatBottom = H - kHotbarReserve;

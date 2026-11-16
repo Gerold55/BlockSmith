@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-class ChunkMesh;
+class ChunkData;
 
 // Minecraft-style caves, carved into chunks after terrain generation:
 //   - Spaghetti caves : long winding tunnels, 3-6 blocks wide
@@ -16,10 +16,13 @@ public:
     static void setSeed(uint32_t seed);
     static void setEnabled(bool enabled);
     static bool isEnabled();
+    // Looks up the block types caves use. carveChunk does this itself the first time, but
+    // call it once before generating on several threads so they don't all do it at once.
+    static void prepare();
 
     // Carves caves into a freshly generated chunk. Never carves through water,
     // tree trunks/leaves, or the bottom bedrock layers.
-    static void carveChunk(ChunkMesh& chunk, int chunkX, int chunkZ);
+    static void carveChunk(ChunkData& chunk, int chunkX, int chunkZ);
 
     // Per-block query without surface information (slower; kept for old code).
     static bool isCarvedOut(int x, int y, int z);

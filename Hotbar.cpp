@@ -391,6 +391,17 @@ void appendIcon(std::vector<float>& out, uint8_t blockId, float cx, float cy, fl
         const FaceDefinition& fd = prop.faces[kFaceToProp[face]];
         if (fd.baseLayer < 0) continue;
 
+        // Only the three faces turned toward the viewer (top, left, right). The cube is
+        // centred on 0, so a face is in front if its centre ends up with z > 0. Drawing just
+        // these means the icons don't need the depth buffer, so nothing left in it from
+        // drawing the world (or a driver that skips the depth clear) can cut pieces out.
+        glm::vec3 centre(0.0f);
+        for (int v = 0; v < 6; ++v) {
+            centre += glm::vec3(kFaceVerts[face][v * 3 + 0], kFaceVerts[face][v * 3 + 1],
+                                kFaceVerts[face][v * 3 + 2]);
+        }
+        if ((xf * glm::vec4(centre / 6.0f, 1.0f)).z <= 0.0f) continue;
+
         const float layer = static_cast<float>(fd.baseLayer);
         const float overlay = fd.overlayLayer >= 0 ? static_cast<float>(fd.overlayLayer) : -1.0f;
 
@@ -401,7 +412,7 @@ void appendIcon(std::vector<float>& out, uint8_t blockId, float cx, float cy, fl
             // Screen Y points down, so flip Y to keep the cube's top on top.
             out.push_back(cx + p.x);
             out.push_back(cy - p.y);
-            out.push_back(-5.0f + p.z * 0.01f);   // nearer faces win the depth test
+            out.push_back(-5.0f);
 
             out.push_back(tint.r);
             out.push_back(tint.g);
@@ -594,13 +605,15 @@ void Hotbar::render3DIcons(GLuint voxelShader, GLuint textureArrayID) {
     const glm::mat4 orthoProj = glm::ortho(0.0f, width, height, 0.0f, -100.0f, 100.0f);
     const glm::mat4 identity(1.0f);
 
-    // Don't rely on whatever state the previous UI left behind
-    glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);        // glClear won't clear depth if writes are disabled
-    glDepthFunc(GL_LESS);
+    // Icons only contain their front faces (see appendIcon), so no depth test is needed.
+    // Don't rely on whatever state drawing the world or the previous UI left behind.
+    const GLboolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
+    glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);  // glClear is clipped by the scissor box too
-    glClear(GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glUseProgram(voxelShader);
 
@@ -624,4 +637,12 @@ void Hotbar::render3DIcons(GLuint voxelShader, GLuint textureArrayID) {
 
     if (isGuiLoc != -1) glUniform1i(isGuiLoc, 0);
     if (unlitLoc != -1) glUniform1i(unlitLoc, 0);
+    if (depthWasOn) glEnable(GL_DEPTH_TEST);
+}
+
+// Where the bar is on screen, in pixels (top-left x, y and size), for mods drawing HUD
+// pieces next to it (hearts, hunger): Lua hotbar.get_rect(W, H).
+void hotbarScreenRect(const Hotbar& hb, float W, float H, float& x, float& y, float& w, float& h) {
+    const BarLayout b = computeBar(hb, W, H);
+    x = b.x; y = b.y; w = b.w; h = b.h;
 }
