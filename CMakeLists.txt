@@ -81,6 +81,7 @@ add_executable(BlockSmith
     Fluids.h
     WeatherEffects.cpp
     WeatherEffects.h
+    Firewall.cpp
     Net.cpp
     Net.h
     PlayerMovement.cpp

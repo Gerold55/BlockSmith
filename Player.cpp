@@ -54,6 +54,10 @@ void Player::update(float deltaTime, const World& world, GLFWwindow* window, sol
     isGrounded = state.grounded;
 }
 
+// Keys mods allow (engine.set_player_controls): hunger can stop sprinting, death can stop
+// everything. Applied here, so prediction and what the server is sent always agree.
+uint8_t g_MoveKeyMask = 0xFF;
+
 MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch) {
     MoveInput in;
     in.yaw = yaw;
@@ -65,6 +69,7 @@ MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch) {
     if (isActionDown(window, "jump"))    in.keys |= MoveInput::Jump;
     if (isActionDown(window, "sneak"))   in.keys |= MoveInput::Sneak;
     if (isActionDown(window, "sprint"))  in.keys |= MoveInput::Sprint;
+    in.keys &= g_MoveKeyMask;
     return in;
 }
 

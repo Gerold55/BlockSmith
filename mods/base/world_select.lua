@@ -84,6 +84,7 @@ local state = {
     last_click_time = 0,
     name = "New World",    -- create screen fields
     seed = "",
+    game_mode = "survival", -- "survival" or "creative" (only offered if the survival mod is on)
     focus = "name",
     message = nil,         -- error shown under the title (e.g. wrong game)
     game = nil,            -- engine.get_game_info()
@@ -130,6 +131,17 @@ local function gui_scale(W, H)
     return clamp(math.floor(math.min(W / 480, H / 360) * 2) / 2, 1, 4)
 end
 
+-- Survival/creative choice: only when the survival mod is installed (it reads the choice
+-- back with engine.get_storage("world:game_mode")); without it every world is creative
+local function has_game_modes()
+    return type(survival) == "table" and survival.set_mode ~= nil
+end
+
+local MODE_INFO = {
+    survival = { label = "Survival", text = "Find blocks yourself. Watch your health and hunger." },
+    creative = { label = "Creative", text = "Unlimited blocks, break them instantly, can't get hurt." },
+}
+
 local function can_play()
     return state.game == nil or state.game.can_play ~= false
 end
@@ -162,10 +174,12 @@ local function open_create()
     state.seed = ""
     state.focus = "name"
     state.message = nil
+    state.game_mode = (has_game_modes() and survival.settings and survival.settings.default_mode) or "survival"
 end
 
 local function create_and_play()
-    local folder, err = engine.create_world(state.name, state.seed)
+    local options = has_game_modes() and { game_mode = state.game_mode } or nil
+    local folder, err = engine.create_world(state.name, state.seed, options)
     state.mode = "list"
     if not folder then
         state.message = err
@@ -342,7 +356,9 @@ local function render_list(W, H)
         end
 
         text(w.name, rx + 6 * S, ry + 4 * S, fs, C.name, true, S)
-        text("Seed: " .. tostring(w.seed), rx + 6 * S, ry + 6 * S + text_height(fs), fs * 0.85, C.detail, false, S)
+        local detail = "Seed: " .. tostring(w.seed)
+        if w.game_mode and MODE_INFO[w.game_mode] then detail = detail .. "   " .. MODE_INFO[w.game_mode].label end
+        text(detail, rx + 6 * S, ry + 6 * S + text_height(fs), fs * 0.85, C.detail, false, S)
     end
 
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
@@ -386,6 +402,14 @@ local function create_layout(W, H)
     L.seedLabelY = L.nameField.y + fh + 16 * S
     L.seedField = { x = fx, y = L.seedLabelY + text_height(fs) + 4 * S, w = fw, h = fh }
     L.hintY = L.seedField.y + fh + 4 * S
+    if has_game_modes() then
+        L.modeButton = { x = fx, y = L.hintY + text_height(fs) + 12 * S, w = fw, h = fh,
+                         label = "Game Mode: " .. MODE_INFO[state.game_mode].label, enabled = true,
+                         action = function()
+                             state.game_mode = state.game_mode == "survival" and "creative" or "survival"
+                         end }
+        L.modeTextY = L.modeButton.y + fh + 4 * S
+    end
 
     L.buttons = {
         { x = bx,            y = row2Y, w = bw, h = bh, label = "Create New World",
@@ -393,6 +417,7 @@ local function create_layout(W, H)
         { x = bx + bw + gap, y = row2Y, w = bw, h = bh, label = "Cancel",
           enabled = true, action = function() state.mode = "list" end },
     }
+    if L.modeButton then table.insert(L.buttons, L.modeButton) end
     return L
 end
 
@@ -410,6 +435,9 @@ local function render_create(W, H)
     text("Seed for the World Generator", L.fx, L.seedLabelY, fs, C.detail, false, S)
     draw_field(L.seedField, state.seed, state.focus == "seed", "Random", S, fs)
     text("Leave blank for a random seed", L.fx, L.hintY, fs * 0.85, C.detail, false, S)
+    if L.modeButton then
+        text(MODE_INFO[state.game_mode].text, L.fx, L.modeTextY, fs * 0.85, C.detail, false, S)
+    end
 
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
 end

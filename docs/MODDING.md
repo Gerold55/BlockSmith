@@ -254,7 +254,7 @@ weather.is_cold = function(x, z) return my_temperature(x, z) < 0.25 end   -- rai
 The `/weather [type [seconds]] | list | cycle on|off` command works in singleplayer and for operators on servers.
 
 **Sky:**
-- `sky.set_time(t)` / `get_time()`. Time is an angle: about `1.57` (π/2) is noon.
+- `sky.set_time(t)` / `get_time()`. Time runs from 0 to 1 over a whole day: `0.75` is midday and `0.25` is midnight (the base mod's `/day` and `/night` use these).
 - `sky.set_moon_phase(n)` / `get_moon_phase()`, `sky.set_moon_textures({ ... })`
 - `engine.set_sun_texture(path)`, `engine.set_moon_texture(path)`
 - `sky.set_sun_color(r,g,b)`, `set_ambient_color(r,g,b)`, `set_fog_color(r,g,b)`
@@ -284,6 +284,70 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
 Define `get_water_color(x, z)` to return `{ r, g, b, deep_r, deep_g, deep_b }` per place, for example by biome.
 
 **Camera:** `engine.set_fov(degrees)`, `engine.is_third_person()`
+
+## Survival: health, hunger, digging
+
+The engine has the mechanics; **`mods/survival`** has Minecraft's rules, and a game can tune or replace them:
+- 10 hearts and 10 hunger (with saturation)
+- fall damage, drowning (with air bubbles) and lava damage
+- regeneration and starvation
+- no sprinting when hungry
+- eating, a death screen and respawning
+- `/gamemode survival|creative`
+
+**Creative or survival:** `engine.set_creative(bool)`.
+- Creative: blocks break with one click, placing is free, and the creative menu opens.
+- Survival: you **hold** to dig, with a crack overlay that darkens in stages. Placing uses one from the stack, and dug blocks go into the hotbar.
+
+**How long a block takes to dig**, as `register_block` properties or with `engine.override_block(name, {...})` for blocks another mod made:
+
+| property | meaning |
+|---|---|
+| `hardness` | seconds to dig by hand (0 = instant, -1 = can't be dug). If it's not set, the engine guesses from the name: dirt 0.6, logs 2, stone 1.5... |
+| `tool` | the tool type that digs it fastest: `"pickaxe"`, `"axe"`, `"shovel"` |
+| `needs_tool` | without that tool it's 3.3× slower and drops nothing (stone, ores) |
+| `drops` | what it gives (`""` = nothing). By default it drops itself. |
+| `tool_type`, `tool_speed` | on an **item**: it's a tool of that type, and digs that many times faster |
+
+```lua
+engine.register_block("iron_pickaxe", 1, 1, 1, "iron_pickaxe.png", nil,
+    { inventory_image = "iron_pickaxe.png", tool_type = "pickaxe", tool_speed = 6 })
+engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
+```
+
+**Hooks:**
+- `get_dig_time(block, item)` returns seconds, to replace the rule.
+- `on_dig_block(x, y, z, block, item)` returns true if you handled the drops (random drops, XP...).
+- `on_player_click(button)` returns true to use a click before digging or placing.
+
+**Player functions:**
+- `engine.get_player_state()` gives position, velocity, `on_ground`, `sprinting`, `sneaking`, `jumping`, and `feet_fluid` / `head_fluid`.
+- `engine.set_player_controls{ move, jump, sprint, sneak }` blocks keys. Prediction and the server stay in sync.
+- `engine.set_player_position(x, y, z)`, `engine.add_player_velocity(...)`.
+- `engine.respawn_player(x, y, z)`. On a server, the server's spawn is used.
+
+**Saving and drawing:**
+- `engine.get_storage(key)` / `set_storage(key, text)` keep text with the world, like Luanti's mod storage.
+- `render_hud(W, H)` draws your HUD. `ui.draw_image(path, x, y, w, h [, u0, v0, u1, v1])` draws a picture, and `hotbar.get_rect(W, H)` says where the hotbar is.
+
+**Your own inventory screen:**
+- `toggle_main_inventory()` returns true when it's now open. While it's open the engine frees the mouse, and Escape closes it.
+- `render_inventory(W, H)` draws it, with all the `ui.*` functions.
+- Clicks arrive in `handle_inventory_click(mx, my, W, H, button, shift)`.
+- `engine.set_inventory_open(bool)` closes it from Lua.
+- `on_hotbar_full(item, count)` takes items that don't fit in the hotbar.
+
+The survival mod has a complete Minecraft-style one: 27 slots plus the hotbar, click / right-click / shift-click. Other mods can use `survival.inventory.add / get / set / clear`.
+
+**The crack picture:** `engine.set_dig_crack_texture(file [, stages])` takes a vertical strip of squares. Leave out `stages` to count them from the picture. A game's `crack_anylength.png`, Luanti's name for it, is used automatically.
+
+**HUD pictures** are drawn long after mods load, so give `ui.draw_image` a full path to anything in your mod's folder (the survival mod does this for you). Plain names are looked for in the game's textures folder.
+
+**Survival mod API:**
+- `survival.damage(amount, reason)`, `heal`, `feed`
+- `survival.register_food(item, food, saturation)`
+- `survival.on_damage`, `on_death`, `on_respawn`
+- `survival.set_mode`, and `survival.settings` (max health, fall distance, keep inventory, lava damage...)
 
 ## 10. Models
 

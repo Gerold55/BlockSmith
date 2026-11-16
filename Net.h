@@ -133,6 +133,8 @@ public:
 
     // Dedicated server helpers
     std::vector<std::string> playerNames() const;                              // joined players
+    // Moves a player (respawn, /tp). Their game follows on the next position update.
+    bool teleportPlayer(const std::string& name, const glm::vec3& pos);
     std::vector<std::pair<std::string, glm::vec3>> playerPositions() const;   // for saving
     bool kickPlayer(const std::string& name, const std::string& reason);
     // Where a returning player should appear (return true + set pos), and a hook for
@@ -347,6 +349,8 @@ private:
 
     // Server clock estimate (for interpolating other players)
     double m_clockOffset = 0.0;           // server clock - our clock
+    double m_jitter = 0.0;                // how late updates arrive, recently (seconds)
+    double m_interpDelay = 0.1;           // how far in the past other players are drawn
     bool m_clockSynced = false;
 };
 

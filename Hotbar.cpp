@@ -639,3 +639,10 @@ void Hotbar::render3DIcons(GLuint voxelShader, GLuint textureArrayID) {
     if (unlitLoc != -1) glUniform1i(unlitLoc, 0);
     if (depthWasOn) glEnable(GL_DEPTH_TEST);
 }
+
+// Where the bar is on screen, in pixels (top-left x, y and size), for mods drawing HUD
+// pieces next to it (hearts, hunger): Lua hotbar.get_rect(W, H).
+void hotbarScreenRect(const Hotbar& hb, float W, float H, float& x, float& y, float& w, float& h) {
+    const BarLayout b = computeBar(hb, W, H);
+    x = b.x; y = b.y; w = b.w; h = b.h;
+}

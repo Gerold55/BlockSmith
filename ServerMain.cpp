@@ -1103,7 +1103,7 @@ int main(int argc, char** argv) {
         // reply)): Lua decides who may use them
         static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed",
             "games", "mods", "motd", "name", "say", "kick", "ban", "unban", "banlist", "whitelist", "op", "deop",
-            "ops", "password"};
+            "ops", "password", "respawn"};
         if (!builtIn.count(cmd)) {
             sol::protected_function fn = lua["on_chat_command"];
             if (fn.valid()) {
@@ -1116,6 +1116,14 @@ int main(int argc, char** argv) {
                     return;   // a mod handled it
                 }
             }
+        }
+        // /respawn: back to the spawn point (sent by the game after dying when joined)
+        if (cmd == "respawn" && !console) {
+            const int sx = config.spawnX, sz = config.spawnZ;
+            int ground = world.groundHeightAt(sx, sz);
+            if (ground < 0) ground = 80;
+            server.teleportPlayer(from, glm::vec3(sx + 0.5f, static_cast<float>(ground), sz + 0.5f));
+            return;
         }
         const std::set<std::string> everyone = {"help", "list", "msg"};
         if (!op && !everyone.count(cmd)) {

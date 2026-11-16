@@ -54,6 +54,12 @@ end
 -- and says where it was expected if it's missing (else the item shows as a white square).
 local function find_image(image, dir)
     dir = dir or g_CurrentModPath or "."
+    if engine.find_texture then   -- the engine knows every mod's folder (Lua has no file access)
+        local found = engine.find_texture(image)
+        if found then return found end
+        print("[Buckets] Can't find " .. image .. " - put it in " .. dir .. "/textures/")
+        return image
+    end
     if not (io and io.open) then return image end
     for _, path in ipairs({ dir .. "/textures/" .. image, dir .. "/" .. image }) do
         local f = io.open(path, "rb")

@@ -13,6 +13,20 @@
 
 using TextureLoader = std::function<int(const std::string& path)>;   // -> texture layer, or -1
 
+struct BlockProperty;
+
+// Survival digging fields from a Lua table (hardness, tool, needs_tool, drops, tool_type,
+// tool_speed). Used by register_block's properties and engine.override_block.
+void applyDigProperties(BlockProperty& block, const sol::table& props);
+
+// Seconds to dig a block by hand: its hardness, or a sensible guess from its name for
+// blocks registered without one (stone 1.5, logs 2, dirt 0.5, leaves 0.2, plants 0...).
+// -1 = can't be dug.
+float blockHardness(const BlockProperty& block);
+// The tool type a block wants when it didn't say ("pickaxe" for stone, "axe" for wood...)
+std::string blockTool(const BlockProperty& block);
+bool blockNeedsTool(const BlockProperty& block);
+
 void registerBlockDefinition(const std::string& name, float r, float g, float b,
                              sol::object texObj, sol::object overlayObj,
                              sol::optional<sol::table> propsTable, const TextureLoader& loadTexture);

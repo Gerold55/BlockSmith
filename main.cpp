@@ -113,7 +113,81 @@ LightingSystem* g_LightingSystem = nullptr;
 Skybox* g_Skybox = nullptr;
 Clouds* g_Clouds = nullptr;
 WeatherEffects g_Weather;
-glm::vec3 g_PlayerPosition(0.0f);   // feet, updated every frame (engine.get_player_position)   // rain/snow/sky tint/flashes - decided in Lua (mods/weather)
+glm::vec3 g_PlayerPosition(0.0f);   // feet, updated every frame (engine.get_player_position)
+
+// Survival / creative (engine.set_creative). Creative: blocks break at once and placing is
+// free. Survival: hold to dig (block hardness and tools), placing uses up the stack.
+bool g_Creative = true;
+struct DigState {
+    bool active = false;
+    glm::ivec3 pos{0};
+    float progress = 0.0f;   // 0..1
+    float seconds = 1.0f;    // how long this block takes with the held item
+    float cooldown = 0.0f;   // short pause after each block, like Minecraft
+    float particleTimer = 0.0f;
+} g_Dig;
+// Crack picture for survival digging (engine.set_dig_crack_texture): a vertical strip of
+// `stages` square pictures, first stage at the top. 0 = no picture: a darkening box instead.
+GLuint g_CrackTexture = 0;
+int g_CrackStages = 10;
+// A mod's own inventory screen (survival): open/closed (toggle_main_inventory decides)
+bool g_LuaInventoryOpen = false;
+sol::state* g_Lua = nullptr;   // the game's Lua, for engine code that needs to call a hook
+
+// Mod storage (engine.get_storage / set_storage): text values saved with the world,
+// in saves/<world>/mod_storage.txt, so mods remember health, hunger, game mode...
+std::unordered_map<std::string, std::string> g_ModStorage;
+bool g_ModStorageDirty = false;
+uint8_t g_LastMoveKeys = 0;   // movement keys held this frame (after engine.set_player_controls)
+
+// Puts items in the hotbar: onto a stack of the same item, else the first empty slot.
+void hotbarScreenRect(const Hotbar& hb, float W, float H, float& x, float& y, float& w, float& h);   // Hotbar.cpp
+
+bool giveHotbarItem(const std::string& name, int count) {
+    if (!g_Hotbar) return false;
+    const uint8_t id = BlockRegistry::getInstance().getBlockId(name);
+    if (id == 0) return false;
+    const int n = std::max(1, count);
+    for (int i = 0; i < g_Hotbar->slotCount; ++i) {
+        HotbarSlot s = g_Hotbar->getSlot(i);
+        if (s.blockId == id && s.count + n <= 64) { g_Hotbar->setSlot(i, id, s.count + n); return true; }
+    }
+    for (int i = 0; i < g_Hotbar->slotCount; ++i) {
+        if (g_Hotbar->getSlot(i).blockId == 0) { g_Hotbar->setSlot(i, id, n); return true; }
+    }
+    // Hotbar full: a mod's inventory may take it - on_hotbar_full(name, count) -> true if stored
+    if (g_Lua) {
+        sol::protected_function hook = (*g_Lua)["on_hotbar_full"];
+        if (hook.valid()) {
+            auto r = hook(name, n);
+            if (r.valid() && r.get_type() == sol::type::boolean && r.get<bool>()) return true;
+        }
+    }
+    return false;
+}
+
+std::string escapeStorage(const std::string& v) {
+    std::string o;
+    for (char ch : v) {
+        if (ch == '\\') o += "\\\\";
+        else if (ch == '\n') o += "\\n";
+        else if (ch == '\t') o += "\\t";
+        else o += ch;
+    }
+    return o;
+}
+std::string unescapeStorage(const std::string& v) {
+    std::string o;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            const char n = v[++i];
+            o += n == 'n' ? '\n' : n == 't' ? '\t' : n;
+        } else {
+            o += v[i];
+        }
+    }
+    return o;
+}   // rain/snow/sky tint/flashes - decided in Lua (mods/weather)
 // Shared values (engine.set_shared): decided by whoever runs the world (singleplayer, the
 // host, or the server) and seen by every player. Here: this game's own copy.
 std::unordered_map<std::string, std::string> g_SharedValues;
@@ -385,6 +459,11 @@ void saveCurrentWorld() {
     if (!w || w->saveDirectory().empty()) return;
 
     const int written = w->saveAll();
+    {
+        std::ofstream f(fs::path(w->saveDirectory()) / "mod_storage.txt");
+        for (const auto& [k, v] : g_ModStorage) f << escapeStorage(k) << '\t' << escapeStorage(v) << '\n';
+        g_ModStorageDirty = false;
+    }
     const bool metaOk = writeWorldMeta(fs::path(w->saveDirectory()) / "world.dat", w->seed(),
                                        g_PlayerInstance, g_LoadedGameFolder);
     std::cout << "[Save] Saved '" << g_ActiveWorldName << "' (" << written << " changed chunks"
@@ -419,6 +498,16 @@ bool openActiveWorld(World& world, Player& player) {
     world.reset();
     g_SharedValues.clear();   // shared values (weather...) belong to a world
     g_SharedChanged.clear();
+    g_ModStorage.clear();     // so does mod storage
+    {
+        std::ifstream f(dir / "mod_storage.txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t tab = line.find('\t');
+            if (tab != std::string::npos) g_ModStorage[unescapeStorage(line.substr(0, tab))] = unescapeStorage(line.substr(tab + 1));
+        }
+    }
+    g_Dig = DigState{};
     world.setSaveDirectory(dir.string());
     world.setSeed(existing ? meta.seed : randomSeed());
 
@@ -470,8 +559,22 @@ struct SavedWorldInfo {
     std::string name;
     std::string seed;
     std::string game;
+    std::string gameMode;   // "world:game_mode" from its mod storage ("" = not set)
     fs::file_time_type lastPlayed;
 };
+
+// One value from a world's mod storage (saves/<world>/mod_storage.txt), "" if not there
+std::string readWorldStorage(const fs::path& worldDir, const std::string& key) {
+    std::ifstream f(worldDir / "mod_storage.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t tab = line.find('\t');
+        if (tab != std::string::npos && unescapeStorage(line.substr(0, tab)) == key) {
+            return unescapeStorage(line.substr(tab + 1));
+        }
+    }
+    return "";
+}
 
 // Worlds for the game currently selected on the title screen, most recently played first.
 // Older saves with no game recorded are shown for every game until one opens them.
@@ -492,6 +595,7 @@ std::vector<SavedWorldInfo> listSavedWorlds() {
         info.game = meta.game;
         if (!info.game.empty() && info.game != g_ActiveGameFolder) continue;   // another game's world
 
+        info.gameMode = readWorldStorage(entry.path(), "world:game_mode");
         info.lastPlayed = fs::exists(dat, ec) ? fs::last_write_time(dat, ec) : fs::last_write_time(entry.path(), ec);
         list.push_back(info);
     }
@@ -501,8 +605,11 @@ std::vector<SavedWorldInfo> listSavedWorlds() {
     return list;
 }
 
-// Creates saves/<name>/ with a world.dat holding the seed. Returns the folder name used.
-std::string createWorld(const std::string& rawName, const std::string& seedText) {
+// Creates saves/<name>/ with a world.dat holding the seed. `options` (e.g. game_mode =
+// "survival") go into the new world's mod storage as world:<key>, for mods to read with
+// engine.get_storage("world:game_mode"). Returns the folder name used.
+std::string createWorld(const std::string& rawName, const std::string& seedText,
+                        const std::map<std::string, std::string>& options = {}) {
     const std::string base = sanitizeWorldName(rawName);
     std::string name = base;
     for (int n = 2; fs::exists(savesRoot() / name); ++n) {
@@ -512,6 +619,10 @@ std::string createWorld(const std::string& rawName, const std::string& seedText)
     std::error_code ec;
     fs::create_directories(savesRoot() / name / "chunks", ec);
     writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_LoadedGameFolder);
+    if (!options.empty()) {
+        std::ofstream f(savesRoot() / name / "mod_storage.txt");
+        for (const auto& [k, v] : options) f << escapeStorage("world:" + k) << '\t' << escapeStorage(v) << '\n';
+    }
     std::cout << "[World] Created save folder '" << name << "' for game '" << g_LoadedGameFolder << "'" << std::endl;
     return name;
 }
@@ -1010,6 +1121,37 @@ bool uploadStandard(GLuint texID, const TextureSource& src) {
     return true;
 }
 
+// Every folder a mod was loaded from. Pictures asked for after loading (the HUD, items
+// used later) are looked for in all of them, since by then the "current mod" is just
+// whichever loaded last.
+std::vector<std::string> g_ModFolders;
+
+// Where a picture is. The calling mod's own folder comes first, so a mod always gets its
+// own picture even if the game or another folder has a file with the same name.
+// "" if nowhere.
+std::string findTextureFile(const std::string& path) {
+    std::vector<std::string> searchPaths = {
+        g_CurrentModPath + "/textures/" + path,
+        g_CurrentModPath + "/" + path,
+        "../../" + g_CurrentModPath + "/textures/" + path,
+        "../../" + g_CurrentModPath + "/" + path,
+        path,
+        "textures/" + path,
+        "../../textures/" + path,
+        "games/" + g_ActiveGameFolder + "/textures/" + path,
+        "../../games/" + g_ActiveGameFolder + "/textures/" + path
+    };
+    for (const auto& dir : g_ModFolders) {
+        searchPaths.push_back(dir + "/textures/" + path);
+        searchPaths.push_back(dir + "/" + path);
+    }
+    for (const auto& p : searchPaths) {
+        std::error_code ec;
+        if (!p.empty() && fs::is_regular_file(p, ec)) return fs::absolute(p, ec).string();
+    }
+    return "";
+}
+
 GLuint loadStandardTexture(const std::string& path) {
     std::string finalPath = path;
     std::vector<std::string> searchPaths = {
@@ -1022,6 +1164,10 @@ GLuint loadStandardTexture(const std::string& path) {
         "games/" + g_ActiveGameFolder + "/textures/" + path,
         "../../games/" + g_ActiveGameFolder + "/textures/" + path
     };
+    for (const auto& dir : g_ModFolders) {   // any loaded mod's folder (see g_ModFolders)
+        searchPaths.push_back(dir + "/textures/" + path);
+        searchPaths.push_back(dir + "/" + path);
+    }
 
     bool found = false;
     for (const auto& p : searchPaths) {
@@ -1470,6 +1616,10 @@ local hooks = {
     { "on_update",                "(dt)  every frame" },
     { "on_chat_command",          "(text, player, is_operator, reply) -> true if handled  a /command" },
     { "on_shared_changed",        "(key, value)  a shared value changed (engine.set_shared; e.g. the weather)" },
+    { "render_hud",               "(W, H)  draw HUD pieces every frame in game (hearts, hunger...)" },
+    { "on_player_click",          "(\"left\"|\"right\") -> true if used  before digging/placing (death screen...)" },
+    { "on_dig_block",             "(x, y, z, block, item) -> true if you handled the drops  (survival digging)" },
+    { "get_dig_time",             "(block, item) -> seconds  override how long a block takes to dig" },
     { "on_right_click_block",     "(x, y, z, block, held_item) -> true if handled" },
     { "on_use_hoe",               "(x, y, z, block)  right-click with a hoe" },
     { "on_use_scythe",            "(x, y, z, block)  left-click with a scythe" },
@@ -1477,8 +1627,9 @@ local hooks = {
     { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
     { "on_char_input",            "(codepoint)  typed text (unicode)" },
     { "on_scroll_input",          "(dx, dy)  mouse wheel" },
-    { "toggle_main_inventory",    "()  the inventory key was pressed" },
-    { "handle_inventory_click",   "(mx, my, W, H)  click while the inventory is open" },
+    { "toggle_main_inventory",    "() -> true if now open  the inventory key in survival (frees the mouse)" },
+    { "handle_inventory_click",   "(mx, my, W, H, \"left\"|\"right\", shift)  click while your inventory is open" },
+    { "on_hotbar_full",           "(item, count) -> true if stored  a dug item didn't fit in the hotbar" },
     { "render_pause_menu",        "(W, H)  draw the pause menu" },
     { "handle_pause_click",       "(mx, my, W, H)" },
     { "render_settings",          "(W, H)  settings screen (also handle_settings_click/_key/_char/_scroll)" },
@@ -1748,6 +1899,34 @@ std::vector<ServerModEntry> listModsForGame(const std::string& game) {
 
 // BlockSmithServer.exe is built next to the game's .exe; also check the usual build folders
 // (and the server's old name, CraftRuinServer, from before the engine was named).
+// Firewall.cpp: asks Windows to let `program` ("" = this game) accept connections
+bool allowThroughFirewall(const std::string& program, const std::string& ruleName);
+
+// The first time something is hosted here, ask Windows Firewall to let other PCs in (one
+// "allow" prompt). Without it the LAN list shows the game but joining it times out.
+void askFirewallOnce(const std::string& settingKey, const std::string& program, const std::string& ruleName) {
+#ifdef _WIN32
+    if (g_Settings[settingKey] == "1") return;
+    if (g_ChatSystem) {
+        g_ChatSystem->addMessage("Windows will ask to let " + ruleName + " through the firewall, so other PCs on your network can join.",
+                                 glm::vec3(1.0f, 1.0f, 0.4f));
+    }
+    if (allowThroughFirewall(program, ruleName)) {
+        g_Settings[settingKey] = "1";
+        saveSettings();
+        std::cout << "[Network] Firewall rule added for " << ruleName << std::endl;
+    } else {
+        std::cout << "[Network] Firewall rule not added (declined) - other PCs may not be able to join" << std::endl;
+        if (g_ChatSystem) {
+            g_ChatSystem->addMessage("Firewall not changed - if friends can't join, allow " + ruleName +
+                                     " in Windows Security > Firewall > Allow an app.", glm::vec3(1.0f, 0.7f, 0.4f));
+        }
+    }
+#else
+    (void)settingKey; (void)program; (void)ruleName;
+#endif
+}
+
 fs::path findServerExe() {
 #ifdef _WIN32
     const std::vector<std::string> names = {"BlockSmithServer.exe", "CraftRuinServer.exe"};
@@ -2284,8 +2463,9 @@ void main() {
 const char* wireframeFragmentShaderSource = R"(
 #version 330 core
 out vec4 FragColor;
+uniform vec4 u_Color;   // outline: black; survival digging: a darkening box
 void main() {
-    FragColor = vec4(0.0, 0.0, 0.0, 0.9);
+    FragColor = u_Color;
 }
 )";
 
@@ -2715,6 +2895,17 @@ int main(int argc, char** argv) {
                 }
 
                 if (key == keyForAction("inventory")) {
+                    // Survival: no creative menu (free blocks); a mod may show its own inventory
+                    if (!g_Creative && !g_Inventory.isCreativeOpen()) {
+                        // toggle_main_inventory() -> true if it's now open
+                        sol::protected_function toggleInv = (*c->lua)["toggle_main_inventory"];
+                        if (toggleInv.valid()) {
+                            auto r = toggleInv();
+                            g_LuaInventoryOpen = r.valid() && r.get_type() == sol::type::boolean && r.get<bool>();
+                            glfwSetInputMode(win, GLFW_CURSOR, g_LuaInventoryOpen ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+                        }
+                        return;
+                    }
                     // Use native C++ inventory toggle & cursor update
                     g_Inventory.toggleCreative();
                     int currentMode = glfwGetInputMode(win, GLFW_CURSOR);
@@ -2731,6 +2922,13 @@ int main(int argc, char** argv) {
 
                 if (key == GLFW_KEY_ESCAPE) {
                     // Escape closes the inventory first; otherwise it opens the pause menu
+                    if (g_LuaInventoryOpen) {
+                        sol::protected_function toggleInv = (*c->lua)["toggle_main_inventory"];
+                        if (toggleInv.valid()) toggleInv();
+                        g_LuaInventoryOpen = false;
+                        glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                        return;
+                    }
                     if (g_Inventory.isCreativeOpen()) {
                         g_Inventory.setCreativeOpen(false);
                         glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
@@ -2784,6 +2982,49 @@ int main(int argc, char** argv) {
         // ui.* table
         // ------------------------------------------------------------------
         auto uiTable = lua.create_named_table("ui");
+        // ui.draw_image(path, x, y, w, h [, u0, v0, u1, v1]) - a picture (png) on screen, in pixels.
+        //   u0..v1 pick part of the image (0..1), e.g. one icon from a sheet. Found in the
+        //   mod's folder / textures/ like block textures. Loaded once, then cached.
+        uiTable["draw_image"] = [texturedUIProgram](const std::string& path, float x, float y, float w, float h,
+                                                     sol::optional<float> u0, sol::optional<float> v0,
+                                                     sol::optional<float> u1, sol::optional<float> v1) {
+            static std::unordered_map<std::string, GLuint> cache;
+            static GLuint vao = 0, vbo = 0;
+            auto it = cache.find(path);
+            if (it == cache.end()) it = cache.emplace(path, loadStandardTexture(path)).first;
+            if (it->second == 0 || w <= 0.0f || h <= 0.0f) return;
+            GLint vp[4];
+            glGetIntegerv(GL_VIEWPORT, vp);
+            const float sw = static_cast<float>(vp[2]), sh = static_cast<float>(vp[3]);
+            if (sw <= 0 || sh <= 0) return;
+            const float x0 = x / sw * 2.0f - 1.0f, x1 = (x + w) / sw * 2.0f - 1.0f;
+            const float y0 = 1.0f - (y + h) / sh * 2.0f, y1 = 1.0f - y / sh * 2.0f;
+            const float a = u0.value_or(0.0f), b = v0.value_or(0.0f), c = u1.value_or(1.0f), d = v1.value_or(1.0f);
+            const float verts[24] = { x0, y0, a, d,  x1, y0, c, d,  x1, y1, c, b,
+                                      x0, y0, a, d,  x1, y1, c, b,  x0, y1, a, b };
+            if (vao == 0) {
+                glGenVertexArrays(1, &vao);
+                glGenBuffers(1, &vbo);
+                glBindVertexArray(vao);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+                glEnableVertexAttribArray(1);
+            }
+            glUseProgram(texturedUIProgram);
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, it->second);
+            glUniform1i(glGetUniformLocation(texturedUIProgram, "u_Texture"), 0);
+            glBindVertexArray(vao);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glBindVertexArray(0);
+        };
 
         uiTable["get_mouse_pos"] = [window]() {
             double x, y;
@@ -2905,6 +3146,13 @@ int main(int argc, char** argv) {
             return std::make_tuple(BlockRegistry::getInstance().getBlock(slot.blockId).name, slot.count);
         };
 
+        // hotbar.get_rect(W, H) -> x, y, w, h: where the bar is drawn (pixels, top-left), so HUD
+        // mods can put hearts and hunger right above it
+        hotbarTable["get_rect"] = [](float W, float H) {
+            float x = 0, y = 0, w = 0, h = 0;
+            if (g_Hotbar) hotbarScreenRect(*g_Hotbar, W, H, x, y, w, h);
+            return std::make_tuple(x, y, w, h);
+        };
         hotbarTable["get_active_slot"] = []() { return g_Hotbar ? g_Hotbar->activeSlot + 1 : 1; };
         hotbarTable["set_active_slot"] = [](int slotIndex) {
             if (g_Hotbar) {
@@ -3312,6 +3560,166 @@ int main(int argc, char** argv) {
         engineTable["get_player_position"] = []() {
             return std::make_tuple(g_PlayerPosition.x, g_PlayerPosition.y, g_PlayerPosition.z);
         };
+        // ---- Survival building blocks (mods/survival uses these; any game can) ----
+        // engine.set_creative(bool) / engine.is_creative()
+        //   creative: blocks break instantly, placing is free, the creative menu opens
+        //   survival: hold to dig (hardness, tools), placing uses up the stack, no creative menu
+        engineTable["set_creative"] = [](bool on) {
+            g_Creative = on;
+            g_Dig = DigState{};
+            if (!on && g_Inventory.isCreativeOpen()) g_Inventory.setCreativeOpen(false);
+        };
+        engineTable["is_creative"] = []() { return g_Creative; };
+
+        // engine.get_player_state() -> { x, y, z, vx, vy, vz, yaw, pitch, on_ground, moving,
+        //   sprinting, sneaking, jumping, feet_fluid, head_fluid }   (fluid names or nil)
+        engineTable["get_player_state"] = [](sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            Player* p = g_PlayerInstance;
+            if (!p) return sol::make_object(lv, sol::lua_nil);
+            sol::table t = lv.create_table();
+            t["x"] = p->position.x; t["y"] = p->position.y; t["z"] = p->position.z;
+            t["vx"] = p->velocity.x; t["vy"] = p->velocity.y; t["vz"] = p->velocity.z;
+            t["yaw"] = p->yaw; t["pitch"] = p->pitch;
+            t["on_ground"] = p->isGrounded;
+            const uint8_t k = g_LastMoveKeys;
+            const bool moving = (k & (MoveInput::Forward | MoveInput::Back | MoveInput::Left | MoveInput::Right)) != 0;
+            t["moving"] = moving;
+            t["sprinting"] = moving && (k & MoveInput::Sprint) != 0;
+            t["sneaking"] = (k & MoveInput::Sneak) != 0;
+            t["jumping"] = (k & MoveInput::Jump) != 0;
+            if (g_WorldInstance) {
+                auto fluidAt = [](const glm::vec3& v) -> const FluidDef* {
+                    FluidRegistry::get().ensureFresh();
+                    return FluidRegistry::get().forBlock(g_WorldInstance->getBlockAt(glm::ivec3(
+                        static_cast<int>(std::floor(v.x)), static_cast<int>(std::floor(v.y)), static_cast<int>(std::floor(v.z)))));
+                };
+                if (const FluidDef* f = fluidAt(p->position + glm::vec3(0.0f, 0.1f, 0.0f))) t["feet_fluid"] = f->name;
+                if (const FluidDef* f = fluidAt(p->position + glm::vec3(0.0f, 1.62f, 0.0f))) t["head_fluid"] = f->name;
+            }
+            return t;
+        };
+        // engine.set_player_position(x, y, z) -> true; false when joined to a server
+        engineTable["set_player_position"] = [](float x, float y, float z) {
+            if (!g_PlayerInstance || g_Client.state() == GameClient::State::Joined) return false;
+            g_PlayerInstance->position = glm::vec3(x, y, z);
+            g_PlayerInstance->velocity = glm::vec3(0.0f);
+            return true;
+        };
+        // engine.add_player_velocity(vx, vy, vz): a push (knockback). Singleplayer/host only.
+        engineTable["add_player_velocity"] = [](float x, float y, float z) {
+            if (!g_PlayerInstance || g_Client.state() == GameClient::State::Joined) return false;
+            g_PlayerInstance->velocity += glm::vec3(x, y, z);
+            return true;
+        };
+        // engine.respawn_player(x, y, z): back to a spawn point. When joined, the server
+        // moves you to its spawn instead (the coordinates are ignored).
+        engineTable["respawn_player"] = [](sol::optional<float> x, sol::optional<float> y, sol::optional<float> z) {
+            if (g_Client.state() == GameClient::State::Joined) { g_Client.sendCommand("respawn"); return true; }
+            if (!g_PlayerInstance || !x || !y || !z) return false;
+            g_PlayerInstance->position = glm::vec3(*x, *y, *z);
+            g_PlayerInstance->velocity = glm::vec3(0.0f);
+            return true;
+        };
+        // engine.set_player_controls{ move = bool, jump = bool, sprint = bool, sneak = bool }
+        //   e.g. sprint = false when hungry, everything false while dead. Missing = unchanged.
+        engineTable["set_player_controls"] = [](sol::table t) {
+            auto flag = [&t](const char* name, uint8_t bits) {
+                sol::optional<bool> on = t[name];
+                if (!on) return;
+                if (*on) g_MoveKeyMask |= bits; else g_MoveKeyMask &= static_cast<uint8_t>(~bits);
+            };
+            flag("move", MoveInput::Forward | MoveInput::Back | MoveInput::Left | MoveInput::Right);
+            flag("jump", MoveInput::Jump);
+            flag("sprint", MoveInput::Sprint);
+            flag("sneak", MoveInput::Sneak);
+        };
+
+        // engine.get_storage(key) -> text or nil; engine.set_storage(key, text or nil)
+        //   saved with the world (singleplayer and hosting; kept in memory when joined)
+        engineTable["get_storage"] = [](const std::string& key, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            const auto it = g_ModStorage.find(key);
+            if (it == g_ModStorage.end()) return sol::make_object(lv, sol::lua_nil);
+            return sol::make_object(lv, it->second);
+        };
+        engineTable["set_storage"] = [](const std::string& key, sol::optional<std::string> value) {
+            if (value) g_ModStorage[key] = *value; else g_ModStorage.erase(key);
+            g_ModStorageDirty = true;
+        };
+
+        // engine.set_dig_crack_texture(file, stages): the crack drawn on a block being dug, a
+        //   vertical strip of `stages` square pictures (first stage at the top), like
+        //   Minecraft's destroy stages. "" goes back to the plain darkening box.
+        //   Leave out `stages` to count them from the picture (height / width), like Luanti's
+        //   crack_anylength.png - which the engine also uses by itself if the game has one.
+        engineTable["set_dig_crack_texture"] = [](const std::string& path, sol::optional<int> stages) {
+            g_CrackTexture = path.empty() ? 0 : loadStandardTexture(path);
+            int n = stages.value_or(0);
+            if (g_CrackTexture != 0 && n <= 0) {
+                GLint w = 0, h = 0;
+                glBindTexture(GL_TEXTURE_2D, g_CrackTexture);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                n = (w > 0 && h >= w) ? h / w : 1;
+            }
+            g_CrackStages = std::clamp(n > 0 ? n : 10, 1, 64);
+            return g_CrackTexture != 0 || path.empty();
+        };
+        // engine.find_texture(name) -> full path, or nil if no such picture (looks in the game's
+        //   textures, the calling mod's folder and every loaded mod's folder)
+        engineTable["find_texture"] = [](const std::string& name, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            const std::string found = findTextureFile(name);
+            if (found.empty()) return sol::make_object(lv, sol::lua_nil);
+            return sol::make_object(lv, found);
+        };
+        // engine.set_inventory_open(bool) / engine.is_inventory_open(): a mod's inventory screen
+        //   (frees the mouse while open; clicks go to handle_inventory_click)
+        engineTable["set_inventory_open"] = [window](bool open) {
+            g_LuaInventoryOpen = open;
+            glfwSetInputMode(window, GLFW_CURSOR, open ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+        };
+        engineTable["is_inventory_open"] = []() { return g_LuaInventoryOpen; };
+        // engine.get_dig_progress() -> progress (0..1), x, y, z - or nil when not digging
+        engineTable["get_dig_progress"] = []() -> std::tuple<sol::optional<float>, int, int, int> {
+            if (!g_Dig.active) return { sol::nullopt, 0, 0, 0 };
+            return { g_Dig.progress, g_Dig.pos.x, g_Dig.pos.y, g_Dig.pos.z };
+        };
+        // engine.override_block(name, { hardness, tool, needs_tool, drops, tool_type, tool_speed,
+        //   in_creative }) - change a block another mod registered (like Luanti's override_item)
+        engineTable["override_block"] = [](const std::string& name, sol::table props) {
+            auto& reg = BlockRegistry::getInstance();
+            const uint8_t id = reg.getBlockId(name);
+            if (id == 0) return false;
+            BlockProperty b = reg.getBlock(id);
+            applyDigProperties(b, props);
+            b.in_creative = props.get_or("in_creative", b.in_creative);
+            reg.registerBlock(b);
+            return true;
+        };
+        // engine.get_block_def(name) -> { name, hardness (by hand, s), tool, needs_tool, drops,
+        //   tool_type, tool_speed, solid, item } or nil
+        engineTable["get_block_def"] = [](const std::string& name, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            auto& reg = BlockRegistry::getInstance();
+            const uint8_t id = reg.getBlockId(name);
+            if (id == 0) return sol::make_object(lv, sol::lua_nil);
+            const BlockProperty& b = reg.getBlock(id);
+            sol::table t = lv.create_table();
+            t["name"] = b.name;
+            t["hardness"] = blockHardness(b);
+            t["tool"] = blockTool(b);
+            t["needs_tool"] = blockNeedsTool(b);
+            t["drops"] = b.dropsSet ? b.drops : b.name;
+            t["tool_type"] = b.toolType;
+            t["tool_speed"] = b.toolSpeed;
+            t["solid"] = b.isWalkable;
+            t["item"] = !b.inventoryImage.empty();
+            return t;
+        };
+
         // engine.is_outdoors(x, y, z) -> true if nothing is above (rain reaches it)
         engineTable["is_outdoors"] = [](int x, int y, int z) {
             return g_WorldInstance && g_WorldInstance->hasSkyAbove(glm::ivec3(x, y, z));
@@ -3319,18 +3727,7 @@ int main(int argc, char** argv) {
         // engine.give_item(name [, count]) -> true if it fit: into a slot holding the same item,
         // else the first empty slot
         engineTable["give_item"] = [](const std::string& name, sol::optional<int> count) {
-            if (!g_Hotbar) return false;
-            const uint8_t id = BlockRegistry::getInstance().getBlockId(name);
-            if (id == 0) return false;
-            const int n = std::max(1, count.value_or(1));
-            for (int i = 0; i < g_Hotbar->slotCount; ++i) {
-                HotbarSlot s = g_Hotbar->getSlot(i);
-                if (s.blockId == id && s.count + n <= 64) { g_Hotbar->setSlot(i, id, s.count + n); return true; }
-            }
-            for (int i = 0; i < g_Hotbar->slotCount; ++i) {
-                if (g_Hotbar->getSlot(i).blockId == 0) { g_Hotbar->setSlot(i, id, n); return true; }
-            }
-            return false;
+            return giveHotbarItem(name, count.value_or(1));
         };
 
         engineTable["draw_text"] = [&](std::string text, float x, float y) {
@@ -3458,17 +3855,30 @@ int main(int argc, char** argv) {
                 sol::table e = lua.create_table();
                 e["name"] = w.name;
                 e["seed"] = w.seed;
+                if (!w.gameMode.empty()) e["game_mode"] = w.gameMode;
                 t[idx++] = e;
             }
             return t;
         };
-        // engine.create_world(name, seedText) -> folder name actually used, or nil + error
-        engineTable["create_world"] = [&lua](const std::string& name, sol::optional<std::string> seed) {
+        // engine.create_world(name, seedText [, options]) -> folder name actually used, or nil + error
+        //   options = { game_mode = "survival", ... }: saved with the world, read by mods as
+        //   engine.get_storage("world:game_mode")
+        engineTable["create_world"] = [&lua](const std::string& name, sol::optional<std::string> seed,
+                                             sol::optional<sol::table> options) {
             if (!selectedGameIsLoaded()) {
                 return std::make_tuple(sol::make_object(lua, sol::lua_nil),
                                        std::string("Restart the game to create worlds for this game."));
             }
-            return std::make_tuple(sol::make_object(lua, createWorld(name, seed.value_or(""))), std::string());
+            std::map<std::string, std::string> opts;
+            if (options) {
+                options->for_each([&opts](const sol::object& k, const sol::object& v) {
+                    if (!k.is<std::string>()) return;
+                    if (v.is<std::string>()) opts[k.as<std::string>()] = v.as<std::string>();
+                    else if (v.is<bool>()) opts[k.as<std::string>()] = v.as<bool>() ? "true" : "false";
+                    else if (v.is<double>()) opts[k.as<std::string>()] = std::to_string(v.as<double>());
+                });
+            }
+            return std::make_tuple(sol::make_object(lua, createWorld(name, seed.value_or(""), opts)), std::string());
         };
         // engine.play_world(name) -> true, or false + error message
         engineTable["play_world"] = [window](const std::string& name) {
@@ -3600,6 +4010,7 @@ int main(int argc, char** argv) {
                 return std::make_tuple(false, error);
             }
             for (const auto& [k, v] : g_SharedValues) g_Server.setShared(k, v);   // weather etc.
+            askFirewallOnce("firewall_ok_game", "", "BlockSmith");
             if (g_ChatSystem) {
                 g_ChatSystem->addMessage("Hosting on port " + std::to_string(p) + ". Friends can join with your IP address.",
                                          glm::vec3(1.0f, 1.0f, 0.4f));
@@ -3783,6 +4194,8 @@ int main(int argc, char** argv) {
         };
         // engine.start_server_profile(name) -> true, or false + error (opens the server's window)
         engineTable["start_server_profile"] = [](const std::string& profile) {
+            const fs::path serverExe = findServerExe();
+            if (!serverExe.empty()) askFirewallOnce("firewall_ok_server", serverExe.string(), "BlockSmith Server");
             std::string error;
             const bool ok = startServerProfile(profile, error);
             return std::make_tuple(ok, error);
@@ -3792,6 +4205,13 @@ int main(int argc, char** argv) {
             openFolderInExplorer(serverProfilesRoot() / profile);
         };
         engineTable["has_server_build"] = []() { return !findServerExe().empty(); };
+        // engine.allow_firewall() -> asks Windows again to let this game accept connections
+        //   (for a "Fix: friends can't join" button). True if allowed (always true off Windows).
+        engineTable["allow_firewall"] = []() {
+            const bool ok = allowThroughFirewall("", "BlockSmith");
+            if (ok) { g_Settings["firewall_ok_game"] = "1"; saveSettings(); }
+            return ok;
+        };
 
         // engine.get_lan_games() -> { { address, host, motd, players, max_players }, ... }
         engineTable["get_lan_games"] = [&lua]() {
@@ -4003,6 +4423,9 @@ int main(int argc, char** argv) {
 
         auto runModFile = [&](const fs::path& file) {
             g_CurrentModPath = file.parent_path().string();
+            if (std::find(g_ModFolders.begin(), g_ModFolders.end(), g_CurrentModPath) == g_ModFolders.end()) {
+                g_ModFolders.push_back(g_CurrentModPath);
+            }
             lua["g_CurrentModPath"] = g_CurrentModPath;
             std::cout << "[Mod] Running " << modPathKey(file) << std::endl;
             try {
@@ -4024,6 +4447,23 @@ int main(int argc, char** argv) {
 
         // Saved video settings win over values set by mods during loading
         applyStoredVideoSettings();
+
+        g_Lua = &lua;
+        // Luanti's crack picture, if the game has one and no mod chose another
+        if (g_CrackTexture == 0) {
+            const std::vector<std::string> places = { "textures/crack_anylength.png", "../../textures/crack_anylength.png",
+                "games/" + g_ActiveGameFolder + "/textures/crack_anylength.png",
+                "../../games/" + g_ActiveGameFolder + "/textures/crack_anylength.png" };
+            for (const auto& f : places) {
+                std::error_code fec;
+                if (fs::exists(f, fec)) {
+                    sol::protected_function setCrack = lua["engine"]["set_dig_crack_texture"];
+                    if (setCrack.valid()) setCrack("crack_anylength.png");
+                    std::cout << "[Dig] Using crack_anylength.png (" << g_CrackStages << " stages)" << std::endl;
+                    break;
+                }
+            }
+        }
 
         // lua_api.txt: everything modders can use in this build (see writeApiReference)
         writeApiReference(lua);
@@ -4103,6 +4543,21 @@ int main(int argc, char** argv) {
         });
 
         glfwSetMouseButtonCallback(window, [](GLFWwindow* win, int button, int action, int mods) {
+            // A mod's inventory screen: handle_inventory_click(mx, my, W, H, "left"|"right", shift)
+            if (g_LuaInventoryOpen && g_CurrentGameState == GameState::PLAYING && action == GLFW_PRESS &&
+                (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_RIGHT)) {
+                EngineContext* ctx = static_cast<EngineContext*>(glfwGetWindowUserPointer(win));
+                if (!ctx) return;
+                int sw, sh;
+                glfwGetFramebufferSize(win, &sw, &sh);
+                double mx, my;
+                glfwGetCursorPos(win, &mx, &my);
+                scaleCursorToFramebuffer(win, mx, my, sw, sh);
+                callLuaUI(ctx->lua, "handle_inventory_click", mx, my, sw, sh,
+                          std::string(button == GLFW_MOUSE_BUTTON_LEFT ? "left" : "right"),
+                          (mods & GLFW_MOD_SHIFT) != 0);
+                return;
+            }
             if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
                 EngineContext* ctx = static_cast<EngineContext*>(glfwGetWindowUserPointer(win));
                 if (!ctx) return;
@@ -4194,6 +4649,7 @@ int main(int argc, char** argv) {
             glfwPollEvents();
 
             g_PlayerPosition = player.position;
+            g_LastMoveKeys = readMoveInput(window, player.yaw, player.pitch).keys;
 
             // Shared values that changed (set here, or sent by the server): on_shared_changed(key, value)
             {
@@ -4390,36 +4846,118 @@ int main(int argc, char** argv) {
                 uint8_t activeBlockId = g_Hotbar->getActiveBlockId();
                 std::string activeItemName = (activeBlockId != 0) ? BlockRegistry::getInstance().getBlock(activeBlockId).name : "air";
 
-                if (leftPress && !leftMousePressedLast && rayResult.hit) {
-                    const glm::ivec3 hitPos(rayResult.blockPos.x, rayResult.blockPos.y, rayResult.blockPos.z);
-                    uint8_t targetBlockId = world.getBlockAt(hitPos);
-                    if (targetBlockId != 0) {
-                        const auto& targetProp = BlockRegistry::getInstance().getBlock(targetBlockId);
+                // Mods get clicks first (e.g. the survival death screen):
+                // on_player_click("left"|"right") -> true = used, nothing else happens
+                bool clickUsed = false;
+                const bool leftClick = leftPress && !leftMousePressedLast;
+                const bool rightClick = rightPress && !rightMousePressedLast;
+                if (leftClick || rightClick) {
+                    sol::protected_function onClick = lua["on_player_click"];
+                    if (onClick.valid()) {
+                        auto r = onClick(leftClick ? "left" : "right");
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_player_click: " << err.what() << std::endl; }
+                        else if (r.get_type() == sol::type::boolean && r.get<bool>()) clickUsed = true;
+                    }
+                }
+                if (g_MoveKeyMask == 0) clickUsed = true;   // frozen (e.g. dead): no digging or placing
 
+                auto& reg = BlockRegistry::getInstance();
+                auto spawnBreakParticles = [&](const glm::ivec3& pos, uint8_t id) {
+                    const auto& prop = reg.getBlock(id);
+                    int particleLayer = -1;   // the block's side texture (or any face it has)
+                    for (int f : { 4, 0, 2, 1, 5, 3 }) {
+                        if (prop.faces[f].baseLayer >= 0) { particleLayer = prop.faces[f].baseLayer; break; }
+                    }
+                    particles.spawnBreakParticles(glm::vec3(pos), id, static_cast<float>(particleLayer));
+                };
+                const uint8_t heldId = g_Hotbar->getActiveBlockId();
+                const BlockProperty* held = heldId != 0 ? &reg.getBlock(heldId) : nullptr;
+                auto rightTool = [&](const BlockProperty& block) {
+                    const std::string want = blockTool(block);
+                    return held && !want.empty() && held->toolType == want;
+                };
+                // Seconds to dig `block` with what's in hand (-1 = can't). get_dig_time(block, item)
+                // in Lua may decide instead.
+                auto digSeconds = [&](const BlockProperty& block) -> float {
+                    sol::protected_function hook = lua["get_dig_time"];
+                    if (hook.valid()) {
+                        auto r = hook(block.name, activeItemName);
+                        if (r.valid() && r.get_type() == sol::type::number) return r.get<float>();
+                    }
+                    float t = blockHardness(block);
+                    if (t <= 0.0f) return t;
+                    if (rightTool(block)) t /= std::max(held->toolSpeed, 0.01f);
+                    else if (blockNeedsTool(block)) t *= 3.33f;   // the wrong tool: much slower
+                    return t;
+                };
+                // A block dug in survival: on_dig_block(x, y, z, block, item) may handle the drops
+                // (return true); otherwise it drops itself (or `drops`) into the hotbar.
+                auto survivalDig = [&](const glm::ivec3& pos, uint8_t id) {
+                    const BlockProperty block = reg.getBlock(id);
+                    bool handled = false;
+                    sol::protected_function hook = lua["on_dig_block"];
+                    if (hook.valid()) {
+                        auto r = hook(pos.x, pos.y, pos.z, block.name, activeItemName);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_dig_block: " << err.what() << std::endl; }
+                        else if (r.get_type() == sol::type::boolean && r.get<bool>()) handled = true;
+                    }
+                    spawnBreakParticles(pos, id);
+                    world.setBlockAt(pos, 0);
+                    if (handled) return;
+                    if (blockNeedsTool(block) && !rightTool(block)) return;   // stone by hand: nothing
+                    const std::string drop = block.dropsSet ? block.drops : block.name;
+                    if (!drop.empty()) giveHotbarItem(drop, 1);
+                };
+
+                g_Dig.cooldown = std::max(0.0f, g_Dig.cooldown - deltaTime);
+                bool digging = false;
+                if (leftPress && !clickUsed && rayResult.hit) {
+                    const glm::ivec3 hitPos(rayResult.blockPos.x, rayResult.blockPos.y, rayResult.blockPos.z);
+                    const uint8_t targetBlockId = world.getBlockAt(hitPos);
+                    if (targetBlockId != 0) {
+                        const auto& targetProp = reg.getBlock(targetBlockId);
                         if (targetProp.isSelectable) {
                             if (activeItemName.find("scythe") != std::string::npos) {
-                                sol::protected_function scytheFunc = lua["on_use_scythe"];
-                                if (scytheFunc.valid()) {
-                                    scytheFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                                if (leftClick) {
+                                    sol::protected_function scytheFunc = lua["on_use_scythe"];
+                                    if (scytheFunc.valid()) scytheFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                                }
+                            } else if (g_Creative) {
+                                if (leftClick) {   // creative: one click, gone
+                                    spawnBreakParticles(hitPos, targetBlockId);
+                                    world.setBlockAt(hitPos, 0);
                                 }
                             } else {
-                                // Break particles use the block's side texture (or any face it has)
-                                int particleLayer = -1;
-                                for (int f : { 4, 0, 2, 1, 5, 3 }) {
-                                    if (targetProp.faces[f].baseLayer >= 0) { particleLayer = targetProp.faces[f].baseLayer; break; }
+                                // survival: hold until the block breaks
+                                digging = true;
+                                if (!g_Dig.active || g_Dig.pos != hitPos) {
+                                    g_Dig = DigState{true, hitPos, 0.0f, digSeconds(targetProp), g_Dig.cooldown, 0.0f};
                                 }
-                                particles.spawnBreakParticles(glm::vec3(hitPos), targetBlockId, static_cast<float>(particleLayer));
-
-                                world.setBlockAt(hitPos, 0);
+                                if (g_Dig.seconds >= 0.0f && g_Dig.cooldown <= 0.0f) {
+                                    g_Dig.progress = g_Dig.seconds <= 0.0f ? 1.0f
+                                        : g_Dig.progress + deltaTime / g_Dig.seconds;
+                                    g_Dig.particleTimer -= deltaTime;
+                                    if (g_Dig.particleTimer <= 0.0f && g_Dig.progress < 1.0f) {
+                                        g_Dig.particleTimer = 0.3f;
+                                        spawnBreakParticles(hitPos, targetBlockId);
+                                    }
+                                    if (g_Dig.progress >= 1.0f) {
+                                        survivalDig(hitPos, targetBlockId);
+                                        g_Dig.active = false;
+                                        g_Dig.progress = 0.0f;
+                                        g_Dig.cooldown = 0.25f;   // Minecraft's short pause between blocks
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                if (!digging) { g_Dig.active = false; g_Dig.progress = 0.0f; }
 
-                // Items with a use (engine.register_item_use) get the click first, even when
+                // Items with a use (engine.register_item_use) get the right-click first, even when
                 // pointing at water or nothing at all
                 bool itemUsed = false;
-                if (rightPress && !rightMousePressedLast) {
+                if (rightClick && !clickUsed) {
                     const auto handler = g_ItemUseHandlers.find(activeItemName);
                     if (handler != g_ItemUseHandlers.end() && handler->second.valid()) {
                         sol::table pointed = lua.create_table();
@@ -4461,7 +4999,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (rightPress && !rightMousePressedLast && rayResult.hit && !itemUsed) {
+                if (rightClick && !clickUsed && rayResult.hit && !itemUsed) {
                     const glm::ivec3 hitPos(rayResult.blockPos.x, rayResult.blockPos.y, rayResult.blockPos.z);
                     uint8_t targetBlockId = world.getBlockAt(hitPos);
                     if (targetBlockId != 0) {
@@ -4514,6 +5052,13 @@ int main(int argc, char** argv) {
 
                                     if (!(solid && overlapsPlayer)) {
                                         world.setBlockAt(cell, selectedBlock);
+                                        // Survival: placing uses one from the stack
+                                        if (!g_Creative) {
+                                            const int slot = g_Hotbar->activeSlot;
+                                            const HotbarSlot held = g_Hotbar->getSlot(slot);
+                                            const int left = held.count - 1;
+                                            g_Hotbar->setSlot(slot, left > 0 ? held.blockId : 0, left > 0 ? left : 0);
+                                        }
                                     }
                                 }
                             }
@@ -4787,9 +5332,92 @@ int main(int argc, char** argv) {
                         glBindVertexArray(0);
                     }
 
+                    glUniform4f(glGetUniformLocation(wireframeProgram, "u_Color"), 0.0f, 0.0f, 0.0f, 0.9f);
                     glBindVertexArray(boxVAO);
                     glDrawArrays(GL_LINES, 0, 24);
                     glBindVertexArray(0);
+
+                    // Survival digging: the crack picture (engine.set_dig_crack_texture) grows stage by
+                    // stage over the block; without one, the block darkens in steps
+                    if (g_Dig.active && g_Dig.progress > 0.0f && g_Dig.pos == glm::ivec3(rayResult.blockPos)) {
+                        const float p = glm::clamp(g_Dig.progress, 0.0f, 0.999f);
+                        glEnable(GL_BLEND);
+                        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                        glDepthMask(GL_FALSE);
+                        if (g_CrackTexture != 0) {
+                            static GLuint crackProg = 0, texVAO = 0, texVBO = 0;
+                            if (crackProg == 0) {
+                                const char* vs = "#version 330 core\n"
+                                    "layout (location = 0) in vec3 aPos; layout (location = 1) in vec2 aUV;\n"
+                                    "uniform mat4 u_MVP; uniform float u_Stage; uniform float u_Stages; out vec2 vUV;\n"
+                                    "void main() { vUV = vec2(aUV.x, (u_Stage + aUV.y) / u_Stages); gl_Position = u_MVP * vec4(aPos, 1.0); }\n";
+                                const char* fs = "#version 330 core\n"
+                                    "in vec2 vUV; out vec4 FragColor; uniform sampler2D u_Tex;\n"
+                                    "void main() { vec4 c = texture(u_Tex, vUV); if (c.a < 0.02) discard; FragColor = c; }\n";
+                                crackProg = glCreateProgram();
+                                glAttachShader(crackProg, compileShader(GL_VERTEX_SHADER, vs));
+                                glAttachShader(crackProg, compileShader(GL_FRAGMENT_SHADER, fs));
+                                glLinkProgram(crackProg);
+                                // 6 faces x 2 triangles, each face with its own 0..1 picture
+                                const float h = 0.503f;
+                                const float faces[6][4][3] = {
+                                    {{ h,-h, h},{ h,-h,-h},{ h, h,-h},{ h, h, h}}, {{-h,-h,-h},{-h,-h, h},{-h, h, h},{-h, h,-h}},
+                                    {{-h, h, h},{ h, h, h},{ h, h,-h},{-h, h,-h}}, {{-h,-h,-h},{ h,-h,-h},{ h,-h, h},{-h,-h, h}},
+                                    {{-h,-h, h},{ h,-h, h},{ h, h, h},{-h, h, h}}, {{ h,-h,-h},{-h,-h,-h},{-h, h,-h},{ h, h,-h}} };
+                                const float uv[4][2] = { {0, 1}, {1, 1}, {1, 0}, {0, 0} };
+                                const int order[6] = { 0, 1, 2, 0, 2, 3 };
+                                float v[6 * 6 * 5];
+                                int n = 0;
+                                for (int f = 0; f < 6; ++f) for (int i : order) {
+                                    v[n++] = faces[f][i][0]; v[n++] = faces[f][i][1]; v[n++] = faces[f][i][2];
+                                    v[n++] = uv[i][0]; v[n++] = uv[i][1];
+                                }
+                                glGenVertexArrays(1, &texVAO);
+                                glGenBuffers(1, &texVBO);
+                                glBindVertexArray(texVAO);
+                                glBindBuffer(GL_ARRAY_BUFFER, texVBO);
+                                glBufferData(GL_ARRAY_BUFFER, sizeof(v), v, GL_STATIC_DRAW);
+                                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+                                glEnableVertexAttribArray(0);
+                                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+                                glEnableVertexAttribArray(1);
+                            }
+                            const glm::mat4 mvp = proj * view * model;
+                            glUseProgram(crackProg);
+                            glUniformMatrix4fv(glGetUniformLocation(crackProg, "u_MVP"), 1, GL_FALSE, glm::value_ptr(mvp));
+                            glUniform1f(glGetUniformLocation(crackProg, "u_Stage"), std::floor(p * g_CrackStages));
+                            glUniform1f(glGetUniformLocation(crackProg, "u_Stages"), static_cast<float>(g_CrackStages));
+                            glActiveTexture(GL_TEXTURE0);
+                            glBindTexture(GL_TEXTURE_2D, g_CrackTexture);
+                            glUniform1i(glGetUniformLocation(crackProg, "u_Tex"), 0);
+                            glBindVertexArray(texVAO);
+                            glDrawArrays(GL_TRIANGLES, 0, 36);
+                            glBindVertexArray(0);
+                        } else {
+                            static GLuint crackVAO = 0, crackVBO = 0;
+                            if (crackVAO == 0) {
+                                // 36 vertices: the 6 faces of a cube, a hair bigger than the block
+                                const float h = 0.502f;
+                                const float c[8][3] = { {-h,-h,-h},{h,-h,-h},{h,h,-h},{-h,h,-h},{-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h} };
+                                const int f[36] = { 0,1,2, 0,2,3,  4,6,5, 4,7,6,  0,4,5, 0,5,1,  3,2,6, 3,6,7,  0,3,7, 0,7,4,  1,5,6, 1,6,2 };
+                                float v[108];
+                                for (int i = 0; i < 36; ++i) for (int k = 0; k < 3; ++k) v[i * 3 + k] = c[f[i]][k];
+                                glGenVertexArrays(1, &crackVAO);
+                                glGenBuffers(1, &crackVBO);
+                                glBindVertexArray(crackVAO);
+                                glBindBuffer(GL_ARRAY_BUFFER, crackVBO);
+                                glBufferData(GL_ARRAY_BUFFER, sizeof(v), v, GL_STATIC_DRAW);
+                                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+                                glEnableVertexAttribArray(0);
+                            }
+                            const float stage = std::floor(p * 10.0f) / 10.0f;   // like Minecraft's 10 stages
+                            glUniform4f(glGetUniformLocation(wireframeProgram, "u_Color"), 0.05f, 0.04f, 0.03f, 0.08f + stage * 0.55f);
+                            glBindVertexArray(crackVAO);
+                            glDrawArrays(GL_TRIANGLES, 0, 36);
+                            glBindVertexArray(0);
+                        }
+                        glDepthMask(GL_TRUE);
+                    }
 
                     // Restore the state the rest of the frame expects (culling was off before)
                     glDisable(GL_CULL_FACE);
@@ -4829,15 +5457,29 @@ int main(int argc, char** argv) {
 
                 glDisable(GL_DEPTH_TEST);
 
+                // HUD drawn by mods (hearts, hunger, air... see mods/survival): render_hud(W, H)
+                {
+                    sol::object hud = lua["render_hud"];
+                    if (hud.valid() && hud.get_type() == sol::type::function) {
+                        g_Inventory.renderLuaScreen(window, lua, "render_hud", static_cast<float>(width),
+                                                    static_cast<float>(height), uiProgram, texturedUIProgram);
+                        glDisable(GL_DEPTH_TEST);
+                    }
+                }
+
                 // 2. Creative inventory (drawn by inventory.lua)
                 g_Inventory.renderCreativeInventory(window, lua, static_cast<float>(width), static_cast<float>(height), uiProgram, texturedUIProgram);
                 glDisable(GL_DEPTH_TEST);
 
-                // 3. Other Lua UI
-                try {
-                    sol::function renderInvUI = lua["render_inventory"];
-                    if (renderInvUI.valid()) renderInvUI(width, height);
-                } catch (...) {}
+                // 3. A mod's inventory screen (render_inventory), with ui.* drawing available
+                {
+                    sol::object inv = lua["render_inventory"];
+                    if (inv.valid() && inv.get_type() == sol::type::function) {
+                        g_Inventory.renderLuaScreen(window, lua, "render_inventory", static_cast<float>(width),
+                                                    static_cast<float>(height), uiProgram, texturedUIProgram);
+                        glDisable(GL_DEPTH_TEST);
+                    }
+                }
 
                 // 4. Pause menu (pause_menu.lua), or Settings if opened from it (settings_menu.lua)
                 if (g_Paused) {

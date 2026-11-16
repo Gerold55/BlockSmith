@@ -63,7 +63,9 @@ constexpr int   kChunksPerUpdate     = 4;            // per client per frame
 constexpr size_t kMaxChunkBytesInFlight = 512 * 1024; // don't queue more than this per client
 constexpr float kPositionInterval    = 1.0f / 30.0f; // 30 position updates a second
 constexpr float kMaxReach            = 10.0f;        // blocks a player may edit from
-constexpr double kInterpDelay        = 0.1;          // other players are drawn this far in the past
+constexpr double kInterpDelay        = 0.1;          // other players are drawn this far in the past (minimum)
+constexpr double kMaxInterpDelay     = 0.35;         // ... and at most this far, on very jittery Wi-Fi
+constexpr float  kMaxMoveBudget      = 2.0f;         // seconds of movement a player may be owed
 constexpr size_t kMaxInputsPerPacket = 100;
 constexpr double kConnectTimeoutSec  = 10.0;
 
@@ -493,7 +495,10 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
     // Host view of the other players: a snapshot of the server's simulation every frame,
     // drawn 100 ms behind so bursts of inputs arriving together still look smooth.
     for (auto& [id, c] : m_clients) {
-        if (c.joined) c.moveBudget = std::min(c.moveBudget + dt, 0.5f);
+        // Up to 2 s of movement can be owed: after a Wi-Fi stall the queued movement is caught
+        // up instead of thrown away (which snapped the player back up to 10 blocks). Over
+        // any longer stretch nobody can move faster than real time.
+        if (c.joined) c.moveBudget = std::min(c.moveBudget + dt, kMaxMoveBudget);
     }
     interpolatePlayers(m_views, net::clockSeconds() - kInterpDelay);
     enet_host_flush(m_host);
@@ -688,6 +693,19 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     std::cout << "[Server] " << name << " joined" << std::endl;
     broadcastChat(name + " joined the game", kInfoColor);
     if (onJoin) onJoin(name);
+}
+
+bool GameServer::teleportPlayer(const std::string& name, const glm::vec3& pos) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        c.sim.position = pos;
+        c.sim.velocity = glm::vec3(0.0f);
+        c.sim.grounded = false;
+        c.position = pos;
+        c.moveBudget = 0.2f;
+        return true;
+    }
+    return false;
 }
 
 void GameServer::sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values) {
@@ -1147,7 +1165,29 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             sendInputs();
         }
         // Other players: 100 ms behind the server's clock
-        if (m_clockSynced) interpolatePlayers(m_views, net::clockSeconds() + m_clockOffset - kInterpDelay);
+        // Draw other players far enough in the past to cover how unevenly their updates arrive
+        // (100 ms on a good network, more on jittery Wi-Fi), easing between values.
+        // m_jitter = how stale a player's newest known position gets before the next one
+        // arrives (their Wi-Fi, the server and ours all add to it). It jumps up at once and
+        // settles down over several seconds, so a bad patch of Wi-Fi stays covered.
+        if (m_clockSynced) {
+            const double serverNow = net::clockSeconds() + m_clockOffset;
+            double stalest = 0.0;
+            for (const auto& [id, v] : m_views) {
+                if (!v.snapshots.empty()) stalest = std::max(stalest, serverNow - v.snapshots.back().time);
+            }
+            stalest = std::min(stalest, 1.0);   // someone standing still / gone isn't Wi-Fi
+            if (stalest > m_jitter) m_jitter = stalest;
+            else m_jitter -= (m_jitter - stalest) * std::min(1.0, static_cast<double>(dt) * 0.3);
+        }
+        {
+            const double target = std::clamp(m_jitter + 0.04, kInterpDelay, kMaxInterpDelay);
+            // Change it gradually: a jump would make other players stop (delay going up) or
+            // skip ahead (going down). This way they play at 75%..110% speed for a moment.
+            const double step = static_cast<double>(dt);
+            m_interpDelay += std::clamp(target - m_interpDelay, -step * 0.10, step * 0.25);
+        }
+        if (m_clockSynced) interpolatePlayers(m_views, net::clockSeconds() + m_clockOffset - m_interpDelay);
     }
     if (m_host) enet_host_flush(m_host);
 }
@@ -1266,6 +1306,7 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
         else m_clockOffset += (sample - m_clockOffset) * 0.01;
         m_clockSynced = true;
+
         for (uint16_t i = 0; i < count && r.ok; ++i) {
             const uint16_t id = r.u16();
             const float time = r.f32();
@@ -1447,6 +1488,12 @@ std::vector<std::string> GameClient::statsLines() const {
     out.push_back("Server " + m_addressText + ": ping " + std::to_string(m_peer->roundTripTime) + " ms");
     out.push_back("Your position corrected by the server " + std::to_string(m_corrections) +
                   " times, " + std::to_string(m_pending.size()) + " inputs waiting");
+    {
+        char jb[160];
+        std::snprintf(jb, sizeof(jb), "Other players' updates arrive up to %.0f ms apart - drawn %.0f ms behind",
+                      m_jitter * 1000.0, m_interpDelay * 1000.0);
+        out.push_back(jb);
+    }
     for (const auto& [id, v] : m_views) {
         const double behind = v.snapshots.empty() ? 0.0
                             : (net::clockSeconds() + m_clockOffset - v.snapshots.back().time) * 1000.0;

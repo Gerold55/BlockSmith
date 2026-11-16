@@ -20,6 +20,9 @@ struct MoveInput {
     bool down(Key k) const { return (keys & k) != 0; }
 };
 
+// Movement keys the player may use (all by default); set with engine.set_player_controls
+extern uint8_t g_MoveKeyMask;
+
 struct MoveState {
     glm::vec3 position{0.0f};
     glm::vec3 velocity{0.0f};
