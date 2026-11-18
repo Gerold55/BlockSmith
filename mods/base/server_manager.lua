@@ -220,6 +220,24 @@ local function server_state(s)
     return "offline", st
 end
 
+local function normalize_world(w)
+    return (w or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+end
+
+-- Returns the conflicting server entry if another running/starting profile uses the same world
+local function running_world_conflict(target_folder, target_world)
+    local norm = normalize_world(target_world)
+    if norm == "" then return nil end
+    for _, other in ipairs(SM.servers) do
+        if other.folder ~= target_folder
+           and normalize_world(other.cfg.world) == norm
+           and server_state(other) ~= "offline" then
+            return other
+        end
+    end
+    return nil
+end
+
 local function selected_server() return SM.selected and SM.servers[SM.selected] or nil end
 
 local function load_mods()
@@ -315,6 +333,14 @@ local function list_layout(W, H)
                     SM.starting[sel.folder] = nil
                     SM.message = "Stopping '" .. sel.folder .. "' (it saves first)..."
                 else
+                    refresh()
+                    sel = selected_server()
+                    if not sel then return end
+                    local conflict = running_world_conflict(sel.folder, sel.cfg.world)
+                    if conflict then
+                        SM.message = "World '" .. (sel.cfg.world or "?") .. "' is already running in '" .. conflict.folder .. "'"
+                        return
+                    end
                     local ok, err = engine.start_server_profile(sel.folder)
                     if ok == false then SM.message = err
                     else SM.starting[sel.folder] = ui.get_time(); SM.message = nil end
@@ -495,9 +521,16 @@ local function edit_layout(W, H)
                 if save_editor() then
                     refresh()
                     local s = selected_server()
-                    local running = s and server_state(s) ~= "offline"
+                    local is_running = s and server_state(s) ~= "offline"
+                    local conflict = s and running_world_conflict(s.folder, s.cfg.world) or nil
                     SM.mode = "list"
-                    SM.message = running and "Saved - restart the server (Stop, then Start) to use the changes" or nil
+                    if is_running then
+                        SM.message = "Saved - restart the server (Stop, then Start) to use the changes"
+                    elseif conflict then
+                        SM.message = "Saved - stop '" .. conflict.folder .. "' before starting (same world '" .. (s.cfg.world or "?") .. "')"
+                    else
+                        SM.message = nil
+                    end
                 end
             end },
             { label = "Icon Folder", action = function() engine.open_server_profile_folder(SM.folder) end },
