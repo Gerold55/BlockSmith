@@ -387,7 +387,11 @@ void World::unloadDistantChunks() {
         if (!wanted(it->first)) {
             // Keep player changes: write the chunk out before throwing it away
             if (m_modified.count(it->first)) {
-                saveChunkToDisk(it->first, *it->second);
+                if (!saveChunkToDisk(it->first, *it->second)) {
+                    // Save failed: retain the chunk and its m_modified record for a later retry
+                    ++it;
+                    continue;
+                }
                 m_modified.erase(it->first);
             }
 
@@ -549,32 +553,72 @@ bool World::saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const {
 
     // Write to a temp file, then swap it in, so a crash mid-write can't corrupt the save
     namespace fs = std::filesystem;
-    const std::string finalPath = chunkPath(c.first, c.second);
-    const std::string tmpPath = finalPath + ".tmp";
+    const fs::path finalPath = chunkPath(c.first, c.second);
+    const fs::path tmpPath = finalPath.string() + ".tmp";
+    const fs::path bakPath = finalPath.string() + ".bak";
     std::error_code ec;
-    fs::create_directories(fs::path(finalPath).parent_path(), ec);
+    fs::create_directories(finalPath.parent_path(), ec);
 
     {
         std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
         if (!f) {
-            std::cerr << "[Save] Could not write " << tmpPath << std::endl;
+            std::cerr << "[Save] Could not write " << tmpPath.string() << std::endl;
             return false;
         }
         f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+        f.flush();
         if (!f) {
-            std::cerr << "[Save] Write failed for " << tmpPath << std::endl;
+            std::cerr << "[Save] Write failed for " << tmpPath.string() << std::endl;
+            f.close();
+            std::error_code ignoreEc;
+            fs::remove(tmpPath, ignoreEc);
+            return false;
+        }
+    }
+
+    // Attempt direct atomic replace first (POSIX rename / Windows MoveFileExW via std::filesystem)
+    fs::rename(tmpPath, finalPath, ec);
+    if (!ec) {
+        std::error_code ignoreEc;
+        fs::remove(bakPath, ignoreEc);
+        return true;
+    }
+
+    // Fallback when target overwrite is rejected (e.g. Windows / non-atomic FS):
+    // preserve the existing save in .bak until the new file is safely in place.
+    ec.clear();
+    std::error_code ignoreEc;
+    fs::remove(bakPath, ignoreEc);
+
+    const bool hadOriginal = fs::exists(finalPath, ec);
+    if (ec) {
+        std::cerr << "[Save] Could not stat " << finalPath.string() << ": " << ec.message() << std::endl;
+        fs::remove(tmpPath, ignoreEc);
+        return false;
+    }
+
+    if (hadOriginal) {
+        fs::rename(finalPath, bakPath, ec);
+        if (ec) {
+            std::cerr << "[Save] Could not back up " << finalPath.string() << ": " << ec.message() << std::endl;
+            fs::remove(tmpPath, ignoreEc);
             return false;
         }
     }
 
     fs::rename(tmpPath, finalPath, ec);
     if (ec) {
-        fs::remove(finalPath, ec);
-        fs::rename(tmpPath, finalPath, ec);
-        if (ec) {
-            std::cerr << "[Save] Could not replace " << finalPath << ": " << ec.message() << std::endl;
-            return false;
+        std::cerr << "[Save] Could not replace " << finalPath.string() << ": " << ec.message() << std::endl;
+        if (hadOriginal) {
+            std::error_code rollbackEc;
+            fs::rename(bakPath, finalPath, rollbackEc);
         }
+        fs::remove(tmpPath, ignoreEc);
+        return false;
+    }
+
+    if (hadOriginal) {
+        fs::remove(bakPath, ignoreEc);
     }
     return true;
 }
@@ -582,15 +626,59 @@ bool World::saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const {
 bool World::loadChunkFromDisk(int cx, int cz, ChunkData& chunk) const {
     if (m_saveDir.empty()) return false;
 
-    std::ifstream f(chunkPath(cx, cz), std::ios::binary);
-    if (!f) return false;   // never saved - generate it instead
+    namespace fs = std::filesystem;
+    const fs::path finalPath = chunkPath(cx, cz);
+    const fs::path tmpPath = finalPath.string() + ".tmp";
+    const fs::path bakPath = finalPath.string() + ".bak";
+    std::error_code ec;
 
-    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (!decodeChunk(d, chunk)) {
-        std::cerr << "[Load] Chunk " << cx << "," << cz << " is damaged - regenerating it" << std::endl;
-        return false;
+    // Discard any incomplete temp file left behind by an interrupted save
+    if (fs::exists(tmpPath, ec)) {
+        fs::remove(tmpPath, ec);
     }
-    return true;
+
+    bool hasFinal = fs::exists(finalPath, ec);
+    const bool hasBak = fs::exists(bakPath, ec);
+
+    // Recover the prior committed save if a crash occurred between moving finalPath -> bakPath and renaming tmpPath
+    if (!hasFinal && hasBak) {
+        fs::rename(bakPath, finalPath, ec);
+        if (!ec) {
+            hasFinal = true;
+        }
+    }
+
+    auto tryRead = [](const fs::path& p, ChunkData& outChunk) -> bool {
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return false;
+        std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        return decodeChunk(d, outChunk);
+    };
+
+    if (hasFinal) {
+        if (tryRead(finalPath, chunk)) {
+            if (hasBak) {
+                fs::remove(bakPath, ec);
+            }
+            return true;
+        }
+    }
+
+    // Fall back to .bak if finalPath was unreadable/corrupted
+    if (hasBak) {
+        ChunkData recovered;
+        if (tryRead(bakPath, recovered)) {
+            chunk = std::move(recovered);
+            fs::remove(finalPath, ec);
+            fs::rename(bakPath, finalPath, ec);
+            return true;
+        }
+    }
+
+    if (hasFinal || hasBak) {
+        std::cerr << "[Load] Chunk " << cx << "," << cz << " is damaged - regenerating it" << std::endl;
+    }
+    return false;
 }
 
 bool World::decodeChunk(const std::vector<uint8_t>& d, ChunkData& chunk) {
