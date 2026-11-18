@@ -1,4 +1,5 @@
 #include "World.h"
+#include "Light.h"
 #include "ChunkData.h"
 #include "Block.h"
 #include "Types.h"
@@ -284,22 +285,43 @@ void World::loadQueuedChunks(sol::state& lua) {
         // nearest first, a few at a time so the closest are always next in line.
         collectGenerated();
         const size_t maxInFlight = static_cast<size_t>(m_generator->threadCount()) * 3;
-        std::vector<ChunkCoord> notYet;
+        std::vector<ChunkCoord> notYet;   // waiting for a generator slot (kept, in queue order)
+        // A chunk the generator must make: ask now if a slot is free, else keep it for later
+        auto generate = [&](const ChunkCoord& c) {
+            if (m_generating.size() < maxInFlight) {
+                m_generator->request(c.first, c.second, m_resetCount, m_seed);
+                m_generating.insert(c);
+            } else {
+                notYet.push_back(c);
+            }
+        };
         while (consumed < m_loadQueue.size()) {
+            // The time budget holds on every path (disk loads, missing files, a busy generator).
+            // At least one chunk is handled per update; everything not reached stays queued,
+            // untouched - no allocation and no disk access for it.
+            if (consumed > 0 && elapsedMs(start) >= m_loadBudgetMs) break;
             const ChunkCoord c = m_loadQueue[consumed++];
             if (chunks.count(c) || m_generating.count(c)) continue;
+
+            // Already known to have no file: straight to the generator (no probe, no allocation)
+            if (m_notOnDisk.count(c)) { generate(c); continue; }
+
+            // Cheap existence check first; ChunkData is only allocated to read a real file
+            if (!chunkFileExists(c)) {
+                m_notOnDisk.insert(c);
+                generate(c);
+                continue;
+            }
             auto chunk = std::make_shared<ChunkData>();
             if (loadChunkFromDisk(c.first, c.second, *chunk)) {
                 computeBiomeTint(*chunk, c.first, c.second, &lua);   // saved before biome colours
                 addLoadedChunk(c.first, c.second, std::move(chunk));
-                if (elapsedMs(start) >= m_loadBudgetMs) break;
-            } else if (m_generating.size() < maxInFlight) {
-                m_generator->request(c.first, c.second, m_resetCount, m_seed);
-                m_generating.insert(c);
             } else {
-                notYet.push_back(c);   // generator busy: ask again next update
+                m_notOnDisk.insert(c);   // damaged file: regenerate (it's replaced when saved)
+                generate(c);
             }
         }
+        // Waiting ones go back in front, then everything not reached: no coordinate is lost
         m_loadQueue.erase(m_loadQueue.begin(), m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
         m_loadQueue.insert(m_loadQueue.begin(), notYet.begin(), notYet.end());
         return;
@@ -334,8 +356,13 @@ void World::collectGenerated() {
 }
 
 void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
+    m_notOnDisk.erase(ChunkCoord{cx, cz});   // loaded now: it may be saved, so probe again next time
+    chunk->chunkX = cx;
+    chunk->chunkZ = cz;
+    ChunkData& added = *chunk;
     chunks[ChunkCoord{cx, cz}] = std::move(chunk);
     linkChunk(cx, cz);
+    lightChunkAdded(added);
     // The new chunk and its neighbors need (re)meshing so border faces cull correctly.
     markDirty(cx, cz);
     markDirty(cx - 1, cz);
@@ -391,11 +418,16 @@ void World::unloadDistantChunks() {
         if (!wanted(it->first)) {
             // Keep player changes: write the chunk out before throwing it away
             if (m_modified.count(it->first)) {
-                saveChunkToDisk(it->first, *it->second);
+                if (!saveChunkToDisk(it->first, *it->second)) {
+                    // Save failed: retain the chunk in memory and keep m_modified intact for retry
+                    ++it;
+                    continue;
+                }
                 m_modified.erase(it->first);
             }
 
             unlinkChunk(cx, cz);                 // clear neighbor pointers before destroying
+            if (m_light) m_light->forget(it->second.get());   // the light engine holds chunk pointers
             m_dirty.erase(it->first);
             m_unloaded.push_back(it->first);
             it = chunks.erase(it);
@@ -497,6 +529,7 @@ void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, 
 // ---------------------------------------------------------------------------
 
 void World::reset() {
+    if (m_light) m_light->takeTouched();   // forget chunk pointers before the chunks go
     chunks.clear();
     m_loadQueue.clear();
     m_dirty.clear();
@@ -510,6 +543,9 @@ void World::reset() {
     m_extraCenters.clear();
     m_fluids->clear();
     m_modified.clear();
+    m_notOnDisk.clear();
+    m_fallChecks.clear();   // blocks falling in the old world
+    m_falling.clear();
     m_queueDirty = true;
     m_luaSeeded = false;
     m_playerChunk = ChunkCoord{0, 0};
@@ -531,6 +567,12 @@ int World::saveAll() {
         }
     }
     return written;
+}
+
+bool World::chunkFileExists(const ChunkCoord& c) const {
+    if (m_saveDir.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(chunkPath(c.first, c.second), ec);
 }
 
 std::string World::chunkPath(int cx, int cz) const {
@@ -755,9 +797,81 @@ std::vector<World::ChunkCoord> World::takeUnloadedChunks() {
 // Fluids: the simulation is in Fluids.cpp
 // ---------------------------------------------------------------------------
 
-void World::updateFluids(float dt) { m_fluids->update(dt); }
+void World::updateFluids(float dt) {
+    m_fluids->update(dt);
+    updateFalling(dt);
+}
 
-void World::noteFluidChange(const glm::ivec3& loc) { m_fluids->noteChange(loc); }
+void World::noteFluidChange(const glm::ivec3& loc) {
+    m_fluids->noteChange(loc);
+    // This cell, and the one above (it may have lost what held it up), may need to fall
+    if (!m_remote && m_fallChecks.size() < 100000) {
+        m_fallChecks.push_back(loc);
+        m_fallChecks.push_back(loc + glm::ivec3(0, 1, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Falling blocks (register_block's gravity = true), like Minecraft's sand and gravel: with
+// nothing solid underneath, the block drops, speeding up, and lands on the first solid block.
+// It moves a whole block at a time through setBlockAt, so it lights, saves and reaches other
+// players like any change; a stack falls one block after another.
+// ---------------------------------------------------------------------------
+
+// Air, a fluid, or something you walk through (grass, flowers, torches - they're crushed)
+bool World::canFallInto(const glm::ivec3& p) const {
+    if (p.y < 0 || p.y >= CHUNK_HEIGHT || !isLoaded(p)) return false;   // unloaded: wait
+    const uint8_t id = getBlockAt(p);
+    if (id == 0) return true;
+    if (FluidRegistry::get().forBlock(id)) return true;
+    return !BlockRegistry::getInstance().getBlock(id).isWalkable;
+}
+
+void World::updateFalling(float dt) {
+    if (m_remote) { m_fallChecks.clear(); m_falling.clear(); return; }
+    auto& reg = BlockRegistry::getInstance();
+
+    // Blocks that should start falling
+    if (!m_fallChecks.empty()) {
+        std::vector<glm::ivec3> checks;
+        checks.swap(m_fallChecks);
+        for (const auto& p : checks) {
+            if (p.y <= 0 || p.y >= CHUNK_HEIGHT || !isLoaded(p)) continue;
+            const uint8_t id = getBlockAt(p);
+            if (id == 0 || !reg.getBlock(id).hasGravity) continue;
+            if (!canFallInto(p + glm::ivec3(0, -1, 0))) continue;
+            bool already = false;
+            for (const auto& f : m_falling) if (f.pos == p) { already = true; break; }
+            if (!already) m_falling.push_back(FallingBlock{ p, 0.0f, 0.0f });
+        }
+    }
+
+    // Move them: Minecraft's 0.04 blocks/tick^2 = 16 blocks/s^2, up to about 40 blocks/s
+    for (size_t i = 0; i < m_falling.size();) {
+        FallingBlock& f = m_falling[i];
+        const uint8_t id = getBlockAt(f.pos);
+        bool done = (id == 0 || !reg.getBlock(id).hasGravity);   // dug or replaced meanwhile
+        if (!done) {
+            f.speed = std::min(f.speed + 16.0f * dt, 40.0f);
+            f.progress += f.speed * dt;
+            while (f.progress >= 1.0f) {
+                const glm::ivec3 below = f.pos + glm::ivec3(0, -1, 0);
+                if (!canFallInto(below)) { done = true; break; }  // landed
+                const uint8_t meta = getMetadataAt(f.pos);
+                setBlockAt(f.pos, 0);                        // (queues the block above: stacks follow)
+                setBlockWithMetaAt(below, id, meta);
+                f.pos = below;
+                f.progress -= 1.0f;
+            }
+        }
+        if (done) {
+            m_falling[i] = m_falling.back();
+            m_falling.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Block and metadata access
@@ -776,8 +890,10 @@ void World::setBlockAt(const glm::ivec3& loc, uint8_t blockId) {
     ChunkData* chunk = chunkAt(loc);
     if (!chunk) return;
 
+    const uint8_t oldId = chunk->getLocalBlock(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
     chunk->setBlock(positiveMod(loc.x, CHUNK_WIDTH), loc.y,
                     positiveMod(loc.z, CHUNK_WIDTH), blockId);
+    lightBlockChanged(loc, oldId);
     // A placed fluid source is a fresh source (old metadata would make it look like flowing)
     const FluidDef* placedFluid = FluidRegistry::get().forBlock(blockId);
     if (placedFluid && blockId == placedFluid->sourceId) {
@@ -801,7 +917,9 @@ void World::setBlockWithMetaAt(const glm::ivec3& loc, uint8_t blockId, uint8_t m
     if (loc.y < 0 || loc.y >= CHUNK_HEIGHT) return;
     ChunkData* chunk = chunkAt(loc);
     if (!chunk) return;
+    const uint8_t oldId = chunk->getLocalBlock(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
     chunk->setBlockWithMeta(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH), blockId, meta);
+    lightBlockChanged(loc, oldId);
     markBlockChanged(loc);
     markModified(loc);
     noteFluidChange(loc);
@@ -840,8 +958,13 @@ void World::insertChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
     const ChunkCoord c{cx, cz};
     if (chunks.count(c)) unlinkChunk(cx, cz);
     chunk->neighbors[0] = chunk->neighbors[1] = chunk->neighbors[4] = chunk->neighbors[5] = nullptr;
+    chunk->chunkX = cx;
+    chunk->chunkZ = cz;
+    if (m_light) { auto old = chunks.find(c); if (old != chunks.end()) m_light->forget(old->second.get()); }
+    ChunkData& added = *chunk;
     chunks[c] = std::move(chunk);
     linkChunk(cx, cz);
+    lightChunkAdded(added);
     markDirty(cx, cz);
     markDirty(cx - 1, cz);
     markDirty(cx + 1, cz);
@@ -859,6 +982,7 @@ void World::removeChunk(int cx, int cz) {
     auto it = chunks.find(c);
     if (it == chunks.end()) return;
     unlinkChunk(cx, cz);
+    if (m_light) m_light->forget(it->second.get());
     m_dirty.erase(c);
     m_unloaded.push_back(c);
     chunks.erase(it);
@@ -871,7 +995,9 @@ void World::applyNetworkBlock(const glm::ivec3& loc, uint8_t id, uint8_t meta) {
     const int lx = positiveMod(loc.x, CHUNK_WIDTH);
     const int lz = positiveMod(loc.z, CHUNK_WIDTH);
     if (chunk->getLocalBlock(lx, loc.y, lz) == id && chunk->getLocalMetadata(lx, loc.y, lz) == meta) return;
+    const uint8_t oldId = chunk->getLocalBlock(lx, loc.y, lz);
     chunk->setBlockWithMeta(lx, loc.y, lz, id, meta);
+    lightBlockChanged(loc, oldId);
     markBlockChanged(loc);
 }
 
@@ -906,4 +1032,52 @@ int World::groundHeightAt(int x, int z) const {
         }
     }
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Light (Light.h)
+// ---------------------------------------------------------------------------
+
+void World::setLighting(bool on) {
+    if (on == m_lightingOn) return;
+    m_lightingOn = on;
+    if (!on) { m_light.reset(); return; }
+    m_light = std::make_unique<LightEngine>();
+    for (auto& entry : chunks) lightChunkAdded(*entry.second);   // chunks already here
+    for (auto& entry : chunks) markDirty(entry.first.first, entry.first.second);
+}
+
+uint16_t World::getLightAt(const glm::ivec3& loc) const {
+    if (loc.y >= CHUNK_HEIGHT) return ChunkData::kFullSky;
+    if (loc.y < 0) return 0;
+    const ChunkData* chunk = chunkAt(loc);
+    if (!chunk || !chunk->hasLight()) return ChunkData::kFullSky;
+    return chunk->getLocalLight(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
+}
+
+void World::lightChunkAdded(ChunkData& chunk) {
+    if (!m_light) return;
+    m_light->chunkAdded(chunk);
+    markLightTouched();
+}
+
+void World::lightBlockChanged(const glm::ivec3& loc, uint8_t oldId) {
+    if (!m_light) return;
+    ChunkData* chunk = chunkAt(loc);
+    if (!chunk || !chunk->hasLight()) return;
+    const int lx = positiveMod(loc.x, CHUNK_WIDTH), lz = positiveMod(loc.z, CHUNK_WIDTH);
+    const light::BlockLight& before = light::blockLight(oldId);
+    const light::BlockLight& after = light::blockLight(chunk->getLocalBlock(lx, loc.y, lz));
+    // Water flowing into water, a block swapped for one that treats light the same: nothing to do
+    if (&before == &after) return;
+    if (before.opaque == after.opaque && before.absorb == after.absorb && !before.emits() && !after.emits()
+        && before.filter[0] == after.filter[0] && before.filter[1] == after.filter[1] && before.filter[2] == after.filter[2]) {
+        return;
+    }
+    m_light->blockChanged(*chunk, lx, loc.y, lz);
+    markLightTouched();
+}
+
+void World::markLightTouched() {
+    for (ChunkData* c : m_light->takeTouched()) markDirty(c->chunkX, c->chunkZ);
 }

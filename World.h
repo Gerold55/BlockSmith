@@ -33,6 +33,7 @@ struct IVec3Hash {
 
 class ChunkGenerator;
 class FluidSimulator;
+class LightEngine;
 
 class World {
 public:
@@ -45,6 +46,8 @@ public:
     void update(const glm::vec3& playerPos, sol::state& lua);
     // Fluids (water, lava, modded fluids - see Fluids.h). Call every frame/tick with the
     // time passed; each fluid flows at its own speed.
+    // Fluids flowing and blocks falling (register_block's gravity = true: sand, gravel...).
+    // Runs where the world is decided (singleplayer, the host, the server); never when remote.
     void updateFluids(float dt);
     FluidSimulator& fluids() { return *m_fluids; }
     // Nothing above this block up to the top of the world (rain and snow reach it)
@@ -52,6 +55,15 @@ public:
         for (int y = loc.y + 1; y < CHUNK_HEIGHT; ++y) if (getBlockAt(glm::ivec3(loc.x, y, loc.z)) != 0) return false;
         return true;
     }
+    // ---------------- Light (Light.h) ----------------
+    // The game turns this on; the dedicated server leaves it off (it never draws anything).
+    void setLighting(bool on);
+    bool lighting() const { return m_lightingOn; }
+    // Every loaded chunk gets redrawn (e.g. after a lighting setting changed)
+    void markAllDirty() { for (auto& entry : chunks) m_dirty.insert(entry.first); }
+    // Packed light at a block (see light::sky/red/green/blue). Open sky if not known.
+    uint16_t getLightAt(const glm::ivec3& loc) const;
+
     // Is the chunk holding this block loaded?
     bool isLoaded(const glm::ivec3& loc) const { return chunkAt(loc) != nullptr; }
     void loadChunk(int chunkX, int chunkZ, sol::state& lua);
@@ -139,7 +151,7 @@ public:
     void reset();
 
     // Folder for this world's chunk files ("" = saving disabled).
-    void setSaveDirectory(const std::string& dir) { m_saveDir = dir; }
+    void setSaveDirectory(const std::string& dir) { m_saveDir = dir; m_notOnDisk.clear(); }
     const std::string& saveDirectory() const { return m_saveDir; }
 
     // The seed passed to Lua's set_world_seed. Changing it re-seeds Lua on the next update.
@@ -173,6 +185,12 @@ private:
 
     // Chunk files: <saveDir>/chunks/c.<x>.<z>.bin
     std::string chunkPath(int cx, int cz) const;
+    // Is there a saved file for this chunk? (no allocation, no reading)
+    bool chunkFileExists(const ChunkCoord& c) const;
+    // Chunks found to have no (usable) file: only the generator can make them, so they aren't
+    // probed again while waiting for a generator slot. Forgotten when the chunk loads (it may be
+    // saved later), on reset and when the save folder changes.
+    std::unordered_set<ChunkCoord, PairHash> m_notOnDisk;
     bool saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const;
     bool loadChunkFromDisk(int cx, int cz, ChunkData& chunk) const;
 
@@ -204,6 +222,20 @@ private:
     unsigned m_resetCount = 0;
 
     std::unique_ptr<FluidSimulator> m_fluids;
+
+    // Light
+    bool m_lightingOn = false;
+    std::unique_ptr<LightEngine> m_light;
+    void lightChunkAdded(ChunkData& chunk);
+    void lightBlockChanged(const glm::ivec3& loc, uint8_t oldId);
+
+    // Falling blocks: cells to check after a change, and blocks on their way down
+    struct FallingBlock { glm::ivec3 pos; float speed; float progress; };
+    std::vector<glm::ivec3> m_fallChecks;
+    std::vector<FallingBlock> m_falling;
+    void updateFalling(float dt);
+    bool canFallInto(const glm::ivec3& p) const;
+    void markLightTouched();
 
     // Saving
     std::string m_saveDir;

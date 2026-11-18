@@ -2,6 +2,9 @@
 #include "Block.h"
 #include "Types.h"
 #include <glm/glm.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 
 namespace {
@@ -17,10 +20,66 @@ void applyDigProperties(BlockProperty& block, const sol::table& props) {
     if (needsTool) block.needsTool = *needsTool;
     sol::optional<std::string> drops = props["drops"];
     if (drops) { block.drops = *drops; block.dropsSet = true; }
+    sol::optional<std::string> pick = props["pick"];
+    if (pick) block.pick = *pick;
     sol::optional<std::string> toolType = props["tool_type"];
     if (toolType) block.toolType = *toolType;
     sol::optional<float> toolSpeed = props["tool_speed"];
     if (toolSpeed) block.toolSpeed = *toolSpeed > 0.0f ? *toolSpeed : 1.0f;
+}
+
+namespace {
+// { r, g, b } as 0..1 (numbers above 1 are taken as 0..255), or "#rrggbb"
+bool readColor(const sol::object& o, float out[3]) {
+    if (o.is<std::string>()) {
+        std::string hex = o.as<std::string>();
+        if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
+        if (hex.size() != 6) return false;
+        const unsigned long v = std::strtoul(hex.c_str(), nullptr, 16);
+        out[0] = ((v >> 16) & 255) / 255.0f; out[1] = ((v >> 8) & 255) / 255.0f; out[2] = (v & 255) / 255.0f;
+        return true;
+    }
+    if (!o.is<sol::table>()) return false;
+    sol::table t = o.as<sol::table>();
+    float c[3];
+    for (int i = 0; i < 3; ++i) {
+        sol::optional<float> v = t[i + 1];
+        if (!v) return false;
+        c[i] = *v;
+    }
+    const bool bytes = c[0] > 1.0f || c[1] > 1.0f || c[2] > 1.0f;
+    for (int i = 0; i < 3; ++i) out[i] = std::max(0.0f, std::min(1.0f, bytes ? c[i] / 255.0f : c[i]));
+    return true;
+}
+}
+
+void applyLightProperties(BlockProperty& block, const sol::table& props) {
+    sol::object lightObj = props["light"];
+    sol::object colorObj = props["light_color"];
+    if (lightObj.is<sol::table>() || lightObj.is<double>()) {
+        block.lightSet = true;
+        if (lightObj.is<sol::table>()) {
+            sol::table t = lightObj.as<sol::table>();
+            for (int i = 0; i < 3; ++i) {
+                block.lightEmit[i] = static_cast<uint8_t>(std::max(0, std::min(15, t.get_or(i + 1, 0))));
+            }
+        } else if (lightObj.is<double>()) {
+            const int level = std::max(0, std::min(15, static_cast<int>(std::lround(lightObj.as<double>()))));
+            float c[3] = {1.0f, 1.0f, 1.0f};
+            readColor(colorObj, c);
+            const float top = std::max(c[0], std::max(c[1], c[2]));
+            for (int i = 0; i < 3; ++i) {
+                block.lightEmit[i] = static_cast<uint8_t>(top > 0.0f ? std::lround(level * c[i] / top) : 0);
+            }
+        }
+    }
+    sol::optional<int> absorb = props["light_absorb"];
+    if (absorb) block.lightAbsorb = std::max(0, std::min(15, *absorb));
+    float f[3];
+    sol::object filterObj = props["light_filter"];
+    if (readColor(filterObj, f)) {
+        for (int i = 0; i < 3; ++i) block.lightFilter[i] = f[i];
+    }
 }
 
 void applySoundProperties(BlockProperty& block, const sol::table& props) {
@@ -55,7 +114,7 @@ float blockHardness(const BlockProperty& b) {
     const std::string& n = b.name;
     if (nameHas(n, {"bedrock", "barrier"})) return -1.0f;
     if (b.pattern == "plantlike" || nameHas(n, {"flower", "short_grass", "sapling", "mushroom", "torch"})) return 0.0f;
-    if (nameHas(n, {"leaves"})) return 0.3f;
+    if (nameHas(n, {"leaves"})) return 0.0f;   // leaves break instantly
     if (nameHas(n, {"glass", "ice"})) return 0.45f;
     if (nameHas(n, {"obsidian"})) return 50.0f;
     if (nameHas(n, {"ore"})) return 3.0f;
@@ -122,6 +181,13 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         block.in_creative   = props.get_or("in_creative", true);
         applyDigProperties(block, props);
         applySoundProperties(block, props);
+        applyLightProperties(block, props);
+        // Doors (DoorShape.h): a thin panel, so light and the blocks beside them show through,
+        // and see-through pixels in the picture (windows) are cut out
+        if (block.pattern == "door") {
+            block.isTransparent = true;
+            block.isCutout = true;
+        }
         sol::optional<std::string> biome = props["biome_tint"];
         if (biome) block.biomeTint = (*biome == "grass") ? 0 : (*biome == "foliage") ? 1 : -2;   // -2 = "none" (chosen)
 

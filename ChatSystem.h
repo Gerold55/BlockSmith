@@ -36,6 +36,14 @@ public:
     void registerCommand(const std::string& name, const std::string& usage, const std::string& description);
     // Gets every "/command" first (without the slash). Return true if it was handled.
     void setCommandHandler(std::function<bool(const std::string&)> handler) { m_commandHandler = std::move(handler); }
+    // Gets every ".command" (without the dot): the player's own client mods. Return true if it
+    // was handled; otherwise the text is sent as a normal message.
+    void setLocalCommandHandler(std::function<bool(const std::string&)> handler) { m_localCommandHandler = std::move(handler); }
+    // Called with every message added to the chat (after it's shown): client mods can read chat.
+    void setMessageListener(std::function<void(const std::string&)> listener) { m_messageListener = std::move(listener); }
+    // Sends text as if the player typed it: "/command" runs it, anything else is a chat message
+    // (".commands" are not run: client mods use this, and must not call themselves)
+    void sendText(const std::string& text);
 
     // ---- Multiplayer ----
     // Name shown before your own messages ("<Name> hello").
@@ -80,6 +88,8 @@ private:
     std::deque<std::string> m_sentHistory;
     std::vector<CommandInfo> m_commands;
     std::function<bool(const std::string&)> m_commandHandler;
+    std::function<bool(const std::string&)> m_localCommandHandler;
+    std::function<void(const std::string&)> m_messageListener;
     std::function<bool(const std::string&)> m_messageSender;
     std::string m_playerName = "Player";
 

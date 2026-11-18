@@ -226,12 +226,16 @@ local function draw_button(b, mx, my, S, fs)
     end
     local outline = hovered and C.outline_hover or C.outline
 
-    rect(b.x, b.y, b.w, b.h, outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-    if b.enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not b.enabled) and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
+        if b.enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
 
     local tc = (not b.enabled) and C.text_off or (hovered and C.text_hover or C.text)

@@ -11,8 +11,10 @@
 
 #include "Net.h"
 #include "Sha256.h"
+#include "Auth.h"
 #include "ChunkData.h"
 #include "Block.h"
+#include "BlockDefs.h"
 #include "Types.h"
 #include <algorithm>
 #include <chrono>
@@ -36,7 +38,9 @@ namespace {
 
 enum Msg : uint8_t {
     // client -> server
-    C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance, str passwordToken
+    C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance, u8 hasPassword
+                      // (no secret: the server answers with S_CHALLENGE)
+    C_AUTH    = 6,    // str response, str registerKey   (answer to S_CHALLENGE; see Auth.h)
     C_INPUTS  = 2,    // u32 firstSeq, u16 count, { u8 keys, f32 yaw, f32 pitch, f32 dt }
     C_BLOCKS  = 3,    // u16 count, { i32 x y z, str block, u8 meta }
     C_CHAT    = 4,    // str text
@@ -56,6 +60,8 @@ enum Msg : uint8_t {
     S_STATUS  = 74,   // u32 protocol, str version, str game, str motd, u16 online, u16 max,
                       // u16 nameCount, { str name }    (server list; sent instead of joining)
     S_SHARED  = 76,   // u16 count, { str key, str value }   shared values (weather...)
+    S_MODE    = 77,   // str gameMode, u8 isOperator   (the server decides; the game follows)
+    S_CHALLENGE = 78, // str serverId, str nonce, u8 accountExists   (after C_HELLO; see Auth.h)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
@@ -281,7 +287,11 @@ float net::clockSeconds() {
 
 std::string net::passwordToken(const std::string& password) {
     if (password.empty()) return "";
-    return sha256Hex("craft-and-ruin-password:" + password);
+    return sha256Hex("craft-and-ruin-password:" + password);   // stays on the player's PC
+}
+
+bool net::AuthProof::matches(const std::string& storedKey, const std::string& name) const {
+    return auth::verify(storedKey, serverId, nonce, name, response);
 }
 
 bool net::parseAddress(const std::string& text, std::string& host, uint16_t& port) {
@@ -514,6 +524,7 @@ void GameServer::handleInputs(Client& c, const uint8_t* data, size_t size) {
     for (uint16_t i = 0; i < count; ++i) {
         MoveInput in;
         in.keys = r.u8();
+        if (c.mode != "creative") in.keys &= static_cast<uint8_t>(~MoveInput::Fly);   // flying: creative only
         in.yaw = r.f32();
         in.pitch = std::clamp(r.f32(), -90.0f, 90.0f);
         float dt = r.f32();
@@ -569,6 +580,7 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
 
     if (!c.joined) {
         if (type == C_HELLO) handleHello(c, data, size);
+        else if (type == C_AUTH) handleAuth(c, data, size);
         return;
     }
 
@@ -612,8 +624,7 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     const std::string game = r.str();
     const int view = r.u8();
     if (!r.ok) { kick(c, "Bad hello packet"); return; }
-    std::string token = r.str();
-    if (!r.ok || token.size() > 128) token.clear();
+    (void)r.u8();   // hasPassword (informational)
 
     if (protocol != net::kProtocolVersion) {
         kick(c, protocol < net::kProtocolVersion ? "Your game is older than the server - please update"
@@ -626,10 +637,43 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
         kick(c, "This server plays " + title + " (" + m_game + "). Select that game on the title screen first.");
         return;
     }
+    if (c.challenged) { kick(c, "Bad hello packet"); return; }
+
+    // Password challenge (Auth.h): a fresh single-use nonce bound to this server's identity.
+    // Nothing secret has been sent yet; the player answers with C_AUTH.
+    if (m_serverId.empty()) m_serverId = "temp-" + auth::randomHex(16);   // setServerId wasn't called
+    c.challenged = true;
+    c.nonce = auth::randomHex(32);
+    c.helloName = name;
+    c.helloView = view;
+    Writer w(S_CHALLENGE);
+    w.str(m_serverId);
+    w.str(c.nonce);
+    w.u8((hasAccount && hasAccount(name)) ? 1 : 0);
+    sendTo(c.peer, w);
+}
+
+void GameServer::handleAuth(Client& c, const uint8_t* data, size_t size) {
+    if (!c.challenged || c.nonce.empty()) { kick(c, "Bad login packet"); return; }
+    Reader r(data, size);
+    net::AuthProof proof;
+    proof.response = r.str();
+    proof.registerKey = r.str();
+    proof.serverId = m_serverId;
+    proof.nonce = c.nonce;
+    c.nonce.clear();                       // single use, whatever happens next
+    c.challenged = false;
+    if (!r.ok || proof.response.size() > 128 || proof.registerKey.size() > 128) { kick(c, "Bad login packet"); return; }
+    const std::string name = c.helloName;
+
     if (canJoin) {
-        const std::string reason = canJoin(name, token);   // banned, not whitelisted, wrong password...
+        const std::string reason = canJoin(name, proof);   // banned, not whitelisted, wrong password...
         if (!reason.empty()) { kick(c, reason); return; }
     }
+    finishJoin(c, name, c.helloView);
+}
+
+void GameServer::finishJoin(Client& c, const std::string& name, int view) {
     if (m_hasHost && name == m_hostName) { kick(c, "Someone called '" + name + "' is already playing"); return; }
     for (const auto& [id, other] : m_clients) {
         if (other.joined && other.name == name) { kick(c, "Someone called '" + name + "' is already playing"); return; }
@@ -690,9 +734,47 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
         sendShared(c.peer, std::vector<std::pair<std::string, std::string>>(m_shared.begin(), m_shared.end()));
     }
 
+    // Their game mode and whether they're an operator
+    c.mode = modeFor ? modeFor(name) : std::string();
+    if (c.mode.empty()) c.mode = m_defaultMode;
+    c.op = isOperator ? isOperator(name) : false;
+    sendMode(c);
+
     std::cout << "[Server] " << name << " joined" << std::endl;
     broadcastChat(name + " joined the game", kInfoColor);
     if (onJoin) onJoin(name);
+}
+
+void GameServer::sendMode(Client& c) {
+    Writer w(S_MODE);
+    w.str(c.mode);
+    w.u8(c.op ? 1 : 0);
+    sendTo(c.peer, w);
+}
+
+bool GameServer::setPlayerMode(const std::string& name, const std::string& mode) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        c.mode = mode;
+        sendMode(c);
+        return true;
+    }
+    return false;
+}
+
+std::string GameServer::playerMode(const std::string& name) const {
+    for (const auto& [id, c] : m_clients) if (c.joined && c.name == name) return c.mode;
+    return "";
+}
+
+bool GameServer::setPlayerOperator(const std::string& name, bool op) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        c.op = op;
+        sendMode(c);
+        return true;
+    }
+    return false;
 }
 
 bool GameServer::teleportPlayer(const std::string& name, const glm::vec3& pos) {
@@ -754,7 +836,15 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         const bool loaded = m_world->chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
 
-        if (blockIdFromName(name, id) && inReach && loaded) {
+        // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever
+        // the player's game says
+        bool allowed = true;
+        if (loaded && c.mode != "creative" && blockIdFromName(name, id) && id == 0) {
+            const uint8_t was = m_world->getBlockAt(pos);
+            if (was != 0 && blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) allowed = false;
+        }
+
+        if (allowed && blockIdFromName(name, id) && inReach && loaded) {
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->setBlockWithMetaAt(pos, id, meta);
             if (onPlayerEdit && oldId != id) onPlayerEdit(pos, oldId, id);
@@ -1031,7 +1121,7 @@ GameClient::~GameClient() {
 
 bool GameClient::connect(World& world, const std::string& address, const std::string& playerName,
                          const std::string& gameFolder, int viewDistance, std::string& error,
-                         const std::string& passwordToken) {
+                         const std::string& passwordToken, const std::string& knownServerId) {
     disconnect();
     m_ended = false;
     m_endReason.clear();
@@ -1071,6 +1161,8 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_addressText = hostText + ":" + std::to_string(port);
     m_name = playerName;
     m_password = passwordToken;
+    m_knownServerId = knownServerId;
+    m_serverId.clear();
     m_game = gameFolder;
     m_viewDistance = std::clamp(viewDistance, 2, net::kMaxViewDistance);
     m_connectStarted = nowSeconds();
@@ -1101,6 +1193,7 @@ void GameClient::disconnect() {
     m_peer = nullptr;
     m_state = State::Idle;
     m_views.clear();
+    m_mode.clear(); m_isOp = false; m_modeChanged = true;   // our own game decides again
     std::cout << "[Client] Disconnected" << std::endl;
 }
 
@@ -1113,6 +1206,7 @@ void GameClient::finish(const std::string& reason) {
     }
     m_state = State::Idle;
     m_views.clear();
+    if (!m_mode.empty() || m_isOp) { m_mode.clear(); m_isOp = false; m_modeChanged = true; }
     m_ended = true;
     if (!m_kickReason.empty()) m_endReason = m_kickReason;
     else m_endReason = wasJoined ? reason : "Could not connect to " + m_addressText +
@@ -1137,7 +1231,7 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             w.str(m_name);
             w.str(m_game);
             w.u8(static_cast<uint8_t>(m_viewDistance));
-            w.str(m_password);
+            w.u8(m_password.empty() ? 0 : 1);   // the password itself is never sent (S_CHALLENGE)
             sendTo(m_peer, w);
             break;
         }
@@ -1240,6 +1334,40 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         std::cout << "[Client] Joined " << m_addressText << std::endl;
         break;
     }
+    case S_CHALLENGE: {
+        // Prove we know the password without sending anything replayable (Auth.h)
+        const std::string serverId = r.str();
+        const std::string nonce = r.str();
+        const bool accountExists = r.u8() != 0;
+        if (!r.ok || serverId.empty() || nonce.empty() || serverId.size() > 128 || nonce.size() > 128) {
+            m_kickReason = "The server sent a bad login challenge";   // (shown as is, not "could not connect")
+            finish(m_kickReason);
+            break;
+        }
+        m_serverId = serverId;
+        Writer w(C_AUTH);
+        if (m_password.empty()) {
+            w.str(""); w.str("");                          // no password: nothing to prove
+        } else {
+            if (!m_knownServerId.empty() && serverId != m_knownServerId) {
+                // A different server answering at this address: don't hand it a response
+                m_kickReason = "This server's identity changed since you last joined, so your password was not "
+                               "used. If its owner reinstalled it, remove the line 'server_id." + m_addressText +
+                               "' from settings.txt and join again.";
+                finish(m_kickReason);
+                break;
+            }
+            // The slow part (PBKDF2): once per (token, name), then remembered
+            static std::string cachedFor, cachedKey;
+            const std::string cacheId = m_password + "\n" + auth::toLower(m_name);
+            if (cachedFor != cacheId) { cachedKey = auth::playerKey(m_password, m_name); cachedFor = cacheId; }
+            const std::string serverKey = auth::serverKey(cachedKey, serverId);
+            w.str(auth::response(serverKey, serverId, nonce, m_name));
+            w.str(accountExists ? std::string() : serverKey);   // only to create the account
+        }
+        sendTo(m_peer, w);
+        break;
+    }
     case S_KICK:
         // The server is dropping us anyway - leave now with its reason
         m_kickReason = r.str();
@@ -1257,6 +1385,16 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
     case S_UNLOAD: {
         const int cx = r.i32(), cz = r.i32();
         if (r.ok && m_state == State::Joined) m_world->removeChunk(cx, cz);
+        break;
+    }
+    case S_MODE: {
+        Reader r(data, size);
+        const std::string mode = r.str();
+        const uint8_t op = r.u8();
+        if (!r.ok) break;
+        m_mode = mode;
+        m_isOp = op != 0;
+        m_modeChanged = true;
         break;
     }
     case S_SHARED: {

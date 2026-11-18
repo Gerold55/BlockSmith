@@ -1,25 +1,46 @@
--- Force a permanent full moon (phase 0)
-sky.set_moon_phase(0)
+-- Weather: decides the weather and makes it look right. The engine only draws effects
+-- (sky.set_precipitation, set_sky_tint, set_light, flash...); everything about WHICH
+-- weather, WHEN and HOW it changes is here, so games and mods can change any of it.
+--
+-- Feels like Minecraft out of the box: long clear spells, rain now and then, sometimes a
+-- thunderstorm, snow instead of rain where it's cold. Mods add or change weathers Luanti
+-- style:
+--
+--   weather.register("sandstorm", {
+--       light = 0.7,                                   -- sunlight on the world (1 = normal)
+--       sky_tint = { 0.8, 0.65, 0.45, 0.6 },           -- r, g, b, how much (0..1)
+--       rain = 0.6,                                    -- 0..1 thickens the fog
+--       precipitation = { type = "dust", texture = "sand_grain.png", intensity = 0.7,
+--                         fall_speed = 3, size = 0.06, streaks = false },
+--       wind = { 6, 1 },                               -- blocks/s, x and z
+--       lightning = 0,                                 -- flashes per minute
+--       clouds = nil,                                  -- optional: clouds.set_weather(name)
+--       chance = 5,                                    -- how often the cycle picks it (0 = never)
+--       duration = { 120, 300 },                       -- seconds, min and max
+--       fade = 15,                                     -- seconds to fade in
+--       cold_variant = nil,                            -- weather to show instead where it's cold
+--   })
+--
+--   weather.set("rain" [, fade_seconds [, duration_seconds]])   -- start a weather now
+--   weather.get()                       -- current weather name
+--   weather.list()                      -- every registered name
+--   weather.set_cycle(false)            -- stop changing by itself (e.g. for a minigame)
+--   weather.on_change(function(old, new) ... end)
+--   weather.on_lightning(function(x, z) ... end)    -- a flash near the player (client side)
+--   weather.is_cold = function(x, z) return ... end -- where rain should be snow
+--
+-- Multiplayer: whoever runs the world (singleplayer, the host or the dedicated server)
+-- decides, using engine.set_shared("weather", ...); every player sees the same weather.
 
--- Lock time to noon
-sky.set_time(1.5)
+weather = weather or {}
 
--- Trigger rain weather effects
-sky.set_rain_intensity(0.8)
+local types, order = {}, {}
+local change_callbacks, lightning_callbacks = {}, {}
+local cycle_enabled = true
+local current = nil          -- name everyone agreed on (from the shared value)
+local remaining = 0          -- seconds until the cycle picks again (authority only)
+local started = false
 
-<<<<<<< Updated upstream
--- Register custom texture pack moon phases dynamically
-sky.set_moon_textures({
-    "textures/moon_1_classic.png",
-    "textures/moon_2_classic.png",
-    "textures/moon_3_classic.png",
-    "textures/moon_4_classic.png",
-    "textures/moon_5_classic.png",
-    "textures/moon_6_classic.png",
-    "textures/moon_7_classic.png",
-    "textures/moon_8_classic.png"
-})
-=======
 local is_server = engine.is_server and engine.is_server() or false
 
 -- ---------------------------------------------------------------------------
@@ -371,5 +392,20 @@ function on_chat_command(text, player, is_operator, reply)
     return true
 end
 
+-- ---------------------------------------------------------------------------
+-- The game's moon: its 8 phase pictures (the sky cycles through them, one per day)
+-- ---------------------------------------------------------------------------
+if not is_server and sky and sky.set_moon_textures then
+    sky.set_moon_textures({
+        "textures/moon_1_classic.png",
+        "textures/moon_2_classic.png",
+        "textures/moon_3_classic.png",
+        "textures/moon_4_classic.png",
+        "textures/moon_5_classic.png",
+        "textures/moon_6_classic.png",
+        "textures/moon_7_classic.png",
+        "textures/moon_8_classic.png"
+    })
+end
+
 print("[Weather] Ready: " .. table.concat(order, ", "))
->>>>>>> Stashed changes

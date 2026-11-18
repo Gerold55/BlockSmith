@@ -70,7 +70,36 @@ MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch) {
     if (isActionDown(window, "sneak"))   in.keys |= MoveInput::Sneak;
     if (isActionDown(window, "sprint"))  in.keys |= MoveInput::Sprint;
     in.keys &= g_MoveKeyMask;
+    if (g_Flying) in.keys |= MoveInput::Fly;
     return in;
+}
+
+// ---------------------------------------------------------------------------
+// Creative flying, like Minecraft: double-tap Jump to start or stop; Jump rises, Sneak sinks,
+// Sprint flies faster; touching the ground stops it.
+// ---------------------------------------------------------------------------
+bool g_Flying = false;
+
+void updateFlight(GLFWwindow* window, bool canFly, bool grounded) {
+    static bool jumpWasDown = false;
+    static double lastJumpPress = -10.0;
+    if (!canFly) {                                   // left creative (or a mod blocked it)
+        g_Flying = false;
+        jumpWasDown = false;
+        return;
+    }
+    const bool jumpDown = isActionDown(window, "jump") && (g_MoveKeyMask & MoveInput::Jump);
+    if (jumpDown && !jumpWasDown) {
+        const double now = glfwGetTime();
+        if (now - lastJumpPress < 0.3) {             // second tap within 0.3 s (Minecraft: 7 ticks)
+            g_Flying = !g_Flying;
+            lastJumpPress = -10.0;                   // a third tap starts a new double tap
+        } else {
+            lastJumpPress = now;
+        }
+    }
+    jumpWasDown = jumpDown;
+    if (g_Flying && grounded && !jumpDown) g_Flying = false;   // landed
 }
 
 glm::mat4 Player::getViewMatrix() const {

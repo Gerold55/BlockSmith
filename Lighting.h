@@ -9,6 +9,7 @@ struct PointLight {
     glm::vec3 color;
     float radius;
     float intensity;
+    bool active = true;   // removed lights stay as empty slots, so other lights keep their ids
 };
 
 class LightingSystem {

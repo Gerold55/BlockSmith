@@ -22,7 +22,10 @@ struct Vertex {
     float overlayLayer;
     float tintBase;
     float tintOverlay;
-    float faceShading;
+    float faceShading;      // face direction shading x ambient occlusion
+    // Light at this corner (0..1): sunlight, then red, green, blue block light (Light.h).
+    // Smoothed over the cells around the corner. Only chunk meshes fill these in.
+    float lightSky = 1.0f, lightR = 0.0f, lightG = 0.0f, lightB = 0.0f;
 };
 
 struct FaceDefinition {
@@ -66,6 +69,7 @@ struct BlockProperty {
     bool needsTool = false;       // without that tool: slow, and drops nothing (stone, ores)
     bool dropsSet = false;        // false = drops itself
     std::string drops;            // item it drops when dug ("" = nothing)
+    std::string pick;             // item pick block gives ("" = the block itself), e.g. crops -> seeds
     // --- Biome colour: -1 none, 0 grass colours, 1 foliage colours (register_block's
     //     biome_tint = "grass" | "foliage" | "none"). Replaces the tint colour where the
     //     block is tinted. ---
@@ -77,6 +81,11 @@ struct BlockProperty {
     SoundSpec soundDig;           // each hit while digging it
     SoundSpec soundDug;           // when it breaks
     SoundSpec soundPlace;         // when it's placed
+    // --- Light (Light.h). register_block's light / light_color / light_absorb / light_filter ---
+    bool lightSet = false;              // false = guessed from the name (torch, lava, glowstone...)
+    uint8_t lightEmit[3] = {0, 0, 0};   // light it gives off, per colour (0..15 each)
+    int lightAbsorb = -1;               // light lost per block passing through (at least 1; sunlight straight down loses only this; -1 = guess: water 1, leaves 1)
+    float lightFilter[3] = {1.0f, 1.0f, 1.0f};   // colour let through (stained glass), 0..1 each
     // --- If this is a tool ---
     std::string toolType;         // "pickaxe", "axe", "shovel", "sword"... ("" = not a tool)
     float toolSpeed = 1.0f;       // how many times faster it digs blocks of its type

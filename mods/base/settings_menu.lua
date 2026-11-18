@@ -86,6 +86,7 @@ local VIDEO_LABELS = {
     fov             = "Field of View",
     render_distance = "Render Distance",
     vsync           = "VSync",
+    main_hand       = "Main Hand",
     volume_master   = "Master Volume",
     volume_music    = "Music",
     volume_effects  = "Blocks & Effects",
@@ -94,6 +95,7 @@ local VIDEO_LABELS = {
 
 local function video_value_text(s)
     if s.id == "vsync" then return (s.value ~= 0) and "On" or "Off" end
+    if s.id == "main_hand" then return (s.value ~= 0) and "Left" or "Right" end
     if s.id == "render_distance" then return s.value .. " chunks" end
     if s.id:find("^volume_") then return (s.value == 0) and "Off" or (s.value .. "%") end
     return tostring(s.value)
@@ -194,12 +196,16 @@ local function draw_button(b, mx, my, S, fs, label_color)
     local hovered = enabled and inside(mx, my, b.x, b.y, b.w, b.h)
     local fill = (not enabled) and C.button_off or (b.selected and C.tab_active)
                  or (hovered and C.button_hover or C.button)
-    rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-    if enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not enabled) and "disabled") or (b.selected and "selected") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
+        if enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
     local tc = label_color or ((not enabled) and C.text_off or (hovered and C.text_hover or C.text))
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs, tc, S)
@@ -279,7 +285,7 @@ local function row_widgets(L, item, rx, ry, rw, rh)
         fw = math.min(fw, rw * 0.65)
         return { field = { x = rx + rw - fw, y = by, w = fw, h = bh } }
     end
-    if item.id == "vsync" then
+    if item.id == "vsync" or item.id == "main_hand" then
         local kw = Theme.key_w * S
         return { toggle = { x = rx + rw - kw, y = by, w = kw, h = bh } }
     end
@@ -421,7 +427,7 @@ function render_settings(W, H)
     if state.message then
         note, note_color = state.message, C.error
     elseif state.waiting then
-        note, note_color = "Press a key for this control (Escape to cancel).", C.waiting
+        note, note_color = "Press a key or mouse button for this control (Escape to cancel).", C.waiting
     elseif state.editing then
         note, note_color = "Type, then press Enter (Escape to cancel).", C.waiting
     elseif state.tab == "controls" then
@@ -551,6 +557,17 @@ function handle_settings_key(key, action, mods)
         return true
     end
     return false   -- Escape falls through to C++ (closes settings)
+end
+
+-- A mouse button while Settings is open (code = 1000 + button, as keybinds store it): if a
+-- control is waiting for its new key, that button becomes it (middle mouse, side buttons...)
+function handle_settings_mouse(code)
+    if not state.waiting then return false end
+    local ok, err = engine.set_keybind(state.waiting, code)
+    state.message = (ok == false) and err or nil
+    state.waiting = nil
+    refresh()
+    return true                    -- don't also click whatever is under the mouse
 end
 
 function handle_settings_char(codepoint, ch)

@@ -2,6 +2,9 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -92,7 +95,7 @@ glm::mat4 Bone::getLocalTransform() const {
     m = glm::translate(m, position + pivot);
     m *= glm::mat4_cast(restRotation);
     m *= eulerMatrix(rotation);
-    m = glm::scale(m, scale);
+    m = glm::scale(m, scale * animScale);
     m = glm::translate(m, -pivot);
     return m;
 }
@@ -493,4 +496,206 @@ void AnimatedModel::loadFromB3D(const std::string& filepath) {
     for (const auto& [n, b] : boneMap) meshCount += static_cast<int>(b->meshes.size());
     std::cout << "[Model] Loaded .b3d model: " << filepath << " (" << boneMap.size() << " nodes, "
               << meshCount << " meshes" << (textureHint.empty() ? "" : ", texture " + textureHint) << ")" << std::endl;
+}
+
+bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world) {
+    if (!loaded) return false;
+    auto bone = getBone(name);
+    if (!bone) return false;
+    // The file's pose: animations and Lua poses are put back afterwards
+    struct Saved { Bone* b; glm::vec3 r, p, s; };
+    std::vector<Saved> saved;
+    std::vector<Bone*> stack{ bone.get() };
+    while (!stack.empty()) {
+        Bone* b = stack.back();
+        stack.pop_back();
+        saved.push_back({ b, b->rotation, b->position, b->animScale });
+        b->rotation = glm::vec3(0.0f);
+        b->position = glm::vec3(0.0f);
+        b->animScale = glm::vec3(1.0f);
+        for (auto& c : b->children) stack.push_back(c.get());
+    }
+
+    glUseProgram(shaderProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture != 0 ? texture : whiteTexture());
+    const GLint texLoc = glGetUniformLocation(shaderProgram, "texture_diffuse1");
+    if (texLoc >= 0) glUniform1i(texLoc, 0);
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    // Move the bone's pivot (its shoulder, for an arm) to the origin of `world`
+    const glm::mat4 root = glm::translate(glm::scale(world, glm::vec3(scale)), -bone->pivot);
+    drawBoneRecursive(bone, modelLoc, root);
+
+    for (const Saved& sv : saved) { sv.b->rotation = sv.r; sv.b->position = sv.p; sv.b->animScale = sv.s; }
+    return true;
+}
+
+// ===========================================================================
+// Animations
+// ===========================================================================
+
+void AnimatedModel::resetPose() {
+    for (auto& [name, bone] : boneMap) {
+        bone->rotation = glm::vec3(0.0f);
+        bone->position = glm::vec3(0.0f);
+        bone->animScale = glm::vec3(1.0f);
+    }
+}
+
+namespace {
+
+// A number, or a number written as text. Molang expressions ("math.sin(...)") aren't
+// supported: they count as 0 and are reported once per file.
+float animNumber(const json& v, bool& unsupported) {
+    if (v.is_number()) return v.get<float>();
+    if (v.is_string()) {
+        const std::string s = v.get<std::string>();
+        char* end = nullptr;
+        const float f = std::strtof(s.c_str(), &end);
+        if (end && end != s.c_str() && *end == '\0') return f;
+        unsupported = true;
+    }
+    return 0.0f;
+}
+
+glm::vec3 animVec(const json& v, bool& unsupported) {
+    if (v.is_array() && v.size() >= 3) return glm::vec3(animNumber(v[0], unsupported), animNumber(v[1], unsupported), animNumber(v[2], unsupported));
+    if (v.is_array() && v.size() == 1) { const float f = animNumber(v[0], unsupported); return glm::vec3(f); }
+    if (v.is_number() || v.is_string()) { const float f = animNumber(v, unsupported); return glm::vec3(f); }
+    return glm::vec3(0.0f);
+}
+
+// "rotation": [x, y, z]   or   { "0.0": [x, y, z], "0.5": { "pre": [...], "post": [...], "lerp_mode": "catmullrom" } }
+AnimChannel readChannel(const json& j, bool& unsupported) {
+    AnimChannel ch;
+    if (j.is_object() && !j.contains("pre") && !j.contains("post")) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            AnimKey k;
+            k.time = std::strtof(it.key().c_str(), nullptr);
+            const json& v = it.value();
+            if (v.is_object()) {
+                k.post = animVec(v.contains("post") ? v["post"] : v.value("pre", json::array()), unsupported);
+                k.pre = v.contains("pre") ? animVec(v["pre"], unsupported) : k.post;
+                const std::string mode = v.value("lerp_mode", std::string("linear"));
+                k.lerp = mode == "catmullrom" ? 1 : mode == "step" ? 2 : 0;
+            } else {
+                k.pre = k.post = animVec(v, unsupported);
+            }
+            ch.keys.push_back(k);
+        }
+        std::sort(ch.keys.begin(), ch.keys.end(), [](const AnimKey& a, const AnimKey& b) { return a.time < b.time; });
+    } else {
+        AnimKey k;
+        k.pre = k.post = animVec(j.is_object() ? j.value("post", j.value("pre", json::array())) : j, unsupported);
+        ch.keys.push_back(k);
+    }
+    return ch;
+}
+
+glm::vec3 catmullRom(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3, float t) {
+    const float t2 = t * t, t3 = t2 * t;
+    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+} // namespace
+
+glm::vec3 AnimChannel::sample(float t) const {
+    if (keys.empty()) return glm::vec3(0.0f);
+    if (keys.size() == 1 || t <= keys.front().time) return keys.front().pre;
+    if (t >= keys.back().time) return keys.back().post;
+    size_t i = 0;
+    while (i + 1 < keys.size() && keys[i + 1].time <= t) ++i;
+    const AnimKey& a = keys[i];
+    const AnimKey& b = keys[i + 1];
+    const float span = b.time - a.time;
+    const float f = span > 0.0f ? (t - a.time) / span : 1.0f;
+    if (a.lerp == 2) return a.post;                                  // step: hold until the next key
+    if (a.lerp == 1 || b.lerp == 1) {                               // smooth curve through the neighbours
+        const glm::vec3 p0 = i > 0 ? keys[i - 1].post : a.post;
+        const glm::vec3 p3 = i + 2 < keys.size() ? keys[i + 2].pre : b.pre;
+        return catmullRom(p0, a.post, b.pre, p3, f);
+    }
+    return glm::mix(a.post, b.pre, f);
+}
+
+void ModelAnimation::apply(AnimatedModel& model, float time, float weight) const {
+    if (length > 0.0f) {
+        if (loop) { time = std::fmod(time, length); if (time < 0.0f) time += length; }
+        else time = std::clamp(time, 0.0f, length);
+    }
+    weight = std::clamp(weight, 0.0f, 1.0f);
+    for (const BoneAnimation& ba : bones) {
+        auto bone = model.getBone(ba.bone);
+        if (!bone) continue;
+        if (!ba.rotation.empty()) bone->rotation = glm::mix(bone->rotation, ba.rotation.sample(time), weight);
+        // Positions are in pixels (16 per block), like the model's cubes
+        if (!ba.position.empty()) bone->position = glm::mix(bone->position, ba.position.sample(time) / 16.0f, weight);
+        if (!ba.scale.empty()) bone->animScale = glm::mix(bone->animScale, ba.scale.sample(time), weight);
+    }
+}
+
+bool AnimationSet::loadFromFile(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "[Animation] Can't open " << path << std::endl;
+        return false;
+    }
+    json root;
+    try {
+        in >> root;
+    } catch (const std::exception& e) {
+        std::cerr << "[Animation] " << path << " isn't valid JSON: " << e.what() << std::endl;
+        return false;
+    }
+    if (!root.contains("animations") || !root["animations"].is_object()) {
+        std::cerr << "[Animation] " << path << " has no \"animations\" section" << std::endl;
+        return false;
+    }
+    bool unsupported = false;
+    for (auto it = root["animations"].begin(); it != root["animations"].end(); ++it) {
+        const json& a = it.value();
+        auto anim = std::make_shared<ModelAnimation>();
+        anim->name = it.key();
+        if (a.contains("loop")) anim->loop = a["loop"].is_boolean() ? a["loop"].get<bool>() : false;   // "hold_on_last_frame" = hold
+        float last = 0.0f;
+        if (a.contains("bones") && a["bones"].is_object()) {
+            for (auto b = a["bones"].begin(); b != a["bones"].end(); ++b) {
+                BoneAnimation ba;
+                ba.bone = b.key();
+                const json& bj = b.value();
+                if (bj.contains("rotation")) ba.rotation = readChannel(bj["rotation"], unsupported);
+                if (bj.contains("position")) ba.position = readChannel(bj["position"], unsupported);
+                if (bj.contains("scale")) ba.scale = readChannel(bj["scale"], unsupported);
+                for (const AnimChannel* c : { &ba.rotation, &ba.position, &ba.scale }) {
+                    if (!c->keys.empty()) last = std::max(last, c->keys.back().time);
+                }
+                anim->bones.push_back(std::move(ba));
+            }
+        }
+        anim->length = a.contains("animation_length") && a["animation_length"].is_number()
+                     ? a["animation_length"].get<float>() : last;
+        animations.push_back(anim);
+    }
+    if (unsupported) {
+        std::cout << "[Animation] " << path << " uses Molang expressions; those values count as 0 (use plain numbers)" << std::endl;
+    }
+    std::cout << "[Animation] Loaded " << animations.size() << " animation(s) from " << path << std::endl;
+    return !animations.empty();
+}
+
+std::shared_ptr<ModelAnimation> AnimationSet::get(const std::string& name) const {
+    if (name.empty()) return animations.empty() ? nullptr : animations.front();
+    for (const auto& a : animations) if (a->name == name) return a;
+    // Short names work too: "walk" finds "animation.player.walk"
+    for (const auto& a : animations) {
+        const std::string& n = a->name;
+        if (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 && n[n.size() - name.size() - 1] == '.') return a;
+    }
+    return nullptr;
+}
+
+std::vector<std::string> AnimationSet::names() const {
+    std::vector<std::string> out;
+    for (const auto& a : animations) out.push_back(a->name);
+    return out;
 }

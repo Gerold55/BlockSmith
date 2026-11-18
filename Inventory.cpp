@@ -438,7 +438,10 @@ void InventorySystem::registerLuaBindings(sol::state& lua) {
         return sol::as_table(getCurrentItems());
     });
 
-    // ui.get_block_info(name) -> { id, name, pattern, has_texture, in_creative } or nil
+    // ui.get_block_info(name) -> { id, name, pattern, has_texture, in_creative, inventory_image,
+    //                              item, tool_type, tool, light, walkable, transparent } or nil
+    //   item = has an inventory picture (never placed); tool_type = what it is as a tool;
+    //   tool = what digs it; light = brightest colour it gives off (0..15, if set)
     ui.set_function("get_block_info", [](const std::string& name, sol::this_state ts) -> sol::object {
         sol::state_view lv(ts);
         auto& reg = BlockRegistry::getInstance();
@@ -454,6 +457,12 @@ void InventorySystem::registerLuaBindings(sol::state& lua) {
         t["has_texture"] = (getIconFace(b) != nullptr) || b.inventoryLayer >= 0;
         t["inventory_image"] = b.inventoryImage;
         t["in_creative"] = b.in_creative;
+        t["item"]        = !b.inventoryImage.empty();
+        t["tool_type"]   = b.toolType;
+        t["tool"]        = b.tool;
+        t["light"]       = static_cast<int>(std::max(b.lightEmit[0], std::max(b.lightEmit[1], b.lightEmit[2])));
+        t["walkable"]    = b.isWalkable;
+        t["transparent"] = b.isTransparent;
         return t;
     });
 
@@ -484,6 +493,15 @@ void InventorySystem::registerLuaBindings(sol::state& lua) {
     keys["DOWN"]      = GLFW_KEY_DOWN;
     keys["PAGE_UP"]   = GLFW_KEY_PAGE_UP;
     keys["PAGE_DOWN"] = GLFW_KEY_PAGE_DOWN;
+    keys["LEFT"]      = GLFW_KEY_LEFT;
+    keys["RIGHT"]     = GLFW_KEY_RIGHT;
+    keys["SPACE"]     = GLFW_KEY_SPACE;
+    keys["TAB"]       = GLFW_KEY_TAB;
+    keys["HOME"]      = GLFW_KEY_HOME;
+    keys["END"]       = GLFW_KEY_END;
+    for (char c = 'A'; c <= 'Z'; ++c) keys[std::string(1, c)] = static_cast<int>(c);       // ui.keys.M ...
+    for (char c = '0'; c <= '9'; ++c) keys[std::string(1, c)] = static_cast<int>(c);       // ui.keys["1"] ...
+    for (int i = 1; i <= 12; ++i) keys["F" + std::to_string(i)] = GLFW_KEY_F1 + i - 1;      // ui.keys.F1 ...
     ui["keys"] = keys;
 
     sol::table actions = lua.create_table();
@@ -540,9 +558,10 @@ void InventorySystem::renderLuaScreen(GLFWwindow* window, sol::state& lua, const
     s_ctx.active = false;
 }
 
-void InventorySystem::handleCreativeClick(double mx, double my, float width, float height) {
+void InventorySystem::handleCreativeClick(double mx, double my, float width, float height,
+                                          const std::string& button, bool shift) {
     if (!isCreativeOpen()) return;
-    callLua("handle_creative_click", mx, my, width, height);
+    callLua("handle_creative_click", mx, my, width, height, button, shift);
 }
 
 void InventorySystem::handleCreativeScroll(double yoffset) {

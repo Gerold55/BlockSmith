@@ -646,3 +646,11 @@ void hotbarScreenRect(const Hotbar& hb, float W, float H, float& x, float& y, fl
     const BarLayout b = computeBar(hb, W, H);
     x = b.x; y = b.y; w = b.w; h = b.h;
 }
+
+// Where slot i's icon area is on screen (pixels, top-left x, y and size): the engine draws
+// stack counts there, and mods can use it for their own overlays.
+void hotbarSlotRect(const Hotbar& hb, int i, float W, float H, float& x, float& y, float& size) {
+    const BarLayout b = computeBar(hb, W, H);
+    const glm::vec2 o = slotOrigin(b, i);
+    x = o.x; y = o.y; size = b.box;
+}

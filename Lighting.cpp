@@ -98,12 +98,17 @@ int LightingSystem::addPointLight(glm::vec3 pos, glm::vec3 color, float radius, 
     light.color = color;
     light.radius = radius;
     light.intensity = intensity;
+    light.active = true;
+    // Reuse a removed light's slot, so ids stay small and never shift
+    for (size_t i = 0; i < m_PointLights.size(); ++i) {
+        if (!m_PointLights[i].active) { m_PointLights[i] = light; return static_cast<int>(i); }
+    }
     m_PointLights.push_back(light);
     return static_cast<int>(m_PointLights.size()) - 1;
 }
 
 void LightingSystem::updatePointLight(int id, glm::vec3 pos, glm::vec3 color, float radius, float intensity) {
-    if (id >= 0 && id < static_cast<int>(m_PointLights.size())) {
+    if (id >= 0 && id < static_cast<int>(m_PointLights.size()) && m_PointLights[id].active) {
         m_PointLights[id].position = pos;
         m_PointLights[id].color = color;
         m_PointLights[id].radius = radius;
@@ -113,7 +118,7 @@ void LightingSystem::updatePointLight(int id, glm::vec3 pos, glm::vec3 color, fl
 
 void LightingSystem::removePointLight(int id) {
     if (id >= 0 && id < static_cast<int>(m_PointLights.size())) {
-        m_PointLights.erase(m_PointLights.begin() + id);
+        m_PointLights[id].active = false;
     }
 }
 

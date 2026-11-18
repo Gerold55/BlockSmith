@@ -101,6 +101,13 @@ add_executable(BlockSmith
     WorldRenderer.h
     ChunkData.cpp
     ChunkData.h
+    Light.cpp
+    Light.h
+    FirstPerson.cpp
+    FirstPerson.h
+    ClientMods.cpp
+    ClientMods.h
+    ClientModRules.h
     ChunkGenerator.cpp
     ChunkGenerator.h
     Fluids.cpp
@@ -174,6 +181,7 @@ add_executable(BlockSmithServer
     Fluids.cpp
     World.cpp
     ChunkData.cpp
+    Light.cpp
     CaveGenerator.cpp
     Block.cpp
     BlockDefs.cpp
