@@ -1,6 +1,7 @@
 // Client mods: see ClientMods.h
 #include "ClientMods.h"
 #include "ModOrder.h"
+#include "SafeReplace.h"
 
 #include <algorithm>
 #include <cctype>
@@ -552,8 +553,9 @@ void ClientMods::saveStorage(const std::string& mod) {
         for (const auto& kv : m_storage[mod]) out << escape(kv.first) << "=" << escape(kv.second) << "\n";
         if (!out) return;
     }
-    fs::rename(tmp, file, ec);
-    if (ec) { fs::remove(file, ec); fs::rename(tmp, file, ec); }
+    if (!replaceFile(tmp, file, ec)) {   // the old storage file stays as it was
+        std::cerr << "[Client mods] Could not save " << file.string() << ": " << ec.message() << std::endl;
+    }
 }
 
 void ClientMods::update(float dt, const std::string& where, const std::string& address) {

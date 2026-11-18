@@ -26,6 +26,7 @@
 #include "ChunkGenerator.h"
 #include "Fluids.h"
 #include "ModOrder.h"
+#include "SafeReplace.h"
 #include "ClientModRules.h"
 #include "Auth.h"
 
@@ -578,12 +579,11 @@ bool writeWorldMeta(const fs::path& file, const WorldMeta& m) {
         for (const auto& l : m.otherLines) out << l << "\n";
         if (!out) return false;
     }
-    fs::rename(tmp, file, ec);
-    if (ec) {
-        fs::remove(file, ec);
-        fs::rename(tmp, file, ec);
+    if (!replaceFile(tmp, file, ec)) {   // the old file stays as it was
+        std::cerr << "[Server] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
     }
-    return !ec;
+    return true;
 }
 
 fs::path playerFile(const fs::path& worldDir, const std::string& name) {

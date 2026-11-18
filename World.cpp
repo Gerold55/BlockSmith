@@ -6,6 +6,7 @@
 #include "CaveGenerator.h"
 #include "ChunkGenerator.h"
 #include "Fluids.h"
+#include "SafeReplace.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -688,14 +689,12 @@ bool World::saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const {
         }
     }
 
-    fs::rename(tmpPath, finalPath, ec);
-    if (ec) {
-        fs::remove(finalPath, ec);
-        fs::rename(tmpPath, finalPath, ec);
-        if (ec) {
-            std::cerr << "[Save] Could not replace " << finalPath << ": " << ec.message() << std::endl;
-            return false;
-        }
+    // One-step replace; on failure the existing save is kept as it was (SafeReplace.h) and the
+    // chunk stays marked as changed, so it's saved again later
+    if (!replaceFile(tmpPath, finalPath, ec)) {
+        std::cerr << "[Save] Could not replace " << finalPath << " (the previous save is kept): "
+                  << ec.message() << std::endl;
+        return false;
     }
     return true;
 }

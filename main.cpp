@@ -38,6 +38,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include <cstdio>
 #include <cctype>
 #include "ModOrder.h"
+#include "SafeReplace.h"
 #include "ClientMods.h"
 #include "Auth.h"
 #include <cstdlib>
@@ -544,12 +545,11 @@ bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, c
         if (!out) return false;
     }
 
-    fs::rename(tmp, file, ec);
-    if (ec) {
-        fs::remove(file, ec);
-        fs::rename(tmp, file, ec);
+    if (!replaceFile(tmp, file, ec)) {   // the old file stays as it was
+        std::cerr << "[Save] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
     }
-    return !ec;
+    return true;
 }
 
 // Writes changed chunks + world.dat for the world that is currently open.
@@ -867,12 +867,11 @@ bool saveModSettings(const std::map<std::string, bool>& settings) {
         if (!out) return false;
     }
     std::error_code ec;
-    fs::rename(tmp, file, ec);
-    if (ec) {
-        fs::remove(file, ec);
-        fs::rename(tmp, file, ec);
+    if (!replaceFile(tmp, file, ec)) {   // the old file stays as it was
+        std::cerr << "[Mods] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
     }
-    return !ec;
+    return true;
 }
 
 // A mod that can't be switched off: the base mod (it contains the Mods screen itself),
@@ -1566,10 +1565,8 @@ void saveSettings() {
         for (const auto& [k, v] : g_Settings) out << k << " = " << v << "\n";
     }
     std::error_code ec;
-    fs::rename(tmp, file, ec);
-    if (ec) {
-        fs::remove(file, ec);
-        fs::rename(tmp, file, ec);
+    if (!replaceFile(tmp, file, ec)) {   // the old settings stay as they were
+        std::cerr << "[Settings] Could not replace " << file.string() << ": " << ec.message() << std::endl;
     }
 }
 
