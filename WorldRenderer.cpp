@@ -75,11 +75,12 @@ bool boxInFrustum(const Frustum& f, const glm::vec3& boxMin, const glm::vec3& bo
 WorldRenderer::WorldRenderer() = default;
 WorldRenderer::~WorldRenderer() = default;
 
-void WorldRenderer::clear() {
+void WorldRenderer::clear(bool forceRebuild) {
     m_meshes.clear();
     m_needsMesh.clear();
     m_needsUpload.clear();
     m_firstUpload.clear();
+    m_forceRebuild = forceRebuild;
 }
 
 void WorldRenderer::update(World& world, const glm::vec3& playerPos) {
