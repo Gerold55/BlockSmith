@@ -32,18 +32,28 @@ local settings = {
     drown_fluids = { water = true },
     max_armor = 20,              -- 10 chestplate icons; each armour point blocks 4% of damage
 
-    -- HUD pictures (9x9 like Minecraft's). Point these at your game's own files.
+    -- HUD pictures (9x9 like Minecraft's). Point these at your game's own files. The
+    -- defaults have names only this mod uses (survival_*), so a same-named file elsewhere
+    -- in the game can't be picked up by mistake.
     --   *_empty = the dark outline drawn behind each icon
     --   *_half  = drawn for an odd last point; *_half_flip = true mirrors it (a half drawn
     --             as the right half shows as the left half, like Minecraft's half heart)
+    -- Each can be one file name or a list to try in order: your game's own pictures first,
+    -- then this mod's survival_* ones, so the HUD always shows something.
     icons = {
-        heart_full = "heart_full.png", heart_half = "heart_half.png", heart_empty = "heart_empty.png",
+        heart_full = { "heart_full.png", "survival_heart_full.png" },
+        heart_half = { "heart_half.png", "survival_heart_half.png" },
+        heart_empty = { "heart_bg.png", "survival_heart_empty.png" },
         heart_half_flip = true,    -- the game's half heart is drawn as the right half
-        hunger_full = "hunger_full.png", hunger_half = "hunger_half.png", hunger_empty = "hunger_empty.png",
+        hunger_full = { "hunger_full.png", "survival_hunger_full.png" },
+        hunger_half = { "hunger_half.png", "survival_hunger_half.png" },
+        hunger_empty = { "hunger_bg.png", "survival_hunger_empty.png" },
         hunger_half_flip = false,
-        armor_full = "armor_full.png", armor_half = "armor_half.png", armor_empty = "armor_empty.png",
+        armor_full = { "armor_full.png", "survival_armor_full.png" },
+        armor_half = { "armor_half.png", "survival_armor_half.png" },
+        armor_empty = { "armor_empty.png", "survival_armor_empty.png" },
         armor_half_flip = false,
-        air = "air.png",
+        air = { "air.png", "survival_air.png" },
     },
 
     -- The crack on a block being dug: a vertical strip of square pictures, first stage on
@@ -109,10 +119,14 @@ function survival.on_respawn(fn) callbacks.respawn[#callbacks.respawn + 1] = fn 
 
 local function exhaust(amount) S.exhaustion = S.exhaustion + amount end
 
-function survival.set_mode(mode)
-    if mode ~= "survival" and mode ~= "creative" then return false end
+-- On a server, the server decides your game mode (only its operators can change it)
+local function server_mode()
+    return engine.get_server_game_mode and engine.get_server_game_mode() or nil
+end
+
+local function apply_mode(mode, online)
     S.mode = mode
-    engine.set_storage("world:game_mode", mode)   -- the world list shows it
+    if not online then engine.set_storage("world:game_mode", mode) end   -- the world list shows it
     engine.set_creative(mode == "creative")
     if mode == "creative" and survival.inventory and survival.inventory.is_open() then
         survival.inventory.set_open(false)
@@ -123,7 +137,22 @@ function survival.set_mode(mode)
         if S.dead then survival.respawn() end
     end
     save()
+end
+
+-- Returns false (and changes nothing) on a server, unless it's the mode the server gave you
+function survival.set_mode(mode)
+    if mode ~= "survival" and mode ~= "creative" then return false end
+    local server = server_mode()
+    if server and server ~= mode then return false end
+    apply_mode(mode, server ~= nil)
     return true
+end
+
+-- The server set our mode (when we join, or an operator changed it)
+local previous_game_mode = on_game_mode
+function on_game_mode(mode, is_operator)
+    if loaded and (mode == "survival" or mode == "creative") then apply_mode(mode, true) end
+    if previous_game_mode then previous_game_mode(mode, is_operator) end
 end
 
 function survival.heal(amount)
@@ -187,6 +216,9 @@ function survival.respawn()
     save()
 end
 
+-- survival.is_food(item) -> true if it can be eaten (the creative inventory's Food tab uses it)
+function survival.is_food(item) return foods[item] ~= nil end
+
 function survival.register_food(item, food, saturation)
     foods[item] = { food = food, saturation = saturation or food * 0.6 }
     engine.register_item_use(item, function(pointed)
@@ -225,8 +257,20 @@ local function resolve(name)
     return name
 end
 survival.resolve_texture = resolve
+-- A list of names: the first one that exists
+local function resolve_first(list)
+    if engine.find_texture then
+        for _, name in ipairs(list) do
+            local found = engine.find_texture(name)
+            if found then print("[Survival] " .. name .. " -> " .. found) return found end
+        end
+        print("[Survival] Can't find any of: " .. table.concat(list, ", ") .. " - put one in " .. MOD_PATH .. "/textures/")
+    end
+    return resolve(list[1])
+end
 for k, v in pairs(settings.icons) do
-    if type(v) == "string" then settings.icons[k] = resolve(v) end
+    if type(v) == "string" then settings.icons[k] = resolve(v)
+    elseif type(v) == "table" then settings.icons[k] = resolve_first(v) end
 end
 
 -- The crack picture for survival digging: the game's crack_anylength.png if it has one
@@ -249,11 +293,17 @@ for item, v in pairs({
 -- ---------------------------------------------------------------------------
 -- Every frame
 -- ---------------------------------------------------------------------------
--- A marker in world storage: when a different world opens its storage is replaced, the
--- marker changes, and the state is loaded again for that world
-local session = tostring(math.random(1, 1e9)) .. tostring(os and os.time and os.time() or "")
+-- A marker in world storage, to notice when another world has opened: opening a world replaces
+-- the whole storage, so the marker read back no longer matches. It must be NEW for every load:
+-- with one marker for the whole game run, each world saved the same one, so going back to a
+-- world played earlier looked like "nothing changed" - the previous world's inventory and stats
+-- stayed (and were saved into it) instead of that world's own being loaded.
+local session_count = 0
+local session = nil
 
 local function first_load()
+    session_count = session_count + 1
+    session = string.format("%d-%d-%s", math.random(1, 1e9), session_count, tostring(os and os.time and os.time() or ""))
     S.mode, S.dead = nil, false
     S.hp, S.food, S.saturation, S.air, S.exhaustion = settings.max_hp, settings.max_food, 5, settings.max_air, 0
     load()
@@ -261,6 +311,7 @@ local function first_load()
     engine.set_storage("survival:session", session)
     if survival.inventory then survival.inventory.load() end
     fall_top, last, was_on_ground = nil, nil, true
+    S.mode = server_mode() or S.mode   -- on a server, its mode wins
     engine.set_creative(S.mode == "creative")
     engine.set_player_controls{ move = not S.dead, jump = not S.dead, sprint = not S.dead, sneak = not S.dead }
 end
@@ -387,8 +438,20 @@ local function draw_row(kind, value, max, x, y, size, step, right_to_left, shake
     end
 end
 
+local hud_note = nil
+local previous_hud = render_hud           -- HUD pieces from mods loaded earlier (chained)
+local draw_survival_hud
 function render_hud(W, H)
-    if not loaded or not survival_on() then return end
+    if previous_hud then pcall(previous_hud, W, H) end
+    return draw_survival_hud(W, H)
+end
+draw_survival_hud = function(W, H)
+    if not loaded or not survival_on() then
+        local why = not loaded and "survival hasn't started yet (no player)" or ("the game mode is " .. tostring(S.mode))
+        if hud_note ~= why then hud_note = why; print("[Survival] HUD hidden: " .. why) end
+        return
+    end
+    hud_note = nil
     local bx, by, bw = hotbar.get_rect(W, H)
     local size = math.floor(math.max(12, bw / 20))
     local step = size * 0.92
@@ -425,7 +488,11 @@ end
 -- ---------------------------------------------------------------------------
 local previous_update = on_update
 function on_update(dt)
-    if previous_update then previous_update(dt) end
+    -- Another mod's on_update failing must not stop survival (the HUD would never appear)
+    if previous_update then
+        local ok, err = pcall(previous_update, dt)
+        if not ok then print("[Survival] another mod's on_update failed: " .. tostring(err)) end
+    end
     if engine.is_server and engine.is_server() then return end   -- each player's own game runs this
     tick(dt)
 end
@@ -455,6 +522,8 @@ function on_chat_command(text, player, is_operator, reply)
         return false
     end
     if engine.is_server and engine.is_server() then return false end
+    -- On a server: the server handles /gamemode (only its operators may change modes)
+    if server_mode() then return false end
     local say = reply or function(t) chat.send(t, 0.75, 0.85, 1) end
     local modes = { s = "survival", survival = "survival", ["0"] = "survival",
                     c = "creative", creative = "creative", ["1"] = "creative" }
@@ -465,8 +534,15 @@ function on_chat_command(text, player, is_operator, reply)
     return true
 end
 
--- The survival inventory (inventory.lua)
+-- The survival inventory (inventory.lua). If inventory.lua is really a copy of this file, it
+-- would load itself forever: stop with a clear message instead.
+if survival.__loading_inventory then
+    error("survival/inventory.lua is a copy of survival/init.lua - put the survival inventory file back "
+          .. "(it starts with '-- Survival inventory, drawn on the game's inventory picture')", 0)
+end
+survival.__loading_inventory = true
 dofile(MOD_PATH .. "/inventory.lua")
+survival.__loading_inventory = nil
 
 local function close_inventory()
     if survival.inventory and survival.inventory.is_open() then

@@ -525,7 +525,11 @@ bool readWorldMeta(const fs::path& file, WorldMeta& meta) {
     return meta.valid;
 }
 
-bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, const std::string& game) {
+// withHotbar: write the hotbar that's on screen now. Only for the world being played - a world
+// that is just being created must not get it (that was the hotbar of the last world played, so
+// every new world started with the previous world's items).
+bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, const std::string& game,
+                    bool withHotbar = true) {
     std::error_code ec;
     fs::create_directories(file.parent_path(), ec);
     const fs::path tmp = file.string() + ".tmp";
@@ -541,7 +545,7 @@ bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, c
             out << "player=" << player->position.x << " " << player->position.y << " " << player->position.z << "\n";
             out << "look=" << player->yaw << " " << player->pitch << "\n";
         }
-        if (g_Hotbar) {
+        if (g_Hotbar && withHotbar) {
             for (int i = 0; i < g_Hotbar->slotCount; ++i) {
                 const HotbarSlot s = g_Hotbar->getSlot(i);
                 const std::string name = s.blockId ? BlockRegistry::getInstance().getBlock(s.blockId).name : "-";
@@ -723,7 +727,8 @@ std::string createWorld(const std::string& rawName, const std::string& seedText,
 
     std::error_code ec;
     fs::create_directories(savesRoot() / name / "chunks", ec);
-    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_LoadedGameFolder);
+    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_LoadedGameFolder,
+                   false);   // a new world starts with an empty hotbar
     if (!options.empty()) {
         std::ofstream f(savesRoot() / name / "mod_storage.txt");
         for (const auto& [k, v] : options) f << escapeStorage("world:" + k) << '\t' << escapeStorage(v) << '\n';
@@ -3229,6 +3234,27 @@ int main(int argc, char** argv) {
             return -1;
         }
 
+        // Closes the window LAST. Everything that owns OpenGL objects (the hotbar, fonts, sky,
+        // and locals declared below such as the world renderer and particles) deletes them in
+        // its destructor, which needs the context to still exist. Locals are destroyed in reverse
+        // order, so this one - made before all of them - goes after them. (Closing the window
+        // first made quitting the game crash in ~Hotbar.)
+        struct GlShutdown {
+            GLFWwindow* window;
+            ~GlShutdown() {
+                g_ModelInstances.clear();   // placed models free their meshes (OpenGL buffers) here
+                delete g_Hotbar;         g_Hotbar = nullptr;
+                delete g_FontRenderer;   g_FontRenderer = nullptr;
+                delete g_ChatSystem;     g_ChatSystem = nullptr;
+                delete g_LightingSystem; g_LightingSystem = nullptr;
+                delete g_Skybox;         g_Skybox = nullptr;
+                delete g_Clouds;         g_Clouds = nullptr;
+                delete g_MainMenu;       g_MainMenu = nullptr;
+                glfwDestroyWindow(window);
+                glfwTerminate();
+            }
+        } glShutdown{ window };
+
         // Which graphics card we actually got (see NvOptimusEnablement at the top of this file)
         {
             const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
@@ -4663,6 +4689,9 @@ int main(int argc, char** argv) {
                 g_WorldInstance->setSaveDirectory("");
             }
             g_ModelInstances.clear();   // models placed in the old world
+            // The hotbar belongs to that world (saved just above): nothing of it stays behind
+            if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
+            g_ModStorage.clear();       // (so does mod storage - the next world loads its own)
             g_ThirdPerson = false;
             g_Paused = false;
             g_Inventory.setCreativeOpen(false);
@@ -6992,16 +7021,7 @@ int main(int argc, char** argv) {
         g_ServerIcons.clear();
 
         g_Audio.shutdown();
-        glfwDestroyWindow(window);
-        glfwTerminate();
-
-        delete g_Hotbar;
-        delete g_FontRenderer;
-        delete g_ChatSystem;
-        delete g_LightingSystem;
-        delete g_Skybox;
-        delete g_Clouds;
-        delete g_MainMenu;
+        // (the window and the objects drawing with OpenGL go at the end of this block: GlShutdown)
     } catch (const std::exception& e) {
         std::cerr << "\n[CRITICAL EXCEPTION]: " << e.what() << std::endl;
         system("pause");
