@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(VoxelEngine C CXX)
+project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,14 +28,23 @@ if (NOT unofficial-lua_FOUND AND NOT Lua_FOUND)
     message(FATAL_ERROR "Could not find unofficial-lua (VCPKG) or Lua library")
 endif()
 
+# ENet (multiplayer networking) - downloaded and built automatically the first time
+# CMake configures. ENet's own CMakeLists is old, so tell newer CMake versions to accept it.
+include(FetchContent)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+FetchContent_Declare(enet
+    URL https://github.com/lsalzman/enet/archive/refs/tags/v1.3.18.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(enet)
 
 add_library(stb IMPORTED INTERFACE)
 add_library(unofficial::stb ALIAS stb)
 
 target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
-add_executable(VoxelEngine 
-    main.cpp 
+add_executable(BlockSmith
+    main.cpp
     Player.cpp
     World.cpp
     ChunkMesh.cpp
@@ -44,7 +53,6 @@ add_executable(VoxelEngine
     PauseMenu.cpp
     FontRenderer.cpp
     ParticleSystem.cpp
-    ChatSystem.cpp
     Lighting.cpp
     Lighting.h
     Skybox.cpp
@@ -63,15 +71,35 @@ add_executable(VoxelEngine
     Fog.cpp
     Inventory.cpp
     Inventory.h
+    WorldRenderer.cpp
+    WorldRenderer.h
+    ChunkData.cpp
+    ChunkData.h
+    ChunkGenerator.cpp
+    ChunkGenerator.h
+    Fluids.cpp
+    Fluids.h
+    WeatherEffects.cpp
+    WeatherEffects.h
+    Firewall.cpp
+    Net.cpp
+    Net.h
+    PlayerMovement.cpp
+    PlayerMovement.h
+    BlockDefs.cpp
+    BlockDefs.h
+    PlayerAvatars.cpp
+    PlayerAvatars.h
     deps/glad.c
 )
 
-target_include_directories(VoxelEngine PRIVATE 
+target_include_directories(BlockSmith PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
+    ${enet_SOURCE_DIR}/include
 )
 
-target_link_libraries(VoxelEngine PRIVATE 
+target_link_libraries(BlockSmith PRIVATE
     glfw
     glm::glm
     sol2::sol2
@@ -80,10 +108,56 @@ target_link_libraries(VoxelEngine PRIVATE
     ${CMAKE_DL_LIBS}
     unofficial::stb
     ${VOXEL_LUA_TARGET}
+    enet
 )
 
+# ENet needs the Windows socket and timer libraries
+if (WIN32)
+    target_link_libraries(BlockSmith PRIVATE ws2_32 winmm)
+endif()
+
 if (TARGET unofficial::lua::lua)
-    target_link_libraries(VoxelEngine PRIVATE unofficial::lua::lua)
+    target_link_libraries(BlockSmith PRIVATE unofficial::lua::lua)
 else()
-    target_link_libraries(VoxelEngine PRIVATE ${LUA_LIBRARY})
+    target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
+endif()
+
+# ---------------------------------------------------------------------------
+# BlockSmithServer: the dedicated (headless) server. No window, no graphics -
+# just the world, the mods and the networking.
+# Build it with:  cmake --build build --config Release --target BlockSmithServer
+# ---------------------------------------------------------------------------
+add_executable(BlockSmithServer
+    ServerMain.cpp
+    ChunkGenerator.cpp
+    Fluids.cpp
+    World.cpp
+    ChunkData.cpp
+    CaveGenerator.cpp
+    Block.cpp
+    BlockDefs.cpp
+    Net.cpp
+    PlayerMovement.cpp
+)
+
+target_include_directories(BlockSmithServer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps
+    ${enet_SOURCE_DIR}/include
+)
+
+target_link_libraries(BlockSmithServer PRIVATE
+    glm::glm
+    sol2::sol2
+    ${VOXEL_LUA_TARGET}
+    enet
+)
+
+if (WIN32)
+    target_link_libraries(BlockSmithServer PRIVATE ws2_32 winmm)
+endif()
+
+if (NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
 endif()

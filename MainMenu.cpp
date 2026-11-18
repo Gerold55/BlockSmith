@@ -413,7 +413,7 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
     }
 
     // 6. Version and copyright
-    fontRenderer.renderText(fontShader, "Craft & Ruin 5.17.0-dev", 15.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
+    fontRenderer.renderText(fontShader, "BlockSmith 5.17.0-dev", 15.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
     fontRenderer.renderText(fontShader, "(c) 2010-2026 Developer Studio", static_cast<float>(screenWidth) - 260.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
 
     glEnable(GL_DEPTH_TEST);

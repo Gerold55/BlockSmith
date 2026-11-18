@@ -84,7 +84,8 @@ engine.register_block("water", 0.2, 0.4, 0.9, {
     walkable = false,
     selectable = false,
     behavior = "liquid",
-    tint = false
+    tint = false,
+    in_creative = true
 })
 
 -- Flowing Water Stream Block (Uses flowing textures)
