@@ -30,8 +30,7 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 8;   // 7: the server decides each player's game mode
-                                            // 8: passwords by per-server challenge-response (Auth.h)
+constexpr uint32_t kProtocolVersion  = 6;   // 6: shared values (weather etc. decided by the server)
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -76,22 +75,9 @@ constexpr int kMaxMotdLength = 200;       // the description may contain {colour
 constexpr size_t kMaxIconBytes = 64 * 1024;   // server_icon.png (64x64 recommended)
 constexpr uint16_t kLanPort = 30001;          // LAN games announce themselves on this UDP port
 
-// What the game stores instead of the player's password (a SHA-256 of it, in settings.txt).
-// It never leaves the player's PC: logins prove knowledge of it with a per-server
-// challenge-response (Auth.h), so no server receives anything it could replay elsewhere.
+// What the game stores and sends instead of the player's password (SHA-256 of it).
+// The server then stores a salted hash of this, so neither side keeps the password.
 std::string passwordToken(const std::string& password);
-
-// What a joining player proved, handed to GameServer::canJoin (see Auth.h)
-struct AuthProof {
-    std::string serverId;     // this server's identity, as sent in the challenge
-    std::string nonce;        // the challenge (fresh, single use)
-    std::string response;     // HMAC answer; "" = the player has no password
-    std::string registerKey;  // this server's key for the player: sent only when the server said
-                              // it had no account for the name ("" otherwise)
-    bool hasPassword() const { return !response.empty(); }
-    // Does `response` answer the challenge for this stored per-server key?
-    bool matches(const std::string& storedKey, const std::string& name) const;
-};
 
 // "host", "host:port" -> host + port (kDefaultPort if none). False if empty/invalid.
 bool parseAddress(const std::string& text, std::string& host, uint16_t& port);
@@ -155,38 +141,15 @@ public:
     // when a player leaves (to save their position). Optional.
     std::function<bool(const std::string& name, glm::vec3& pos)> spawnFor;
     std::function<void(const std::string& name, const glm::vec3& pos)> onLeave;
-    // Asked before someone joins, after the password challenge: return "" to let them in, or
-    // the reason they can't (banned, not on the whitelist, wrong password...). `proof` holds
-    // their answer to this connection's challenge (check it with proof.matches(storedKey, name))
-    // and, for a new account, the per-server key to store. Optional.
-    std::function<std::string(const std::string& name, const net::AuthProof& proof)> canJoin;
-    // Whether the server already has an account (a password) for this name: told to the
-    // player in the challenge, so their game only sends a registration key when needed.
-    std::function<bool(const std::string& name)> hasAccount;
-    // This server's identity, bound into every password response (Auth.h). Set it before
-    // start; it should stay the same across restarts (dedicated: server_id.txt).
-    void setServerId(const std::string& id) { m_serverId = id; }
-    const std::string& serverId() const { return m_serverId; }
+    // Asked before someone joins: return "" to let them in, or the reason they can't
+    // (banned, not on the whitelist, wrong password...). `passwordToken` is a hash of the
+    // player's password ("" if they haven't set one) - never the password itself. Optional.
+    std::function<std::string(const std::string& name, const std::string& passwordToken)> canJoin;
     // A "/command" a player typed (without the slash). Reply with messagePlayer. Optional.
     std::function<void(const std::string& name, const std::string& command)> onCommand;
     // Called once someone has joined (e.g. to send them a welcome message). Optional.
     std::function<void(const std::string& name)> onJoin;
-    // A player changed a block (and the server accepted it): for break/place sounds
-    std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onPlayerEdit;
     // A chat line to one player only. False if they're not online.
-    // ---- Game modes and operators: the server decides. Each player's game follows what it's
-    //      told and won't let the player change it themselves (only the server/admins can). ----
-    // Mode for a player as they join ("" = the default mode)
-    std::function<std::string(const std::string& name)> modeFor;
-    // Whether a player is an operator (told to their game, e.g. to show admin buttons)
-    std::function<bool(const std::string& name)> isOperator;
-    void setDefaultMode(const std::string& mode) { if (!mode.empty()) m_defaultMode = mode; }
-    const std::string& defaultMode() const { return m_defaultMode; }
-    // Changes a joined player's mode ("survival", "creative", or any mode a game defines)
-    bool setPlayerMode(const std::string& name, const std::string& mode);
-    std::string playerMode(const std::string& name) const;   // "" if not online
-    bool setPlayerOperator(const std::string& name, bool op);
-
     bool messagePlayer(const std::string& name, const std::string& text,
                        const glm::vec3& color = glm::vec3(1.0f, 1.0f, 0.4f));
     // The furthest any player may see, in chunks (they can choose less).
@@ -208,13 +171,6 @@ private:
         ENetPeer* peer = nullptr;
         uint16_t id = 0;
         bool joined = false;
-        // Between C_HELLO and C_AUTH: the challenge we sent and what they asked for
-        bool challenged = false;
-        std::string nonce;
-        std::string helloName;
-        int helloView = 8;
-        std::string mode;             // game mode the server gave them
-        bool op = false;
         std::string name;
         int viewDistance = 8;
         glm::vec3 position{0.0f};     // = sim.position (kept for reach checks, chunk loading...)
@@ -240,13 +196,10 @@ private:
     void handlePacket(Client& c, const uint8_t* data, size_t size);
     void sendStatus(ENetPeer* peer);
     void handleHello(Client& c, const uint8_t* data, size_t size);
-    void handleAuth(Client& c, const uint8_t* data, size_t size);
-    void finishJoin(Client& c, const std::string& name, int view);
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
     void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
     void dropClient(uint16_t id);
-    void sendMode(Client& c);
 
     void streamChunks(Client& c);
     void sendBlockChanges(const std::vector<World::BlockChange>& changes);
@@ -275,8 +228,6 @@ private:
     net::PlayerMap m_views;
     std::vector<net::ChatLine> m_chat;
     std::unordered_map<std::string, std::string> m_shared;
-    std::string m_defaultMode = "survival";
-    std::string m_serverId;       // this server's identity for password challenges (setServerId)
 
     glm::vec3 m_hostPos{0.0f};
     float m_hostYaw = 0.0f, m_hostPitch = 0.0f;
@@ -305,15 +256,10 @@ public:
 
     // Starts connecting (returns straight away; watch takeWelcome / takeDisconnect).
     // When the server accepts, `world` is reset and switched to remote mode.
-    // passwordToken: net::passwordToken(password) from the player's settings, or "". It is
-    // never sent: the game answers the server's challenge with it (Auth.h).
-    // knownServerId: the identity this address had last time ("" = first visit). If the server
-    // now claims a different one, the game refuses to answer with the password.
+    // passwordToken: net::passwordToken(password) from the player's settings, or "".
     bool connect(World& world, const std::string& address, const std::string& playerName,
                  const std::string& gameFolder, int viewDistance, std::string& error,
-                 const std::string& passwordToken = "", const std::string& knownServerId = "");
-    // The identity of the server we joined (to remember it for next time), "" before the challenge
-    const std::string& serverId() const { return m_serverId; }
+                 const std::string& passwordToken = "");
     // Leaves the server (no-op when not connected).
     void disconnect();
 
@@ -358,13 +304,6 @@ public:
     }
     // Keys that changed since the last call (in order)
     std::vector<std::string> takeSharedChanges() { std::vector<std::string> out; out.swap(m_sharedChanges); return out; }
-    // Game mode the server gave us ("" = not told yet / not online) and whether we're an operator
-    const std::string& gameMode() const { return m_mode; }
-    bool isOperator() const { return m_isOp; }
-    // True once each time the server changes our mode or operator status
-    bool takeModeChange() { const bool c = m_modeChanged; m_modeChanged = false; return c; }
-    // A block changed by the server (another player, water...): for break/place sounds
-    std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
 
 private:
     void handlePacket(const uint8_t* data, size_t size);
@@ -372,17 +311,13 @@ private:
     void sendEdits();
 
     std::vector<std::string> m_sharedChanges;
-    std::string m_mode;
-    bool m_isOp = false;
-    bool m_modeChanged = false;
     ENetHost* m_host = nullptr;
     ENetPeer* m_peer = nullptr;
     World* m_world = nullptr;
     State m_state = State::Idle;
     std::string m_addressText;
     std::string m_name;
-    std::string m_password;   // token, not the password (never sent)
-    std::string m_knownServerId, m_serverId;
+    std::string m_password;   // token, not the password
     std::string m_game;
     int m_viewDistance = 8;
     double m_connectStarted = 0.0;

@@ -611,14 +611,50 @@ function render_creative_inventory(W, H)
         else
             bevel(x, y, w, h, S, hov and C.row_hover or C.row, C.panel_hi, C.panel_lo)
         end
-        local isz = h - 8 * S
-        if cat.all then
-            icon_grid(x + 5 * S, y + 4 * S, isz, C.text)
-        elseif cat.special and not category_icon(cat) then
-            icon_bag(x + 5 * S, y + 4 * S, isz, C.text)
+    end
+
+    -- 3. Main panel
+    draw_panel(L.x, L.y, L.w, L.h, S, C.panel)
+
+    -- 4. Selected tab (drawn after the panel, raised, joined to it)
+    draw_active_tab(tab_x(L, state.tab), L.tabTopActive, L.tabW, L.y, S)
+
+    -- 5. Tab icons + hover
+    local icon_size = Theme.tab_icon * S
+    for i, tab in ipairs(Tabs) do
+        local tx = tab_x(L, i)
+        local top, visible_h
+        if i == state.tab then
+            top, visible_h = L.tabTopActive, L.y - L.tabTopActive
         else
-            local icon = category_icon(cat)
-            if icon then ui.draw_block_icon(icon, x + 5 * S, y + 4 * S, isz) end
+            top, visible_h = L.tabTopIdle, L.y - L.tabTopIdle   -- part above the panel
+        end
+
+        local icon = tab_icon(tab)
+        if icon then
+            ui.draw_block_icon(icon,
+                tx + (L.tabW - icon_size) / 2,
+                top + (visible_h - icon_size) / 2 + S,
+                icon_size)
+        end
+
+        if tab_hit(L, i, mx, my) then tooltip = tab.name end
+    end
+
+    -- 6. Title + search box
+    local text_y = L.searchY + (L.searchH - text_height(fs)) / 2
+    local title = (state.search == "") and Tabs[state.tab].name or "Search Results"
+    text(title, L.x + L.m, text_y, fs, C.text_dark, false, S)
+
+    rect(L.searchX, L.searchY, L.searchW, L.searchH, state.search_focused and C.white or C.search_bdr)
+    rect(L.searchX + S, L.searchY + S, L.searchW - 2 * S, L.searchH - 2 * S, C.black)
+
+        local icon = tab_icon(tab)
+        if icon then
+            ui.draw_block_icon(icon,
+                tx + (L.tabW - icon_size) / 2,
+                top + (visible_h - icon_size) / 2 + S,
+                icon_size)
         end
         local tx = x + 10 * S + isz
         local n = cat.special and "" or tostring(count_in(cat))

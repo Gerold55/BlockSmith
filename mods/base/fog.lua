@@ -38,10 +38,12 @@ end
 -- Seconds to fade into water, and to fade back out of it
 underwater.set_fade(0.6, 0.4)
 
--- Colours: taken from the water block itself (its texture), so being underwater looks like the
--- water you see from above. get_water_color() below shifts them a little per biome.
-underwater.set_visibility(25, 15)   -- blocks visible near the surface, and at depth
+-- Fallback colors, used only if get_water_color() below is missing.
+underwater.set_shallow_color(0.16, 0.38, 0.72)
+underwater.set_deep_color(0.02, 0.07, 0.20)
+underwater.set_visibility(48, 20)   -- blocks visible near the surface, and at depth
 underwater.set_full_depth(40)      -- depth where colors and visibility reach their deep values
+underwater.set_tint_strength(0.15)
 
 -- Biome-specific water colors. The engine calls this while the camera is
 -- underwater or fading. Returns shallow r,g,b and deep r,g,b.

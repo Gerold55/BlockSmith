@@ -35,9 +35,7 @@ public:
     void setUploadBudgetMs(float ms) { m_uploadBudgetMs = ms; }
 
     // Throws away every mesh (e.g. after textures change size or when leaving a world).
-    // forceRebuild = true: on the next update, every chunk still loaded is meshed again (the
-    // world won't report them as changed by itself). Plain clear() keeps working as before.
-    void clear(bool forceRebuild = false);
+    void clear();
 
     size_t meshCount() const { return m_meshes.size(); }
 
@@ -62,7 +60,6 @@ private:
     std::unordered_map<ChunkCoord, Clock::time_point, PairHash> m_firstUpload;
 
     unsigned m_seenResetCount = 0;
-    bool m_forceRebuild = false;   // set by clear(true): re-mesh every loaded chunk on the next update
     float m_meshBudgetMs = 4.0f;
     float m_uploadBudgetMs = 3.0f;
 };

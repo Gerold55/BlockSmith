@@ -23,12 +23,6 @@ void applyDigProperties(BlockProperty& block, const sol::table& props);
 // blocks registered without one (stone 1.5, logs 2, dirt 0.5, leaves 0.2, plants 0...).
 // -1 = can't be dug.
 float blockHardness(const BlockProperty& block);
-// sounds = { footstep = "...", dig = {name=..., gain=..., pitch=...}, dug = ..., place = ... }
-void applySoundProperties(BlockProperty& block, const sol::table& props);
-// Light: light = 0..15 (or { r, g, b } levels), light_color = { r, g, b } (0..255 or 0..1) or
-// "#rrggbb", light_absorb = extra light lost passing through, light_filter = { r, g, b } colour
-// let through (stained glass). See Light.h.
-void applyLightProperties(BlockProperty& block, const sol::table& props);
 // The tool type a block wants when it didn't say ("pickaxe" for stone, "axe" for wood...)
 std::string blockTool(const BlockProperty& block);
 bool blockNeedsTool(const BlockProperty& block);

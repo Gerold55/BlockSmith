@@ -12,8 +12,6 @@ struct GLFWwindow;
 struct MoveInput {
     enum Key : uint8_t {
         Forward = 1, Back = 2, Left = 4, Right = 8, Jump = 16, Sneak = 32, Sprint = 64,
-        Fly = 128,        // creative flying: no gravity, Jump rises, Sneak sinks (the server only
-                          // accepts it from players in creative mode)
     };
     uint8_t keys = 0;     // Key flags held this frame
     float yaw = 0.0f;     // facing (degrees) - decides which way "forward" is
@@ -38,11 +36,5 @@ constexpr float kMaxMoveStep = 0.1f;
 // gravity and block collision).
 void stepMovement(MoveState& state, const MoveInput& input, float dt, const World& world);
 
-// The movement keys held right now (Settings > Controls), plus the facing, plus Fly while
-// flying. Defined in Player.cpp.
+// The movement keys held right now (Settings > Controls), plus the facing. Defined in Player.cpp.
 MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch);
-
-// Creative flying (the player's game only; Player.cpp). updateFlight runs once per frame before
-// moving: double-tapping Jump starts or stops flying when `canFly`; landing stops it.
-extern bool g_Flying;
-void updateFlight(GLFWwindow* window, bool canFly, bool grounded);

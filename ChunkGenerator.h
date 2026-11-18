@@ -15,7 +15,6 @@
 #include <memory>
 #include <mutex>
 #include <set>
-#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -31,11 +30,7 @@ public:
     struct Result {
         int cx, cz;
         unsigned epoch;                    // World::resetCount() when requested
-        std::shared_ptr<ChunkData> chunk;  // nullptr: the job failed - nothing was generated
-        // Why it failed: the world generator's set_world_seed raised this Lua error (or its Lua
-        // couldn't be rebuilt). The thread has already rebuilt its Lua from scratch, so the
-        // next request is a clean retry; World decides when to ask again and when to give up.
-        std::string seedError;
+        std::shared_ptr<ChunkData> chunk;
     };
 
     // threads <= 0: one per CPU core, minus `reserveCores` left free for the main thread

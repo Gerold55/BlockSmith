@@ -6,11 +6,11 @@ function on_chat_command(cmd)
 
     if name == "time" then
         if args == "day" then
-            sky.set_time(0.25)
+            sky.set_time(0.75)
             chat.send("Set time to day")
             return true
         elseif args == "night" then
-            sky.set_time(0.75)
+            sky.set_time(0.25)
             chat.send("Set time to night")
             return true
         end

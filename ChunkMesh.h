@@ -20,11 +20,6 @@ public:
     // Sends the last built vertex lists to the GPU. Needs the GL context.
     void uploadMesh();
 
-    // Smooth lighting and ambient occlusion (soft shadows in corners). Changing these needs
-    // every chunk rebuilt (World::markAllDirty).
-    static bool smoothLighting;
-    static bool ambientOcclusion;
-
     void drawOpaque() const;
     void drawTransparent() const;
 

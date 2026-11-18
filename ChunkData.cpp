@@ -1,5 +1,4 @@
 #include "ChunkData.h"
-#include <algorithm>
 #include <cstring>
 
 ChunkData::ChunkData() {
@@ -55,25 +54,4 @@ uint8_t ChunkData::getMetadata(int x, int y, int z) const {
     if (y < 0 || y >= CHUNK_HEIGHT) return 0;
     const ChunkData* c = resolve(x, z);
     return c ? c->getLocalMetadata(x, y, z) : 0;
-}
-
-void ChunkData::setColumnTint(int x, int z, uint32_t rgb, int channel) {
-    if (channel < 0 || channel >= kTintChannels || x < 0 || x >= CHUNK_WIDTH || z < 0 || z >= CHUNK_WIDTH) return;
-    tint[channel][x][z] = rgb & 0xFFFFFFu;
-    tintSet[channel] = true;
-}
-
-uint32_t ChunkData::getColumnTint(int x, int z, int channel) const {
-    if (channel < 0 || channel >= kTintChannels) return kNoTint;
-    const ChunkData* c = resolve(x, z);
-    if (!c || !c->tintSet[channel]) return kNoTint;
-    return c->tint[channel][x][z];
-}
-
-uint16_t ChunkData::getLight(int x, int y, int z) const {
-    if (y >= CHUNK_HEIGHT) return kFullSky;
-    if (y < 0) return 0;
-    const ChunkData* c = resolve(x, z);
-    if (!c || !c->hasLight()) return kFullSky;
-    return c->getLocalLight(x, y, z);
 }

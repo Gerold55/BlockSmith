@@ -3,10 +3,6 @@
 #include "Block.h"
 #include "Types.h"
 #include "Fluids.h"
-#include "Light.h"
-#include "DoorShape.h"
-#include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -38,17 +34,9 @@ struct FaceStyle {
 inline float tintFlag(bool on) { return on ? 1.0f : 0.0f; }
 
 inline Vertex makeVertex(float x, float y, float z, float u, float v, const FaceStyle& s) {
-    Vertex out{x, y, z, s.r, s.g, s.b, u, v,
-               s.baseLayer, s.overlayLayer, s.tintBase, s.tintOverlay, s.shade};
-    return out;
+    return Vertex{x, y, z, s.r, s.g, s.b, u, v,
+                  s.baseLayer, s.overlayLayer, s.tintBase, s.tintOverlay, s.shade};
 }
-
-inline void setLight(Vertex& v, float s, float r, float g, float b) {
-    v.lightSky = s; v.lightR = r; v.lightG = g; v.lightB = b;
-}
-
-// How dark a corner is with 0..3 solid blocks around it (Minecraft-style ambient occlusion)
-constexpr float kAoLevels[4] = { 0.50f, 0.68f, 0.84f, 1.0f };
 
 // Two triangles: (0,1,2) and (0,2,3).
 inline void pushQuad(std::vector<Vertex>& buf, const Vertex (&q)[4]) {
@@ -119,7 +107,6 @@ void setupVertexAttributes() {
     glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(Vertex, tintBase));      glEnableVertexAttribArray(5);
     glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(Vertex, tintOverlay));   glEnableVertexAttribArray(6);
     glVertexAttribPointer(7, 1, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(Vertex, faceShading));   glEnableVertexAttribArray(7);
-    glVertexAttribPointer(8, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(Vertex, lightSky));      glEnableVertexAttribArray(8);
 }
 
 void uploadBuffer(GLuint& vao, GLuint& vbo, const std::vector<Vertex>& verts) {
@@ -150,8 +137,7 @@ inline bool isCutout(const BlockProperty& p) {
 }
 
 inline bool canWaterlog(const BlockProperty& p) {
-    // Doors use their metadata for facing/open, not for "waterlogged"
-    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door";
+    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id);
 }
 
 // Fluids never hide what's next to them (even opaque ones like lava: their surface is
@@ -234,9 +220,6 @@ bool isFaceHidden(const BlockProperty& self, uint8_t selfId, const FluidDef* ren
 
 } // namespace
 
-bool ChunkMesh::smoothLighting = true;
-bool ChunkMesh::ambientOcclusion = true;
-
 ChunkMesh::~ChunkMesh() {
     if (opaqueVAO != 0)      glDeleteVertexArrays(1, &opaqueVAO);
     if (opaqueVBO != 0)      glDeleteBuffers(1, &opaqueVBO);
@@ -251,98 +234,6 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
     auto& registry = BlockRegistry::getInstance();
     FluidRegistry::get().refresh();   // block ids by name: never stale
     const FluidDef* waterFluid = FluidRegistry::get().byName("water");
-
-    // ---- Light (Light.h) ----
-    auto opaqueAt = [&](int x, int y, int z) {
-        const uint8_t id = data.getBlock(x, y, z);
-        return id != 0 && light::blockLight(id).opaque;
-    };
-    // Plants and other see-through shapes: the light of their own cell
-    auto lightCell = [&](Vertex* verts, int count, int x, int y, int z) {
-        const uint16_t l = data.getLight(x, y, z);
-        const light::BlockLight& own = light::blockLight(data.getLocalBlock(x, y, z));
-        for (int i = 0; i < count; ++i) {
-            setLight(verts[i], light::sky(l) / 15.0f,
-                     std::max(light::red(l), (int)own.emit[0]) / 15.0f,
-                     std::max(light::green(l), (int)own.emit[1]) / 15.0f,
-                     std::max(light::blue(l), (int)own.emit[2]) / 15.0f);
-        }
-    };
-    // Cube faces: each corner averages the light of the (up to) 4 cells in front of the face
-    // that touch it, and is darkened by solid blocks around it (ambient occlusion)
-    auto lightFace = [&](Vertex (&q)[4], int f, int x, int y, int z) {
-        const int axis = (f < 2) ? 0 : (f < 4) ? 1 : 2;
-        const int t1 = (axis == 0) ? 1 : 0;
-        const int t2 = (axis == 2) ? 1 : 2;
-        int front[3] = { x + kFaceOffset[f][0], y + kFaceOffset[f][1], z + kFaceOffset[f][2] };
-        const int self[3] = { x, y, z };
-        const bool frontSolid = opaqueAt(front[0], front[1], front[2]);
-        const light::BlockLight& own = light::blockLight(data.getLocalBlock(x, y, z));
-        // Faces that touch a solid block (rare: only shown for see-through blocks) use their own cell
-        const int* base = frontSolid ? self : front;
-        for (Vertex& v : q) {
-            const float pos[3] = { v.posX, v.posY, v.posZ };
-            int d1 = (pos[t1] - self[t1] > 0.5f) ? 1 : -1;
-            int d2 = (pos[t2] - self[t2] > 0.5f) ? 1 : -1;
-            int c1[3] = { base[0], base[1], base[2] }; c1[t1] += d1;
-            int c2[3] = { base[0], base[1], base[2] }; c2[t2] += d2;
-            int cc[3] = { base[0], base[1], base[2] }; cc[t1] += d1; cc[t2] += d2;
-
-            const bool s1 = opaqueAt(c1[0], c1[1], c1[2]);
-            const bool s2 = opaqueAt(c2[0], c2[1], c2[2]);
-            const bool sc = opaqueAt(cc[0], cc[1], cc[2]);
-
-            float sum[4] = {0, 0, 0, 0};
-            int n = 0;
-            auto add = [&](const int* p) {
-                const uint16_t l = data.getLight(p[0], p[1], p[2]);
-                sum[0] += light::sky(l); sum[1] += light::red(l); sum[2] += light::green(l); sum[3] += light::blue(l);
-                ++n;
-            };
-            add(base);
-            if (smoothLighting && !frontSolid) {
-                if (!s1) add(c1);
-                if (!s2) add(c2);
-                if (!sc && !(s1 && s2)) add(cc);
-            }
-            const float k = 1.0f / (15.0f * static_cast<float>(n));
-            setLight(v, sum[0] * k,
-                     std::max(sum[1] * k, own.emit[0] / 15.0f),
-                     std::max(sum[2] * k, own.emit[1] / 15.0f),
-                     std::max(sum[3] * k, own.emit[2] / 15.0f));
-            if (ambientOcclusion && !frontSolid) {
-                const int level = (s1 && s2) ? 0 : 3 - (int(s1) + int(s2) + int(sc));
-                v.faceShading *= kAoLevels[level];
-            }
-        }
-    };
-
-    // Biome colours (ChunkData's column tints): a vertex takes the average colour of the up to
-    // 4 columns around its corner, so colours blend smoothly from block to block
-    auto applyBiomeTint = [&](Vertex* verts, int count, int channel) {
-        if (channel < 0 || !data.hasTint(channel)) return;
-        for (int i = 0; i < count; ++i) {
-            const int cx = static_cast<int>(std::lround(verts[i].posX));
-            const int cz = static_cast<int>(std::lround(verts[i].posZ));
-            float r = 0, g = 0, b = 0;
-            int n = 0;
-            for (int dx = -1; dx <= 0; ++dx) {
-                for (int dz = -1; dz <= 0; ++dz) {
-                    const uint32_t t = data.getColumnTint(cx + dx, cz + dz, channel);
-                    if (t == ChunkData::kNoTint) continue;
-                    r += static_cast<float>((t >> 16) & 0xFF);
-                    g += static_cast<float>((t >> 8) & 0xFF);
-                    b += static_cast<float>(t & 0xFF);
-                    ++n;
-                }
-            }
-            if (n == 0) continue;
-            const float k = 1.0f / (255.0f * static_cast<float>(n));
-            verts[i].tintR = r * k;
-            verts[i].tintG = g * k;
-            verts[i].tintB = b * k;
-        }
-    };
 
     auto emitPlant = [&](int x, int y, int z, const BlockProperty& prop) {
         const FaceStyle style{
@@ -362,83 +253,21 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         const float minZ = fz + kPlantInset, maxZ = fz + 1.0f - kPlantInset;
         const float minY = fy, maxY = fy + 1.0f;
 
-        Vertex p1[4] = {
+        const Vertex p1[4] = {
             makeVertex(minX, minY, minZ, 0.0f, 1.0f, style),
             makeVertex(maxX, minY, maxZ, 1.0f, 1.0f, style),
             makeVertex(maxX, maxY, maxZ, 1.0f, 0.0f, style),
             makeVertex(minX, maxY, minZ, 0.0f, 0.0f, style),
         };
-        Vertex p2[4] = {
+        const Vertex p2[4] = {
             makeVertex(minX, minY, maxZ, 0.0f, 1.0f, style),
             makeVertex(maxX, minY, minZ, 1.0f, 1.0f, style),
             makeVertex(maxX, maxY, minZ, 1.0f, 0.0f, style),
             makeVertex(minX, maxY, maxZ, 0.0f, 0.0f, style),
         };
 
-        applyBiomeTint(p1, 4, prop.biomeTint);
-        applyBiomeTint(p2, 4, prop.biomeTint);
-        lightCell(p1, 4, x, y, z);
-        lightCell(p2, 4, x, y, z);
         pushDoubleSided(cpuOpaqueVertices, p1);
         pushDoubleSided(cpuOpaqueVertices, p2);
-    };
-
-    // Doors: a thin panel along one side (DoorShape.h), every face drawn. The upper half uses
-    // the block's top texture, the lower half its bottom texture; the thin edges show a strip
-    // of the same picture. Across the panel the picture is measured from the hinge edge, so the
-    // handle side of the picture is always the edge away from the hinges, like a real door: seen
-    // from the back it's mirrored, and it stays right when the door swings open or is hinged on
-    // the other side.
-    auto emitDoor = [&](int x, int y, int z, const BlockProperty& prop) {
-        const uint8_t meta = data.getLocalMetadata(x, y, z);
-        const bool upper = (meta & door::kUpper) != 0;
-        int layer = upper ? prop.faces[2].baseLayer : prop.faces[3].baseLayer;
-        for (int f : { 3, 2, 4, 0, 1, 5 }) if (layer < 0) layer = prop.faces[f].baseLayer;
-        if (layer < 0) return;
-        glm::vec3 mn, mx;
-        door::box(meta, mn, mx);
-
-        // Where the hinges are (x, z inside the block): the placer's left or right edge of the
-        // closed position, which stays put when the door opens
-        const glm::ivec2 fd = door::facingDir(meta & door::kFacingMask);
-        const glm::ivec2 left(fd.y, -fd.x);
-        const glm::ivec2 hingeSide = (meta & door::kHingeRight) ? -left : left;
-        const float hingeX = 0.5f - 0.5f * fd.x + 0.5f * hingeSide.x;
-        const float hingeZ = 0.5f - 0.5f * fd.y + 0.5f * hingeSide.y;
-        const bool alongX = (mx.x - mn.x) > (mx.z - mn.z);   // the panel's long side runs along x
-
-        const FaceStyle style{ prop.defaultTint.r, prop.defaultTint.g, prop.defaultTint.b,
-                               static_cast<float>(layer), -1.0f, 0.0f, 0.0f, 1.0f };
-        for (int f = 0; f < 6; ++f) {
-            float unit[4][3];
-            faceCorners(f, 0.0f, 0.0f, 0.0f, 1.0f, unit);
-            const bool bigFace = alongX ? (f == 4 || f == 5) : (f == 0 || f == 1);
-            Vertex q[4];
-            for (int i = 0; i < 4; ++i) {
-                const float px = mn.x + unit[i][0] * (mx.x - mn.x);
-                const float py = mn.y + unit[i][1] * (mx.y - mn.y);
-                const float pz = mn.z + unit[i][2] * (mx.z - mn.z);
-                float u, v;
-                if (bigFace) {
-                    u = alongX ? std::fabs(px - hingeX) : std::fabs(pz - hingeZ);   // 0 at the hinges
-                    v = 1.0f - py;
-                } else {
-                    switch (f) {
-                    case 0:  u = 1.0f - pz; v = 1.0f - py; break;   // +X edge
-                    case 1:  u = pz;        v = 1.0f - py; break;   // -X edge
-                    case 4:  u = px;        v = 1.0f - py; break;   // +Z edge
-                    case 5:  u = 1.0f - px; v = 1.0f - py; break;   // -Z edge
-                    case 2:  u = px;        v = pz;        break;   // top
-                    default: u = px;        v = 1.0f - pz; break;   // bottom
-                    }
-                }
-                FaceStyle st = style;
-                st.shade = kFaceShading[f];
-                q[i] = makeVertex(x + px, y + py, z + pz, u, v, st);
-            }
-            lightCell(q, 4, x, y, z);
-            pushQuad(cpuOpaqueVertices, q);
-        }
     };
 
     auto emitCube = [&](int x, int y, int z, uint8_t blockId, const BlockProperty& selfProp,
@@ -509,7 +338,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 }
             }
 
-            Vertex q[4] = {
+            const Vertex q[4] = {
                 makeVertex(fv[0][0], fv[0][1], fv[0][2], 0.0f, 1.0f, style),
                 makeVertex(fv[1][0], fv[1][1], fv[1][2], 1.0f, 1.0f, style),
                 makeVertex(fv[2][0], fv[2][1], fv[2][2], 1.0f, 0.0f, style),
@@ -518,9 +347,6 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
 
             const bool blended = renderProp.isTransparent && !isCutout(renderProp);
             auto& buf = blended ? cpuTransparentVertices : cpuOpaqueVertices;
-            if (!renderingWater) applyBiomeTint(q, 4, renderProp.biomeTint);
-            if (selfProp.pattern == "cube" || renderingWater) lightFace(q, f, x, y, z);
-            else lightCell(q, 4, x, y, z);
             pushQuad(buf, q);
         }
     };
@@ -534,10 +360,6 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 const auto& prop = registry.getBlock(blockId);
                 const bool waterlogged = canWaterlog(prop) && ((data.getLocalMetadata(x, y, z) & 1) != 0);
 
-                if (prop.pattern == "door") {
-                    emitDoor(x, y, z, prop);
-                    continue;
-                }
                 if (isPlantLike(prop)) {
                     emitPlant(x, y, z, prop);
                     if (!waterlogged) continue;
