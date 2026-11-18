@@ -11,9 +11,6 @@
 #include <cmath>
 #include <cstdint>
 
-uint8_t g_MoveKeyMask = 0xFF;
-bool g_Flying = false;
-
 Player::Player() {
     position = glm::vec3(8.0f, 75.0f, 8.0f);
     velocity = glm::vec3(0.0f);
@@ -38,15 +35,18 @@ void Player::handleMouseLook(double xpos, double ypos) {
     lastX = static_cast<float>(xpos);
     lastY = static_cast<float>(ypos);
 
-    constexpr float sensitivity = 0.1f;
+    float sensitivity = 0.1f;
     xoffset *= sensitivity;
     yoffset *= sensitivity;
 
     yaw += xoffset;
     pitch += yoffset;
 
-    if (pitch > 89.0f) pitch = 89.0f;
-    if (pitch < -89.0f) pitch = -89.0f;
+    if (pitch > 89.0f)
+        pitch = 89.0f;
+
+    if (pitch < -89.0f)
+        pitch = -89.0f;
 }
 
 void Player::update(
@@ -56,6 +56,11 @@ void Player::update(
     sol::state& lua)
 {
     (void)lua;
+
+    // Keys come from Settings > Controls (defaults: W/A/S/D,
+    // Space, Left Shift, Left Ctrl).
+    // Movement logic lives in PlayerMovement.cpp so client
+    // and server can share the exact same behavior.
 
     MoveState state{
         position,
@@ -74,6 +79,9 @@ void Player::update(
     velocity = state.velocity;
     isGrounded = state.grounded;
 }
+
+// Key mask used by gameplay systems to disable movement actions.
+uint8_t g_MoveKeyMask = 0xFF;
 
 MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch)
 {
@@ -105,42 +113,7 @@ MoveInput readMoveInput(GLFWwindow* window, float yaw, float pitch)
 
     in.keys &= g_MoveKeyMask;
 
-    if (g_Flying)
-        in.keys |= MoveInput::Fly;
-
     return in;
-}
-
-void updateFlight(GLFWwindow* window, bool canFly, bool grounded)
-{
-    static bool jumpWasDown = false;
-    static double lastJumpPress = -10.0;
-
-    if (!canFly) {
-        g_Flying = false;
-        jumpWasDown = false;
-        return;
-    }
-
-    const bool jumpDown =
-        isActionDown(window, "jump") &&
-        (g_MoveKeyMask & MoveInput::Jump);
-
-    if (jumpDown && !jumpWasDown) {
-        const double now = glfwGetTime();
-
-        if (now - lastJumpPress < 0.3) {
-            g_Flying = !g_Flying;
-            lastJumpPress = -10.0;
-        } else {
-            lastJumpPress = now;
-        }
-    }
-
-    jumpWasDown = jumpDown;
-
-    if (g_Flying && grounded && !jumpDown)
-        g_Flying = false;
 }
 
 glm::mat4 Player::getViewMatrix() const
