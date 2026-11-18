@@ -28,6 +28,7 @@
 
 #include "Types.h"
 #include "Block.h"
+#include "ChunkData.h"
 #include "ChunkMesh.h"
 #include "World.h"
 #include "Player.h"
@@ -2763,12 +2764,19 @@ int main() {
         // Saved video settings win over values set by mods during loading
         applyStoredVideoSettings();
 
-        lua.new_usertype<ChunkMesh>("Chunk",
-            "set_block", &ChunkMesh::setBlock, "setBlock", &ChunkMesh::setBlock,
-            "get_block", &ChunkMesh::getBlock, "getBlock", &ChunkMesh::getBlock,
-            "set_block_with_meta", &ChunkMesh::setBlockWithMeta,
-            "set_metadata", &ChunkMesh::setMetadata, "get_metadata", &ChunkMesh::getMetadata,
-            "generate_mesh_data", &ChunkMesh::generateMeshData, "upload_mesh", &ChunkMesh::uploadMesh
+        lua.new_usertype<ChunkData>("Chunk",
+            "set_block", &ChunkData::setBlock,
+            "setBlock", &ChunkData::setBlock,
+            "get_block", &ChunkData::getBlock,
+            "getBlock", &ChunkData::getBlock,
+            "set_block_with_meta", &ChunkData::setBlockWithMeta,
+            "set_metadata", &ChunkData::setMetadata,
+            "get_metadata", &ChunkData::getMetadata
+        );
+
+        lua.new_usertype<ChunkMesh>("ChunkMesh",
+            "generate_mesh_data", &ChunkMesh::generateMeshData,
+            "upload_mesh", &ChunkMesh::uploadMesh
         );
 
         GLuint shaderProgram = glCreateProgram();
