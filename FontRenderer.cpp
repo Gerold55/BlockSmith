@@ -76,6 +76,71 @@ std::vector<unsigned char> readFontFile(const std::string& path) {
     if (!file.read(reinterpret_cast<char*>(data.data()), size)) return {};
     return data;
 }
+// stb_truetype is never told how long the font file is: it trusts the offsets inside it. So
+// before it sees a file, check that everything it reads while loading and baking lies inside
+// the buffer: the font directory (TrueType, OpenType/CFF or the first font of a collection),
+// every table it lists, and the parts of the tables it uses (head, hhea, hmtx, maxp, cmap's
+// list, loca with each glyph inside glyf). A truncated or malformed file is skipped.
+bool fontBufferLooksValid(const std::vector<unsigned char>& d) {
+    const size_t n = d.size();
+    auto u16 = [&](size_t p) { return static_cast<uint32_t>(d[p] << 8 | d[p + 1]); };
+    auto u32 = [&](size_t p) { return static_cast<uint32_t>(d[p]) << 24 | static_cast<uint32_t>(d[p + 1]) << 16 |
+                                      static_cast<uint32_t>(d[p + 2]) << 8 | d[p + 3]; };
+    auto fits = [&](uint64_t off, uint64_t len) { return off <= n && len <= n - off; };
+    if (n < 12) return false;
+    size_t font = 0;
+    if (u32(0) == 0x74746366) {                                   // 'ttcf': a collection - font 0 is used
+        if (!fits(12, 4) || u32(8) == 0) return false;
+        font = u32(12);
+    }
+    if (!fits(font, 12)) return false;
+    const uint32_t tag = u32(font);
+    if (tag != 0x00010000 && tag != 0x74727565 && tag != 0x4F54544F && tag != 0x31000000) return false;
+    const uint32_t numTables = u16(font + 4);
+    if (numTables == 0 || !fits(font + 12, uint64_t(numTables) * 16)) return false;
+
+    struct Table { uint64_t off = 0, len = 0; bool found = false; };
+    Table head, hhea, hmtx, maxp, cmap, loca, glyf, cff;
+    for (uint32_t i = 0; i < numTables; ++i) {
+        const size_t e = font + 12 + i * 16;
+        const uint64_t off = u32(e + 8), len = u32(e + 12);
+        if (!fits(off, len)) return false;                         // a table past the end of the file
+        Table* t = nullptr;
+        switch (u32(e)) {
+            case 0x68656164: t = &head; break;   // head
+            case 0x68686561: t = &hhea; break;   // hhea
+            case 0x686D7478: t = &hmtx; break;   // hmtx
+            case 0x6D617870: t = &maxp; break;   // maxp
+            case 0x636D6170: t = &cmap; break;   // cmap
+            case 0x6C6F6361: t = &loca; break;   // loca
+            case 0x676C7966: t = &glyf; break;   // glyf
+            case 0x43464620: t = &cff;  break;   // 'CFF '
+            default: break;
+        }
+        if (t) *t = Table{ off, len, true };
+    }
+    if (!head.found || head.len < 54 || !hhea.found || hhea.len < 36 || !maxp.found || maxp.len < 6 ||
+        !hmtx.found || !cmap.found || cmap.len < 4) return false;
+    if (hmtx.len < uint64_t(u16(size_t(hhea.off) + 34)) * 4) return false;   // numberOfHMetrics
+    const uint32_t cmapCount = u16(size_t(cmap.off) + 2);
+    if (cmap.len < 4 + uint64_t(cmapCount) * 8) return false;
+    for (uint32_t i = 0; i < cmapCount; ++i) {
+        const uint64_t sub = u32(size_t(cmap.off) + 4 + i * 8 + 4);
+        if (sub + 4 > cmap.len) return false;                      // each mapping inside cmap
+    }
+    if (cff.found) return true;                                    // CFF outlines: stb_truetype checks those itself
+    if (!loca.found || !glyf.found) return false;
+    const uint64_t glyphs = u16(size_t(maxp.off) + 4);
+    const bool longOffsets = u16(size_t(head.off) + 50) != 0;
+    if (loca.len < (glyphs + 1) * (longOffsets ? 4 : 2)) return false;
+    uint64_t prev = 0;
+    for (uint64_t g = 0; g <= glyphs; ++g) {                       // every glyph inside glyf, in order
+        const uint64_t at = longOffsets ? u32(size_t(loca.off + g * 4)) : uint64_t(u16(size_t(loca.off + g * 2))) * 2;
+        if (at > glyf.len || at < prev) return false;
+        prev = at;
+    }
+    return true;
+}
 }  // namespace
 
 bool FontRenderer::init(const std::vector<std::string>& fonts) {
@@ -85,22 +150,31 @@ bool FontRenderer::init(const std::vector<std::string>& fonts) {
     const int maxSize = std::clamp(static_cast<int>(maxTex), 1024, 4096);
 
     std::vector<std::string> tried;
+    // Every place each font may be: as given, then from one or two folders up (running from a
+    // build folder). A copy that can't be used doesn't end the search - the next one is tried.
+    std::vector<std::pair<std::string, std::string>> candidates;   // (font as given, location)
     for (const std::string& font : fonts) {
         if (font.empty()) continue;
-        // Find it: as given, then from one or two folders up (running from a build folder)
-        std::string path;
-        for (const std::string& p : { font, "../" + font, "../../" + font }) {
-            std::error_code ec;
-            if (fs::is_regular_file(p, ec)) { path = fs::absolute(p, ec).string(); break; }
+        for (const std::string& p : { font, "../" + font, "../../" + font }) candidates.emplace_back(font, p);
+    }
+    for (const auto& [font, location] : candidates) {
+        std::error_code ec;
+        if (!fs::is_regular_file(location, ec)) {
+            // (reported once, after its last location - and only if no location had it)
+            if (location == "../../" + font && !fs::is_regular_file(font, ec) && !fs::is_regular_file("../" + font, ec)) {
+                tried.push_back(font + " (not found)");
+            }
+            continue;
         }
-        if (path.empty()) { tried.push_back(font + " (not found)"); continue; }
+        const std::string path = fs::absolute(location, ec).string();
 
         const std::vector<unsigned char> data = readFontFile(path);
         stbtt_fontinfo info;
-        const int offset = data.empty() ? -1 : stbtt_GetFontOffsetForIndex(data.data(), 0);
+        const bool valid = !data.empty() && fontBufferLooksValid(data);
+        const int offset = valid ? stbtt_GetFontOffsetForIndex(data.data(), 0) : -1;
         if (offset < 0 || !stbtt_InitFont(&info, data.data(), offset)) {
             std::cout << "[Font] Can't read '" << path << "' as a TrueType font - skipping it" << std::endl;
-            tried.push_back(font + " (not a readable font)");
+            tried.push_back(path + " (not a readable font)");
             continue;
         }
 
@@ -120,7 +194,7 @@ bool FontRenderer::init(const std::vector<std::string>& fonts) {
         if (result <= 0) {
             std::cout << "[Font] '" << path << "': only " << -result << " of " << kNumChars
                       << " characters fit even in a " << w << "x" << h << " atlas - skipping it" << std::endl;
-            tried.push_back(font + " (too big to bake)");
+            tried.push_back(path + " (too big to bake)");
             continue;
         }
 
@@ -140,7 +214,7 @@ bool FontRenderer::init(const std::vector<std::string>& fonts) {
             if (tex != 0) glDeleteTextures(1, &tex);
             std::cout << "[Font] The graphics card wouldn't take the " << w << "x" << h
                       << " font atlas for '" << path << "' - skipping it" << std::endl;
-            tried.push_back(font + " (atlas upload failed)");
+            tried.push_back(path + " (atlas upload failed)");
             continue;
         }
 

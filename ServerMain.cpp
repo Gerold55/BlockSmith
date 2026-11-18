@@ -1065,6 +1065,11 @@ int main(int argc, char** argv) {
     const auto loadStart = Clock::now();
     while (world.areaLoadProgress(spawnCenter, 2) < 1.0f && Clock::now() - loadStart < std::chrono::seconds(60)) {
         world.update(spawnCenter, lua);
+        if (!world.fatalError().empty()) {            // the world generator can't run: don't serve a void
+            std::cerr << "[Server] " << world.fatalError() << std::endl;
+            std::cerr << "[Server] Can't open the world - stopping (fix the game's world generator and start again)" << std::endl;
+            return 1;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));   // the threads do the work
     }
     world.setLoadBudgetMs(1000.0f / config.tickRate * 0.25f);   // reading saved chunks: at most 1/4 of a tick
@@ -1477,6 +1482,11 @@ int main(int argc, char** argv) {
             }
         }
         world.update(spawnCenter, lua);   // spawn + every player's surroundings stay loaded
+        if (!world.fatalError().empty()) {    // the world generator stopped working: save and stop
+            std::cerr << "[Server] " << world.fatalError() << " - saving and stopping" << std::endl;
+            g_Running = false;
+            break;
+        }
         server.update(spawnCenter, 0.0f, 0.0f, tickDt);
         world.updateFluids(tickDt);   // each fluid at its own speed (Fluids.h)
 

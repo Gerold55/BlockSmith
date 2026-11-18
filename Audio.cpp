@@ -159,13 +159,19 @@ std::vector<std::string> AudioSystem::findFiles(const std::string& name, bool sa
         }
         if (name.empty() || fs::path(name).is_absolute() || fs::path(name).has_root_name()) roots.clear();
     }
-    auto accept = [&](const std::string& candidate) {
+    // `format`: the extension the candidate was matched with - kept with the returned path, so
+    // the decoder never depends on the (canonical) target's own name
+    auto accept = [&](const std::string& candidate, const char* format) {
         if (!fs::is_regular_file(candidate, ec)) return;
-        if (!sandboxed) { found.push_back(candidate); return; }
+        if (!sandboxed) { found.push_back(candidate); m_formats[candidate] = format; return; }
         const fs::path real = fs::canonical(candidate, ec);
         if (ec) return;
         for (const auto& root : roots) {
-            if (insideRoot(real, root)) { found.push_back(real.string()); return; }
+            if (insideRoot(real, root)) {
+                found.push_back(real.string());          // decoded directly: the link isn't reopened
+                m_formats[real.string()] = format;
+                return;
+            }
         }
         std::cerr << "[Audio] Refused sound file outside the sound folders: " << candidate << std::endl;
     };
@@ -173,12 +179,12 @@ std::vector<std::string> AudioSystem::findFiles(const std::string& name, bool sa
     if (!sandboxed || !roots.empty()) {
         for (const auto& dir : dirs) {
             if (ext == ".ogg" || ext == ".wav") {
-                accept(dir + name);
+                accept(dir + name, ext == ".ogg" ? ".ogg" : ".wav");
             } else {
                 for (const char* e : { ".ogg", ".wav" }) {
-                    accept(dir + name + e);
+                    accept(dir + name + e, e);
                     for (int i = 1; i <= 16; ++i) {   // Luanti-style variants: name.1.ogg, name.2.ogg...
-                        accept(dir + name + "." + std::to_string(i) + e);
+                        accept(dir + name + "." + std::to_string(i) + e, e);
                     }
                 }
             }
@@ -188,6 +194,12 @@ std::vector<std::string> AudioSystem::findFiles(const std::string& name, bool sa
     if (found.empty()) std::cerr << "[Audio] Sound not found: " << name << std::endl;
     cache[name] = found;
     return found;
+}
+
+std::string AudioSystem::formatOf(const std::string& path) const {
+    const auto it = m_formats.find(path);
+    if (it != m_formats.end()) return it->second;
+    return lower(fs::path(path).extension().string());
 }
 
 bool AudioSystem::soundExists(const std::string& name, bool sandboxed) {
@@ -202,7 +214,7 @@ const AudioSystem::Buffer* AudioSystem::loadBuffer(const std::string& path, bool
     Buffer b;
     std::vector<int16_t> pcm;
     int channels = 0, rate = 0;
-    if (lower(fs::path(path).extension().string()) == ".ogg") {
+    if (formatOf(path) == ".ogg") {
         short* out = nullptr;
         const int frames = stb_vorbis_decode_filename(path.c_str(), &channels, &rate, &out);
         if (frames > 0 && out) {
@@ -404,7 +416,7 @@ int AudioSystem::playMusic(const std::string& name, float fadeSeconds, bool loop
     const std::string& file = files[std::uniform_int_distribution<size_t>(0, files.size() - 1)(m_rng)];
 
     int handle = 0;
-    if (lower(fs::path(file).extension().string()) != ".ogg") {
+    if (formatOf(file) != ".ogg") {
         SoundParams p;
         p.group = "music"; p.loop = loop; p.gain = gain;
         handle = play(file, p);

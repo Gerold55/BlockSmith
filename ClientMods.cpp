@@ -441,6 +441,7 @@ void ClientMods::load() {
         }
         loadStorage(name);
     }
+    if (onModFoldersReady) onModFoldersReady();   // e.g. their sounds: findable from init.lua on
     for (const auto& init : inits) {
         const std::string name = init.parent_path().filename().string();
         m_loading = name;

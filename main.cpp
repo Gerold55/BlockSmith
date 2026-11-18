@@ -76,6 +76,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "Fluids.h"
 #include "WeatherEffects.h"
 #include "Audio.h"
+#include "Firewall.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
 
@@ -301,6 +302,11 @@ GameClient g_Client;
 ServerPinger g_Pinger;    // server list: online? description? players?
 LanScanner g_Lan;         // games hosted on the local network (Multiplayer screen)
 std::string g_NetError;
+// Why the last world couldn't be opened or was closed (world_select.lua shows it: engine.take_world_error)
+std::string g_WorldError;
+// LOADING timed out but the chunk under the player isn't loaded (e.g. its save file can't be
+// read yet): the loading screen says so and offers Esc = back to the menu, while it keeps trying
+bool g_SpawnChunkWaiting = false;
 bool g_ShowDebugInfo = false;   // F3: FPS, ping and multiplayer info in the top-left corner
 std::string g_GpuName;          // graphics card in use (shown on F3)
 float g_Fps = 0.0f;       // frames per second, updated twice a second (shown by /netstats)   // why the last connection failed/ended (shown on the Multiplayer screen)
@@ -2071,29 +2077,56 @@ std::vector<ServerModEntry> listModsForGame(const std::string& game) {
 
 // BlockSmithServer.exe is built next to the game's .exe; also check the usual build folders
 // (and the server's old name, CraftRuinServer, from before the engine was named).
-// Firewall.cpp: asks Windows to let `program` ("" = this game) accept connections
-bool allowThroughFirewall(const std::string& program, const std::string& ruleName);
+// Firewall updates Windows was still applying when asked (Firewall.h): rule -> the setting to
+// record once it finishes. Polled from the main loop (pollFirewallUpdates).
+std::map<std::string, std::string> g_FirewallWatch;
 
-// The first time something is hosted here, ask Windows Firewall to let other PCs in (one
-// "allow" prompt). Without it the LAN list shows the game but joining it times out.
-void askFirewallOnce(const std::string& settingKey, const std::string& program, const std::string& ruleName) {
-#ifdef _WIN32
-    if (g_Settings[settingKey] == "1") return;
-    if (g_ChatSystem) {
-        g_ChatSystem->addMessage("Windows will ask to let " + ruleName + " through the firewall, so other PCs on your network can join.",
-                                 glm::vec3(1.0f, 1.0f, 0.4f));
-    }
-    if (allowThroughFirewall(program, ruleName)) {
+void reportFirewallResult(FirewallStatus st, const std::string& settingKey, const std::string& ruleName) {
+    if (st == FirewallStatus::Allowed) {
         g_Settings[settingKey] = "1";
         saveSettings();
         std::cout << "[Network] Firewall rule added for " << ruleName << std::endl;
-    } else {
+    } else if (st == FirewallStatus::Pending) {
+        g_FirewallWatch[ruleName] = settingKey;   // recorded when Windows finishes, not before
+        std::cout << "[Network] Windows is still updating the firewall for " << ruleName << std::endl;
+        if (g_ChatSystem) {
+            g_ChatSystem->addMessage("Windows is still updating the firewall for " + ruleName + "...",
+                                     glm::vec3(1.0f, 1.0f, 0.4f));
+        }
+    } else if (st == FirewallStatus::Failed) {
         std::cout << "[Network] Firewall rule not added (declined) - other PCs may not be able to join" << std::endl;
         if (g_ChatSystem) {
             g_ChatSystem->addMessage("Firewall not changed - if friends can't join, allow " + ruleName +
                                      " in Windows Security > Firewall > Allow an app.", glm::vec3(1.0f, 0.7f, 0.4f));
         }
     }
+}
+
+// Once a second: did a pending firewall update finish?
+void pollFirewallUpdates(float dt) {
+    static float wait = 0.0f;
+    if (g_FirewallWatch.empty() || (wait -= dt) > 0.0f) return;
+    wait = 1.0f;
+    for (auto it = g_FirewallWatch.begin(); it != g_FirewallWatch.end();) {
+        const FirewallStatus st = firewallStatus(it->first);
+        if (st == FirewallStatus::Pending) { ++it; continue; }
+        const std::string rule = it->first, key = it->second;
+        it = g_FirewallWatch.erase(it);
+        if (st != FirewallStatus::Idle) reportFirewallResult(st, key, rule);
+    }
+}
+
+// The first time something is hosted here, ask Windows Firewall to let other PCs in (one
+// "allow" prompt). Without it the LAN list shows the game but joining it times out.
+void askFirewallOnce(const std::string& settingKey, const std::string& program, const std::string& ruleName) {
+#ifdef _WIN32
+    if (g_Settings[settingKey] == "1") return;
+    if (g_FirewallWatch.count(ruleName)) return;   // an update for it is still running: no second prompt
+    if (g_ChatSystem) {
+        g_ChatSystem->addMessage("Windows will ask to let " + ruleName + " through the firewall, so other PCs on your network can join.",
+                                 glm::vec3(1.0f, 1.0f, 0.4f));
+    }
+    reportFirewallResult(allowThroughFirewall(program, ruleName), settingKey, ruleName);
 #else
     (void)settingKey; (void)program; (void)ruleName;
 #endif
@@ -3137,6 +3170,15 @@ void drawLoadingScreen(GLuint uiProgram, GLuint fontProgram, float progress, int
         g_FontRenderer->renderText(fontProgram, std::to_string(percent) + "%",
                                    width * 0.5f - 20.0f, height * 0.5f - 60.0f,
                                    0.9f, 0.9f, glm::vec4(0.9f, 0.9f, 0.9f, 1.0f), screen);
+        if (g_SpawnChunkWaiting) {
+            const glm::vec4 warn(1.0f, 0.8f, 0.4f, 1.0f);
+            const std::string a = "The ground where you are can't be loaded yet - still trying.";
+            const std::string b = "Press Esc to go back to the menu.";
+            g_FontRenderer->renderText(fontProgram, a, width * 0.5f - g_FontRenderer->textWidth(a, 0.8f, screen) * 0.5f,
+                                       height * 0.5f - 120.0f, 0.8f, 0.8f, warn, screen);
+            g_FontRenderer->renderText(fontProgram, b, width * 0.5f - g_FontRenderer->textWidth(b, 0.8f, screen) * 0.5f,
+                                       height * 0.5f - 160.0f, 0.8f, 0.8f, warn, screen);
+        }
     }
 }
 
@@ -3219,15 +3261,14 @@ int main(int argc, char** argv) {
 
         // The game's font, else one that comes with the operating system. With neither, there is
         // no text at all (menus would be blank buttons), so say why - in the console and in the
-        // window's title bar, where the player sees it - and carry on with text switched off
-        // (every text call checks g_FontRenderer) rather than drawing from an empty atlas.
+        // window's title bar, where the player sees it - and carry on with text switched off. The
+        // renderer stays (some screens draw through it unconditionally): without an atlas
+        // (ready() is false) it draws nothing and measures every text as 0 wide.
         if (!g_FontRenderer->init("fonts/PixeloidSans.ttf")) {
             std::cerr << "[Font] fonts/PixeloidSans.ttf couldn't be used - trying the system's fonts" << std::endl;
             if (!g_FontRenderer->init(FontRenderer::systemFonts())) {
                 std::cerr << "[Font Error] No font could be loaded: the game will show no text. Check that the "
                              "'fonts' folder is next to the game (with PixeloidSans.ttf in it)." << std::endl;
-                delete g_FontRenderer;
-                g_FontRenderer = nullptr;
                 glfwSetWindowTitle(window, (windowTitle + " - no font found: is the 'fonts' folder missing?").c_str());
             }
         }
@@ -3334,6 +3375,14 @@ int main(int argc, char** argv) {
 
             if (g_CurrentGameState == GameState::MENU && action == GLFW_PRESS) {
                 if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(win, true);
+                return;
+            }
+            // Stuck loading (the ground under the player can't be loaded): Esc leaves the world
+            if (g_CurrentGameState == GameState::LOADING && g_SpawnChunkWaiting && action == GLFW_PRESS &&
+                key == GLFW_KEY_ESCAPE) {
+                g_SpawnChunkWaiting = false;
+                sol::protected_function quit = (*c->lua)["engine"]["quit_to_menu"];
+                if (quit.valid()) quit();
                 return;
             }
 
@@ -4622,6 +4671,14 @@ int main(int argc, char** argv) {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         };
         engineTable["start_game"] = [window]() { beginLoadingWorld(window); };
+        // engine.take_world_error() -> why the last world was closed or couldn't be opened, once
+        //   (e.g. its world generator failed), else nil
+        engineTable["take_world_error"] = [](sol::this_state ts) -> sol::object {
+            if (g_WorldError.empty()) return sol::make_object(ts, sol::lua_nil);
+            std::string e;
+            e.swap(g_WorldError);
+            return sol::make_object(ts, e);
+        };
 
         // ---- World saves (used by world_select.lua) ----
         // engine.list_worlds() -> { { name = "My World", seed = "123" }, ... }  newest first
@@ -5021,11 +5078,16 @@ int main(int argc, char** argv) {
         };
         engineTable["has_server_build"] = []() { return !findServerExe().empty(); };
         // engine.allow_firewall() -> asks Windows again to let this game accept connections
-        //   (for a "Fix: friends can't join" button). True if allowed (always true off Windows).
+        //   (for a "Fix: friends can't join" button). Returns ok, status: true, "allowed" (always,
+        //   off Windows) / false, "failed" / false, "pending" (Windows is still applying it; the
+        //   game records the result itself when it finishes - asking again meanwhile starts nothing)
         engineTable["allow_firewall"] = []() {
-            const bool ok = allowThroughFirewall("", "BlockSmith");
-            if (ok) { g_Settings["firewall_ok_game"] = "1"; saveSettings(); }
-            return ok;
+            const FirewallStatus st = allowThroughFirewall("", "BlockSmith");
+            if (st == FirewallStatus::Allowed) { g_Settings["firewall_ok_game"] = "1"; saveSettings(); }
+            if (st == FirewallStatus::Pending) g_FirewallWatch["BlockSmith"] = "firewall_ok_game";
+            return std::make_tuple(st == FirewallStatus::Allowed,
+                                   std::string(st == FirewallStatus::Allowed ? "allowed"
+                                               : st == FirewallStatus::Pending ? "pending" : "failed"));
         };
 
         // engine.get_lan_games() -> { { address, host, motd, players, max_players }, ... }
@@ -5338,6 +5400,17 @@ int main(int argc, char** argv) {
             std::cout << "[Client mods] Folder: " << fs::absolute(clientModsFolder, ec).string() << std::endl;
         }
         clientMods.setFolder(clientModsFolder.string());
+        // Sounds are looked for in every mod's folder (and its sounds/), then the game's. Installed
+        // as the client mods' folders become known (before their init.lua runs) and again after
+        // loading; Audio's sandboxed lookups check every file against these same roots each time.
+        auto installSoundFolders = [&clientMods] {
+            std::vector<std::string> soundFolders = g_ModFolders;
+            for (const auto& f : clientMods.modFolders()) soundFolders.push_back(f);   // client mods' sounds, last
+            soundFolders.push_back("games/" + g_ActiveGameFolder);
+            soundFolders.push_back("../../games/" + g_ActiveGameFolder);
+            g_Audio.setSearchFolders(soundFolders);
+        };
+        clientMods.onModFoldersReady = installSoundFolders;
         if (settingInt("client_mods", 1) != 0 && g_Settings["client_mods"] != "false") {
             const fs::path folder = clientModsFolder;
             clientMods.showChat = [](const std::string& text, float r, float g, float b) {
@@ -5360,14 +5433,7 @@ int main(int argc, char** argv) {
         applyStoredVideoSettings();
 
         g_Lua = &lua;
-        // Sounds are looked for in every mod's folder (and its sounds/), then the game's
-        {
-            std::vector<std::string> soundFolders = g_ModFolders;
-            for (const auto& f : clientMods.modFolders()) soundFolders.push_back(f);   // client mods' sounds, last
-            soundFolders.push_back("games/" + g_ActiveGameFolder);
-            soundFolders.push_back("../../games/" + g_ActiveGameFolder);
-            g_Audio.setSearchFolders(soundFolders);
-        }
+        installSoundFolders();   // (also with client mods off)
         // Other players building (and, when hosting, players editing our world): their
         // break/place sounds where it happened. Fluids flowing make no sound.
         {
@@ -5602,6 +5668,18 @@ int main(int argc, char** argv) {
         bool leftMousePressedLast = false;
         bool rightMousePressedLast = false;
 
+        // The world's generator can't run (World::fatalError): save what there is, leave the world
+        // and show why on the world list - instead of loading forever or playing in a void
+        auto leaveBrokenWorld = [&]() {
+            g_WorldError = world.fatalError();
+            std::cerr << "[World] Closing the world: " << g_WorldError << std::endl;
+            sol::protected_function quit = lua["engine"]["quit_to_menu"];
+            if (quit.valid()) quit();
+            g_CurrentGameState = GameState::WORLD_SELECT;
+            callLuaUI(&lua, "on_world_select_opened");
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);   // (read again each frame)
+        };
+
         while (!glfwWindowShouldClose(window)) {
             float currentFrameTime = static_cast<float>(glfwGetTime());
             float deltaTime = currentFrameTime - lastFrameTime;
@@ -5624,6 +5702,7 @@ int main(int argc, char** argv) {
                                     std::sin(glm::radians(player.yaw)) * std::cos(glm::radians(player.pitch)));
                 g_Audio.setListener(eye, fwd, glm::vec3(0.0f, 1.0f, 0.0f));
                 g_Audio.update(deltaTime);
+                pollFirewallUpdates(deltaTime);
             }
             g_LastMoveKeys = readMoveInput(window, player.yaw, player.pitch).keys;
 
@@ -5777,26 +5856,33 @@ int main(int argc, char** argv) {
                 worldRenderer.setMeshBudgetMs(30.0f);
                 worldRenderer.setUploadBudgetMs(30.0f);
                 world.update(player.position, lua);
+                if (!world.fatalError().empty()) { leaveBrokenWorld(); continue; }
                 worldRenderer.update(world, player.position);
 
                 const int sx = static_cast<int>(std::floor(player.position.x));
                 const int sz = static_cast<int>(std::floor(player.position.z));
                 const bool timedOut = (glfwGetTime() - g_LoadStartTime) > kLoadTimeoutSec;
 
+                // The chunk the player stands in must be there before they can move: the timeout
+                // may skip waiting for meshes, never for the ground (a missing chunk isn't air).
+                // Until it loads, the saved position is kept as it is.
+                const bool spawnChunkReady = world.isLoaded(glm::ivec3(sx, 0, sz));
                 if (!g_SpawnPlaced) {
                     const int ground = world.groundHeightAt(sx, sz);
                     if (ground >= 0) {
                         player.position.y = static_cast<float>(ground);
                         g_SpawnPlaced = true;
-                    } else if (timedOut) {
+                    } else if (timedOut && spawnChunkReady) {   // loaded, with nothing to stand on
                         player.position.y = 100.0f;
                         g_SpawnPlaced = true;
                     }
                 }
 
                 g_LoadingProgress = worldRenderer.areaReadyProgress(world, player.position, kSpawnReadyRadius);
+                g_SpawnChunkWaiting = timedOut && !spawnChunkReady;   // Esc = back to the menu
 
-                if (g_SpawnPlaced && (g_LoadingProgress >= 1.0f || timedOut)) {
+                if (g_SpawnPlaced && spawnChunkReady && (g_LoadingProgress >= 1.0f || timedOut)) {
+                    g_SpawnChunkWaiting = false;
                     world.setLoadBudgetMs(4.0f);
                     worldRenderer.setMeshBudgetMs(4.0f);
                     worldRenderer.setUploadBudgetMs(3.0f);
@@ -5814,6 +5900,7 @@ int main(int argc, char** argv) {
 
                 // Chunks keep loading even while paused / in menus (other players may need them)
                 world.update(player.position, lua);
+                if (!world.fatalError().empty()) { leaveBrokenWorld(); continue; }
 
                 if (isCursorDisabled && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
                     // Hotbar slot keys (rebindable in Settings > Controls)
@@ -6886,7 +6973,7 @@ int main(int argc, char** argv) {
 
                 if (g_MainMenu) {
                     g_MainMenu->updateAndBuildBuffers(mx, my, sw, sh);
-                    g_MainMenu->render(uiProgram, texturedUIProgram, fontProgram, *g_FontRenderer, sw, sh);
+                    if (g_FontRenderer) g_MainMenu->render(uiProgram, texturedUIProgram, fontProgram, *g_FontRenderer, sw, sh);
                 }
             }
 

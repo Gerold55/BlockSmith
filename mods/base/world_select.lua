@@ -504,7 +504,8 @@ end
 function on_world_select_opened()
     state.mode = "list"
     state.scroll = 0
-    state.message = nil
+    -- Why the last world was closed or couldn't open (e.g. its world generator failed), if so
+    state.message = engine.take_world_error and engine.take_world_error() or nil
     refresh_worlds()
 end
 

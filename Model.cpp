@@ -259,6 +259,7 @@ void appendCube(const json& cube, float texW, float texH, bool boneMirror, std::
 } // namespace
 
 void AnimatedModel::loadFromJson(const std::string& filepath) {
+    m_hierarchyState = 0;   // bones may be added: work the hierarchy check out again
     std::ifstream file(filepath);
     if (!file.is_open()) {
         std::cerr << "[Model Error] Failed to open JSON model file: " << filepath << std::endl;
@@ -317,25 +318,40 @@ void AnimatedModel::loadFromJson(const std::string& filepath) {
             parents.emplace_back(bone, bData.value("parent", std::string()));
         }
 
-        // Pass 2: link parents (a child may be listed before its parent)
+        // Each bone's parent (the bone that "parent" names; none for a root or a bad name)
+        std::unordered_map<const Bone*, Bone*> parentOf;
         for (auto& [bone, parentName] : parents) {
             auto it = boneMap.find(parentName);
-            if (!parentName.empty() && it != boneMap.end() && it->second != bone) {
-                it->second->children.push_back(bone);
-            } else {
-                rootBones.push_back(bone);
+            if (!parentName.empty() && it != boneMap.end() && it->second != bone) parentOf[bone.get()] = it->second.get();
+        }
+        // Before any bone owns another: refuse a loop in the "parent" names (a is b's parent and b
+        // is a's). Linked, it would be a ring of bones owning each other - never freed, and
+        // endless to draw. Following parents from a bone must end within the number of bones.
+        for (auto& [bone, parentName] : parents) {
+            const Bone* b = bone.get();
+            for (size_t steps = 0; b && steps <= parents.size(); ++steps) {
+                const auto p = parentOf.find(b);
+                b = p == parentOf.end() ? nullptr : p->second;
+            }
+            if (b) {                                       // still going: it went round a loop
+                std::cerr << "[Model Error] " << filepath << ": bone '" << bone->name << "' is in a loop of "
+                          << "\"parent\" names (a bone can't be its own ancestor) - model not loaded" << std::endl;
+                boneMap.clear();
+                rootBones.clear();
+                return;                                    // `loaded` stays false
             }
         }
 
-        loaded = true;
-        std::cout << "[Model] Loaded JSON model: " << filepath << " (" << boneMap.size() << " bones)" << std::endl;
-        {
-            std::string where;
-            if (!hierarchyIsAcyclic(&where)) {
-                std::cerr << "[Model] " << filepath << ": bone '" << where << "' is its own ancestor (check the "
-                          << "\"parent\" names). Those bones won't be drawn on their own (drawBone)." << std::endl;
-            }
+        // Pass 2: link parents (a child may be listed before its parent)
+        for (auto& [bone, parentName] : parents) {
+            const auto p = parentOf.find(bone.get());
+            if (p != parentOf.end()) p->second->children.push_back(bone);
+            else rootBones.push_back(bone);
         }
+
+        loaded = true;
+        m_hierarchyState = 1;                              // checked above: no loops
+        std::cout << "[Model] Loaded JSON model: " << filepath << " (" << boneMap.size() << " bones)" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[Model Error] Could not read JSON model " << filepath << ": " << e.what() << std::endl;
     }
@@ -469,6 +485,7 @@ void parseNode(std::ifstream& f, std::streamoff end, const std::shared_ptr<Bone>
 } // namespace
 
 void AnimatedModel::loadFromB3D(const std::string& filepath) {
+    m_hierarchyState = 0;   // bones may be added: work the hierarchy check out again
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "[Model Error] Failed to open .b3d binary file: " << filepath << std::endl;
@@ -541,22 +558,25 @@ bool AnimatedModel::hierarchyIsAcyclic(std::string* cycleBone) const {
     return true;
 }
 
+// The whole-hierarchy check, done once (not on every arm draw) and redone after a load
+bool AnimatedModel::hierarchyOk() const {
+    if (m_hierarchyState == 0) m_hierarchyState = hierarchyIsAcyclic(&m_cycleBone) ? 1 : 2;
+    return m_hierarchyState == 1;
+}
+
 bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world) {
     if (!loaded) return false;
     auto bone = getBone(name);
     if (!bone) return false;
     // A bone that is its own ancestor would make the pose pass and the drawing below go round
     // forever: check the whole hierarchy before touching anything, and refuse a looped one
-    {
-        std::string where;
-        if (!hierarchyIsAcyclic(&where)) {
-            if (!m_reportedCycle) {
-                std::cerr << "[Model] Bone '" << where << "' is its own ancestor (a loop in the bones' parents): "
-                          << "not drawing bone '" << name << "'" << std::endl;
-                m_reportedCycle = true;
-            }
-            return false;
+    if (!hierarchyOk()) {
+        if (!m_reportedCycle) {
+            std::cerr << "[Model] Bone '" << m_cycleBone << "' is its own ancestor (a loop in the bones' parents): "
+                      << "not drawing bone '" << name << "'" << std::endl;
+            m_reportedCycle = true;
         }
+        return false;
     }
     // The file's pose: animation offsets, rotations and scales are cleared for the subtree (rest
     // positions stay) and put back afterwards
@@ -661,7 +681,9 @@ glm::vec3 catmullRom(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& 
 
 glm::vec3 AnimChannel::sample(float t) const {
     if (keys.empty()) return glm::vec3(0.0f);
-    if (keys.size() == 1 || t <= keys.front().time) return keys.front().pre;
+    // "pre" is the value before a key, "post" from it on: before the first key its pre, at or after
+    // the last key its post (a single key too). Constant channels have pre == post anyway.
+    if (t < keys.front().time) return keys.front().pre;
     if (t >= keys.back().time) return keys.back().post;
     size_t i = 0;
     while (i + 1 < keys.size() && keys[i + 1].time <= t) ++i;

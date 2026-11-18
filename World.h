@@ -72,6 +72,10 @@ public:
     // adds nothing) if the save file couldn't be checked or read: the chunk may be saved, so it
     // is not replaced with new terrain - ask again later.
     bool loadChunk(int chunkX, int chunkZ, sol::state& lua);
+    // Not empty: the world generator can't run for this world (its set_world_seed kept failing;
+    // this is the Lua error). Nothing new is generated; whoever opened the world should stop
+    // and show this. Cleared by reset().
+    const std::string& fatalError() const { return m_fatalError; }
 
     uint8_t getBlockAt(const glm::ivec3& loc) const;
     void setBlockAt(const glm::ivec3& loc, uint8_t blockId);
@@ -207,8 +211,17 @@ private:
         std::chrono::steady_clock::time_point next;
     };
     std::unordered_map<ChunkCoord, DiskRetry, PairHash> m_diskRetry;
+    // The world generator's set_world_seed failed: no new terrain is asked for until
+    // m_genHoldUntil (0.5 s, doubling up to 8 s) - saved chunks keep loading meanwhile. After
+    // kMaxSeedAttempts failed attempts, m_fatalError holds the Lua error and generation stops
+    // for good (until reset): the world can't be opened (see fatalError()).
+    static constexpr int kMaxSeedAttempts = 6;
+    int m_seedFailures = 0;
+    std::chrono::steady_clock::time_point m_genHoldUntil{};
+    std::string m_fatalError;
     // A disk problem for chunk c: logged (not every attempt) and its next try scheduled
     void noteDiskError(const ChunkCoord& c, const std::string& what);
+    void noteSeedFailure(const std::string& error);
     bool saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const;
     enum class DiskLoad { Loaded, Missing, Damaged, Error };
     // Missing: no file. Damaged: a file that isn't a valid chunk (regenerated, and replaced when

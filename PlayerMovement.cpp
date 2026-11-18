@@ -221,10 +221,15 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     };
 
     // --- X Axis Collision & Move ---
+    // The direction of this move is kept until the overlap check below has used it: the check
+    // pushes out against the direction of travel, and must still do so after the sweep hit
+    // something. Velocity is cleared only once both are done.
+    float dirX = velocity.x;
+    bool stopX = false;
     {
         bool hit = false;
         position.x += sweepAxis(0, velocity.x * deltaTime, hit);
-        if (hit) velocity.x = 0.0f;
+        stopX = hit;
     }
     {
         const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
@@ -236,23 +241,31 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     glm::vec3 mn, mx;
                     if (!solidBox(x, y, z, mn, mx)) continue;
                     if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
-                    if (velocity.x > 0.0f) {
+                    if (dirX > 0.0f) {
                         position.x = mn.x - halfWidth - 0.001f;
-                        velocity.x = 0.0f;
-                    } else if (velocity.x < 0.0f) {
+                        dirX = 0.0f;
+                        stopX = true;
+                    } else if (dirX < 0.0f) {
                         position.x = mx.x + halfWidth + 0.001f;
-                        velocity.x = 0.0f;
+                        dirX = 0.0f;
+                        stopX = true;
                     }
                 }
             }
         }
     }
+    if (stopX) velocity.x = 0.0f;
 
     // --- Z Axis Collision & Move ---
+    // The direction of this move is kept until the overlap check below has used it: the check
+    // pushes out against the direction of travel, and must still do so after the sweep hit
+    // something. Velocity is cleared only once both are done.
+    float dirZ = velocity.z;
+    bool stopZ = false;
     {
         bool hit = false;
         position.z += sweepAxis(2, velocity.z * deltaTime, hit);
-        if (hit) velocity.z = 0.0f;
+        stopZ = hit;
     }
     {
         const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
@@ -264,27 +277,31 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     glm::vec3 mn, mx;
                     if (!solidBox(x, y, z, mn, mx)) continue;
                     if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
-                    if (velocity.z > 0.0f) {
+                    if (dirZ > 0.0f) {
                         position.z = mn.z - halfWidth - 0.001f;
-                        velocity.z = 0.0f;
-                    } else if (velocity.z < 0.0f) {
+                        dirZ = 0.0f;
+                        stopZ = true;
+                    } else if (dirZ < 0.0f) {
                         position.z = mx.z + halfWidth + 0.001f;
-                        velocity.z = 0.0f;
+                        dirZ = 0.0f;
+                        stopZ = true;
                     }
                 }
             }
         }
     }
+    if (stopZ) velocity.z = 0.0f;
 
     // --- Y Axis Collision & Move ---
     grounded = false;
+    float dirY = velocity.y;                  // kept for the overlap check, as for x and z
+    bool stopY = false;
     {
         bool hit = false;
-        const float vy = velocity.y;
-        position.y += sweepAxis(1, vy * deltaTime, hit);
+        position.y += sweepAxis(1, dirY * deltaTime, hit);
         if (hit) {
-            velocity.y = 0.0f;
-            if (vy < 0.0f) grounded = true;   // landed on the first thing below
+            stopY = true;
+            if (dirY < 0.0f) grounded = true;   // landed on the first thing below
         }
     }
     {
@@ -297,18 +314,21 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                     glm::vec3 mn, mx;
                     if (!solidBox(x, y, z, mn, mx)) continue;
                     if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 >= mn.y && z0 < mx.z && z1 > mn.z)) continue;
-                    if (velocity.y < 0.0f) {
+                    if (dirY < 0.0f) {
                         position.y = mx.y;
-                        velocity.y = 0.0f;
+                        dirY = 0.0f;
+                        stopY = true;
                         grounded = true;
-                    } else if (velocity.y > 0.0f) {
+                    } else if (dirY > 0.0f) {
                         position.y = mn.y - playerHeight;
-                        velocity.y = 0.0f;
+                        dirY = 0.0f;
+                        stopY = true;
                     }
                 }
             }
         }
     }
+    if (stopY) velocity.y = 0.0f;
 
     // --- VOID SAFETY NET ---
     if (position.y < -10.0f) {

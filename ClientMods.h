@@ -37,6 +37,10 @@ public:
     // are off until the player switches them on, on the Mods screen). Alphabetical, depends =
     // ... honoured. modFolders() = the folders of those that loaded (for sounds).
     void load();
+    // Called by load() once the switched-on mods are known (modFolders() is filled) and before
+    // any of their init.lua runs: the place to install their folders as sound search roots, so
+    // sound.exists / sound.play work while the mods start up.
+    std::function<void()> onModFoldersReady;
 
     // ---- The Mods screen ----
     struct Info {

@@ -293,8 +293,11 @@ void World::loadQueuedChunks(sol::state& lua) {
         const size_t maxInFlight = static_cast<size_t>(m_generator->threadCount()) * 3;
         std::vector<ChunkCoord> notYet;   // waiting for a generator slot or a disk retry (kept, in queue order)
         // A chunk the generator must make: ask now if a slot is free, else keep it for later
+        // (While set_world_seed is failing - or has failed for good - new terrain waits; the
+        //  chunk stays queued, and chunks with a save file still load below.)
+        const bool generationHeld = !m_fatalError.empty() || Clock::now() < m_genHoldUntil;
         auto generate = [&](const ChunkCoord& c) {
-            if (m_generating.size() < maxInFlight) {
+            if (!generationHeld && m_generating.size() < maxInFlight) {
                 m_generator->request(c.first, c.second, m_resetCount, m_seed);
                 m_generating.insert(c);
             } else {
@@ -381,10 +384,12 @@ void World::collectGenerated() {
         const ChunkCoord c{r.cx, r.cz};
         if (r.epoch != m_resetCount) continue;          // from before a reset (another world)
         m_generating.erase(c);
-        if (!r.chunk) {                                 // the job failed: ask for it again
+        if (!r.chunk) {                                 // the job failed: ask for it again later
             m_queueDirty = true;                        // (the rebuilt queue includes it)
+            if (!r.seedError.empty()) noteSeedFailure(r.seedError);
             continue;
         }
+        m_seedFailures = 0;                             // the generator works (again)
         if (chunks.count(c) || !wantedChunk(c)) continue;   // already there / player went away
         addLoadedChunk(r.cx, r.cz, std::move(r.chunk));
     }
@@ -393,6 +398,25 @@ void World::collectGenerated() {
         if (!wantedChunk(*it) && m_generator->cancel(it->first, it->second)) it = m_generating.erase(it);
         else ++it;
     }
+}
+
+// set_world_seed failed in a generator thread. Every job in flight fails the same way at about
+// the same time, so only the first failure after a hold counts as an attempt.
+void World::noteSeedFailure(const std::string& error) {
+    if (!m_fatalError.empty()) return;
+    const auto now = Clock::now();
+    if (m_seedFailures > 0 && now < m_genHoldUntil) return;   // part of the attempt already counted
+    ++m_seedFailures;
+    if (m_seedFailures >= kMaxSeedAttempts) {
+        m_fatalError = "The world generator failed (set_world_seed): " + error;
+        std::cerr << "[World] " << m_fatalError << " - giving up after " << m_seedFailures << " attempts" << std::endl;
+        if (m_generator) m_generator->clearQueue();
+        return;
+    }
+    const int shift = std::min(m_seedFailures - 1, 4);          // 0.5 s, 1 s, 2 s, 4 s, 8 s
+    m_genHoldUntil = now + std::chrono::milliseconds(500 << shift);
+    std::cerr << "[World] set_world_seed failed (attempt " << m_seedFailures << " of " << kMaxSeedAttempts
+              << "), trying again in " << (500 << shift) / 1000.0 << " s: " << error << std::endl;
 }
 
 void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
@@ -595,6 +619,9 @@ void World::reset() {
     m_modified.clear();
     m_notOnDisk.clear();
     m_diskRetry.clear();
+    m_seedFailures = 0;
+    m_genHoldUntil = {};
+    m_fatalError.clear();
     m_fallChecks.clear();   // blocks falling in the old world
     m_falling.clear();
     m_queueDirty = true;

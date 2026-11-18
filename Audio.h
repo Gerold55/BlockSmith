@@ -104,6 +104,12 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> m_resolved;   // name -> files
     std::unordered_map<std::string, std::vector<std::string>> m_resolvedSandboxed;   // same, for client mods
     std::unordered_map<std::string, Buffer> m_buffers;                      // path(+#mono) -> buffer
+    // The format (".ogg" / ".wav") of each file findFiles matched, by the path it returns. A
+    // sandboxed match is returned as its canonical target, whose own name may not end in the
+    // matched extension (a symlink "step.ogg" -> "blob"), so the decoder is chosen from this.
+    std::unordered_map<std::string, std::string> m_formats;
+    // ".ogg" or ".wav" for a path findFiles returned (else from the path's own extension)
+    std::string formatOf(const std::string& path) const;
     std::vector<Voice> m_voices;
     std::map<std::string, float> m_volumes{ {"master", 1.0f}, {"effects", 1.0f}, {"ambient", 1.0f},
                                             {"music", 0.6f}, {"ui", 1.0f} };

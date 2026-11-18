@@ -82,6 +82,12 @@ public:
 
 private:
     mutable bool m_reportedCycle = false;   // the cycle error is printed once per model
+    // hierarchyIsAcyclic's answer, worked out once: 0 = not known yet, 1 = no loop, 2 = a loop
+    // (m_cycleBone names a bone in it). Bones are only linked while a file loads, so the loaders
+    // reset it to 0 - that is the one place the hierarchy can change.
+    mutable int m_hierarchyState = 0;
+    mutable std::string m_cycleBone;
+    bool hierarchyOk() const;
 };
 
 // ===========================================================================

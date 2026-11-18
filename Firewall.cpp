@@ -11,6 +11,7 @@
 //
 // Kept in its own file: <windows.h> clashes with OpenGL's and the standard library's names.
 
+#include "Firewall.h"
 #include <cstdint>
 #include <string>
 
@@ -92,33 +93,89 @@ inline std::wstring encodeCommand(const std::wstring& script) {
 } // namespace firewall
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
+#include <iostream>
+#include <map>
+
+namespace {
+
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    return w;
+}
+
+// Updates still running after the wait below, by rule name: their process is kept so the result
+// can be read when it ends (and so a second update for the same rule isn't started meanwhile).
+std::map<std::wstring, HANDLE> g_pending;
+
+// Windows PowerShell from the Windows system folder - never "powershell.exe" looked up through
+// the search path (the current folder or PATH could hold another program of that name). Empty if
+// it isn't there.
+std::wstring systemPowerShell() {
+    wchar_t dir[MAX_PATH] = {};
+    const UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::wstring();
+    const std::wstring exe = std::wstring(dir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const DWORD attr = GetFileAttributesW(exe.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return std::wstring();
+    return exe;
+}
+
+// Has the pending update for this rule finished? Idle if there is none.
+FirewallStatus pollPending(const std::wstring& rule) {
+    const auto it = g_pending.find(rule);
+    if (it == g_pending.end()) return FirewallStatus::Idle;
+    const DWORD w = WaitForSingleObject(it->second, 0);
+    if (w == WAIT_TIMEOUT) return FirewallStatus::Pending;
+    DWORD code = 1;
+    if (w != WAIT_OBJECT_0 || !GetExitCodeProcess(it->second, &code)) code = 1;
+    CloseHandle(it->second);
+    g_pending.erase(it);
+    return code == 0 ? FirewallStatus::Allowed : FirewallStatus::Failed;
+}
 
 // Makes sure the game's own inbound "allow" rule for `program` (full path) exists on private
-// and domain networks (home / work - not public Wi-Fi). Windows shows its admin prompt; returns
-// false if the person said no or the update failed (any existing working rule is then kept).
-bool requestFirewallRule(const std::wstring& program, const std::wstring& ruleName) {
+// and domain networks (home / work - not public Wi-Fi). Windows shows its admin prompt.
+FirewallStatus requestFirewallRule(const std::wstring& program, const std::wstring& ruleName) {
+    // One update per rule at a time: a still-running one is waited for, not repeated
+    const FirewallStatus previous = pollPending(ruleName);
+    if (previous == FirewallStatus::Pending || previous == FirewallStatus::Allowed) return previous;
+
+    const std::wstring powershell = systemPowerShell();
+    if (powershell.empty()) {
+        std::cerr << "[Network] Windows PowerShell isn't in the Windows system folder - can't update the firewall" << std::endl;
+        return FirewallStatus::Failed;
+    }
     const std::wstring params = L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand " +
                                 firewall::encodeCommand(firewall::updateScript(program, ruleName));
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOCLOSEPROCESS;
     info.lpVerb = L"runas";               // the "allow changes?" prompt
-    info.lpFile = L"powershell.exe";
+    info.lpFile = powershell.c_str();
     info.lpParameters = params.c_str();
     info.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&info)) return false;   // e.g. they clicked No
-    if (info.hProcess) {
-        const DWORD waited = WaitForSingleObject(info.hProcess, 30000);   // PowerShell can be slow to start
-        DWORD code = 1;
-        if (waited == WAIT_OBJECT_0) GetExitCodeProcess(info.hProcess, &code);
-        CloseHandle(info.hProcess);
-        return code == 0;
+    if (!ShellExecuteExW(&info)) return FirewallStatus::Failed;   // e.g. they clicked No
+    if (!info.hProcess) return FirewallStatus::Allowed;
+    const DWORD waited = WaitForSingleObject(info.hProcess, 30000);   // PowerShell can be slow to start
+    if (waited == WAIT_TIMEOUT) {
+        g_pending[ruleName] = info.hProcess;   // still working: not a failure - its result comes later
+        return FirewallStatus::Pending;
     }
-    return true;
+    DWORD code = 1;
+    if (waited != WAIT_OBJECT_0 || !GetExitCodeProcess(info.hProcess, &code)) code = 1;
+    CloseHandle(info.hProcess);
+    return code == 0 ? FirewallStatus::Allowed : FirewallStatus::Failed;
 }
 
 std::wstring thisProgramPath() {
@@ -127,17 +184,17 @@ std::wstring thisProgramPath() {
     return path;
 }
 
-bool allowThroughFirewall(const std::string& programUtf8, const std::string& ruleNameUtf8) {
-    auto widen = [](const std::string& s) {
-        if (s.empty()) return std::wstring();
-        const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-        std::wstring w(n > 0 ? n - 1 : 0, L'\0');
-        if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
-        return w;
-    };
+} // namespace
+
+FirewallStatus allowThroughFirewall(const std::string& programUtf8, const std::string& ruleNameUtf8) {
     const std::wstring program = programUtf8.empty() ? thisProgramPath() : widen(programUtf8);
     return requestFirewallRule(program, widen(ruleNameUtf8));
 }
+
+FirewallStatus firewallStatus(const std::string& ruleNameUtf8) {
+    return pollPending(widen(ruleNameUtf8));
+}
 #else
-bool allowThroughFirewall(const std::string&, const std::string&) { return true; }
+FirewallStatus allowThroughFirewall(const std::string&, const std::string&) { return FirewallStatus::Allowed; }
+FirewallStatus firewallStatus(const std::string&) { return FirewallStatus::Idle; }
 #endif

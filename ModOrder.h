@@ -89,12 +89,19 @@ inline void applyDepends(std::vector<fs::path>& files) {
     std::map<std::string, size_t> byName;      // mod name -> index in inits (first one wins)
     for (size_t i = 0; i < inits.size(); ++i) byName.emplace(inits[i].parent_path().filename().string(), i);
 
-    std::vector<std::vector<size_t>> needs(inits.size());
+    std::vector<std::vector<size_t>> needs(inits.size());       // depends + optional_depends
+    std::vector<std::vector<size_t>> requires_(inits.size());   // depends only
     for (size_t i = 0; i < inits.size(); ++i) {
         std::vector<std::string> required;
         for (const auto& d : readDepends(inits[i].parent_path(), &required)) {
             const auto it = byName.find(d);
-            if (it != byName.end()) { if (it->second != i) needs[i].push_back(it->second); continue; }
+            if (it != byName.end()) {
+                if (it->second != i) {
+                    needs[i].push_back(it->second);
+                    if (std::find(required.begin(), required.end(), d) != required.end()) requires_[i].push_back(it->second);
+                }
+                continue;
+            }
             if (std::find(required.begin(), required.end(), d) != required.end()) {
                 std::cout << "[Mod] " << inits[i].parent_path().filename().string() << " depends on '" << d
                           << "', which isn't installed (or is switched off)" << std::endl;
@@ -156,12 +163,31 @@ inline void applyDepends(std::vector<fs::path>& files) {
             }
             std::string names;
             for (size_t k : cycle) names += (names.empty() ? "" : ", ") + inits[k].parent_path().filename().string();
-            std::cout << "[Mod] Dependency loop between " << names
-                      << " - loading them together, in their usual order" << std::endl;
-            for (size_t k : cycle) {
-                done[k] = true;
-                ordered.push_back(inits[k]);
+            // Inside the loop, keep what `depends` asks for: optional links are what gets dropped
+            // to break it. Repeatedly the first member (usual order) whose REQUIRED dependencies in
+            // the loop have loaded goes next. Only if required links alone go round (that can't be
+            // honoured) is the first remaining member taken anyway - always the same one.
+            bool requiredLoop = false;
+            std::vector<size_t> rest = cycle;
+            while (!rest.empty()) {
+                size_t pick = rest.size();
+                for (size_t r = 0; r < rest.size() && pick == rest.size(); ++r) {
+                    bool ready = true;
+                    for (size_t d : requires_[rest[r]]) {
+                        if (!done[d] && std::find(rest.begin(), rest.end(), d) != rest.end()) { ready = false; break; }
+                    }
+                    if (ready) pick = r;
+                }
+                if (pick == rest.size()) { pick = 0; requiredLoop = true; }
+                done[rest[pick]] = true;
+                ordered.push_back(inits[rest[pick]]);
+                rest.erase(rest.begin() + static_cast<std::ptrdiff_t>(pick));
             }
+            std::cout << "[Mod] Dependency loop between " << names
+                      << (requiredLoop ? " - their required dependencies go round in a loop too, so they load "
+                                         "together in their usual order where it can't be kept"
+                                       : " - loading them together: required dependencies kept, an optional one dropped")
+                      << std::endl;
         }
     }
     for (size_t k = 0; k < slots.size(); ++k) files[slots[k]] = ordered[k];
