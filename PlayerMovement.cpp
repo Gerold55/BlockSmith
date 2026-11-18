@@ -166,8 +166,66 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
         velocity.z = dz / deltaTime;
     }
 
+    // --- Swept movement along one axis (0 = x, 1 = y, 2 = z) ---
+    // Moving the box by the whole step and only then looking for overlaps lets a fast player
+    // (falling, sprint-flying) pass through anything thinner than one step, like a 3-pixel door.
+    // So first the box is swept along the axis: every solid shape ahead of it that it overlaps
+    // on the other two axes can stop it, and the nearest one does. The overlap checks after each
+    // move (unchanged) still handle being inside a block already (placed on you, a door closing).
+    // Returns the allowed movement; `hit` = it was cut short by a contact.
+    auto sweepAxis = [&](int axis, float d, bool& hit) -> float {
+        hit = false;
+        if (d == 0.0f) return 0.0f;
+        constexpr float kGap = 0.001f;     // the old resolution stops this far from walls (x, z)
+        constexpr float kAhead = 0.01f;    // shapes overlapping less than this count as ahead
+        // The box, with the same skins the overlap checks below use on the axes not moving
+        const float bx0 = position.x - halfWidth, bx1 = position.x + halfWidth;
+        const float by0 = position.y, by1 = position.y + playerHeight;
+        const float bz0 = position.z - halfWidth, bz1 = position.z + halfWidth;
+        float lo[3] = { bx0 + skin, by0 + skin, bz0 + skin };
+        float hi[3] = { bx1 - skin, by1 - skin, bz1 - skin };
+        const float boxLo[3] = { bx0, by0, bz0 }, boxHi[3] = { bx1, by1, bz1 };
+        // Cells the sweep passes through
+        lo[axis] = d > 0.0f ? boxHi[axis] - kAhead : boxLo[axis] + d;
+        hi[axis] = d > 0.0f ? boxHi[axis] + d : boxLo[axis] + kAhead;
+        float allowed = d;
+        for (int x = static_cast<int>(std::floor(lo[0])); x <= static_cast<int>(std::floor(hi[0])); ++x) {
+            for (int y = static_cast<int>(std::floor(lo[1])); y <= static_cast<int>(std::floor(hi[1])); ++y) {
+                for (int z = static_cast<int>(std::floor(lo[2])); z <= static_cast<int>(std::floor(hi[2])); ++z) {
+                    glm::vec3 mn, mx;
+                    if (!solidBox(x, y, z, mn, mx)) continue;
+                    // Must overlap the box on the two other axes (same tests as below)
+                    bool across = true;
+                    for (int k = 0; k < 3 && across; ++k) {
+                        if (k == axis) continue;
+                        const float sLo = (k == 1) ? by0 + skin : boxLo[k] + skin;
+                        const float sHi = boxHi[k] - skin;
+                        across = sLo < mx[k] && sHi > mn[k];
+                    }
+                    if (!across) continue;
+                    if (d > 0.0f) {
+                        if (mn[axis] < boxHi[axis] - kAhead) continue;          // already inside it: below
+                        const float gap = (axis == 1) ? 0.0f : kGap;
+                        const float stop = std::max(0.0f, mn[axis] - gap - boxHi[axis]);
+                        if (stop < allowed) { allowed = stop; hit = true; }
+                    } else {
+                        if (mx[axis] > boxLo[axis] + kAhead) continue;          // already inside it: below
+                        const float gap = (axis == 1) ? 0.0f : kGap;
+                        const float stop = std::min(0.0f, mx[axis] + gap - boxLo[axis]);
+                        if (stop > allowed) { allowed = stop; hit = true; }
+                    }
+                }
+            }
+        }
+        return allowed;
+    };
+
     // --- X Axis Collision & Move ---
-    position.x += velocity.x * deltaTime;
+    {
+        bool hit = false;
+        position.x += sweepAxis(0, velocity.x * deltaTime, hit);
+        if (hit) velocity.x = 0.0f;
+    }
     {
         const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
         const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
@@ -191,7 +249,11 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     }
 
     // --- Z Axis Collision & Move ---
-    position.z += velocity.z * deltaTime;
+    {
+        bool hit = false;
+        position.z += sweepAxis(2, velocity.z * deltaTime, hit);
+        if (hit) velocity.z = 0.0f;
+    }
     {
         const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
         const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
@@ -215,8 +277,16 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     }
 
     // --- Y Axis Collision & Move ---
-    position.y += velocity.y * deltaTime;
     grounded = false;
+    {
+        bool hit = false;
+        const float vy = velocity.y;
+        position.y += sweepAxis(1, vy * deltaTime, hit);
+        if (hit) {
+            velocity.y = 0.0f;
+            if (vy < 0.0f) grounded = true;   // landed on the first thing below
+        }
+    }
     {
         const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
         const float y0 = position.y, y1 = position.y + playerHeight - skin;

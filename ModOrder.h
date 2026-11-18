@@ -75,7 +75,9 @@ inline std::vector<std::string> readDepends(const fs::path& modFolder, std::vect
 
 // Moves each mod's init.lua after the init.lua of the mods it depends on. Mods with no
 // dependencies keep their place; loose .lua files are not moved. Missing dependencies and
-// loops are reported in the console (a mod in a loop loads after the others).
+// loops are reported in the console. A loop (b needs c, c needs b) can't be ordered: its
+// members load together, in their usual order, as soon as everything else they need has
+// loaded - and mods that depend on the loop (a needs b) still load after it.
 inline void applyDepends(std::vector<fs::path>& files) {
     std::vector<size_t> slots;                 // where the init.lua files are in `files`
     std::vector<fs::path> inits;
@@ -114,14 +116,51 @@ inline void applyDepends(std::vector<fs::path>& files) {
             progress = true;
             break;                              // restart: keeps the alphabetical order otherwise
         }
-        if (!progress) {                        // a loop (a depends on b, b depends on a)
-            for (size_t i = 0; i < inits.size(); ++i) {
+        if (!progress) {
+            // Stuck: every unfinished mod waits for another unfinished one, so there is a loop.
+            // Load one whole loop - and only a loop whose members need nothing else that's still
+            // unfinished (one always exists: follow the dependencies far enough and you reach a
+            // loop that depends only on finished mods and itself). Mods that merely depend on a
+            // loop, or loops that depend on other loops, wait their turn as usual.
+            const size_t n = inits.size();
+            // reach[i][j]: unfinished mod i needs unfinished mod j, directly or through others
+            std::vector<std::vector<char>> reach(n, std::vector<char>(n, 0));
+            for (size_t i = 0; i < n; ++i) {
                 if (done[i]) continue;
-                std::cout << "[Mod] Dependency loop involving " << inits[i].parent_path().filename().string()
-                          << ": loading it after the other mods" << std::endl;
-                done[i] = true;
-                ordered.push_back(inits[i]);
-                break;
+                std::vector<size_t> stack;
+                for (size_t d : needs[i]) if (!done[d]) stack.push_back(d);
+                while (!stack.empty()) {
+                    const size_t x = stack.back();
+                    stack.pop_back();
+                    if (reach[i][x]) continue;
+                    reach[i][x] = 1;
+                    for (size_t d : needs[x]) if (!done[d] && !reach[i][d]) stack.push_back(d);
+                }
+            }
+            std::vector<size_t> cycle;
+            for (size_t i = 0; i < n && cycle.empty(); ++i) {
+                if (done[i] || !reach[i][i]) continue;            // not in a loop
+                std::vector<size_t> group;                        // i's loop: mods it needs that need it back
+                for (size_t j = 0; j < n; ++j) if (!done[j] && (j == i || (reach[i][j] && reach[j][i]))) group.push_back(j);
+                bool waitsOnOthers = false;                       // anything outside the loop still pending?
+                for (size_t g : group) {
+                    for (size_t d : needs[g]) {
+                        if (!done[d] && std::find(group.begin(), group.end(), d) == group.end()) { waitsOnOthers = true; break; }
+                    }
+                    if (waitsOnOthers) break;
+                }
+                if (!waitsOnOthers) cycle = group;                // already in their usual order
+            }
+            if (cycle.empty()) {                                  // can't happen; never loop forever
+                for (size_t i = 0; i < n; ++i) if (!done[i]) { cycle.push_back(i); break; }
+            }
+            std::string names;
+            for (size_t k : cycle) names += (names.empty() ? "" : ", ") + inits[k].parent_path().filename().string();
+            std::cout << "[Mod] Dependency loop between " << names
+                      << " - loading them together, in their usual order" << std::endl;
+            for (size_t k : cycle) {
+                done[k] = true;
+                ordered.push_back(inits[k]);
             }
         }
     }

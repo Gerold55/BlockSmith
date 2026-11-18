@@ -289,13 +289,28 @@ void tunnel(CarveContext& ctx, uint64_t seed, double x, double y, double z, doub
         yaw += yawChange * 0.1;
         pitchChange *= 0.9;
         yawChange *= 0.75;
-        pitchChange += (rng.nextDouble() - rng.nextDouble()) * rng.nextDouble() * 2.0;
-        yawChange += (rng.nextDouble() - rng.nextDouble()) * rng.nextDouble() * 4.0;
+        // One draw per statement: C++ leaves the order of calls inside one expression open, so
+        // writing them in one line let different compilers (MSVC, GCC, Clang) draw them in a
+        // different order and carve different caves from the same seed. Order: source order.
+        const double pitchA = rng.nextDouble();
+        const double pitchB = rng.nextDouble();
+        const double pitchC = rng.nextDouble();
+        pitchChange += (pitchA - pitchB) * pitchC * 2.0;
+        const double yawA = rng.nextDouble();
+        const double yawB = rng.nextDouble();
+        const double yawC = rng.nextDouble();
+        yawChange += (yawA - yawB) * yawC * 4.0;
 
         // Split into two branches going left and right
         if (!room && step == splitAt && width > 1.0) {
-            tunnel(ctx, rng.next(), x, y, z, rng.nextDouble() * 0.5 + 0.5, yaw - kPi / 2, pitch / 3.0, step, length, 1.0);
-            tunnel(ctx, rng.next(), x, y, z, rng.nextDouble() * 0.5 + 0.5, yaw + kPi / 2, pitch / 3.0, step, length, 1.0);
+            // (each branch's seed, then its width: drawn before the call - function arguments
+            // are evaluated in no fixed order)
+            const uint64_t leftSeed = rng.next();
+            const double leftWidth = rng.nextDouble() * 0.5 + 0.5;
+            tunnel(ctx, leftSeed, x, y, z, leftWidth, yaw - kPi / 2, pitch / 3.0, step, length, 1.0);
+            const uint64_t rightSeed = rng.next();
+            const double rightWidth = rng.nextDouble() * 0.5 + 0.5;
+            tunnel(ctx, rightSeed, x, y, z, rightWidth, yaw + kPi / 2, pitch / 3.0, step, length, 1.0);
             return;
         }
         if (!room && rng.nextInt(4) == 0) continue;   // some steps carve nothing: lumpier walls
@@ -329,14 +344,22 @@ void tunnelsFrom(CarveContext& ctx, uint32_t seed, int ox, int oz, float frequen
         int branches = 1;
         if (rng.nextInt(4) == 0) {
             // A room: a big round chamber the tunnels come out of
-            tunnel(ctx, rng.next(), x, y, z, 1.0 + rng.nextDouble() * 6.0, 0.0, 0.0, -1, -1, 0.5);
+            const uint64_t roomSeed = rng.next();                 // seed, then size (not as two arguments)
+            const double roomWidth = 1.0 + rng.nextDouble() * 6.0;
+            tunnel(ctx, roomSeed, x, y, z, roomWidth, 0.0, 0.0, -1, -1, 0.5);
             branches += rng.nextInt(4);
         }
         for (int b = 0; b < branches; ++b) {
             const double yaw = rng.nextDouble() * kPi * 2.0;
             const double pitch = (rng.nextDouble() - 0.5) * 2.0 / 8.0;
-            double width = rng.nextDouble() * 2.0 + rng.nextDouble();
-            if (rng.nextInt(10) == 0) width *= rng.nextDouble() * rng.nextDouble() * 3.0 + 1.0;   // a big one
+            const double widthA = rng.nextDouble();
+            const double widthB = rng.nextDouble();
+            double width = widthA * 2.0 + widthB;
+            if (rng.nextInt(10) == 0) {                           // a big one
+                const double bigA = rng.nextDouble();
+                const double bigB = rng.nextDouble();
+                width *= bigA * bigB * 3.0 + 1.0;
+            }
             tunnel(ctx, rng.next(), x, y, z, width, yaw, pitch, 0, 0, 1.0);
         }
     }
@@ -357,7 +380,11 @@ void ravine(CarveContext& ctx, uint64_t seed, double x, double y, double z, doub
     float yScale[CHUNK_HEIGHT];
     float f = 1.0f;
     for (int i = 0; i < CHUNK_HEIGHT; ++i) {
-        if (i == 0 || rng.nextInt(3) == 0) f = 1.0f + static_cast<float>(rng.nextDouble() * rng.nextDouble());
+        if (i == 0 || rng.nextInt(3) == 0) {
+            const double wallA = rng.nextDouble();
+            const double wallB = rng.nextDouble();
+            f = 1.0f + static_cast<float>(wallA * wallB);
+        }
         yScale[i] = f * f;
     }
 
@@ -376,8 +403,17 @@ void ravine(CarveContext& ctx, uint64_t seed, double x, double y, double z, doub
         yaw += yawChange * 0.05;
         pitchChange *= 0.8;
         yawChange *= 0.5;
-        pitchChange += (rng.nextDouble() - rng.nextDouble()) * rng.nextDouble() * 2.0;
-        yawChange += (rng.nextDouble() - rng.nextDouble()) * rng.nextDouble() * 4.0;
+        // One draw per statement: C++ leaves the order of calls inside one expression open, so
+        // writing them in one line let different compilers (MSVC, GCC, Clang) draw them in a
+        // different order and carve different caves from the same seed. Order: source order.
+        const double pitchA = rng.nextDouble();
+        const double pitchB = rng.nextDouble();
+        const double pitchC = rng.nextDouble();
+        pitchChange += (pitchA - pitchB) * pitchC * 2.0;
+        const double yawA = rng.nextDouble();
+        const double yawB = rng.nextDouble();
+        const double yawC = rng.nextDouble();
+        yawChange += (yawA - yawB) * yawC * 4.0;
         if (rng.nextInt(4) == 0) continue;
 
         const double dx = x - ctx.centerX, dz = z - ctx.centerZ;
@@ -401,7 +437,9 @@ void ravinesFrom(CarveContext& ctx, uint32_t seed, int ox, int oz, float frequen
     const double z = oz * 16 + rng.nextInt(16);
     const double yaw = rng.nextDouble() * kPi * 2.0;
     const double pitch = (rng.nextDouble() - 0.5) * 2.0 / 8.0;
-    const double width = (rng.nextDouble() * 2.0 + rng.nextDouble()) * 2.0;
+    const double widthA = rng.nextDouble();
+    const double widthB = rng.nextDouble();
+    const double width = (widthA * 2.0 + widthB) * 2.0;
     ravine(ctx, rng.next(), x, y, z, width, yaw, pitch, 3.0);
 }
 

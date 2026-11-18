@@ -3,6 +3,8 @@
 #include <fstream>
 #include <vector>
 #include <filesystem>
+#include <algorithm>
+#include <iterator>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include <stb_truetype.h>
@@ -30,9 +32,9 @@ int nextGlyph(std::string_view text, size_t& i) {
         }
     }
     if (cp < 32) return -1;                                    // control characters: skip
-    if (cp >= 32 + static_cast<uint32_t>(224)) cp = '?';
+    if (cp >= static_cast<uint32_t>(FontRenderer::kFirstChar + FontRenderer::kNumChars)) cp = '?';
     if (cp >= 127 && cp < 160) cp = '?';                       // not printable
-    return static_cast<int>(cp) - 32;
+    return static_cast<int>(cp) - FontRenderer::kFirstChar;
 }
 }  // namespace
 
@@ -47,89 +49,119 @@ FontRenderer::~FontRenderer() {
     if (fontTextureID != 0) glDeleteTextures(1, &fontTextureID);
 }
 
-bool FontRenderer::init(const std::string& fontPath) {
-    std::vector<std::string> searchPaths = {
-        fontPath,
-        "../" + fontPath,
-        "../../" + fontPath
-    };
+std::vector<std::string> FontRenderer::systemFonts() {
+#if defined(_WIN32)
+    return { "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/tahoma.ttf" };
+#elif defined(__APPLE__)
+    return { "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf",
+             "/System/Library/Fonts/Helvetica.ttc" };
+#else
+    return { "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+             "/usr/share/fonts/TTF/DejaVuSans.ttf",
+             "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/truetype/freefont/FreeSans.ttf" };
+#endif
+}
 
-    #if defined(_WIN32)
-    searchPaths.push_back("C:/Windows/Fonts/arial.ttf");
-    searchPaths.push_back("C:/Windows/Fonts/segoeui.ttf");
-    #elif defined(__APPLE__)
-    searchPaths.push_back("/Library/Fonts/Arial.ttf");
-    searchPaths.push_back("/System/Library/Fonts/Helvetica.ttc");
-    #else
-    searchPaths.push_back("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
-    searchPaths.push_back("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf");
-    #endif
-
-    std::string resolvedPath = "";
-    bool found = false;
-
-    for (const auto& p : searchPaths) {
-        if (!p.empty() && fs::exists(p) && fs::is_regular_file(p)) {
-            resolvedPath = fs::absolute(p).string();
-            found = true;
-            break;
-        }
-    }
-
-    if (!found) {
-        std::cout << "[Font Error] Could not find font file '" << fontPath << "' in any search path or system fallback locations." << std::endl;
-        return false;
-    }
-
-    std::ifstream file(resolvedPath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cout << "[Font Error] Failed to open resolved font file: " << resolvedPath << std::endl;
-        return false;
-    }
-
-    std::streamsize size = file.tellg();
+namespace {
+// The font file's bytes, or empty if it can't be read
+std::vector<unsigned char> readFontFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return {};
+    const std::streamsize size = file.tellg();
+    if (size <= 0) return {};
     file.seekg(0, std::ios::beg);
+    std::vector<unsigned char> data(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(data.data()), size)) return {};
+    return data;
+}
+}  // namespace
 
-    std::vector<unsigned char> fontBuffer(size);
-    if (!file.read((char*)fontBuffer.data(), size)) {
-        std::cout << "[Font Error] Failed to read font file data from: " << resolvedPath << std::endl;
-        return false;
+bool FontRenderer::init(const std::vector<std::string>& fonts) {
+    // The largest atlas the GPU accepts (every OpenGL 3.3 GPU takes at least 1024; capped at 4096)
+    GLint maxTex = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+    const int maxSize = std::clamp(static_cast<int>(maxTex), 1024, 4096);
+
+    std::vector<std::string> tried;
+    for (const std::string& font : fonts) {
+        if (font.empty()) continue;
+        // Find it: as given, then from one or two folders up (running from a build folder)
+        std::string path;
+        for (const std::string& p : { font, "../" + font, "../../" + font }) {
+            std::error_code ec;
+            if (fs::is_regular_file(p, ec)) { path = fs::absolute(p, ec).string(); break; }
+        }
+        if (path.empty()) { tried.push_back(font + " (not found)"); continue; }
+
+        const std::vector<unsigned char> data = readFontFile(path);
+        stbtt_fontinfo info;
+        const int offset = data.empty() ? -1 : stbtt_GetFontOffsetForIndex(data.data(), 0);
+        if (offset < 0 || !stbtt_InitFont(&info, data.data(), offset)) {
+            std::cout << "[Font] Can't read '" << path << "' as a TrueType font - skipping it" << std::endl;
+            tried.push_back(font + " (not a readable font)");
+            continue;
+        }
+
+        // Bake every character; if they don't all fit, double the atlas (width first) and try again
+        stbtt_bakedchar baked[kNumChars] = {};
+        std::vector<unsigned char> bitmap;
+        int w = 512, h = 512, result = 0;
+        while (true) {
+            bitmap.assign(static_cast<size_t>(w) * static_cast<size_t>(h), 0);
+            result = stbtt_BakeFontBitmap(data.data(), offset, kPixelHeight, bitmap.data(), w, h,
+                                          kFirstChar, kNumChars, baked);
+            if (result > 0) break;                         // > 0: all of them fit
+            // <= 0: only -result characters fit
+            if (w == maxSize && h == maxSize) break;
+            if (w <= h) w *= 2; else h *= 2;
+        }
+        if (result <= 0) {
+            std::cout << "[Font] '" << path << "': only " << -result << " of " << kNumChars
+                      << " characters fit even in a " << w << "x" << h << " atlas - skipping it" << std::endl;
+            tried.push_back(font + " (too big to bake)");
+            continue;
+        }
+
+        // Upload. Only now is the old atlas (from an earlier init) replaced.
+        while (glGetError() != GL_NO_ERROR) {}
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);             // one byte per pixel
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, bitmap.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (tex == 0 || glGetError() != GL_NO_ERROR) {
+            if (tex != 0) glDeleteTextures(1, &tex);
+            std::cout << "[Font] The graphics card wouldn't take the " << w << "x" << h
+                      << " font atlas for '" << path << "' - skipping it" << std::endl;
+            tried.push_back(font + " (atlas upload failed)");
+            continue;
+        }
+
+        if (fontTextureID != 0) glDeleteTextures(1, &fontTextureID);
+        fontTextureID = tex;
+        atlasWidth = w;
+        atlasHeight = h;
+        std::copy(std::begin(baked), std::end(baked), std::begin(cdata));
+        loadedFont = path;
+        if (vao == 0) glGenVertexArrays(1, &vao);
+        if (vbo == 0) glGenBuffers(1, &vbo);
+        std::cout << "[Font] Loaded " << path << " (" << kNumChars << " characters in a "
+                  << w << "x" << h << " atlas)" << std::endl;
+        return true;
     }
 
-    int fontOffset = stbtt_GetFontOffsetForIndex(fontBuffer.data(), 0);
-    if (fontOffset < 0) {
-        std::cout << "[Font Error] stb_truetype failed to parse font structure: " << resolvedPath << std::endl;
-        return false;
-    }
-
-    int bitmapWidth = 512;
-    int bitmapHeight = 512;
-    std::vector<unsigned char> bitmap(bitmapWidth * bitmapHeight);
-
-    int bakeResult = stbtt_BakeFontBitmap(fontBuffer.data(), fontOffset, 32.0f, bitmap.data(), bitmapWidth, bitmapHeight, kFirstChar, kNumChars, cdata);
-    if (bakeResult <= 0) {
-        std::cout << "[Font Error] stbtt_BakeFontBitmap failed (return code: " << bakeResult << ")." << std::endl;
-        return false;
-    }
-
-    glGenTextures(1, &fontTextureID);
-    glBindTexture(GL_TEXTURE_2D, fontTextureID);
-    
-    // Ensure byte alignment is set to 1 for single-byte pixel data
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, bitmapWidth, bitmapHeight, 0, GL_RED, GL_UNSIGNED_BYTE, bitmap.data());
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-
-    std::cout << "[Font Success] Loaded TrueType font from: " << resolvedPath << std::endl;
-    return true;
+    std::cout << "[Font Error] No usable font. Tried:";
+    for (const std::string& t : tried) std::cout << "\n    " << t;
+    if (tried.empty()) std::cout << " (no fonts given)";
+    std::cout << std::endl;
+    return false;
 }
 
 void FontRenderer::renderText(GLuint fontShader, const std::string& text,
@@ -147,7 +179,7 @@ void FontRenderer::renderText(GLuint fontShader, const std::string& text,
 
 // Same scaling as generateFontVertices, so the numbers match what is drawn.
 float FontRenderer::textWidth(std::string_view text, float scaleX, Dimensions2D resolution) const {
-    if (this->baseResolution.width <= 0) return 0.0f;
+    if (this->baseResolution.width <= 0 || fontTextureID == 0) return 0.0f;
     const float scaleWidth = scaleX * static_cast<float>(resolution.width)
                            / static_cast<float>(this->baseResolution.width);
     float rx = 0.0f, ry = 0.0f;
@@ -155,18 +187,18 @@ float FontRenderer::textWidth(std::string_view text, float scaleX, Dimensions2D 
         const int glyph = nextGlyph(text, i);
         if (glyph < 0) continue;
         stbtt_aligned_quad q;
-        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, glyph, &rx, &ry, &q, 1);
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), atlasWidth, atlasHeight, glyph, &rx, &ry, &q, 1);
     }
     return rx * scaleWidth;
 }
 
 float FontRenderer::capHeight(float scaleY, Dimensions2D resolution) const {
-    if (this->baseResolution.height <= 0) return 0.0f;
+    if (this->baseResolution.height <= 0 || fontTextureID == 0) return 0.0f;
     const float scaleHeight = scaleY * static_cast<float>(resolution.height)
                             / static_cast<float>(this->baseResolution.height);
     float rx = 0.0f, ry = 0.0f;
     stbtt_aligned_quad q;
-    stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, 'H' - 32, &rx, &ry, &q, 1);
+    stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), atlasWidth, atlasHeight, 'H' - 32, &rx, &ry, &q, 1);
     return -q.y0 * scaleHeight;   // y0 is negative: how far the top of 'H' is above the baseline
 }
 
@@ -188,7 +220,7 @@ std::vector<float> FontRenderer::generateFontVertices(float x, float y,
         if (glyph < 0) continue;
 
         stbtt_aligned_quad q;
-        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), 512, 512, glyph, &rx, &ry, &q, 1);
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), atlasWidth, atlasHeight, glyph, &rx, &ry, &q, 1);
 
         float x0 = q.x0 * scaleWidth + x;
         float x1 = q.x1 * scaleWidth + x;

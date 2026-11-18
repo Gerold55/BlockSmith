@@ -123,17 +123,27 @@ inline std::string playerKey(const std::string& token, const std::string& name) 
 inline std::string serverKey(const std::string& playerKeyRaw, const std::string& serverId) {
     return toHex(hmac(playerKeyRaw, "blocksmith-server-key-v1\n" + serverId));
 }
-// The answer to one challenge (hex)
-inline std::string response(const std::string& serverKeyHex, const std::string& serverId,
-                            const std::string& nonce, const std::string& name) {
-    return toHex(hmac(fromHex(serverKeyHex),
+// The answer to one challenge, from the raw 32-byte server key (hex)
+inline std::string responseFromKey(const std::string& serverKeyRaw, const std::string& serverId,
+                                   const std::string& nonce, const std::string& name) {
+    return toHex(hmac(serverKeyRaw,
                       "blocksmith-login-v1\n" + serverId + "\n" + nonce + "\n" + toLower(name)));
 }
+// The answer to one challenge (hex), from the hex server key
+inline std::string response(const std::string& serverKeyHex, const std::string& serverId,
+                            const std::string& nonce, const std::string& name) {
+    return responseFromKey(fromHex(serverKeyHex), serverId, nonce, name);
+}
 // Server side: is `resp` the right answer for this stored key and this challenge?
+// The key is decoded first and must be exactly 32 bytes: a malformed key (wrong length, or not
+// hex - which would decode to nothing and make the expected answer an HMAC with an EMPTY key,
+// computable by anyone) is rejected outright instead of being used.
 inline bool verify(const std::string& serverKeyHex, const std::string& serverId, const std::string& nonce,
                    const std::string& name, const std::string& resp) {
-    if (serverKeyHex.size() != 64 || resp.size() != 64 || nonce.empty() || serverId.empty()) return false;
-    return equalConstantTime(response(serverKeyHex, serverId, nonce, name), toLower(resp));
+    if (resp.size() != 64 || nonce.empty() || serverId.empty()) return false;
+    const std::string key = fromHex(serverKeyHex);
+    if (key.size() != 32) return false;
+    return equalConstantTime(responseFromKey(key, serverId, nonce, name), toLower(resp));
 }
 
 } // namespace auth

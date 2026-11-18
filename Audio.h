@@ -28,6 +28,7 @@ struct SoundParams {
     glm::vec3 position{0.0f};
     float maxDistance = 24.0f;       // silent beyond this (blocks)
     float refDistance = 2.0f;        // full volume within this
+    bool sandboxed = false;          // client mods: only files inside the sound folders (see findFiles)
 };
 
 class AudioSystem {
@@ -38,7 +39,11 @@ public:
     bool available() const { return m_device != nullptr; }
 
     // Folders to look for sounds in (each also gets /sounds tried). Set before playing.
-    void setSearchFolders(const std::vector<std::string>& folders) { m_folders = folders; m_resolved.clear(); }
+    void setSearchFolders(const std::vector<std::string>& folders) {
+        m_folders = folders;
+        m_resolved.clear();
+        m_resolvedSandboxed.clear();
+    }
 
     // Returns a handle (0 = nothing played: unknown name, no audio...)
     int play(const std::string& name, const SoundParams& params = {});
@@ -62,7 +67,7 @@ public:
     void setListener(const glm::vec3& pos, const glm::vec3& forward, const glm::vec3& up);
     void update(float dt);   // every frame: fades, streaming, finished sounds
 
-    bool soundExists(const std::string& name);   // any file for this name?
+    bool soundExists(const std::string& name, bool sandboxed = false);   // any file for this name?
 
 private:
     struct Buffer { unsigned id = 0; int channels = 0; float seconds = 0.0f; };
@@ -81,7 +86,10 @@ private:
         double started = 0.0;
     };
 
-    std::vector<std::string> findFiles(const std::string& name);
+    // The files a sound name can play (variants name.1.ogg ... included). sandboxed = true (client
+    // mods): no raw paths, only the sound folders, and each file's real location - symlinks
+    // followed - must be inside one of them; else as for game mods.
+    std::vector<std::string> findFiles(const std::string& name, bool sandboxed = false);
     const Buffer* loadBuffer(const std::string& path, bool mono);
     Voice* newVoice(const std::string& group);
     Voice* findVoice(int handle);
@@ -94,6 +102,7 @@ private:
     void* m_context = nullptr;
     std::vector<std::string> m_folders;
     std::unordered_map<std::string, std::vector<std::string>> m_resolved;   // name -> files
+    std::unordered_map<std::string, std::vector<std::string>> m_resolvedSandboxed;   // same, for client mods
     std::unordered_map<std::string, Buffer> m_buffers;                      // path(+#mono) -> buffer
     std::vector<Voice> m_voices;
     std::map<std::string, float> m_volumes{ {"master", 1.0f}, {"effects", 1.0f}, {"ambient", 1.0f},

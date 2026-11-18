@@ -1,4 +1,5 @@
 #include "Model.h"
+#include <unordered_map>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -92,7 +93,7 @@ void Mesh::draw() const {
 // position, then rotate/scale around the pivot (file pose first, then the Lua animation rotation)
 glm::mat4 Bone::getLocalTransform() const {
     glm::mat4 m(1.0f);
-    m = glm::translate(m, position + pivot);
+    m = glm::translate(m, restPosition + position + pivot);   // file's rest position + animation offset
     m *= glm::mat4_cast(restRotation);
     m *= eulerMatrix(rotation);
     m = glm::scale(m, scale * animScale);
@@ -328,6 +329,13 @@ void AnimatedModel::loadFromJson(const std::string& filepath) {
 
         loaded = true;
         std::cout << "[Model] Loaded JSON model: " << filepath << " (" << boneMap.size() << " bones)" << std::endl;
+        {
+            std::string where;
+            if (!hierarchyIsAcyclic(&where)) {
+                std::cerr << "[Model] " << filepath << ": bone '" << where << "' is its own ancestor (check the "
+                          << "\"parent\" names). Those bones won't be drawn on their own (drawBone)." << std::endl;
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[Model Error] Could not read JSON model " << filepath << ": " << e.what() << std::endl;
     }
@@ -440,7 +448,7 @@ void parseNode(std::ifstream& f, std::streamoff end, const std::shared_ptr<Bone>
     const float rw = readFloat(f), rx = readFloat(f), ry = readFloat(f), rz = readFloat(f);   // w first
 
     bone->name = name;
-    bone->position = pos;
+    bone->restPosition = pos;   // the node's translation: kept apart from the animation offset
     bone->scale = scl;
     bone->restRotation = glm::normalize(glm::quat(rw, -rx, -ry, rz));   // mirror for the Z flip
 
@@ -498,11 +506,60 @@ void AnimatedModel::loadFromB3D(const std::string& filepath) {
               << meshCount << " meshes" << (textureHint.empty() ? "" : ", texture " + textureHint) << ")" << std::endl;
 }
 
+bool AnimatedModel::hierarchyIsAcyclic(std::string* cycleBone) const {
+    // Depth-first over every bone (boneMap holds all of them, rootBones the tops), without
+    // recursion: 0 = not seen, 1 = on the current path, 2 = finished. Meeting a bone that's on
+    // the path again means a loop.
+    std::unordered_map<const Bone*, uint8_t> state;
+    std::vector<const Bone*> starts;
+    for (const auto& entry : boneMap) if (entry.second) starts.push_back(entry.second.get());
+    for (const auto& b : rootBones) if (b) starts.push_back(b.get());
+
+    struct Frame { const Bone* bone; size_t next; };
+    std::vector<Frame> path;
+    for (const Bone* start : starts) {
+        if (state[start] != 0) continue;
+        state[start] = 1;
+        path.push_back({ start, 0 });
+        while (!path.empty()) {
+            Frame& top = path.back();
+            if (top.next < top.bone->children.size()) {
+                const Bone* child = top.bone->children[top.next++].get();
+                if (!child) continue;
+                uint8_t& s = state[child];
+                if (s == 1) {                                 // back to a bone on this path
+                    if (cycleBone) *cycleBone = child->name;
+                    return false;
+                }
+                if (s == 0) { s = 1; path.push_back({ child, 0 }); }   // (`top` not used after this)
+            } else {
+                state[top.bone] = 2;
+                path.pop_back();
+            }
+        }
+    }
+    return true;
+}
+
 bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world) {
     if (!loaded) return false;
     auto bone = getBone(name);
     if (!bone) return false;
-    // The file's pose: animations and Lua poses are put back afterwards
+    // A bone that is its own ancestor would make the pose pass and the drawing below go round
+    // forever: check the whole hierarchy before touching anything, and refuse a looped one
+    {
+        std::string where;
+        if (!hierarchyIsAcyclic(&where)) {
+            if (!m_reportedCycle) {
+                std::cerr << "[Model] Bone '" << where << "' is its own ancestor (a loop in the bones' parents): "
+                          << "not drawing bone '" << name << "'" << std::endl;
+                m_reportedCycle = true;
+            }
+            return false;
+        }
+    }
+    // The file's pose: animation offsets, rotations and scales are cleared for the subtree (rest
+    // positions stay) and put back afterwards
     struct Saved { Bone* b; glm::vec3 r, p, s; };
     std::vector<Saved> saved;
     std::vector<Bone*> stack{ bone.get() };
@@ -522,8 +579,10 @@ bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, cons
     const GLint texLoc = glGetUniformLocation(shaderProgram, "texture_diffuse1");
     if (texLoc >= 0) glUniform1i(texLoc, 0);
     const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
-    // Move the bone's pivot (its shoulder, for an arm) to the origin of `world`
-    const glm::mat4 root = glm::translate(glm::scale(world, glm::vec3(scale)), -bone->pivot);
+    // Recentre only the selected bone: cancel its own rest position and pivot so its pivot point
+    // (the shoulder, for an arm) lands at the origin of `world`. Bones under it keep their rest
+    // positions, so the subtree keeps its shape.
+    const glm::mat4 root = glm::translate(glm::scale(world, glm::vec3(scale)), -(bone->pivot + bone->restPosition));
     drawBoneRecursive(bone, modelLoc, root);
 
     for (const Saved& sv : saved) { sv.b->rotation = sv.r; sv.b->position = sv.p; sv.b->animScale = sv.s; }
@@ -534,6 +593,7 @@ bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, cons
 // Animations
 // ===========================================================================
 
+// (rest positions from the file stay: only what animations and Lua add is cleared)
 void AnimatedModel::resetPose() {
     for (auto& [name, bone] : boneMap) {
         bone->rotation = glm::vec3(0.0f);

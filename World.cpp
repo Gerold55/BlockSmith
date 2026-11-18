@@ -281,12 +281,17 @@ void World::loadQueuedChunks(sol::state& lua) {
     const auto start = Clock::now();
     size_t consumed = 0;
 
+    for (auto it = m_diskRetry.begin(); it != m_diskRetry.end();) {   // player went away: forget them
+        if (!wantedChunk(it->first)) it = m_diskRetry.erase(it);
+        else ++it;
+    }
+
     if (m_generator) {
         // Saved chunks are read here (fast); new ones are handed to the generator's threads,
         // nearest first, a few at a time so the closest are always next in line.
         collectGenerated();
         const size_t maxInFlight = static_cast<size_t>(m_generator->threadCount()) * 3;
-        std::vector<ChunkCoord> notYet;   // waiting for a generator slot (kept, in queue order)
+        std::vector<ChunkCoord> notYet;   // waiting for a generator slot or a disk retry (kept, in queue order)
         // A chunk the generator must make: ask now if a slot is free, else keep it for later
         auto generate = [&](const ChunkCoord& c) {
             if (m_generating.size() < maxInFlight) {
@@ -304,22 +309,46 @@ void World::loadQueuedChunks(sol::state& lua) {
             const ChunkCoord c = m_loadQueue[consumed++];
             if (chunks.count(c) || m_generating.count(c)) continue;
 
+            // Its file couldn't be checked or read lately: wait for the next try (kept queued)
+            if (const auto r = m_diskRetry.find(c); r != m_diskRetry.end() && Clock::now() < r->second.next) {
+                notYet.push_back(c);
+                continue;
+            }
+
             // Already known to have no file: straight to the generator (no probe, no allocation)
             if (m_notOnDisk.count(c)) { generate(c); continue; }
 
             // Cheap existence check first; ChunkData is only allocated to read a real file
-            if (!chunkFileExists(c)) {
+            std::error_code ec;
+            const ChunkFile file = chunkFileState(c, ec);
+            if (file == ChunkFile::Missing) {           // confirmed: never saved
+                m_diskRetry.erase(c);
                 m_notOnDisk.insert(c);
                 generate(c);
                 continue;
             }
+            if (file == ChunkFile::Error) {             // unknown: maybe saved - don't overwrite it
+                noteDiskError(c, "couldn't check its save file (" + ec.message() + ")");
+                notYet.push_back(c);
+                continue;
+            }
             auto chunk = std::make_shared<ChunkData>();
-            if (loadChunkFromDisk(c.first, c.second, *chunk)) {
+            std::string why;
+            switch (loadChunkFromDisk(c.first, c.second, *chunk, &why)) {
+            case DiskLoad::Loaded:
                 computeBiomeTint(*chunk, c.first, c.second, &lua);   // saved before biome colours
                 addLoadedChunk(c.first, c.second, std::move(chunk));
-            } else {
-                m_notOnDisk.insert(c);   // damaged file: regenerate (it's replaced when saved)
+                break;
+            case DiskLoad::Missing:                     // deleted since the check: as never saved
+            case DiskLoad::Damaged:                     // regenerate (it's replaced when saved)
+                m_diskRetry.erase(c);
+                m_notOnDisk.insert(c);
                 generate(c);
+                break;
+            case DiskLoad::Error:
+                noteDiskError(c, why);
+                notYet.push_back(c);
+                break;
             }
         }
         // Waiting ones go back in front, then everything not reached: no coordinate is lost
@@ -328,16 +357,22 @@ void World::loadQueuedChunks(sol::state& lua) {
         return;
     }
 
+    std::vector<ChunkCoord> retryLater;   // file couldn't be checked or read: kept queued
     while (consumed < m_loadQueue.size()) {
         const ChunkCoord c = m_loadQueue[consumed++];
         if (chunks.find(c) == chunks.end()) {
-            loadChunk(c.first, c.second, lua);
+            if (const auto r = m_diskRetry.find(c); r != m_diskRetry.end() && Clock::now() < r->second.next) {
+                retryLater.push_back(c);
+                continue;
+            }
+            if (!loadChunk(c.first, c.second, lua)) retryLater.push_back(c);
             if (elapsedMs(start) >= m_loadBudgetMs) break;
         }
     }
 
     m_loadQueue.erase(m_loadQueue.begin(),
                       m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
+    m_loadQueue.insert(m_loadQueue.begin(), retryLater.begin(), retryLater.end());
 }
 
 // Finished chunks from the generator's threads: keep the ones still needed.
@@ -346,6 +381,10 @@ void World::collectGenerated() {
         const ChunkCoord c{r.cx, r.cz};
         if (r.epoch != m_resetCount) continue;          // from before a reset (another world)
         m_generating.erase(c);
+        if (!r.chunk) {                                 // the job failed: ask for it again
+            m_queueDirty = true;                        // (the rebuilt queue includes it)
+            continue;
+        }
         if (chunks.count(c) || !wantedChunk(c)) continue;   // already there / player went away
         addLoadedChunk(r.cx, r.cz, std::move(r.chunk));
     }
@@ -358,6 +397,7 @@ void World::collectGenerated() {
 
 void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
     m_notOnDisk.erase(ChunkCoord{cx, cz});   // loaded now: it may be saved, so probe again next time
+    m_diskRetry.erase(ChunkCoord{cx, cz});
     chunk->chunkX = cx;
     chunk->chunkZ = cz;
     ChunkData& added = *chunk;
@@ -438,11 +478,19 @@ void World::unloadDistantChunks() {
     }
 }
 
-void World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
+bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
     auto chunk = std::make_shared<ChunkData>();
+    const ChunkCoord c{chunkX, chunkZ};
 
     // 1. Saved chunk on disk? Use it instead of generating.
-    bool fromDisk = loadChunkFromDisk(chunkX, chunkZ, *chunk);
+    std::string why;
+    const DiskLoad disk = loadChunkFromDisk(chunkX, chunkZ, *chunk, &why);
+    if (disk == DiskLoad::Error) {                 // maybe saved: never replace it with new terrain
+        noteDiskError(c, why);
+        return false;
+    }
+    m_diskRetry.erase(c);
+    const bool fromDisk = disk == DiskLoad::Loaded;
 
     // 2. Otherwise generate it (Lua mapgen, or the C++ fallback).
     if (!fromDisk) {
@@ -452,6 +500,7 @@ void World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
         computeBiomeTint(*chunk, chunkX, chunkZ, &lua);   // saved before biome colours
     }
     addLoadedChunk(chunkX, chunkZ, std::move(chunk));
+    return true;
 }
 
 // Biome colours from the game's Lua: get_grass_color(x, z) and get_foliage_color(x, z) return
@@ -545,6 +594,7 @@ void World::reset() {
     m_fluids->clear();
     m_modified.clear();
     m_notOnDisk.clear();
+    m_diskRetry.clear();
     m_fallChecks.clear();   // blocks falling in the old world
     m_falling.clear();
     m_queueDirty = true;
@@ -570,10 +620,34 @@ int World::saveAll() {
     return written;
 }
 
-bool World::chunkFileExists(const ChunkCoord& c) const {
-    if (m_saveDir.empty()) return false;
-    std::error_code ec;
-    return std::filesystem::is_regular_file(chunkPath(c.first, c.second), ec);
+World::ChunkFile World::chunkFileState(const ChunkCoord& c, std::error_code& ec) const {
+    ec.clear();
+    if (m_saveDir.empty()) return ChunkFile::Missing;          // not saving: nothing is ever on disk
+    const std::filesystem::file_status st = std::filesystem::status(chunkPath(c.first, c.second), ec);
+    // A path that doesn't exist (or whose folder doesn't: "chunks/" not made yet, or a file in
+    // its place) is a confirmed absence, not an error.
+    if (st.type() == std::filesystem::file_type::not_found ||
+        ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) {
+        ec.clear();
+        return ChunkFile::Missing;
+    }
+    if (ec) return ChunkFile::Error;                           // couldn't look: unknown
+    if (std::filesystem::is_regular_file(st)) return ChunkFile::Present;
+    return ChunkFile::Missing;   // something that isn't a file (a folder...): not a saved chunk, as before
+}
+
+void World::noteDiskError(const ChunkCoord& c, const std::string& what) {
+    DiskRetry& r = m_diskRetry[c];
+    ++r.failures;
+    // 0.25 s, 0.5 s, 1 s, 2 s, then every 4 s while it lasts
+    const int shift = std::min(r.failures - 1, 4);
+    r.next = Clock::now() + std::chrono::milliseconds(250 << shift);
+    if (r.failures == 1 || r.failures % 15 == 0) {             // not every attempt
+        std::cerr << "[Load] Chunk " << c.first << "," << c.second << ": " << what
+                  << " - not generating it (it may be saved); trying again"
+                  << (r.failures > 1 ? " (" + std::to_string(r.failures) + " attempts so far)" : std::string())
+                  << std::endl;
+    }
 }
 
 std::string World::chunkPath(int cx, int cz) const {
@@ -699,18 +773,44 @@ bool World::saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const {
     return true;
 }
 
-bool World::loadChunkFromDisk(int cx, int cz, ChunkData& chunk) const {
-    if (m_saveDir.empty()) return false;
+World::DiskLoad World::loadChunkFromDisk(int cx, int cz, ChunkData& chunk, std::string* why) const {
+    if (m_saveDir.empty()) return DiskLoad::Missing;
+    auto fail = [&](const std::string& msg) { if (why) *why = msg; return DiskLoad::Error; };
 
-    std::ifstream f(chunkPath(cx, cz), std::ios::binary);
-    if (!f) return false;   // never saved - generate it instead
+    const std::string path = chunkPath(cx, cz);
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        // Never saved - or there, but couldn't be opened. Only a confirmed absence means "generate".
+        std::error_code ec;
+        const ChunkFile state = chunkFileState(ChunkCoord{cx, cz}, ec);
+        if (state == ChunkFile::Missing) return DiskLoad::Missing;
+        return fail(state == ChunkFile::Error ? "couldn't check its save file (" + ec.message() + ")"
+                                              : "its save file exists but couldn't be opened");
+    }
 
-    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // Read exactly as many bytes as the file has: a read that stops early is a disk error (try
+    // again), not a damaged file (which would be regenerated and then overwritten when saved).
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        if (ec == std::errc::no_such_file_or_directory) return DiskLoad::Missing;   // deleted just now
+        return fail("couldn't get its save file's size (" + ec.message() + ")");
+    }
+    constexpr std::uintmax_t kMaxChunkFile = 64u * 1024u * 1024u;   // far more than any chunk needs
+    if (size > kMaxChunkFile) {
+        std::cerr << "[Load] Chunk " << cx << "," << cz << " has an impossibly large file - regenerating it" << std::endl;
+        return DiskLoad::Damaged;
+    }
+    std::vector<uint8_t> d(static_cast<size_t>(size));
+    if (size > 0) f.read(reinterpret_cast<char*>(d.data()), static_cast<std::streamsize>(size));
+    if (static_cast<std::uintmax_t>(f.gcount()) != size && size > 0) {
+        return fail("read only " + std::to_string(f.gcount()) + " of its " + std::to_string(size) + " bytes");
+    }
     if (!decodeChunk(d, chunk)) {
         std::cerr << "[Load] Chunk " << cx << "," << cz << " is damaged - regenerating it" << std::endl;
-        return false;
+        return DiskLoad::Damaged;
     }
-    return true;
+    return DiskLoad::Loaded;
 }
 
 bool World::decodeChunk(const std::vector<uint8_t>& d, ChunkData& chunk) {

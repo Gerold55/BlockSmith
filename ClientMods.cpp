@@ -353,10 +353,14 @@ void ClientMods::init(sol::state& gameLua, const std::string& folder) {
     sol::table sound = L.create_named_table("sound");
     if (game["sound"].get_type() == sol::type::table) {
         sol::table gameSound = game["sound"];
-        for (const char* n : { "play", "stop", "fade", "set_gain", "set_pitch", "set_position", "is_playing",
-                               "exists", "is_available", "get_volume" }) {
+        for (const char* n : { "stop", "fade", "set_gain", "set_pitch", "set_position", "is_playing",
+                               "is_available", "get_volume" }) {
             bridge(gameSound, sound, n, n);
         }
+        // Looking sounds up by name: only the sandboxed versions, which can't reach files outside
+        // the sound folders (no raw paths, no "..", no symlinks out). Without them: no play/exists.
+        bridge(gameSound, sound, "__play_sandboxed", "play");
+        bridge(gameSound, sound, "__exists_sandboxed", "exists");
     }
     // Read-only facts about the player (always allowed: it's their own game)
     struct Alias { const char* table; const char* from; const char* to; };

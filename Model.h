@@ -34,11 +34,12 @@ struct Bone {
     std::string name;
 
     // Set from Lua for animation (on top of the pose stored in the model file)
-    glm::vec3 position{0.0f};    // offset (b3d: starts at the node's position)
+    glm::vec3 position{0.0f};    // offset added to the rest position (0 = where the file puts it)
     glm::vec3 rotation{0.0f};    // extra rotation in degrees (x, y, z)
     glm::vec3 animScale{1.0f};   // extra scale (animations)
 
-    // From the model file
+    // From the model file (never changed by animations, resetPose or drawBone)
+    glm::vec3 restPosition{0.0f};   // where the bone sits in its parent (b3d node translation)
     glm::vec3 pivot{0.0f};       // point the bone rotates around (json)
     glm::vec3 scale{1.0f};
     glm::quat restRotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -73,6 +74,14 @@ public:
     // Draws one bone and everything attached to it (e.g. an arm for the first-person view),
     // in the model file's pose, with the bone's pivot at `world`'s origin. False if no such bone.
     bool drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world);
+
+    // True if no bone is its own ancestor: following children from any bone - including bones
+    // no root reaches - never comes back to a bone already on the path. False sets `cycleBone`
+    // (if given) to a bone in the loop. drawBone refuses models that fail this.
+    bool hierarchyIsAcyclic(std::string* cycleBone = nullptr) const;
+
+private:
+    mutable bool m_reportedCycle = false;   // the cycle error is printed once per model
 };
 
 // ===========================================================================

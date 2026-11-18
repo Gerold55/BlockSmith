@@ -10,7 +10,26 @@ ChunkGenerator::ChunkGenerator(int threads, LuaFactory factory, uint32_t seed, i
         threads = std::clamp(cores - reserveCores, 1, 8);
     }
     threads = std::clamp(threads, 1, 8);
-    for (int i = 0; i < threads; ++i) m_threads.emplace_back(&ChunkGenerator::workerLoop, this, i);
+    m_threads.reserve(static_cast<size_t>(threads));   // adding a started thread can't reallocate (and throw)
+    try {
+        for (int i = 0; i < threads; ++i) m_threads.emplace_back(&ChunkGenerator::workerLoop, this, i);
+    } catch (...) {
+        // A thread couldn't be started (std::system_error: the OS refused). The workers already
+        // running must be stopped and joined here, while the mutex and condition variable they
+        // wait on are still alive - leaving the constructor with joinable std::threads would
+        // call std::terminate. Then the original error goes to the caller.
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+            m_jobs.clear();
+        }
+        m_wake.notify_all();
+        for (auto& t : m_threads) {
+            if (t.joinable()) t.join();
+        }
+        m_threads.clear();
+        throw;
+    }
 }
 
 ChunkGenerator::~ChunkGenerator() {
@@ -80,8 +99,10 @@ void ChunkGenerator::workerLoop(int index) {
         lua.reset();
     }
 
-    bool seeded = false;
+    bool seeded = false;          // luaSeed is what set_world_seed last ran with successfully
     uint32_t luaSeed = 0;
+    bool reportedFailure = false; // set_world_seed errors are logged once per seed, not per chunk
+    uint32_t reportedSeed = 0;
     for (;;) {
         Job job;
         {
@@ -92,16 +113,32 @@ void ChunkGenerator::workerLoop(int index) {
             m_jobs.pop_front();
         }
         if (lua && (!seeded || luaSeed != job.seed)) {
+            bool ok = true;
             sol::protected_function setSeed = (*lua)["set_world_seed"];
             if (setSeed.valid()) {
                 auto r = setSeed(job.seed);
                 if (!r.valid()) {
-                    sol::error err = r;
-                    std::cerr << "[Generator " << index << "] set_world_seed: " << err.what() << std::endl;
+                    ok = false;
+                    if (!reportedFailure || reportedSeed != job.seed) {
+                        sol::error err = r;
+                        std::cerr << "[Generator " << index << "] set_world_seed: " << err.what()
+                                  << " (chunks wait until it works)" << std::endl;
+                        reportedFailure = true;
+                        reportedSeed = job.seed;
+                    }
                 }
             }
-            seeded = true;
+            if (!ok) {
+                // Don't cache the seed (the next job tries the hook again) and don't run the Lua
+                // terrain unseeded: this job fails, and the world asks for the chunk again
+                seeded = false;
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_done.push_back({job.cx, job.cz, job.epoch, nullptr});
+                continue;
+            }
+            seeded = true;                     // only now: set_world_seed really ran with it
             luaSeed = job.seed;
+            reportedFailure = false;
         }
         auto chunk = std::make_shared<ChunkData>();
         World::generateNewChunk(*chunk, job.cx, job.cz, lua.get(), job.seed);

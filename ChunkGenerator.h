@@ -30,7 +30,8 @@ public:
     struct Result {
         int cx, cz;
         unsigned epoch;                    // World::resetCount() when requested
-        std::shared_ptr<ChunkData> chunk;
+        std::shared_ptr<ChunkData> chunk;  // nullptr: the job failed (set_world_seed errored) -
+                                           // nothing was generated; request it again later
     };
 
     // threads <= 0: one per CPU core, minus `reserveCores` left free for the main thread

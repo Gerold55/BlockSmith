@@ -1755,7 +1755,7 @@ engine.remove_model(id)
 **Moving bones:**
 - <a id="fn-model-get_bone"></a>`model:get_bone(name)` returns a bone, or nil.
 - <a id="fn-bone-set_rotation"></a><a id="fn-bone-get_rotation"></a>`bone:set_rotation(x, y, z)` / `bone:get_rotation()`: degrees, relative to the model file's pose.
-- <a id="fn-bone-set_position"></a>`bone:set_position(x, y, z)`: in model pixels (16 per block).
+- <a id="fn-bone-set_position"></a>`bone:set_position(x, y, z)`: an offset from where the model file puts the bone, in model pixels (16 per block). `model:reset_pose()` sets it back to 0; the file's own positions are never lost.
 - <a id="fn-model-reset_pose"></a>`model:reset_pose()` puts every bone back to the model file's pose.
 
 <a id="fn-hooks-on_update"></a><a id="fn-hooks-update_player_animation"></a>Use `on_update(dt)` to move them every frame. The player model is the global `g_PlayerModel`, and the engine calls `update_player_animation(dt, is_moving, pitch)`.

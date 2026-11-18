@@ -3217,7 +3217,20 @@ int main(int argc, char** argv) {
         }
         g_MainMenu = new MainMenu();
 
-        g_FontRenderer->init("fonts/PixeloidSans.ttf");
+        // The game's font, else one that comes with the operating system. With neither, there is
+        // no text at all (menus would be blank buttons), so say why - in the console and in the
+        // window's title bar, where the player sees it - and carry on with text switched off
+        // (every text call checks g_FontRenderer) rather than drawing from an empty atlas.
+        if (!g_FontRenderer->init("fonts/PixeloidSans.ttf")) {
+            std::cerr << "[Font] fonts/PixeloidSans.ttf couldn't be used - trying the system's fonts" << std::endl;
+            if (!g_FontRenderer->init(FontRenderer::systemFonts())) {
+                std::cerr << "[Font Error] No font could be loaded: the game will show no text. Check that the "
+                             "'fonts' folder is next to the game (with PixeloidSans.ttf in it)." << std::endl;
+                delete g_FontRenderer;
+                g_FontRenderer = nullptr;
+                glfwSetWindowTitle(window, (windowTitle + " - no font found: is the 'fonts' folder missing?").c_str());
+            }
+        }
 
         EngineContext ctx;
         glfwSetWindowUserPointer(window, &ctx);
@@ -4357,9 +4370,13 @@ int main(int argc, char** argv) {
         //   name: "my_mod_click" plays my_mod_click.ogg/.wav (or a random .1/.2/... variant)
         //   from any mod's folder or sounds/ folder. With `pos` it's heard from that place.
         //   group: "effects" (default), "ambient", "music" or "ui" - each has its own volume.
-        soundTable["play"] = [](const std::string& name, sol::optional<sol::table> opts, sol::this_state ts) -> sol::object {
+        // sound.play(name [, opts]); the sandboxed copy is what client mods get (ClientMods.cpp):
+        // it only plays files inside the sound folders (AudioSystem::findFiles)
+        auto playSound = [](const std::string& name, sol::optional<sol::table> opts, sol::this_state ts,
+                            bool sandboxed) -> sol::object {
             sol::state_view lv(ts);
             SoundParams p;
+            p.sandboxed = sandboxed;
             if (opts) {
                 const sol::table& o = *opts;
                 p.gain = o.get_or("gain", 1.0f);
@@ -4378,6 +4395,12 @@ int main(int argc, char** argv) {
             if (h == 0) return sol::make_object(lv, sol::lua_nil);
             return sol::make_object(lv, h);
         };
+        soundTable["play"] = [playSound](const std::string& name, sol::optional<sol::table> opts, sol::this_state ts) {
+            return playSound(name, opts, ts, false);
+        };
+        soundTable["__play_sandboxed"] = [playSound](const std::string& name, sol::optional<sol::table> opts, sol::this_state ts) {
+            return playSound(name, opts, ts, true);
+        };
         soundTable["stop"] = [](int h) { g_Audio.stop(h); };
         // sound.fade(handle, gain, seconds): to 0 stops it at the end
         soundTable["fade"] = [](int h, float gain, sol::optional<float> seconds) { g_Audio.fade(h, gain, seconds.value_or(1.0f)); };
@@ -4386,6 +4409,7 @@ int main(int argc, char** argv) {
         soundTable["set_position"] = [](int h, float x, float y, float z) { g_Audio.setPosition(h, glm::vec3(x, y, z)); };
         soundTable["is_playing"] = [](int h) { return g_Audio.isPlaying(h); };
         soundTable["exists"] = [](const std::string& name) { return g_Audio.soundExists(name); };
+        soundTable["__exists_sandboxed"] = [](const std::string& name) { return g_Audio.soundExists(name, true); };
         soundTable["is_available"] = []() { return g_Audio.available(); };
         // sound.play_music(name [, { fade = 2, loop = false, gain = 1 }]) - streamed, crossfades
         soundTable["play_music"] = [](const std::string& name, sol::optional<sol::table> opts) {

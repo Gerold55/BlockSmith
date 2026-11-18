@@ -6,9 +6,11 @@
 #include <glm/glm.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -66,7 +68,10 @@ public:
 
     // Is the chunk holding this block loaded?
     bool isLoaded(const glm::ivec3& loc) const { return chunkAt(loc) != nullptr; }
-    void loadChunk(int chunkX, int chunkZ, sol::state& lua);
+    // Loads the chunk from its save file, or generates it if it has none. Returns false (and
+    // adds nothing) if the save file couldn't be checked or read: the chunk may be saved, so it
+    // is not replaced with new terrain - ask again later.
+    bool loadChunk(int chunkX, int chunkZ, sol::state& lua);
 
     uint8_t getBlockAt(const glm::ivec3& loc) const;
     void setBlockAt(const glm::ivec3& loc, uint8_t blockId);
@@ -151,7 +156,7 @@ public:
     void reset();
 
     // Folder for this world's chunk files ("" = saving disabled).
-    void setSaveDirectory(const std::string& dir) { m_saveDir = dir; m_notOnDisk.clear(); }
+    void setSaveDirectory(const std::string& dir) { m_saveDir = dir; m_notOnDisk.clear(); m_diskRetry.clear(); }
     const std::string& saveDirectory() const { return m_saveDir; }
 
     // The seed passed to Lua's set_world_seed. Changing it re-seeds Lua on the next update.
@@ -185,14 +190,30 @@ private:
 
     // Chunk files: <saveDir>/chunks/c.<x>.<z>.bin
     std::string chunkPath(int cx, int cz) const;
-    // Is there a saved file for this chunk? (no allocation, no reading)
-    bool chunkFileExists(const ChunkCoord& c) const;
-    // Chunks found to have no (usable) file: only the generator can make them, so they aren't
-    // probed again while waiting for a generator slot. Forgotten when the chunk loads (it may be
-    // saved later), on reset and when the save folder changes.
+    // What is on disk for a chunk. Only Missing means "never saved": Error means the file system
+    // couldn't tell (permissions, a locked or unplugged drive, too many open files...) - the
+    // chunk may well be saved, so it must not be replaced with new terrain.
+    enum class ChunkFile { Present, Missing, Error };
+    // Is there a saved file for this chunk? (no allocation, no reading) `ec` says why on Error.
+    ChunkFile chunkFileState(const ChunkCoord& c, std::error_code& ec) const;
+    // Chunks CONFIRMED to have no file (or only a damaged one): only the generator can make them,
+    // so they aren't probed again while waiting for a generator slot. Forgotten when the chunk
+    // loads (it may be saved later), on reset and when the save folder changes.
     std::unordered_set<ChunkCoord, PairHash> m_notOnDisk;
+    // Chunks whose file couldn't be checked or read: tried again later (sooner at first, then
+    // up to every few seconds) - never generated in the meantime.
+    struct DiskRetry {
+        int failures = 0;
+        std::chrono::steady_clock::time_point next;
+    };
+    std::unordered_map<ChunkCoord, DiskRetry, PairHash> m_diskRetry;
+    // A disk problem for chunk c: logged (not every attempt) and its next try scheduled
+    void noteDiskError(const ChunkCoord& c, const std::string& what);
     bool saveChunkToDisk(const ChunkCoord& c, const ChunkData& chunk) const;
-    bool loadChunkFromDisk(int cx, int cz, ChunkData& chunk) const;
+    enum class DiskLoad { Loaded, Missing, Damaged, Error };
+    // Missing: no file. Damaged: a file that isn't a valid chunk (regenerated, and replaced when
+    // saved). Error: the file couldn't be opened or read - try again later. `why` is set on Error.
+    DiskLoad loadChunkFromDisk(int cx, int cz, ChunkData& chunk, std::string* why = nullptr) const;
 
     uint32_t m_seed = 0;
     bool m_luaSeeded = false;

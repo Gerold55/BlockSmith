@@ -117,37 +117,81 @@ void AudioSystem::shutdown() {
 // Finding and loading sounds
 // ---------------------------------------------------------------------------
 
-std::vector<std::string> AudioSystem::findFiles(const std::string& name) {
-    const auto cached = m_resolved.find(name);
-    if (cached != m_resolved.end()) return cached->second;
+namespace {
+// Is `path` (canonical) inside `root` (canonical)? Compared part by part, so "sounds2" isn't
+// inside "sounds" and ".." can't be in either (canonical paths have none).
+bool insideRoot(const fs::path& path, const fs::path& root) {
+    auto r = root.begin(), p = path.begin();
+    for (; r != root.end(); ++r, ++p) {
+        if (r->empty()) continue;                      // a trailing separator on the root
+        if (p == path.end() || *p != *r) return false;
+    }
+    return p != path.end();                            // something below the root, not the root itself
+}
+}
+
+std::vector<std::string> AudioSystem::findFiles(const std::string& name, bool sandboxed) {
+    auto& cache = sandboxed ? m_resolvedSandboxed : m_resolved;
+    const auto cached = cache.find(name);
+    if (cached != cache.end()) return cached->second;
 
     std::vector<std::string> found;
     std::error_code ec;
     const std::string ext = lower(fs::path(name).extension().string());
-    std::vector<std::string> dirs = { "" };
+    // Where to look, in order: (game mods only) the name as given; each sound folder's sounds/
+    // and the folder itself; then ./sounds. The first folder that has the sound wins.
+    std::vector<std::string> dirs;
+    if (!sandboxed) dirs.push_back("");
     for (const auto& f : m_folders) { dirs.push_back(f + "/sounds/"); dirs.push_back(f + "/"); }
     dirs.push_back("sounds/");
-    for (const auto& dir : dirs) {
-        if (ext == ".ogg" || ext == ".wav") {
-            if (fs::is_regular_file(dir + name, ec)) found.push_back(dir + name);
-        } else {
-            for (const char* e : { ".ogg", ".wav" }) {
-                if (fs::is_regular_file(dir + name + e, ec)) found.push_back(dir + name + e);
-                for (int i = 1; i <= 16; ++i) {   // Luanti-style variants: name.1.ogg, name.2.ogg...
-                    const std::string v = dir + name + "." + std::to_string(i) + e;
-                    if (fs::is_regular_file(v, ec)) found.push_back(v);
+
+    // Sandboxed (client mods): the folders a sound may come from, resolved to where they really
+    // are. A match counts only if its own real location (symlinks followed, ".." resolved) is
+    // inside one of them - so neither "../../secret", an absolute path nor a symlink pointing out
+    // of the folders can reach other files. The checked, canonical path is what's returned.
+    std::vector<fs::path> roots;
+    if (sandboxed) {
+        std::vector<std::string> rootDirs = m_folders;
+        rootDirs.push_back("sounds");
+        for (const auto& d : rootDirs) {
+            const fs::path c = fs::canonical(d, ec);
+            if (!ec && fs::is_directory(c, ec)) roots.push_back(c);
+        }
+        if (name.empty() || fs::path(name).is_absolute() || fs::path(name).has_root_name()) roots.clear();
+    }
+    auto accept = [&](const std::string& candidate) {
+        if (!fs::is_regular_file(candidate, ec)) return;
+        if (!sandboxed) { found.push_back(candidate); return; }
+        const fs::path real = fs::canonical(candidate, ec);
+        if (ec) return;
+        for (const auto& root : roots) {
+            if (insideRoot(real, root)) { found.push_back(real.string()); return; }
+        }
+        std::cerr << "[Audio] Refused sound file outside the sound folders: " << candidate << std::endl;
+    };
+
+    if (!sandboxed || !roots.empty()) {
+        for (const auto& dir : dirs) {
+            if (ext == ".ogg" || ext == ".wav") {
+                accept(dir + name);
+            } else {
+                for (const char* e : { ".ogg", ".wav" }) {
+                    accept(dir + name + e);
+                    for (int i = 1; i <= 16; ++i) {   // Luanti-style variants: name.1.ogg, name.2.ogg...
+                        accept(dir + name + "." + std::to_string(i) + e);
+                    }
                 }
             }
+            if (!found.empty()) break;   // the first folder that has it wins
         }
-        if (!found.empty()) break;   // the first folder that has it wins
     }
     if (found.empty()) std::cerr << "[Audio] Sound not found: " << name << std::endl;
-    m_resolved[name] = found;
+    cache[name] = found;
     return found;
 }
 
-bool AudioSystem::soundExists(const std::string& name) {
-    return !findFiles(name).empty();
+bool AudioSystem::soundExists(const std::string& name, bool sandboxed) {
+    return !findFiles(name, sandboxed).empty();
 }
 
 const AudioSystem::Buffer* AudioSystem::loadBuffer(const std::string& path, bool mono) {
@@ -246,7 +290,7 @@ void AudioSystem::freeVoice(Voice& v) {
 
 int AudioSystem::play(const std::string& name, const SoundParams& p) {
     if (!m_device || name.empty()) return 0;
-    const auto files = findFiles(name);
+    const auto files = findFiles(name, p.sandboxed);
     if (files.empty()) return 0;
     const std::string& file = files[std::uniform_int_distribution<size_t>(0, files.size() - 1)(m_rng)];
     const Buffer* b = loadBuffer(file, p.positional);

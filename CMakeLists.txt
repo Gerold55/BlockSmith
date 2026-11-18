@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.15)
+# 3.24+: the ENet and OpenAL downloads below use FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP (new
+# in 3.24), and FindLua knows Lua 5.4. Visual Studio 2022 and current vcpkg ship a newer CMake.
+cmake_minimum_required(VERSION 3.24)
 project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
@@ -10,12 +12,23 @@ if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
 endif()
 
-# Find vcpkg packages
-find_package(OpenGL REQUIRED)
-find_package(glfw3 CONFIG REQUIRED)
+# Server-only builds (e.g. a headless Linux box): only BlockSmithServer, without the game's
+# graphics, window, sound and JSON libraries. Off by default: both targets, as before.
+#   cmake -B build -DBLOCKSMITH_SERVER_ONLY=ON
+#   cmake --build build --config Release --target BlockSmithServer
+option(BLOCKSMITH_SERVER_ONLY "Build only the dedicated server (no OpenGL/glfw3/OpenAL needed)" OFF)
+if (BLOCKSMITH_SERVER_ONLY)
+    message(STATUS "BlockSmith: server-only build (BlockSmithServer only; the game is not built)")
+endif()
+
+# Find vcpkg packages (the game alone needs OpenGL, glfw3 and nlohmann_json)
+if (NOT BLOCKSMITH_SERVER_ONLY)
+    find_package(OpenGL REQUIRED)
+    find_package(glfw3 CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
+endif()
 find_package(glm CONFIG REQUIRED)
 find_package(sol2 CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
 
 # vcpkg ships Lua as unofficial-lua, other platforms use CMake's FindLua
 find_package(unofficial-lua CONFIG QUIET)
@@ -42,6 +55,11 @@ FetchContent_Declare(enet
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(enet)
+
+# ---------------------------------------------------------------------------
+# BlockSmith: the game (skipped in server-only builds)
+# ---------------------------------------------------------------------------
+if (NOT BLOCKSMITH_SERVER_ONLY)
 
 # OpenAL Soft (sound) - from vcpkg if it has it (openal-soft), else downloaded and built
 # the first time CMake configures, like ENet
@@ -169,6 +187,8 @@ if (TARGET unofficial::lua::lua)
 else()
     target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
 endif()
+
+endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
 
 # ---------------------------------------------------------------------------
 # BlockSmithServer: the dedicated (headless) server. No window, no graphics -
