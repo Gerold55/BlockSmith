@@ -1083,7 +1083,8 @@ int main(int argc, char** argv) {
     using Reply = std::function<void(const std::string&)>;
     auto handleCommand = [&](const std::string& line, const Reply& reply, const std::string& from) {
         const bool console = from.empty();
-        const bool op = console || ops.has(from);
+        // Operator rights need a password-protected name (accounts.check passed in canJoin)
+        const bool op = console || (ops.has(from) && accounts.has(from));
         std::istringstream ss(line);
         std::string cmd;
         ss >> cmd;
