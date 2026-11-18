@@ -34,10 +34,12 @@ struct Bone {
     std::string name;
 
     // Set from Lua for animation (on top of the pose stored in the model file)
-    glm::vec3 position{0.0f};    // offset (b3d: starts at the node's position)
+    glm::vec3 position{0.0f};    // offset added to the rest position (0 = where the file puts it)
     glm::vec3 rotation{0.0f};    // extra rotation in degrees (x, y, z)
+    glm::vec3 animScale{1.0f};   // extra scale (animations)
 
-    // From the model file
+    // From the model file (never changed by animations, resetPose or drawBone)
+    glm::vec3 restPosition{0.0f};   // where the bone sits in its parent (b3d node translation)
     glm::vec3 pivot{0.0f};       // point the bone rotates around (json)
     glm::vec3 scale{1.0f};
     glm::quat restRotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -66,4 +68,69 @@ public:
 
     std::map<std::string, std::shared_ptr<Bone>> boneMap;
     std::vector<std::shared_ptr<Bone>> rootBones;
+
+    // Every bone back to the pose in the model file (no Lua/animation rotation or offset)
+    void resetPose();
+    // Draws one bone and everything attached to it (e.g. an arm for the first-person view),
+    // in the model file's pose, with the bone's pivot at `world`'s origin. False if no such bone.
+    bool drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world);
+
+    // True if no bone is its own ancestor: following children from any bone - including bones
+    // no root reaches - never comes back to a bone already on the path. False sets `cycleBone`
+    // (if given) to a bone in the loop. drawBone refuses models that fail this.
+    bool hierarchyIsAcyclic(std::string* cycleBone = nullptr) const;
+
+private:
+    mutable bool m_reportedCycle = false;   // the cycle error is printed once per model
+    // hierarchyIsAcyclic's answer, worked out once: 0 = not known yet, 1 = no loop, 2 = a loop
+    // (m_cycleBone names a bone in it). Bones are only linked while a file loads, so the loaders
+    // reset it to 0 - that is the one place the hierarchy can change.
+    mutable int m_hierarchyState = 0;
+    mutable std::string m_cycleBone;
+    bool hierarchyOk() const;
+};
+
+// ===========================================================================
+// Animations: Bedrock / Blockbench .animation.json files. A file holds any number of
+// animations; each moves bones (rotation in degrees, position in pixels, scale) over time
+// with keyframes - linear, catmullrom (smooth) or step. Lua decides which animation plays,
+// at what time and how strongly (see the player mod).
+// ===========================================================================
+struct AnimKey {
+    float time = 0.0f;
+    glm::vec3 pre{0.0f}, post{0.0f};   // value arriving at / leaving this key (usually the same)
+    int lerp = 0;                      // 0 linear, 1 catmullrom, 2 step
+};
+
+struct AnimChannel {
+    std::vector<AnimKey> keys;         // sorted by time; one key = a constant value
+    bool empty() const { return keys.empty(); }
+    glm::vec3 sample(float t) const;
+};
+
+struct BoneAnimation {
+    std::string bone;
+    AnimChannel rotation, position, scale;
+};
+
+class ModelAnimation {
+public:
+    std::string name;
+    float length = 0.0f;               // seconds (animation_length, or the last key)
+    bool loop = false;                 // the file's "loop"
+    std::vector<BoneAnimation> bones;
+
+    // Poses `model` at `time` seconds (wrapped if the animation loops, else held at the end).
+    // weight 0..1 blends from the bone's current pose to this one, so one animation can fade
+    // into another. Bones the model doesn't have are skipped.
+    void apply(AnimatedModel& model, float time, float weight = 1.0f) const;
+};
+
+class AnimationSet {
+public:
+    bool loadFromFile(const std::string& path);   // false (and a console message) on failure
+    std::shared_ptr<ModelAnimation> get(const std::string& name) const;   // "" = the first one
+    std::vector<std::string> names() const;
+
+    std::vector<std::shared_ptr<ModelAnimation>> animations;   // in file order
 };

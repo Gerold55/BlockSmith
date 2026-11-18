@@ -31,7 +31,15 @@ engine.register_block("grass", 120, 200, 85, {
     transparent = false,
     walkable = true,
     behavior = "solid",
-    tint = true
+    tint = true,
+
+    -- Sounds the engine plays by itself
+    sounds = {
+        footstep = { name = "default_dirt_footstep", gain = 0.45, pitch = 1.1 },  -- walking / landing on it
+        dig      = { name = "default_dirt_dig",      gain = 0.6 },               -- each hit while digging (survival)
+        dug      = { name = "default_dirt_dug",      gain = 0.9 },               -- when it breaks
+        place    = { name = "default_place",         gain = 0.8 },               -- when it's placed
+    },
 })
 
 -- Oak Log
@@ -72,6 +80,68 @@ engine.register_block("leaves_birch", 1.0, 0.85, 0.1, "textures/cw_birch_leaves.
     walkable    = true,
     behavior    = "solid",
     tint        = true
+})
+
+-- --- Planks (crafted from logs: 1 log = 4 planks in the survival inventory) ---
+-- Wood sounds, axe digging and hardness 2 come automatically from the name ("planks").
+engine.register_block("planks_oak", 1.0, 1.0, 1.0, "textures/planks_oak.png", nil, {
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("planks_birch", 1.0, 1.0, 1.0, "textures/planks_birch.png", nil, {
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("planks_spruce", 1.0, 1.0, 1.0, "textures/cw_spruce_planks.png", nil, {
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("planks_jungle", 1.0, 1.0, 1.0, "textures/planks_jungle.png", nil, {
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+-- --- Stick (an item: shown as a picture, never placed) ---
+-- Crafted from 2 planks; leaves sometimes drop them (leafdecay mod).
+engine.register_block("stick", 1.0, 1.0, 1.0, "textures/stick.png", nil, {
+    transparent = true,
+    walkable = false,
+    inventory_image = "stick.png",
+})
+
+-- --- Saplings (leaves sometimes drop them; plant them like flowers) ---
+engine.register_block("sapling_oak", 1.0, 1.0, 1.0, "textures/sapling_oak.png", nil, {
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+})
+engine.register_block("sapling_birch", 1.0, 1.0, 1.0, "textures/sapling_birch.png", nil, {
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+})
+
+-- --- Workbench: right-click it to craft on a 3x3 grid (survival mod) ---
+-- Crafted from 4 planks in the inventory's 2x2 grid.
+engine.register_block("workbench", 1.0, 1.0, 1.0, {
+    top    = "textures/workbench_top.png",
+    bottom = "textures/planks_oak.png",
+    sides  = "textures/workbench_side.png"
+}, nil, {
+    transparent = false,
+    walkable = true,
+    behavior = "solid",
+    hardness = 2.5,
+    tool = "axe",
+    sounds = {
+        footstep = { name = "default_wood_footstep", gain = 0.5 },
+        dig      = { name = "default_wood_dig", gain = 0.6 },
+        dug      = { name = "default_wood_dug", gain = 0.9 },
+        place    = { name = "default_place", gain = 0.8 },
+    },
 })
 
 -- Static Water Source Block
@@ -233,3 +303,4 @@ engine.register_block("flower_tulip_pink", 1.0, 1.0, 1.0, "textures/cw_flower_tu
 -- Load separate UI script
 dofile(g_CurrentModPath .. "/ui.lua")
 dofile(g_CurrentModPath .. "/pause_menu.lua")
+dofile(g_CurrentModPath .. "/leafdecay.lua")

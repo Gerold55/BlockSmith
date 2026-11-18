@@ -59,7 +59,7 @@ local Theme = {
     },
 
     -- Font metrics at scale 1.0 (PixeloidSans is about 20px tall at scale 1)
-    font = { char_w = 13, char_h = 20, base_scale = 0.5, y_offset = 0.75 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
     line_gap = 4,               -- extra space between lines, in GUI pixels
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
@@ -96,12 +96,18 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -173,13 +179,17 @@ end
 local function draw_button(b, mx, my, S, fs)
     local enabled = b.enabled ~= false
     local hovered = enabled and inside(mx, my, b.x, b.y, b.w, b.h)
-    rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S,
-         (not enabled) and C.button_off or (hovered and C.button_hover or C.button))
-    if enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not enabled) and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S,
+             (not enabled) and C.button_off or (hovered and C.button_hover or C.button))
+        if enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs,
                   (not enabled) and C.text_off or (hovered and C.text_hover or C.text), S)

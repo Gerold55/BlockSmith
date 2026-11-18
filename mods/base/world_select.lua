@@ -58,7 +58,7 @@ local Theme = {
     },
 
     -- Keep in sync with inventory.lua / pause_menu.lua
-    font = { char_w = 13, char_h = 14, base_scale = 0.5, y_offset = 0.8 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
     list_w = 270, row_h = 36,
@@ -84,6 +84,7 @@ local state = {
     last_click_time = 0,
     name = "New World",    -- create screen fields
     seed = "",
+    game_mode = "survival", -- "survival" or "creative" (only offered if the survival mod is on)
     focus = "name",
     message = nil,         -- error shown under the title (e.g. wrong game)
     game = nil,            -- engine.get_game_info()
@@ -104,12 +105,18 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -123,6 +130,17 @@ end
 local function gui_scale(W, H)
     return clamp(math.floor(math.min(W / 480, H / 360) * 2) / 2, 1, 4)
 end
+
+-- Survival/creative choice: only when the survival mod is installed (it reads the choice
+-- back with engine.get_storage("world:game_mode")); without it every world is creative
+local function has_game_modes()
+    return type(survival) == "table" and survival.set_mode ~= nil
+end
+
+local MODE_INFO = {
+    survival = { label = "Survival", text = "Find blocks yourself. Watch your health and hunger." },
+    creative = { label = "Creative", text = "Unlimited blocks, break them instantly, can't get hurt." },
+}
 
 local function can_play()
     return state.game == nil or state.game.can_play ~= false
@@ -156,10 +174,12 @@ local function open_create()
     state.seed = ""
     state.focus = "name"
     state.message = nil
+    state.game_mode = (has_game_modes() and survival.settings and survival.settings.default_mode) or "survival"
 end
 
 local function create_and_play()
-    local folder, err = engine.create_world(state.name, state.seed)
+    local options = has_game_modes() and { game_mode = state.game_mode } or nil
+    local folder, err = engine.create_world(state.name, state.seed, options)
     state.mode = "list"
     if not folder then
         state.message = err
@@ -206,12 +226,16 @@ local function draw_button(b, mx, my, S, fs)
     end
     local outline = hovered and C.outline_hover or C.outline
 
-    rect(b.x, b.y, b.w, b.h, outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-    if b.enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not b.enabled) and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
+        if b.enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
 
     local tc = (not b.enabled) and C.text_off or (hovered and C.text_hover or C.text)
@@ -336,7 +360,9 @@ local function render_list(W, H)
         end
 
         text(w.name, rx + 6 * S, ry + 4 * S, fs, C.name, true, S)
-        text("Seed: " .. tostring(w.seed), rx + 6 * S, ry + 6 * S + text_height(fs), fs * 0.85, C.detail, false, S)
+        local detail = "Seed: " .. tostring(w.seed)
+        if w.game_mode and MODE_INFO[w.game_mode] then detail = detail .. "   " .. MODE_INFO[w.game_mode].label end
+        text(detail, rx + 6 * S, ry + 6 * S + text_height(fs), fs * 0.85, C.detail, false, S)
     end
 
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
@@ -380,6 +406,14 @@ local function create_layout(W, H)
     L.seedLabelY = L.nameField.y + fh + 16 * S
     L.seedField = { x = fx, y = L.seedLabelY + text_height(fs) + 4 * S, w = fw, h = fh }
     L.hintY = L.seedField.y + fh + 4 * S
+    if has_game_modes() then
+        L.modeButton = { x = fx, y = L.hintY + text_height(fs) + 12 * S, w = fw, h = fh,
+                         label = "Game Mode: " .. MODE_INFO[state.game_mode].label, enabled = true,
+                         action = function()
+                             state.game_mode = state.game_mode == "survival" and "creative" or "survival"
+                         end }
+        L.modeTextY = L.modeButton.y + fh + 4 * S
+    end
 
     L.buttons = {
         { x = bx,            y = row2Y, w = bw, h = bh, label = "Create New World",
@@ -387,6 +421,7 @@ local function create_layout(W, H)
         { x = bx + bw + gap, y = row2Y, w = bw, h = bh, label = "Cancel",
           enabled = true, action = function() state.mode = "list" end },
     }
+    if L.modeButton then table.insert(L.buttons, L.modeButton) end
     return L
 end
 
@@ -404,6 +439,9 @@ local function render_create(W, H)
     text("Seed for the World Generator", L.fx, L.seedLabelY, fs, C.detail, false, S)
     draw_field(L.seedField, state.seed, state.focus == "seed", "Random", S, fs)
     text("Leave blank for a random seed", L.fx, L.hintY, fs * 0.85, C.detail, false, S)
+    if L.modeButton then
+        text(MODE_INFO[state.game_mode].text, L.fx, L.modeTextY, fs * 0.85, C.detail, false, S)
+    end
 
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
 end
@@ -466,7 +504,8 @@ end
 function on_world_select_opened()
     state.mode = "list"
     state.scroll = 0
-    state.message = nil
+    -- Why the last world was closed or couldn't open (e.g. its world generator failed), if so
+    state.message = engine.take_world_error and engine.take_world_error() or nil
     refresh_worlds()
 end
 

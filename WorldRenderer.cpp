@@ -90,6 +90,12 @@ void WorldRenderer::update(World& world, const glm::vec3& playerPos) {
         clear();
     }
 
+    // clear(true): mesh every chunk that's still loaded again (nothing else would ask for it)
+    if (m_forceRebuild) {
+        m_forceRebuild = false;
+        for (const auto& entry : world.chunks) m_needsMesh.insert(entry.first);
+    }
+
     for (const ChunkCoord& c : world.takeUnloadedChunks()) {
         m_meshes.erase(c);
         m_needsMesh.erase(c);

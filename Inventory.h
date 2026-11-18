@@ -27,7 +27,9 @@ public:
 
     // Drawing and input are forwarded to inventory.lua
     void renderCreativeInventory(GLFWwindow* window, sol::state& lua, float width, float height, GLuint uiProgram, GLuint texturedUIProgram);
-    void handleCreativeClick(double mx, double my, float width, float height);
+    // handle_creative_click(mx, my, W, H, button, shift): button = "left" | "right", shift = Shift held
+    void handleCreativeClick(double mx, double my, float width, float height,
+                             const std::string& button = "left", bool shift = false);
     void handleCreativeScroll(double yoffset);
     bool handleCreativeKey(int key, int action, int mods);
     bool handleCreativeChar(unsigned int codepoint);

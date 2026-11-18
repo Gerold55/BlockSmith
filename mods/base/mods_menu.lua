@@ -8,9 +8,12 @@
 --
 -- Engine functions used:
 --   engine.list_mods()        -> { { id, title, author, description, version, depends,
---                                    source, path, status, error, lua_files, is_folder }, ... }
+--                                    source, path, status, error, lua_files, is_folder,
+--                                    enabled, required, restart_needed, client }, ... }
+--                                client = true: one of the player's client mods (clientmods/,
+--                                id "client:<name>"): off until switched on here
 --                                status = "loaded" | "error" | "not_loaded"
---   engine.open_mods_folder()
+--   engine.open_mods_folder(["client"])   ("client" = the clientmods folder)
 --   engine.back_to_title()
 --
 -- C++ calls:
@@ -59,7 +62,7 @@ local Theme = {
     },
 
     -- Font metrics at scale 1.0 (PixeloidSans is about 20px tall at scale 1)
-    font = { char_w = 13, char_h = 20, base_scale = 0.5, y_offset = 0.75 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
     line_gap = 4,               -- extra space between lines, in GUI pixels
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
@@ -103,12 +106,18 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -182,13 +191,17 @@ end
 local function draw_button(b, mx, my, S, fs)
     local enabled = b.enabled ~= false
     local hovered = enabled and inside(mx, my, b.x, b.y, b.w, b.h)
-    rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S,
-         (not enabled) and C.button_off or (hovered and C.button_hover or C.button))
-    if enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not enabled) and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S,
+             (not enabled) and C.button_off or (hovered and C.button_hover or C.button))
+        if enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs,
                   (not enabled) and C.text_off or (hovered and C.text_hover or C.text), S)
@@ -238,12 +251,14 @@ local function layout(W, H)
     -- Enable/Disable button at the bottom of the details panel
     L.toggle = { x = L.infoX + 8 * S, y = L.infoY + L.infoH - bh - 8 * S, w = bw, h = bh }
 
-    local totalW = bw * 2 + gap
+    local totalW = bw * 3 + gap * 2
     local bx = math.floor((W - totalW) / 2)
     L.buttons = {
-        { x = bx,            y = buttonsY, w = bw, h = bh, label = "Open Mods Folder",
+        { x = bx,                  y = buttonsY, w = bw, h = bh, label = "Open Mods Folder",
           action = function() engine.open_mods_folder() end },
-        { x = bx + bw + gap, y = buttonsY, w = bw, h = bh, label = "Done",
+        { x = bx + bw + gap,       y = buttonsY, w = bw, h = bh, label = "Client Mods Folder",
+          action = function() engine.open_mods_folder("client") end },
+        { x = bx + (bw + gap) * 2, y = buttonsY, w = bw, h = bh, label = "Done",
           action = function() engine.back_to_title() end },
     }
     return L
@@ -297,6 +312,7 @@ local function draw_list(L, mx, my)
         local ty = ry + (rh - block) / 2
         text(fit(m.title, tw, fs), tx, ty, fs, m.enabled and C.name or C.detail, true, S)
         local sub = (m.author ~= "" and ("by " .. m.author) or m.source)
+        if m.client then sub = "Client mod" .. (m.author ~= "" and (" - by " .. m.author) or "") end
         text(fit(sub, tw, fs * 0.85), tx, ty + text_height(fs) + 2 * S, fs * 0.85, C.detail, false, S)
     end
 end
@@ -363,6 +379,10 @@ local function draw_info(L, mx, my)
 
     paragraph(m.description ~= "" and m.description or "No description.", C.text)
     if m.status == "error" then paragraph("Error: " .. m.error, C.error) end
+    if m.client then
+        paragraph("A client mod: it runs only in your game. Servers decide what client mods may do "
+                  .. "while you play there.", C.detail)
+    end
     paragraph(m.path, C.detail)
 end
 
@@ -392,8 +412,17 @@ function render_mods(W, H)
     elseif any_restart_needed() then
         text_centered("Restart the game to apply your changes.", W / 2, L.noteY, fs * 0.8, C.warning, S)
     else
-        text_centered("Mods load when the game starts - restart after adding or removing mods.",
-                      W / 2, L.noteY, fs * 0.8, C.detail, S)
+        -- Where client mods come from, so a missing one is easy to track down
+        local cm = engine.get_client_mods_folder and engine.get_client_mods_folder()
+        if cm and cm ~= "" then
+            local n = 0
+            for _, m in ipairs(state.mods) do if m.client then n = n + 1 end end
+            text_centered(fit("Client mods (" .. n .. "): " .. cm, W - 20 * S, fs * 0.8),
+                          W / 2, L.noteY, fs * 0.8, C.detail, S)
+        else
+            text_centered("Mods load when the game starts - restart after adding or removing mods.",
+                          W / 2, L.noteY, fs * 0.8, C.detail, S)
+        end
     end
 
     draw_list(L, mx, my)

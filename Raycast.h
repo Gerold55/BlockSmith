@@ -5,6 +5,25 @@
 #include <cmath>
 #include "World.h"
 #include "Block.h" // Make sure Block.h is included for BlockRegistry
+#include "DoorShape.h"
+#include <algorithm>
+
+// Does the ray hit this box (world coordinates)? Slab test.
+inline bool rayHitsBox(const glm::vec3& o, const glm::vec3& d, const glm::vec3& mn, const glm::vec3& mx) {
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int a = 0; a < 3; ++a) {
+        if (std::abs(d[a]) < 1e-8f) {
+            if (o[a] < mn[a] || o[a] > mx[a]) return false;
+            continue;
+        }
+        float ta = (mn[a] - o[a]) / d[a], tb = (mx[a] - o[a]) / d[a];
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+        if (t0 > t1) return false;
+    }
+    return true;
+}
 
 struct RaycastResult {
     bool hit = false;
@@ -39,8 +58,16 @@ inline RaycastResult raycastBlock(const glm::vec3& rayOrigin, const glm::vec3& r
         if (blockId != 0) {
             const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
             
-            // Only register a hit if the block is selectable (skips water, air, etc.)
-            if (prop.isSelectable) {
+            // Only register a hit if the block is selectable (skips water, air, etc.).
+            // Doors only where their panel is: you can reach past an open door.
+            bool hitShape = true;
+            if (prop.isSelectable && prop.pattern == "door") {
+                glm::vec3 mn, mx;
+                door::box(world.getMetadataAt({x, y, z}), mn, mx);
+                const glm::vec3 cell(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                hitShape = rayHitsBox(rayOrigin, rayDir, cell + mn, cell + mx);
+            }
+            if (prop.isSelectable && hitShape) {
                 result.hit = true;
                 result.blockPos = glm::ivec3(x, y, z);
                 result.faceNormal = normal;

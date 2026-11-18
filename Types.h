@@ -22,7 +22,10 @@ struct Vertex {
     float overlayLayer;
     float tintBase;
     float tintOverlay;
-    float faceShading;
+    float faceShading;      // face direction shading x ambient occlusion
+    // Light at this corner (0..1): sunlight, then red, green, blue block light (Light.h).
+    // Smoothed over the cells around the corner. Only chunk meshes fill these in.
+    float lightSky = 1.0f, lightR = 0.0f, lightG = 0.0f, lightB = 0.0f;
 };
 
 struct FaceDefinition {
@@ -58,6 +61,34 @@ struct BlockProperty {
     bool hasGravity = false; // Enabled for falling blocks like sand and gravel
     bool in_creative = true; // Controls whether the block appears in the creative inventory menu
     std::string pattern = "cube"; // Controls rendering style (e.g. "cube", "plantlike", "door", "custom_model")
+
+    // --- Survival digging (used when the game isn't in creative mode) ---
+    float hardness = -2.0f;       // seconds to dig by hand; 0 = instant, -1 = unbreakable,
+                                  // -2 = not set (guessed from the name, see blockHardness)
+    std::string tool;             // tool type that digs it fastest: "pickaxe", "axe", "shovel"...
+    bool needsTool = false;       // without that tool: slow, and drops nothing (stone, ores)
+    bool dropsSet = false;        // false = drops itself
+    std::string drops;            // item it drops when dug ("" = nothing)
+    std::string pick;             // item pick block gives ("" = the block itself), e.g. crops -> seeds
+    // --- Biome colour: -1 none, 0 grass colours, 1 foliage colours (register_block's
+    //     biome_tint = "grass" | "foliage" | "none"). Replaces the tint colour where the
+    //     block is tinted. ---
+    int biomeTint = -1;
+
+    // --- Sounds the engine plays by itself (Luanti's `sounds`): "" = none ---
+    struct SoundSpec { std::string name; float gain = 1.0f; float pitch = 1.0f; };
+    SoundSpec soundFootstep;      // walking on it (and landing)
+    SoundSpec soundDig;           // each hit while digging it
+    SoundSpec soundDug;           // when it breaks
+    SoundSpec soundPlace;         // when it's placed
+    // --- Light (Light.h). register_block's light / light_color / light_absorb / light_filter ---
+    bool lightSet = false;              // false = guessed from the name (torch, lava, glowstone...)
+    uint8_t lightEmit[3] = {0, 0, 0};   // light it gives off, per colour (0..15 each)
+    int lightAbsorb = -1;               // light lost per block passing through (at least 1; sunlight straight down loses only this; -1 = guess: water 1, leaves 1)
+    float lightFilter[3] = {1.0f, 1.0f, 1.0f};   // colour let through (stained glass), 0..1 each
+    // --- If this is a tool ---
+    std::string toolType;         // "pickaxe", "axe", "shovel", "sword"... ("" = not a tool)
+    float toolSpeed = 1.0f;       // how many times faster it digs blocks of its type
 
     // --- Inventory image (like Luanti's inventory_image) ---
     // If set, the creative inventory and hotbar show this flat image instead of the

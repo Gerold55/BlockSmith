@@ -36,7 +36,7 @@ local Theme = {
     },
 
     -- Keep these in sync with inventory.lua so text looks the same everywhere
-    font = { char_w = 13, char_h = 14, base_scale = 0.5, y_offset = 0.8 },
+    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
     button_w   = 200,
@@ -55,14 +55,51 @@ local Theme = {
 
 local Title = "Game Menu"
 
+-- Multiplayer: "Host Game" opens this world to other players (its label and the status
+-- line below the buttons are updated every frame from engine.get_network_info()).
+local HostButton
+HostButton = { label = "Host Game", action = function()
+    local info = engine.get_network_info()
+    if info.hosting then
+        engine.stop_hosting()
+    else
+        local ok, err = engine.host_game()
+        if ok == false then HostButton.error = err else HostButton.error = nil end
+    end
+end }
+
+local QuitButton = { label = "Quit to Title", action = function() engine.quit_to_menu() end }
+
 local Buttons = {
     { label = "Back to Game",  action = function() engine.resume() end },
     { gap = 12 },
+    HostButton,
     { label = "Options...",    action = function() engine.open_settings() end },
     { gap = 12 },
-    { label = "Quit to Title", action = function() engine.quit_to_menu() end },
+    QuitButton,
     { label = "Quit Game",     action = function() engine.quit() end },
 }
+
+-- Text shown under the buttons (nil = nothing)
+local function update_network_buttons()
+    if not engine.get_network_info then return nil end
+    local info = engine.get_network_info()
+    if info.joined then
+        HostButton.label = "Playing on a server"
+        HostButton.disabled = true
+        QuitButton.label = "Disconnect"
+        return "Connected to " .. (info.address or "a server") .. " - " .. info.players .. " online", false
+    end
+    HostButton.disabled = false
+    QuitButton.label = "Quit to Title"
+    if info.hosting then
+        HostButton.label = "Stop Hosting"
+        return "Hosting on port " .. info.port .. " - " .. info.players .. " online. Friends join with your IP address.", false
+    end
+    HostButton.label = "Host Game"
+    if HostButton.error then return HostButton.error, true end
+    return nil
+end
 
 -- ===========================================================================
 -- HELPERS
@@ -81,12 +118,18 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale) return #str * Theme.font.char_w * scale end
-local function text_height(scale) return Theme.font.char_h * scale end
+local function text_width(str, scale)
+    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    return #str * Theme.font.char_w * scale
+end
+local function text_height(scale)
+    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    return Theme.font.char_h * scale
+end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, S)
-    y = y + Theme.font.char_h * scale * Theme.font.y_offset
+    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
     ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)  -- shadow
     ui.draw_text(str, x, y, scale, c[1], c[2], c[3], c[4] or 1)
 end
@@ -146,12 +189,16 @@ local function draw_button(it, hovered, S, fs)
     local fill = b.disabled and C.button_off or (hovered and C.button_hover or C.button)
     local outline = (hovered and not b.disabled) and C.outline_hover or C.outline
 
-    rect(x, y, w, h, outline)                                   -- outline
-    rect(x + S, y + S, w - 2 * S, h - 2 * S, fill)              -- body
-    if not b.disabled then
-        rect(x + S, y + S, w - 2 * S, S, C.bevel_light)         -- top highlight
-        rect(x + S, y + 2 * S, S, h - 3 * S, C.bevel_light)     -- left highlight
-        rect(x + S, y + h - 2 * S, w - 2 * S, S, C.bevel_dark)  -- bottom shadow
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = (b.disabled and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(x, y, w, h, state, b.danger)) then
+        rect(x, y, w, h, outline)                                   -- outline
+        rect(x + S, y + S, w - 2 * S, h - 2 * S, fill)              -- body
+        if not b.disabled then
+            rect(x + S, y + S, w - 2 * S, S, C.bevel_light)         -- top highlight
+            rect(x + S, y + 2 * S, S, h - 3 * S, C.bevel_light)     -- left highlight
+            rect(x + S, y + h - 2 * S, w - 2 * S, S, C.bevel_dark)  -- bottom shadow
+        end
     end
 
     local tc = b.disabled and C.text_off or (hovered and C.text_hover or C.text)
@@ -168,12 +215,20 @@ function render_pause_menu(W, H)
     local L = compute_layout(W, H)
     local mx, my = ui.get_mouse()
 
+    local status, is_error = update_network_buttons()
+
     rect(0, 0, W, H, C.dim)
     text_centered(Title, L.cx, L.titleY, L.fs, C.title, L.S)
 
     for _, it in ipairs(L.items) do
         local hovered = inside(mx, my, it.x, it.y, it.w, it.h)
         draw_button(it, hovered, L.S, L.fs)
+    end
+
+    if status and #L.items > 0 then
+        local last = L.items[#L.items]
+        local color = is_error and { 1.0, 0.45, 0.40, 1.0 } or { 0.75, 0.75, 0.75, 1.0 }
+        text_centered(status, L.cx, last.y + last.h + 10 * L.S, L.fs * 0.85, color, L.S)
     end
 end
 

@@ -14,6 +14,10 @@ public:
 
     GLuint cubemapTexture = 0;
 
+    // Stars (set from Lua with sky.set_stars): chance per sky cell (0..1) and brightness (0 = off)
+    float starDensity = 0.06f;
+    float starBrightness = 0.9f;
+
 private:
     GLuint VAO = 0;
     GLuint VBO = 0;

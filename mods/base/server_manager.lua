@@ -131,11 +131,15 @@ local function draw_button(b, mx, my, S, fs)
               or (b.danger and (hovered and C.danger_hov or C.danger))
               or (b.selected and C.tab_active)
               or (hovered and C.button_hov or C.button)
-    rect(b.x, b.y, b.w, b.h, hovered and C.outline_hov or C.outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-    if enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not enabled) and "disabled") or (b.selected and "selected") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hov or C.outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
+        if enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
     local tc = (not enabled) and C.text_off or (hovered and C.text_hov or C.text)
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs, tc, S)
@@ -220,24 +224,6 @@ local function server_state(s)
     return "offline", st
 end
 
-local function normalize_world(w)
-    return (w or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
-end
-
--- Returns the conflicting server entry if another running/starting profile uses the same world
-local function running_world_conflict(target_folder, target_world)
-    local norm = normalize_world(target_world)
-    if norm == "" then return nil end
-    for _, other in ipairs(SM.servers) do
-        if other.folder ~= target_folder
-           and normalize_world(other.cfg.world) == norm
-           and server_state(other) ~= "offline" then
-            return other
-        end
-    end
-    return nil
-end
-
 local function selected_server() return SM.selected and SM.servers[SM.selected] or nil end
 
 local function load_mods()
@@ -248,8 +234,9 @@ local function open_editor(folder)
     SM.folder = folder
     SM.cfg = engine.get_server_profile(folder)
     SM.disabled = {}
-    for id in (SM.cfg.disabled_mods or ""):gmatch("[^,]+") do
-        id = id:gsub("^%s+", ""):gsub("%s+$", "")
+    for entry in (SM.cfg.disabled_mods or ""):gmatch("[^,]+") do
+        -- (a copy: Lua 5.5 doesn't allow assigning to a for loop's own variable)
+        local id = entry:gsub("^%s+", ""):gsub("%s+$", "")
         if id ~= "" then SM.disabled[id] = true end
     end
     load_mods()
@@ -275,6 +262,7 @@ local SETTINGS = {
     { key = "view_distance", label = "View distance",     kind = "number", min = 2, max = 10 },
     { key = "welcome",       label = "Welcome message",   kind = "text", max = 120 },
     { key = "whitelist",     label = "Whitelist only",    kind = "toggle" },
+    { key = "gamemode",      label = "Game mode",         kind = "mode" },
 }
 
 local function setting_value(key) return SM.cfg[key] or "" end
@@ -333,14 +321,6 @@ local function list_layout(W, H)
                     SM.starting[sel.folder] = nil
                     SM.message = "Stopping '" .. sel.folder .. "' (it saves first)..."
                 else
-                    refresh()
-                    sel = selected_server()
-                    if not sel then return end
-                    local conflict = running_world_conflict(sel.folder, sel.cfg.world)
-                    if conflict then
-                        SM.message = "World '" .. (sel.cfg.world or "?") .. "' is already running in '" .. conflict.folder .. "'"
-                        return
-                    end
                     local ok, err = engine.start_server_profile(sel.folder)
                     if ok == false then SM.message = err
                     else SM.starting[sel.folder] = ui.get_time(); SM.message = nil end
@@ -521,16 +501,9 @@ local function edit_layout(W, H)
                 if save_editor() then
                     refresh()
                     local s = selected_server()
-                    local is_running = s and server_state(s) ~= "offline"
-                    local conflict = s and running_world_conflict(s.folder, s.cfg.world) or nil
+                    local running = s and server_state(s) ~= "offline"
                     SM.mode = "list"
-                    if is_running then
-                        SM.message = "Saved - restart the server (Stop, then Start) to use the changes"
-                    elseif conflict then
-                        SM.message = "Saved - stop '" .. conflict.folder .. "' before starting (same world '" .. (s.cfg.world or "?") .. "')"
-                    else
-                        SM.message = nil
-                    end
+                    SM.message = running and "Saved - restart the server (Stop, then Start) to use the changes" or nil
                 end
             end },
             { label = "Icon Folder", action = function() engine.open_server_profile_folder(SM.folder) end },
@@ -568,8 +541,8 @@ local function setting_widgets(L, item, rx, ry, rw, rh)
     local by = ry + (rh - bh) / 2
     local fw = math.min(Theme.field_w * S, rw * 0.62)
     if item.kind == "text" then return { field = { x = rx + rw - fw, y = by, w = fw, h = bh } } end
-    if item.kind == "toggle" or item.kind == "game" then
-        local w = (item.kind == "game") and fw or 60 * S
+    if item.kind == "toggle" or item.kind == "game" or item.kind == "mode" then
+        local w = (item.kind == "game") and fw or (item.kind == "mode") and 90 * S or 60 * S
         return { button = { x = rx + rw - w, y = by, w = w, h = bh } }
     end
     if item.kind == "number" then
@@ -615,6 +588,7 @@ local function render_edit(W, H)
                     draw_field(w.field, setting_value(item.key), SM.focus == item.key, S, fs)
                 elseif w.button then
                     local label = (item.kind == "game") and ("< " .. game_title(SM.cfg.game) .. " >")
+                               or (item.kind == "mode") and (((SM.cfg.gamemode == "creative") and "Creative" or "Survival"))
                                or ((SM.cfg.whitelist == "true") and "On" or "Off")
                     draw_button({ x = w.button.x, y = w.button.y, w = w.button.w, h = w.button.h, label = fit(label, w.button.w - 6 * S, fs) }, mx, my, S, fs)
                 elseif w.plus then
@@ -685,6 +659,8 @@ local function click_edit(mx, my, W, H)
             elseif w.button and inside(mx, my, w.button.x, w.button.y, w.button.w, w.button.h) then
                 if item.kind == "game" then
                     cycle_game((mx < w.button.x + w.button.w / 2) and -1 or 1)
+                elseif item.kind == "mode" then
+                    SM.cfg.gamemode = (SM.cfg.gamemode == "creative") and "survival" or "creative"
                 else
                     SM.cfg.whitelist = (SM.cfg.whitelist == "true") and "false" or "true"
                 end

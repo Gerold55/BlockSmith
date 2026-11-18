@@ -1,7 +1,11 @@
 #include "Model.h"
+#include <unordered_map>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -89,10 +93,10 @@ void Mesh::draw() const {
 // position, then rotate/scale around the pivot (file pose first, then the Lua animation rotation)
 glm::mat4 Bone::getLocalTransform() const {
     glm::mat4 m(1.0f);
-    m = glm::translate(m, position + pivot);
+    m = glm::translate(m, restPosition + position + pivot);   // file's rest position + animation offset
     m *= glm::mat4_cast(restRotation);
     m *= eulerMatrix(rotation);
-    m = glm::scale(m, scale);
+    m = glm::scale(m, scale * animScale);
     m = glm::translate(m, -pivot);
     return m;
 }
@@ -255,6 +259,7 @@ void appendCube(const json& cube, float texW, float texH, bool boneMirror, std::
 } // namespace
 
 void AnimatedModel::loadFromJson(const std::string& filepath) {
+    m_hierarchyState = 0;   // bones may be added: work the hierarchy check out again
     std::ifstream file(filepath);
     if (!file.is_open()) {
         std::cerr << "[Model Error] Failed to open JSON model file: " << filepath << std::endl;
@@ -313,17 +318,39 @@ void AnimatedModel::loadFromJson(const std::string& filepath) {
             parents.emplace_back(bone, bData.value("parent", std::string()));
         }
 
-        // Pass 2: link parents (a child may be listed before its parent)
+        // Each bone's parent (the bone that "parent" names; none for a root or a bad name)
+        std::unordered_map<const Bone*, Bone*> parentOf;
         for (auto& [bone, parentName] : parents) {
             auto it = boneMap.find(parentName);
-            if (!parentName.empty() && it != boneMap.end() && it->second != bone) {
-                it->second->children.push_back(bone);
-            } else {
-                rootBones.push_back(bone);
+            if (!parentName.empty() && it != boneMap.end() && it->second != bone) parentOf[bone.get()] = it->second.get();
+        }
+        // Before any bone owns another: refuse a loop in the "parent" names (a is b's parent and b
+        // is a's). Linked, it would be a ring of bones owning each other - never freed, and
+        // endless to draw. Following parents from a bone must end within the number of bones.
+        for (auto& [bone, parentName] : parents) {
+            const Bone* b = bone.get();
+            for (size_t steps = 0; b && steps <= parents.size(); ++steps) {
+                const auto p = parentOf.find(b);
+                b = p == parentOf.end() ? nullptr : p->second;
+            }
+            if (b) {                                       // still going: it went round a loop
+                std::cerr << "[Model Error] " << filepath << ": bone '" << bone->name << "' is in a loop of "
+                          << "\"parent\" names (a bone can't be its own ancestor) - model not loaded" << std::endl;
+                boneMap.clear();
+                rootBones.clear();
+                return;                                    // `loaded` stays false
             }
         }
 
+        // Pass 2: link parents (a child may be listed before its parent)
+        for (auto& [bone, parentName] : parents) {
+            const auto p = parentOf.find(bone.get());
+            if (p != parentOf.end()) p->second->children.push_back(bone);
+            else rootBones.push_back(bone);
+        }
+
         loaded = true;
+        m_hierarchyState = 1;                              // checked above: no loops
         std::cout << "[Model] Loaded JSON model: " << filepath << " (" << boneMap.size() << " bones)" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[Model Error] Could not read JSON model " << filepath << ": " << e.what() << std::endl;
@@ -437,7 +464,7 @@ void parseNode(std::ifstream& f, std::streamoff end, const std::shared_ptr<Bone>
     const float rw = readFloat(f), rx = readFloat(f), ry = readFloat(f), rz = readFloat(f);   // w first
 
     bone->name = name;
-    bone->position = pos;
+    bone->restPosition = pos;   // the node's translation: kept apart from the animation offset
     bone->scale = scl;
     bone->restRotation = glm::normalize(glm::quat(rw, -rx, -ry, rz));   // mirror for the Z flip
 
@@ -458,6 +485,7 @@ void parseNode(std::ifstream& f, std::streamoff end, const std::shared_ptr<Bone>
 } // namespace
 
 void AnimatedModel::loadFromB3D(const std::string& filepath) {
+    m_hierarchyState = 0;   // bones may be added: work the hierarchy check out again
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "[Model Error] Failed to open .b3d binary file: " << filepath << std::endl;
@@ -493,4 +521,263 @@ void AnimatedModel::loadFromB3D(const std::string& filepath) {
     for (const auto& [n, b] : boneMap) meshCount += static_cast<int>(b->meshes.size());
     std::cout << "[Model] Loaded .b3d model: " << filepath << " (" << boneMap.size() << " nodes, "
               << meshCount << " meshes" << (textureHint.empty() ? "" : ", texture " + textureHint) << ")" << std::endl;
+}
+
+bool AnimatedModel::hierarchyIsAcyclic(std::string* cycleBone) const {
+    // Depth-first over every bone (boneMap holds all of them, rootBones the tops), without
+    // recursion: 0 = not seen, 1 = on the current path, 2 = finished. Meeting a bone that's on
+    // the path again means a loop.
+    std::unordered_map<const Bone*, uint8_t> state;
+    std::vector<const Bone*> starts;
+    for (const auto& entry : boneMap) if (entry.second) starts.push_back(entry.second.get());
+    for (const auto& b : rootBones) if (b) starts.push_back(b.get());
+
+    struct Frame { const Bone* bone; size_t next; };
+    std::vector<Frame> path;
+    for (const Bone* start : starts) {
+        if (state[start] != 0) continue;
+        state[start] = 1;
+        path.push_back({ start, 0 });
+        while (!path.empty()) {
+            Frame& top = path.back();
+            if (top.next < top.bone->children.size()) {
+                const Bone* child = top.bone->children[top.next++].get();
+                if (!child) continue;
+                uint8_t& s = state[child];
+                if (s == 1) {                                 // back to a bone on this path
+                    if (cycleBone) *cycleBone = child->name;
+                    return false;
+                }
+                if (s == 0) { s = 1; path.push_back({ child, 0 }); }   // (`top` not used after this)
+            } else {
+                state[top.bone] = 2;
+                path.pop_back();
+            }
+        }
+    }
+    return true;
+}
+
+// The whole-hierarchy check, done once (not on every arm draw) and redone after a load
+bool AnimatedModel::hierarchyOk() const {
+    if (m_hierarchyState == 0) m_hierarchyState = hierarchyIsAcyclic(&m_cycleBone) ? 1 : 2;
+    return m_hierarchyState == 1;
+}
+
+bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world) {
+    if (!loaded) return false;
+    auto bone = getBone(name);
+    if (!bone) return false;
+    // A bone that is its own ancestor would make the pose pass and the drawing below go round
+    // forever: check the whole hierarchy before touching anything, and refuse a looped one
+    if (!hierarchyOk()) {
+        if (!m_reportedCycle) {
+            std::cerr << "[Model] Bone '" << m_cycleBone << "' is its own ancestor (a loop in the bones' parents): "
+                      << "not drawing bone '" << name << "'" << std::endl;
+            m_reportedCycle = true;
+        }
+        return false;
+    }
+    // The file's pose: animation offsets, rotations and scales are cleared for the subtree (rest
+    // positions stay) and put back afterwards
+    struct Saved { Bone* b; glm::vec3 r, p, s; };
+    std::vector<Saved> saved;
+    std::vector<Bone*> stack{ bone.get() };
+    while (!stack.empty()) {
+        Bone* b = stack.back();
+        stack.pop_back();
+        saved.push_back({ b, b->rotation, b->position, b->animScale });
+        b->rotation = glm::vec3(0.0f);
+        b->position = glm::vec3(0.0f);
+        b->animScale = glm::vec3(1.0f);
+        for (auto& c : b->children) stack.push_back(c.get());
+    }
+
+    glUseProgram(shaderProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture != 0 ? texture : whiteTexture());
+    const GLint texLoc = glGetUniformLocation(shaderProgram, "texture_diffuse1");
+    if (texLoc >= 0) glUniform1i(texLoc, 0);
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    // Recentre only the selected bone: cancel its own rest position and pivot so its pivot point
+    // (the shoulder, for an arm) lands at the origin of `world`. Bones under it keep their rest
+    // positions, so the subtree keeps its shape.
+    const glm::mat4 root = glm::translate(glm::scale(world, glm::vec3(scale)), -(bone->pivot + bone->restPosition));
+    drawBoneRecursive(bone, modelLoc, root);
+
+    for (const Saved& sv : saved) { sv.b->rotation = sv.r; sv.b->position = sv.p; sv.b->animScale = sv.s; }
+    return true;
+}
+
+// ===========================================================================
+// Animations
+// ===========================================================================
+
+// (rest positions from the file stay: only what animations and Lua add is cleared)
+void AnimatedModel::resetPose() {
+    for (auto& [name, bone] : boneMap) {
+        bone->rotation = glm::vec3(0.0f);
+        bone->position = glm::vec3(0.0f);
+        bone->animScale = glm::vec3(1.0f);
+    }
+}
+
+namespace {
+
+// A number, or a number written as text. Molang expressions ("math.sin(...)") aren't
+// supported: they count as 0 and are reported once per file.
+float animNumber(const json& v, bool& unsupported) {
+    if (v.is_number()) return v.get<float>();
+    if (v.is_string()) {
+        const std::string s = v.get<std::string>();
+        char* end = nullptr;
+        const float f = std::strtof(s.c_str(), &end);
+        if (end && end != s.c_str() && *end == '\0') return f;
+        unsupported = true;
+    }
+    return 0.0f;
+}
+
+glm::vec3 animVec(const json& v, bool& unsupported) {
+    if (v.is_array() && v.size() >= 3) return glm::vec3(animNumber(v[0], unsupported), animNumber(v[1], unsupported), animNumber(v[2], unsupported));
+    if (v.is_array() && v.size() == 1) { const float f = animNumber(v[0], unsupported); return glm::vec3(f); }
+    if (v.is_number() || v.is_string()) { const float f = animNumber(v, unsupported); return glm::vec3(f); }
+    return glm::vec3(0.0f);
+}
+
+// "rotation": [x, y, z]   or   { "0.0": [x, y, z], "0.5": { "pre": [...], "post": [...], "lerp_mode": "catmullrom" } }
+AnimChannel readChannel(const json& j, bool& unsupported) {
+    AnimChannel ch;
+    if (j.is_object() && !j.contains("pre") && !j.contains("post")) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            AnimKey k;
+            k.time = std::strtof(it.key().c_str(), nullptr);
+            const json& v = it.value();
+            if (v.is_object()) {
+                k.post = animVec(v.contains("post") ? v["post"] : v.value("pre", json::array()), unsupported);
+                k.pre = v.contains("pre") ? animVec(v["pre"], unsupported) : k.post;
+                const std::string mode = v.value("lerp_mode", std::string("linear"));
+                k.lerp = mode == "catmullrom" ? 1 : mode == "step" ? 2 : 0;
+            } else {
+                k.pre = k.post = animVec(v, unsupported);
+            }
+            ch.keys.push_back(k);
+        }
+        std::sort(ch.keys.begin(), ch.keys.end(), [](const AnimKey& a, const AnimKey& b) { return a.time < b.time; });
+    } else {
+        AnimKey k;
+        k.pre = k.post = animVec(j.is_object() ? j.value("post", j.value("pre", json::array())) : j, unsupported);
+        ch.keys.push_back(k);
+    }
+    return ch;
+}
+
+glm::vec3 catmullRom(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3, float t) {
+    const float t2 = t * t, t3 = t2 * t;
+    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+} // namespace
+
+glm::vec3 AnimChannel::sample(float t) const {
+    if (keys.empty()) return glm::vec3(0.0f);
+    // "pre" is the value before a key, "post" from it on: before the first key its pre, at or after
+    // the last key its post (a single key too). Constant channels have pre == post anyway.
+    if (t < keys.front().time) return keys.front().pre;
+    if (t >= keys.back().time) return keys.back().post;
+    size_t i = 0;
+    while (i + 1 < keys.size() && keys[i + 1].time <= t) ++i;
+    const AnimKey& a = keys[i];
+    const AnimKey& b = keys[i + 1];
+    const float span = b.time - a.time;
+    const float f = span > 0.0f ? (t - a.time) / span : 1.0f;
+    if (a.lerp == 2) return a.post;                                  // step: hold until the next key
+    if (a.lerp == 1 || b.lerp == 1) {                               // smooth curve through the neighbours
+        const glm::vec3 p0 = i > 0 ? keys[i - 1].post : a.post;
+        const glm::vec3 p3 = i + 2 < keys.size() ? keys[i + 2].pre : b.pre;
+        return catmullRom(p0, a.post, b.pre, p3, f);
+    }
+    return glm::mix(a.post, b.pre, f);
+}
+
+void ModelAnimation::apply(AnimatedModel& model, float time, float weight) const {
+    if (length > 0.0f) {
+        if (loop) { time = std::fmod(time, length); if (time < 0.0f) time += length; }
+        else time = std::clamp(time, 0.0f, length);
+    }
+    weight = std::clamp(weight, 0.0f, 1.0f);
+    for (const BoneAnimation& ba : bones) {
+        auto bone = model.getBone(ba.bone);
+        if (!bone) continue;
+        if (!ba.rotation.empty()) bone->rotation = glm::mix(bone->rotation, ba.rotation.sample(time), weight);
+        // Positions are in pixels (16 per block), like the model's cubes
+        if (!ba.position.empty()) bone->position = glm::mix(bone->position, ba.position.sample(time) / 16.0f, weight);
+        if (!ba.scale.empty()) bone->animScale = glm::mix(bone->animScale, ba.scale.sample(time), weight);
+    }
+}
+
+bool AnimationSet::loadFromFile(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "[Animation] Can't open " << path << std::endl;
+        return false;
+    }
+    json root;
+    try {
+        in >> root;
+    } catch (const std::exception& e) {
+        std::cerr << "[Animation] " << path << " isn't valid JSON: " << e.what() << std::endl;
+        return false;
+    }
+    if (!root.contains("animations") || !root["animations"].is_object()) {
+        std::cerr << "[Animation] " << path << " has no \"animations\" section" << std::endl;
+        return false;
+    }
+    bool unsupported = false;
+    for (auto it = root["animations"].begin(); it != root["animations"].end(); ++it) {
+        const json& a = it.value();
+        auto anim = std::make_shared<ModelAnimation>();
+        anim->name = it.key();
+        if (a.contains("loop")) anim->loop = a["loop"].is_boolean() ? a["loop"].get<bool>() : false;   // "hold_on_last_frame" = hold
+        float last = 0.0f;
+        if (a.contains("bones") && a["bones"].is_object()) {
+            for (auto b = a["bones"].begin(); b != a["bones"].end(); ++b) {
+                BoneAnimation ba;
+                ba.bone = b.key();
+                const json& bj = b.value();
+                if (bj.contains("rotation")) ba.rotation = readChannel(bj["rotation"], unsupported);
+                if (bj.contains("position")) ba.position = readChannel(bj["position"], unsupported);
+                if (bj.contains("scale")) ba.scale = readChannel(bj["scale"], unsupported);
+                for (const AnimChannel* c : { &ba.rotation, &ba.position, &ba.scale }) {
+                    if (!c->keys.empty()) last = std::max(last, c->keys.back().time);
+                }
+                anim->bones.push_back(std::move(ba));
+            }
+        }
+        anim->length = a.contains("animation_length") && a["animation_length"].is_number()
+                     ? a["animation_length"].get<float>() : last;
+        animations.push_back(anim);
+    }
+    if (unsupported) {
+        std::cout << "[Animation] " << path << " uses Molang expressions; those values count as 0 (use plain numbers)" << std::endl;
+    }
+    std::cout << "[Animation] Loaded " << animations.size() << " animation(s) from " << path << std::endl;
+    return !animations.empty();
+}
+
+std::shared_ptr<ModelAnimation> AnimationSet::get(const std::string& name) const {
+    if (name.empty()) return animations.empty() ? nullptr : animations.front();
+    for (const auto& a : animations) if (a->name == name) return a;
+    // Short names work too: "walk" finds "animation.player.walk"
+    for (const auto& a : animations) {
+        const std::string& n = a->name;
+        if (n.size() > name.size() && n.compare(n.size() - name.size(), name.size(), name) == 0 && n[n.size() - name.size() - 1] == '.') return a;
+    }
+    return nullptr;
+}
+
+std::vector<std::string> AnimationSet::names() const {
+    std::vector<std::string> out;
+    for (const auto& a : animations) out.push_back(a->name);
+    return out;
 }

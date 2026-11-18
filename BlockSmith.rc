@@ -1,0 +1,4 @@
+// Windows resources: the BlockSmith icon for BlockSmith.exe and BlockSmithServer.exe
+// (Explorer, shortcuts, the taskbar). GLFW uses the icon named GLFW_ICON for the game's
+// window, so the title bar and taskbar button show it too.
+GLFW_ICON ICON "icons/blocksmith.ico"

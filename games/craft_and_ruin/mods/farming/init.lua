@@ -11,7 +11,8 @@ engine.register_block("farmland_dry", 0.5, 0.4, 0.3, {
     transparent = false,
     walkable = true,
     pattern = "cube",
-    in_creative = true
+    in_creative = true,
+    pick = "dirt",                       -- like Minecraft
 })
 
 engine.register_block("farmland_wet", 0.35, 0.28, 0.18, {
@@ -22,21 +23,26 @@ engine.register_block("farmland_wet", 0.35, 0.28, 0.18, {
     transparent = false,
     walkable = true,
     pattern = "cube",
-    in_creative = true
+    in_creative = true,
+    pick = "dirt",                       -- like Minecraft
 })
 
 -- 2. Register Crops across Growth Stages (Hidden from Creative Inventory)
 engine.register_block("wheat_stage_0", 0.4, 0.8, 0.2, "cw_farming_wheat_1.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
+    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
 })
 engine.register_block("wheat_stage_1", 0.5, 0.9, 0.2, "cw_farming_wheat_2.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
+    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
 })
 engine.register_block("wheat_stage_2", 0.7, 0.95, 0.15, "cw_farming_wheat_3.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
+    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
 })
 engine.register_block("wheat_ripe", 0.95, 0.9, 0.1, "cw_farming_wheat_4.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false
+    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
+    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
 })
 
 -- Register Seeds and Harvested Wheat Item (Visible in Creative)
@@ -53,16 +59,21 @@ engine.register_block("scythe", 0.7, 0.7, 0.7, "scythe.png", nil, {
 })
 
 -- 3. Hoe Tilling Interaction
+local previous_hoe = on_use_hoe
 function on_use_hoe(x, y, z, block_name)
     if block_name == "grass" or block_name == "dirt" then
         engine.set_block(x, y, z, "farmland_dry")
         return true 
     end
+    if previous_hoe then return previous_hoe(x, y, z, block_name) end
     return false
 end
 
 -- 4. Right-Click Interactions (Planting & Hand Harvesting)
-function on_right_click_block(x, y, z, block_name, held_item)
+-- Keeps any other mod's right-click working (doors, buckets...): what farming doesn't use is
+-- passed on to the version that was there before
+local previous_right_click = on_right_click_block
+function on_right_click_block(x, y, z, block_name, held_item, ...)
     -- Planting seeds on farmland
     if block_name == "farmland_dry" or block_name == "farmland_wet" then
         local above_block = engine.get_block_name(x, y + 1, z)
@@ -79,12 +90,15 @@ function on_right_click_block(x, y, z, block_name, held_item)
         return true
     end
 
+    if previous_right_click then return previous_right_click(x, y, z, block_name, held_item, ...) end
     return false
 end
 
 -- 5. Scythe Interaction Hook (Called when left or right-clicking with a scythe)
 -- You can wire this into your C++ block break / left-click handler if checking held items!
+local previous_scythe = on_use_scythe
 function on_use_scythe(x, y, z, block_name)
+    if block_name ~= "wheat_ripe" and previous_scythe then return previous_scythe(x, y, z, block_name) end
     if block_name == "wheat_ripe" then
         -- Instantly harvest the mature crop and reset it back to stage 0
         -- Without destroying the underlying farmland or requiring manual replanting!

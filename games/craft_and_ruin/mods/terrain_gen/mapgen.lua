@@ -575,3 +575,37 @@ function generate_chunk(chunk, chunk_x, chunk_z)
 end
 
 print("[Mapgen] Loaded Minecraft-Style Blended Biomes with swamps successfully.")
+
+-- ===========================================================================
+-- Biome colours (Minecraft-style). The engine asks these for every few blocks of each new
+-- chunk and blends in between; grass (and leaves, if tinted) take the colour of the place.
+-- Uses the same temperature / humidity as the terrain, so colours follow the biomes.
+-- ===========================================================================
+local function clamp01(v) return math.max(0, math.min(1, v)) end
+local function mix(a, b, t) return { a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t } end
+
+local GRASS = {
+    cold_dry = { 130, 190, 120 },  -- cool, slightly blue
+    cold_wet = { 100, 190, 110 },
+    hot_dry  = { 190, 190,  80 },  -- savanna / desert edge: yellowish
+    hot_wet  = {  80, 215,  55 },  -- jungle: vivid
+    swamp    = { 106, 112,  57 },  -- dark olive
+}
+
+function get_grass_color(x, z)
+    local _, temp, hum = get_biome_parameters(x, z)
+    temp, hum = clamp01(temp), clamp01(hum)
+    local cold = mix(GRASS.cold_dry, GRASS.cold_wet, hum)
+    local hot = mix(GRASS.hot_dry, GRASS.hot_wet, hum)
+    local c = mix(cold, hot, temp)
+    -- swamps (the same blend the terrain uses)
+    local swamp = clamp01((hum - 0.55) / 0.15) * clamp01((temp - 0.35) / 0.15)
+    c = mix(c, GRASS.swamp, swamp * 0.8)
+    return c[1], c[2], c[3]
+end
+
+-- Leaves: the same colours, a little darker (only for leaves registered with tint = true)
+function get_foliage_color(x, z)
+    local r, g, b = get_grass_color(x, z)
+    return r * 0.8, g * 0.85, b * 0.8
+end
