@@ -328,6 +328,9 @@ engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
 
 **Saving and drawing:**
 - `engine.get_storage(key)` / `set_storage(key, text)` keep text with the world, like Luanti's mod storage.
+
+**Saving and drawing:**
+- `engine.get_storage(key)` / `set_storage(key, text)` keep text with the world, like Luanti's mod storage.
 - `render_hud(W, H)` draws your HUD. `ui.draw_image(path, x, y, w, h [, u0, v0, u1, v1])` draws a picture, and `hotbar.get_rect(W, H)` says where the hotbar is.
 
 **Your own inventory screen:**
