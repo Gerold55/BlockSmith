@@ -282,13 +282,20 @@ void World::loadQueuedChunks(sol::state& lua) {
         collectGenerated();
         const size_t maxInFlight = static_cast<size_t>(m_generator->threadCount()) * 3;
         std::vector<ChunkCoord> notYet;
+        std::shared_ptr<ChunkData> scratchChunk;
+
         while (consumed < m_loadQueue.size()) {
+            if (elapsedMs(start) >= m_loadBudgetMs) break;
+
             const ChunkCoord c = m_loadQueue[consumed++];
             if (chunks.count(c) || m_generating.count(c)) continue;
-            auto chunk = std::make_shared<ChunkData>();
-            if (loadChunkFromDisk(c.first, c.second, *chunk)) {
-                addLoadedChunk(c.first, c.second, std::move(chunk));
-                if (elapsedMs(start) >= m_loadBudgetMs) break;
+
+            if (!scratchChunk) {
+                scratchChunk = std::make_shared<ChunkData>();
+            }
+
+            if (loadChunkFromDisk(c.first, c.second, *scratchChunk)) {
+                addLoadedChunk(c.first, c.second, std::move(scratchChunk));
             } else if (m_generating.size() < maxInFlight) {
                 m_generator->request(c.first, c.second, m_resetCount, m_seed);
                 m_generating.insert(c);
@@ -296,16 +303,19 @@ void World::loadQueuedChunks(sol::state& lua) {
                 notYet.push_back(c);   // generator busy: ask again next update
             }
         }
-        m_loadQueue.erase(m_loadQueue.begin(), m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
+
+        m_loadQueue.erase(m_loadQueue.begin(),
+                          m_loadQueue.begin() + static_cast<std::ptrdiff_t>(consumed));
         m_loadQueue.insert(m_loadQueue.begin(), notYet.begin(), notYet.end());
         return;
     }
 
     while (consumed < m_loadQueue.size()) {
+        if (elapsedMs(start) >= m_loadBudgetMs) break;
+
         const ChunkCoord c = m_loadQueue[consumed++];
         if (chunks.find(c) == chunks.end()) {
             loadChunk(c.first, c.second, lua);
-            if (elapsedMs(start) >= m_loadBudgetMs) break;
         }
     }
 
