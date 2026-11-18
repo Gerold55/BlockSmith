@@ -10,7 +10,26 @@ ChunkGenerator::ChunkGenerator(int threads, LuaFactory factory, uint32_t seed, i
         threads = std::clamp(cores - reserveCores, 1, 8);
     }
     threads = std::clamp(threads, 1, 8);
-    for (int i = 0; i < threads; ++i) m_threads.emplace_back(&ChunkGenerator::workerLoop, this, i);
+    m_threads.reserve(static_cast<size_t>(threads));   // adding a started thread can't reallocate (and throw)
+    try {
+        for (int i = 0; i < threads; ++i) m_threads.emplace_back(&ChunkGenerator::workerLoop, this, i);
+    } catch (...) {
+        // A thread couldn't be started (std::system_error: the OS refused). The workers already
+        // running must be stopped and joined here, while the mutex and condition variable they
+        // wait on are still alive - leaving the constructor with joinable std::threads would
+        // call std::terminate. Then the original error goes to the caller.
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+            m_jobs.clear();
+        }
+        m_wake.notify_all();
+        for (auto& t : m_threads) {
+            if (t.joinable()) t.join();
+        }
+        m_threads.clear();
+        throw;
+    }
 }
 
 ChunkGenerator::~ChunkGenerator() {
@@ -80,8 +99,14 @@ void ChunkGenerator::workerLoop(int index) {
         lua.reset();
     }
 
-    bool seeded = false;
+    // The Lua had a world generator (the factory worked) but couldn't be rebuilt after a failed
+    // set_world_seed: jobs fail instead of quietly switching to the built-in terrain
+    bool generatorLost = false;
+    std::string lastSeedError;
+    bool seeded = false;          // luaSeed is what set_world_seed last ran with successfully
     uint32_t luaSeed = 0;
+    bool reportedFailure = false; // set_world_seed errors are logged once per seed, not per chunk
+    uint32_t reportedSeed = 0;
     for (;;) {
         Job job;
         {
@@ -91,22 +116,59 @@ void ChunkGenerator::workerLoop(int index) {
             job = m_jobs.front();
             m_jobs.pop_front();
         }
+        if (generatorLost) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done.push_back({job.cx, job.cz, job.epoch, nullptr,
+                              "the world generator couldn't be restarted after set_world_seed failed: " + lastSeedError});
+            continue;
+        }
         if (lua && (!seeded || luaSeed != job.seed)) {
-            sol::protected_function setSeed = (*lua)["set_world_seed"];
-            if (setSeed.valid()) {
-                auto r = setSeed(job.seed);
-                if (!r.valid()) {
-                    sol::error err = r;
-                    std::cerr << "[Generator " << index << "] set_world_seed: " << err.what() << std::endl;
+            bool ok = true;
+            {   // (everything referring to this Lua state ends here - it may be replaced below)
+                sol::protected_function setSeed = (*lua)["set_world_seed"];
+                if (setSeed.valid()) {
+                    auto r = setSeed(job.seed);
+                    if (!r.valid()) {
+                        ok = false;
+                        sol::error err = r;
+                        lastSeedError = err.what();
+                        if (!reportedFailure || reportedSeed != job.seed) {
+                            std::cerr << "[Generator " << index << "] set_world_seed: " << lastSeedError
+                                      << " (chunks wait until it works)" << std::endl;
+                            reportedFailure = true;
+                            reportedSeed = job.seed;
+                        }
+                    }
                 }
             }
-            seeded = true;
+            if (!ok) {
+                // The terrain is never generated unseeded: this job fails with the Lua error, and
+                // World decides when to ask again (and when to give up and stop opening the world).
+                // The hook may have half-changed this state before failing, so it is thrown away:
+                // a retry starts from a fresh state, exactly like the first attempt (set up by the
+                // same factory) - see set_world_seed in docs/MODDING.md.
+                seeded = false;
+                std::string error = lastSeedError;
+                lua.reset();
+                try {
+                    if (m_factory) lua = m_factory();
+                } catch (const std::exception& e) {
+                    lua.reset();
+                    error += std::string(" (and the world generator couldn't be restarted: ") + e.what() + ")";
+                }
+                if (!lua) generatorLost = true;   // no Lua to retry with: every job fails from now on
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_done.push_back({job.cx, job.cz, job.epoch, nullptr, error});
+                continue;
+            }
+            seeded = true;                     // only now: set_world_seed really ran with it
             luaSeed = job.seed;
+            reportedFailure = false;
         }
         auto chunk = std::make_shared<ChunkData>();
         World::generateNewChunk(*chunk, job.cx, job.cz, lua.get(), job.seed);
         ++m_generatedThisWindow;
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_done.push_back({job.cx, job.cz, job.epoch, std::move(chunk)});
+        m_done.push_back({job.cx, job.cz, job.epoch, std::move(chunk), std::string()});
     }
 }

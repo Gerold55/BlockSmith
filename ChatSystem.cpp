@@ -191,6 +191,7 @@ void ChatSystem::addMessage(const std::string& message, const glm::vec3& color) 
     for (const auto& piece : wrapText(message, kWrapChars)) {
         pushLine(piece, color);
     }
+    if (m_messageListener) m_messageListener(message);
 }
 
 void ChatSystem::pushLine(const std::string& text, const glm::vec3& color) {
@@ -337,6 +338,9 @@ void ChatSystem::sendCurrentInput(GLFWwindow* window) {
 
         if (text[0] == '/') {
             executeCommand(text.substr(1));
+        } else if (text.size() > 1 && text[0] == '.' && text[1] != '.' && text[1] != ' ' &&
+                   m_localCommandHandler && m_localCommandHandler(text.substr(1))) {
+            // A client mod's ".command": handled in this game only, never sent
         } else if (m_messageSender && m_messageSender(text)) {
             // Online: the server sends it to everyone (including us), so nothing to add here
         } else {
@@ -348,8 +352,23 @@ void ChatSystem::sendCurrentInput(GLFWwindow* window) {
     closeChat(window);
 }
 
+void ChatSystem::sendText(const std::string& text) {
+    if (text.empty()) return;
+    if (text[0] == '/') {
+        executeCommand(text.substr(1));
+    } else if (m_messageSender && m_messageSender(text)) {
+        // sent online
+    } else {
+        const std::string name = m_playerName.empty() ? std::string("Player") : m_playerName;
+        addMessage("<" + name + "> " + text, kPlayerColor);
+    }
+}
+
 // Lua gets the first look. Built-ins are the fallback.
-void ChatSystem::executeCommand(const std::string& cmd) {
+void ChatSystem::executeCommand(const std::string& rawCmd) {
+    // "/netstats " (Tab completion adds a space) must work the same as "/netstats"
+    std::string cmd = trimLeft(rawCmd);
+    while (!cmd.empty() && std::isspace(static_cast<unsigned char>(cmd.back()))) cmd.pop_back();
     if (m_commandHandler && m_commandHandler(cmd)) return;
 
     const size_t sp = cmd.find(' ');

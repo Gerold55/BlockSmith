@@ -1,4 +1,3 @@
-#include <atomic>
 #include "CaveGenerator.h"
 #include "ChunkData.h"
 #include "Block.h"

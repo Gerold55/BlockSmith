@@ -1,16 +1,34 @@
-cmake_minimum_required(VERSION 3.15)
+# 3.24+: the ENet and OpenAL downloads below use FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP (new
+# in 3.24), and FindLua knows Lua 5.4. Visual Studio 2022 and current vcpkg ship a newer CMake.
+cmake_minimum_required(VERSION 3.24)
 project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-# Find vcpkg packages
-find_package(OpenGL REQUIRED)
-find_package(glfw3 CONFIG REQUIRED)
+# main.cpp has thousands of sol2 bindings; MSVC needs /bigobj for that many sections
+if (MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+endif()
+
+# Server-only builds (e.g. a headless Linux box): only BlockSmithServer, without the game's
+# graphics, window, sound and JSON libraries. Off by default: both targets, as before.
+#   cmake -B build -DBLOCKSMITH_SERVER_ONLY=ON
+#   cmake --build build --config Release --target BlockSmithServer
+option(BLOCKSMITH_SERVER_ONLY "Build only the dedicated server (no OpenGL/glfw3/OpenAL needed)" OFF)
+if (BLOCKSMITH_SERVER_ONLY)
+    message(STATUS "BlockSmith: server-only build (BlockSmithServer only; the game is not built)")
+endif()
+
+# Find vcpkg packages (the game alone needs OpenGL, glfw3 and nlohmann_json)
+if (NOT BLOCKSMITH_SERVER_ONLY)
+    find_package(OpenGL REQUIRED)
+    find_package(glfw3 CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
+endif()
 find_package(glm CONFIG REQUIRED)
 find_package(sol2 CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
 
 # vcpkg ships Lua as unofficial-lua, other platforms use CMake's FindLua
 find_package(unofficial-lua CONFIG QUIET)
@@ -37,6 +55,32 @@ FetchContent_Declare(enet
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(enet)
+
+# ---------------------------------------------------------------------------
+# BlockSmith: the game (skipped in server-only builds)
+# ---------------------------------------------------------------------------
+if (NOT BLOCKSMITH_SERVER_ONLY)
+
+# OpenAL Soft (sound) - from vcpkg if it has it (openal-soft), else downloaded and built
+# the first time CMake configures, like ENet
+find_package(OpenAL CONFIG QUIET)
+if (TARGET OpenAL::OpenAL)
+    message(STATUS "Sound: OpenAL from vcpkg")
+else()
+    message(STATUS "Sound: downloading OpenAL Soft")
+    set(ALSOFT_UTILS OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_TESTS OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_INSTALL_CONFIG OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_INSTALL_HRTF_DATA OFF CACHE BOOL "" FORCE)
+    set(ALSOFT_INSTALL_AMBDEC_PRESETS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(openal
+        URL https://github.com/kcat/openal-soft/archive/refs/tags/1.24.3.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(openal)
+endif()
 
 add_library(stb IMPORTED INTERFACE)
 add_library(unofficial::stb ALIAS stb)
@@ -75,6 +119,13 @@ add_executable(BlockSmith
     WorldRenderer.h
     ChunkData.cpp
     ChunkData.h
+    Light.cpp
+    Light.h
+    FirstPerson.cpp
+    FirstPerson.h
+    ClientMods.cpp
+    ClientMods.h
+    ClientModRules.h
     ChunkGenerator.cpp
     ChunkGenerator.h
     Fluids.cpp
@@ -82,6 +133,9 @@ add_executable(BlockSmith
     WeatherEffects.cpp
     WeatherEffects.h
     Firewall.cpp
+    Audio.cpp
+    Audio.h
+    StbVorbis.cpp
     Net.cpp
     Net.h
     PlayerMovement.cpp
@@ -109,7 +163,19 @@ target_link_libraries(BlockSmith PRIVATE
     unofficial::stb
     ${VOXEL_LUA_TARGET}
     enet
+    OpenAL::OpenAL
 )
+
+# The BlockSmith icon on the .exe files (icons/blocksmith.ico, via BlockSmith.rc)
+if (WIN32)
+    target_sources(BlockSmith PRIVATE BlockSmith.rc)
+endif()
+
+# OpenAL Soft is a DLL on Windows: put it next to BlockSmith.exe so the game finds it
+if (WIN32 AND TARGET OpenAL)
+    add_custom_command(TARGET BlockSmith POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:OpenAL> $<TARGET_FILE_DIR:BlockSmith>)
+endif()
 
 # ENet needs the Windows socket and timer libraries
 if (WIN32)
@@ -122,6 +188,8 @@ else()
     target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
 endif()
 
+endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
+
 # ---------------------------------------------------------------------------
 # BlockSmithServer: the dedicated (headless) server. No window, no graphics -
 # just the world, the mods and the networking.
@@ -133,12 +201,17 @@ add_executable(BlockSmithServer
     Fluids.cpp
     World.cpp
     ChunkData.cpp
+    Light.cpp
     CaveGenerator.cpp
     Block.cpp
     BlockDefs.cpp
     Net.cpp
     PlayerMovement.cpp
 )
+
+if (WIN32)
+    target_sources(BlockSmithServer PRIVATE BlockSmith.rc)   # same icon for the server .exe
+endif()
 
 target_include_directories(BlockSmithServer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

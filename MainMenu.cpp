@@ -1,6 +1,10 @@
 #include "MainMenu.h"
 #include "FontRenderer.h"
 #include "Types.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -11,7 +15,8 @@ namespace fs = std::filesystem;
 // External reference to the active game folder managed by the engine/Lua
 extern std::string g_ActiveGameFolder;
 
-static GLuint loadMenuTexture(const std::string& path) {
+static GLuint loadMenuTexture(const std::string& path, int* outW = nullptr, int* outH = nullptr,
+                              bool pixelArt = false) {
     if (!fs::exists(path)) return 0;
 
     int width, height, nrChannels;
@@ -23,11 +28,74 @@ static GLuint loadMenuTexture(const std::string& path) {
     glGenTextures(1, &texID);
     glBindTexture(GL_TEXTURE_2D, texID);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Button pictures are usually pixel art: keep them crisp when scaled up
+    const GLint filter = pixelArt ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (outW) *outW = width;
+    if (outH) *outH = height;
 
     stbi_image_free(data);
     return texID;
+}
+
+// The engine's own button, made in memory: used when neither the game nor the base mod has a
+// button picture, so the menu never needs a file to look right. 100x20, a dark outline, a
+// light bevel along the top and left, a shadow along the bottom and right, and a little
+// stone-like grain. The hover one is blue with a white outline.
+static GLuint makeBuiltInButton(bool hover, int& outW, int& outH) {
+    const int W = 100, H = 20;
+    std::vector<unsigned char> px(static_cast<size_t>(W * H * 4));
+    const int base[3]  = { hover ? 110 : 108, hover ? 128 : 108, hover ? 170 : 112 };
+    const int light[3] = { hover ? 150 : 150, hover ? 170 : 150, hover ? 215 : 156 };
+    const int dark[3]  = { hover ? 70 : 70,   hover ? 85 : 70,   hover ? 125 : 74 };
+    const int edge[3]  = { hover ? 235 : 20,  hover ? 235 : 20,  hover ? 240 : 22 };
+    uint32_t seed = 12345u;
+    for (int row = 0; row < H; ++row) {
+        const int y = H - 1 - row;            // textures are stored bottom row first
+        for (int x = 0; x < W; ++x) {
+            seed = seed * 1664525u + 1013904223u;
+            const int grain = static_cast<int>((seed >> 24) % 21) - 10;
+            const int* c = base;
+            bool noisy = true;
+            if (x == 0 || y == 0 || x == W - 1 || y == H - 1) { c = edge; noisy = false; }
+            else if (y <= 2 || x <= 2) { c = light; noisy = false; }
+            else if (y >= H - 3 || x >= W - 3) { c = dark; noisy = false; }
+            unsigned char* p = &px[static_cast<size_t>((row * W + x) * 4)];
+            for (int k = 0; k < 3; ++k) p[k] = static_cast<unsigned char>(std::clamp(c[k] + (noisy ? grain : 0), 0, 255));
+            p[3] = 255;
+        }
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    outW = W;
+    outH = H;
+    return tex;
+}
+
+// "#rrggbb" or "r, g, b" (0-255) -> colour; false if it isn't one
+static bool parseMenuColor(const std::string& text, glm::vec4& out) {
+    std::string t = text;
+    if (!t.empty() && t[0] == '#') {
+        if (t.size() != 7) return false;
+        const unsigned long v = std::strtoul(t.c_str() + 1, nullptr, 16);
+        out = glm::vec4(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f, 1.0f);
+        return true;
+    }
+    int r = 0, g = 0, b = 0;
+    if (std::sscanf(t.c_str(), "%d , %d , %d", &r, &g, &b) == 3) {
+        out = glm::vec4(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+        return true;
+    }
+    return false;
 }
 
 MainMenu::MainMenu() {
@@ -56,7 +124,18 @@ MainMenu::~MainMenu() {
     for (auto& game : availableGames) {
         if (game.headerTextureID != 0) glDeleteTextures(1, &game.headerTextureID);
         if (game.iconTextureID != 0) glDeleteTextures(1, &game.iconTextureID);
+        if (game.buttonIsBuiltIn) continue;   // shared: deleted once below
+        if (game.buttonTextureID != 0) glDeleteTextures(1, &game.buttonTextureID);
+        if (game.buttonHoverTextureID != 0) glDeleteTextures(1, &game.buttonHoverTextureID);
     }
+    for (auto& game : availableGames) {
+        if (!game.buttonIsBuiltIn) continue;
+        glDeleteTextures(1, &game.buttonTextureID);
+        glDeleteTextures(1, &game.buttonHoverTextureID);
+        break;
+    }
+    if (buttonVAO != 0) glDeleteVertexArrays(1, &buttonVAO);
+    if (buttonVBO != 0) glDeleteBuffers(1, &buttonVBO);
 }
 
 void MainMenu::scanSubgames() {
@@ -96,6 +175,10 @@ void MainMenu::scanSubgames() {
 
                             if (key == "title" || key == "name") info.title = value;
                             else if (key == "author") info.author = value;
+                            // Main menu buttons (see menu/button.png)
+                            else if (key == "button_border") info.buttonBorder = std::max(0, std::atoi(value.c_str()));
+                            else if (key == "button_text_color") parseMenuColor(value, info.buttonTextColor);
+                            else if (key == "button_text_hover_color") parseMenuColor(value, info.buttonTextHoverColor);
                             else if (key == "description") info.description = value;
                         }
                     }
@@ -110,6 +193,21 @@ void MainMenu::scanSubgames() {
 
                 info.headerTextureID = loadMenuTexture(headerPath);
                 info.iconTextureID = loadMenuTexture(iconPath);
+                // Buttons: the game's menu/button.png, else the base mod's (shared by every game),
+                // else the engine's built-in one (applied after the scan). The same for the hover look.
+                const std::string menuDir = entry.path().string() + "/menu/";
+                const std::string baseDir = (fs::path(gamesPath).parent_path() / "mods" / "base" / "menu").string() + "/";
+                for (const std::string& dir : { menuDir, baseDir }) {
+                    if (info.buttonTextureID != 0) break;
+                    info.buttonTextureID = loadMenuTexture(dir + "button.png", &info.buttonTexW, &info.buttonTexH, true);
+                    if (info.buttonTextureID != 0) {
+                        int hw = 0, hh = 0;
+                        info.buttonHoverTextureID = loadMenuTexture(dir + "button_hover.png", &hw, &hh, true);
+                        std::cout << "[Menu] " << info.folderName << ": buttons from " << dir << "button.png ("
+                                  << info.buttonTexW << "x" << info.buttonTexH
+                                  << (info.buttonHoverTextureID ? ", with hover picture" : "") << ")" << std::endl;
+                    }
+                }
 
                 availableGames.push_back(info);
             }
@@ -118,6 +216,26 @@ void MainMenu::scanSubgames() {
 
     if (availableGames.empty()) {
         availableGames.push_back({ "craft_and_ruin", "Craft & Ruin", "Developer", "Default Game", 0, 0 });
+    }
+
+    // No button picture anywhere: the engine's built-in button (one copy shared by all games)
+    {
+        GLuint builtIn = 0, builtInHover = 0;
+        int bw = 0, bh = 0;
+        for (auto& g : availableGames) {
+            if (g.buttonTextureID != 0) continue;
+            if (builtIn == 0) {
+                builtIn = makeBuiltInButton(false, bw, bh);
+                builtInHover = makeBuiltInButton(true, bw, bh);
+                std::cout << "[Menu] No button.png found: using the built-in buttons" << std::endl;
+            }
+            g.buttonTextureID = builtIn;
+            g.buttonHoverTextureID = builtInHover;
+            g.buttonTexW = bw;
+            g.buttonTexH = bh;
+            g.buttonBorder = 3;
+            g.buttonIsBuiltIn = true;
+        }
     }
 
     // Highlight the game that is actually loaded, not just the first folder found
@@ -166,10 +284,15 @@ void MainMenu::updateAndBuildBuffers(double mouseX, double mouseY, int screenWid
     // 2. Top bar background strip
     addQuad(-1.0f, 0.80f, 2.0f, 0.20f, glm::vec4(0.16f, 0.16f, 0.16f, 0.95f));
 
+    // The selected game's own button picture replaces the plain boxes (drawn in render)
+    const bool customButtons = selectedGameIndex >= 0 && selectedGameIndex < static_cast<int>(availableGames.size())
+                            && availableGames[selectedGameIndex].buttonTextureID != 0;
+
     // 3. Center buttons
     for (auto& btn : centerButtons) {
         btn.isHovered = (ndcX >= btn.x && ndcX <= (btn.x + btn.w) &&
                          ndcY >= btn.y && ndcY <= (btn.y + btn.h));
+        if (customButtons) continue;
 
         glm::vec4 bgColor = btn.isHovered ? glm::vec4(0.35f, 0.35f, 0.45f, 0.95f) : glm::vec4(0.20f, 0.20f, 0.20f, 0.90f);
 
@@ -182,6 +305,7 @@ void MainMenu::updateAndBuildBuffers(double mouseX, double mouseY, int screenWid
     for (auto& btn : topRightButtons) {
         btn.isHovered = (ndcX >= btn.x && ndcX <= (btn.x + btn.w) &&
                          ndcY >= btn.y && ndcY <= (btn.y + btn.h));
+        if (customButtons) continue;
 
         glm::vec4 bgColor = btn.isHovered ? glm::vec4(0.35f, 0.35f, 0.45f, 0.95f) : glm::vec4(0.20f, 0.20f, 0.20f, 0.90f);
 
@@ -281,6 +405,9 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
     glDrawArrays(GL_TRIANGLES, 0, g_TotalUIVertices);
     glBindVertexArray(0);
 
+    // 1b. The game's own button pictures, if it has them
+    renderButtonImages(texturedUIShader, screenWidth, screenHeight);
+
     // 2. Subgame icons
     glUseProgram(texturedUIShader);
     float iconStartX = -0.92f;
@@ -374,47 +501,186 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
         }
     }
 
-    // Tuning values for button labels, in pixels. Change these to nudge the text.
-    constexpr float kLabelCharWidth = 14.0f;   // approximate advance per character at scale 1.0
-    constexpr float kLabelNudgeX    = 0.0f;    // positive moves right
-    constexpr float kLabelNudgeY    = 0.0f;    // positive moves down
+    // Text is sized by the height of its capital letters, in pixels, and measured with the
+    // font itself, so it stays centred and in proportion at any window size.
+    const Dimensions2D screenRes{screenWidth, screenHeight};
+    const Dimensions2D fontBase = fontRenderer.baseSize();
+    const float rawCap = std::max(fontRenderer.capHeight(1.0f, fontBase), 0.001f);   // at scale 1
+    // Font scales (x, y) that make capitals `capPx` pixels tall, with square letters
+    auto scalesFor = [&](float capPx) {
+        const float f = capPx / rawCap;
+        return glm::vec2(f * fontBase.width / std::max(1, screenWidth),
+                         f * fontBase.height / std::max(1, screenHeight));
+    };
 
-    // Centered button labels. NDC spans 2 units across the screen, so sizes convert with * 0.5 * screen size.
-    auto renderCenteredButtonText = [&](const ButtonInfo& btn, float fontScale) {
+    // Button labels: capitals 38% of the button's height, centred both ways on the
+    // measured text. NDC spans 2 units across the screen, so sizes convert with * 0.5 * size.
+    constexpr float kLabelCapOfButton = 0.38f;
+    auto renderCenteredButtonText = [&](const ButtonInfo& btn) {
         if (btn.label.empty()) return;
-
-        const float textWidth  = static_cast<float>(btn.label.length()) * kLabelCharWidth * fontScale;
-        const float textHeight = 16.0f * fontScale;
 
         const float btnX = ((btn.x + 1.0f) * 0.5f) * screenWidth;
         const float btnY = ((1.0f - (btn.y + btn.h)) * 0.5f) * screenHeight;
         const float btnW = btn.w * 0.5f * screenWidth;
         const float btnH = btn.h * 0.5f * screenHeight;
 
-        // Center the text box inside the button. pixelY is treated as the baseline.
-        const float pixelX = btnX + (btnW - textWidth) * 0.5f + kLabelNudgeX;
-        const float pixelY = btnY + (btnH - textHeight) * 0.5f + textHeight + kLabelNudgeY;
+        const float capPx = std::max(6.0f, btnH * kLabelCapOfButton);
+        const glm::vec2 sc = scalesFor(capPx);
+        const float textW = fontRenderer.textWidth(btn.label, sc.x, screenRes);
+
+        // renderText's y is the baseline: centre the capitals' height in the button
+        const float pixelX = std::round(btnX + (btnW - textW) * 0.5f);
+        const float pixelY = std::round(btnY + (btnH + capPx) * 0.5f);
 
         glm::vec4 textColor = btn.isHovered ? glm::vec4(1.0f, 1.0f, 0.6f, 1.0f)
                                             : glm::vec4(0.9f, 0.9f, 0.9f, 1.0f);
-        fontRenderer.renderText(fontShader, btn.label, pixelX, pixelY,
-                                fontScale, fontScale, textColor,
-                                Dimensions2D{screenWidth, screenHeight});
+        if (selectedGameIndex >= 0 && selectedGameIndex < static_cast<int>(availableGames.size())) {
+            const SubgameInfo& g = availableGames[selectedGameIndex];
+            textColor = btn.isHovered ? g.buttonTextHoverColor : g.buttonTextColor;
+        }
+        fontRenderer.renderText(fontShader, btn.label, pixelX, pixelY, sc.x, sc.y, textColor, screenRes);
     };
 
     // 4. Center button labels
-    for (const auto& btn : centerButtons) {
-        renderCenteredButtonText(btn, 0.9f);
-    }
+    for (const auto& btn : centerButtons) renderCenteredButtonText(btn);
 
     // 5. Top-right button labels
-    for (const auto& btn : topRightButtons) {
-        renderCenteredButtonText(btn, 0.85f);
+    for (const auto& btn : topRightButtons) renderCenteredButtonText(btn);
+
+    // 6. Version (bottom left) and copyright (bottom right), sized to the window
+    {
+        const float capPx = std::max(6.0f, screenHeight * 0.011f);
+        const glm::vec2 sc = scalesFor(capPx);
+        const float margin = std::round(capPx * 1.5f);
+        const float baseline = std::round(screenHeight - margin);
+        const glm::vec4 grey(0.8f, 0.8f, 0.8f, 1.0f);
+        const std::string version = "BlockSmith 5.17.0-dev";
+        const std::string copyright = "(c) 2010-2026 Developer Studio";
+        fontRenderer.renderText(fontShader, version, margin, baseline, sc.x, sc.y, grey, screenRes);
+        const float cw = fontRenderer.textWidth(copyright, sc.x, screenRes);
+        fontRenderer.renderText(fontShader, copyright, std::round(screenWidth - margin - cw), baseline,
+                                sc.x, sc.y, grey, screenRes);
     }
 
-    // 6. Version and copyright
-    fontRenderer.renderText(fontShader, "BlockSmith 5.17.0-dev", 15.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
-    fontRenderer.renderText(fontShader, "(c) 2010-2026 Developer Studio", static_cast<float>(screenWidth) - 260.0f, static_cast<float>(screenHeight) - 25.0f, 0.5f, 0.5f, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), Dimensions2D{screenWidth, screenHeight});
-
     glEnable(GL_DEPTH_TEST);
+}
+
+// The 9-slice pieces of a button picture for one button (NDC rect, button height in pixels):
+// the picture's corners keep their shape (scaled with the button's height, so pixel art stays
+// square), the edges stretch one way and the middle both ways.
+static void appendNineSlice(std::vector<float>& v, const SubgameInfo& game, float x, float y, float w, float h,
+                            int screenWidth, int screenHeight) {
+    const float texW = static_cast<float>(std::max(1, game.buttonTexW));
+    const float texH = static_cast<float>(std::max(1, game.buttonTexH));
+    // Corner size in the picture: as set in game.conf, else about a sixth of its height
+    const float border = game.buttonBorder >= 0 ? static_cast<float>(game.buttonBorder)
+                                                : std::max(1.0f, std::round(std::min(texW, texH) / 6.0f));
+    const float btnPxH = h * 0.5f * screenHeight;
+    const float scale = btnPxH / texH;
+    float bx = border * scale * 2.0f / screenWidth;
+    float by = border * scale * 2.0f / screenHeight;
+    bx = std::min(bx, w * 0.5f);
+    by = std::min(by, h * 0.5f);
+    const float bu = std::min(border / texW, 0.5f), bv = std::min(border / texH, 0.5f);
+    const float xs[4] = { x, x + bx, x + w - bx, x + w };
+    const float ys[4] = { y, y + by, y + h - by, y + h };
+    const float us[4] = { 0.0f, bu, 1.0f - bu, 1.0f };
+    const float vs[4] = { 0.0f, bv, 1.0f - bv, 1.0f };   // pictures are loaded bottom-up
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const float q[] = { xs[i], ys[j], us[i], vs[j],          xs[i + 1], ys[j], us[i + 1], vs[j],
+                                xs[i + 1], ys[j + 1], us[i + 1], vs[j + 1],
+                                xs[i], ys[j], us[i], vs[j],          xs[i + 1], ys[j + 1], us[i + 1], vs[j + 1],
+                                xs[i], ys[j + 1], us[i], vs[j + 1] };
+            v.insert(v.end(), std::begin(q), std::end(q));
+        }
+    }
+}
+
+void MainMenu::drawButtonVerts(GLuint texturedUIShader, const std::vector<float>& v, GLuint tex) {
+    if (v.empty() || tex == 0) return;
+    if (buttonVAO == 0) glGenVertexArrays(1, &buttonVAO);
+    if (buttonVBO == 0) glGenBuffers(1, &buttonVBO);
+    glUseProgram(texturedUIShader);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(texturedUIShader, "u_Texture"), 0);
+    glBindVertexArray(buttonVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, buttonVBO);
+    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(v.size() / 4));
+    glBindVertexArray(0);
+}
+
+// Draws over the button picture just drawn: `add` brightens it (hover without a hover
+// picture), otherwise it's multiplied by `color` (disabled = darker, danger = red)
+void MainMenu::shadeButtonVerts(GLuint texturedUIShader, const std::vector<float>& v, GLuint tex, bool add,
+                                const glm::vec4& color) {
+    if (add) {
+        glBlendColor(0.0f, 0.0f, 0.0f, color.a);
+        glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE);
+    } else {
+        glBlendColor(color.r, color.g, color.b, 1.0f);
+        glBlendFunc(GL_ZERO, GL_CONSTANT_COLOR);
+    }
+    drawButtonVerts(texturedUIShader, v, tex);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+const SubgameInfo* MainMenu::buttonGame() const {
+    if (selectedGameIndex < 0 || selectedGameIndex >= static_cast<int>(availableGames.size())) return nullptr;
+    const SubgameInfo& g = availableGames[selectedGameIndex];
+    return g.buttonTextureID != 0 ? &g : nullptr;
+}
+
+bool MainMenu::drawButton(GLuint texturedUIShader, float x, float y, float w, float h, int state, bool danger,
+                          int screenWidth, int screenHeight) {
+    const SubgameInfo* game = buttonGame();
+    if (!game || w <= 0.0f || h <= 0.0f || screenWidth <= 0 || screenHeight <= 0) return false;
+    // Pixels (top-left origin) -> NDC
+    const float nx = x / screenWidth * 2.0f - 1.0f;
+    const float ny = 1.0f - (y + h) / screenHeight * 2.0f;
+    const float nw = w / screenWidth * 2.0f, nh = h / screenHeight * 2.0f;
+    std::vector<float> v;
+    appendNineSlice(v, *game, nx, ny, nw, nh, screenWidth, screenHeight);
+
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    const bool lit = state == 1 || state == 3;   // hover, selected
+    const GLuint tex = (lit && game->buttonHoverTextureID != 0) ? game->buttonHoverTextureID : game->buttonTextureID;
+    drawButtonVerts(texturedUIShader, v, tex);
+    if (lit && game->buttonHoverTextureID == 0) shadeButtonVerts(texturedUIShader, v, tex, true, glm::vec4(0, 0, 0, 0.35f));
+    if (danger) shadeButtonVerts(texturedUIShader, v, tex, false, glm::vec4(1.0f, 0.45f, 0.42f, 1.0f));
+    if (state == 2) shadeButtonVerts(texturedUIShader, v, tex, false, glm::vec4(0.5f, 0.5f, 0.5f, 1.0f));
+    return true;
+}
+
+glm::vec4 MainMenu::buttonTextColor(bool hovered) const {
+    const SubgameInfo* g = buttonGame();
+    if (!g) return hovered ? glm::vec4(1.0f, 1.0f, 0.6f, 1.0f) : glm::vec4(0.9f, 0.9f, 0.9f, 1.0f);
+    return hovered ? g->buttonTextHoverColor : g->buttonTextColor;
+}
+
+// The title screen's buttons
+void MainMenu::renderButtonImages(GLuint texturedUIShader, int screenWidth, int screenHeight) {
+    const SubgameInfo* game = buttonGame();
+    if (!game || screenWidth <= 0 || screenHeight <= 0) return;
+    std::vector<float> normal, hover, highlight;
+    for (const auto* list : { &centerButtons, &topRightButtons }) {
+        for (const auto& b : *list) {
+            const bool useHover = b.isHovered && game->buttonHoverTextureID != 0;
+            appendNineSlice(useHover ? hover : normal, *game, b.x, b.y, b.w, b.h, screenWidth, screenHeight);
+            if (b.isHovered && game->buttonHoverTextureID == 0) {
+                appendNineSlice(highlight, *game, b.x, b.y, b.w, b.h, screenWidth, screenHeight);
+            }
+        }
+    }
+    drawButtonVerts(texturedUIShader, normal, game->buttonTextureID);
+    drawButtonVerts(texturedUIShader, hover, game->buttonHoverTextureID);
+    if (!highlight.empty()) shadeButtonVerts(texturedUIShader, highlight, game->buttonTextureID, true, glm::vec4(0, 0, 0, 0.35f));
 }
