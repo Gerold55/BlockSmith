@@ -2,7 +2,6 @@
 #include "World.h"
 #include "Block.h"
 #include "Settings.h"   // isActionDown(): controls follow the key bindings from Settings
-#include "PlayerMovement.h"
 #include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
@@ -43,16 +42,182 @@ void Player::handleMouseLook(double xpos, double ypos) {
 }
 
 void Player::update(float deltaTime, const World& world, GLFWwindow* window, sol::state& lua) {
-    (void)lua;
-    // Keys come from Settings > Controls (defaults: W/A/S/D, Space, Left Shift, Left Ctrl).
-    // The movement itself lives in stepMovement (PlayerMovement.cpp) so the multiplayer
-    // server can run exactly the same code.
-    MoveState state{position, velocity, isGrounded};
-    stepMovement(state, readMoveInput(window, yaw, pitch), deltaTime, world);
-    position = state.position;
-    velocity = state.velocity;
-    isGrounded = state.grounded;
-}
+    if (deltaTime > 0.1f) deltaTime = 0.1f;
+
+    // --- 1. CHECK IF PLAYER IS SUBMERGED IN WATER ---
+    bool inWater = false;
+    int headX = static_cast<int>(std::floor(position.x));
+    int headY = static_cast<int>(std::floor(position.y + 1.0f));
+    int headZ = static_cast<int>(std::floor(position.z));
+    uint8_t blockAtHead = world.getBlockAt({headX, headY, headZ});
+    if (blockAtHead != 0) {
+        const auto& prop = BlockRegistry::getInstance().getBlock(blockAtHead);
+        if (prop.name == "water" || prop.name == "flowing_water") {
+            inWater = true;
+        }
+    }
+
+    // --- 2. HANDLE INPUT & MOVEMENT DIRECTION ---
+    // Keys come from Settings > Controls (defaults: W/A/S/D, Space, Left Shift, Left Ctrl)
+    const bool keyForward = isActionDown(window, "forward");
+    const bool keyBack    = isActionDown(window, "back");
+    const bool keyLeft    = isActionDown(window, "left");
+    const bool keyRight   = isActionDown(window, "right");
+    const bool keyJump    = isActionDown(window, "jump");
+    const bool keySneak   = isActionDown(window, "sneak");
+    const bool keySprint  = isActionDown(window, "sprint");
+
+    glm::vec3 forward(
+        cos(glm::radians(yaw)) * cos(glm::radians(pitch)),
+        sin(glm::radians(pitch)),
+        sin(glm::radians(yaw)) * cos(glm::radians(pitch))
+    );
+    forward = glm::normalize(glm::vec3(forward.x, 0.0f, forward.z));
+    glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+
+    glm::vec3 moveDir(0.0f);
+    if (keyForward) moveDir += forward;
+    if (keyBack)    moveDir -= forward;
+    if (keyRight)   moveDir += right;
+    if (keyLeft)    moveDir -= right;
+
+    float speed = inWater ? 2.2f : 4.3f;
+    if (!inWater && keySneak) {
+        speed = 1.3f;                       // sneaking: slow walk
+    } else if (!inWater && keySprint) {
+        speed = 7.0f;
+    }
+
+    if (glm::length(moveDir) > 0.0f) {
+        moveDir = glm::normalize(moveDir);
+    }
+
+    velocity.x = moveDir.x * speed;
+    velocity.z = moveDir.z * speed;
+
+    // --- 3. GRAVITY, BUOYANCY & JUMPING/SWIMMING ---
+    if (inWater) {
+        float waterGravity = -4.0f;
+        velocity.y += waterGravity * deltaTime;
+        velocity.y *= 0.85f;
+
+        if (keyJump) {
+            velocity.y = 4.0f;              // swim up
+        } else if (keySneak) {
+            velocity.y = -3.0f;             // swim down
+        }
+    } else {
+        float gravity = -22.0f;
+        if (!isGrounded) {
+            velocity.y += gravity * deltaTime;
+        }
+
+        if (keyJump && isGrounded) {
+            velocity.y = 8.0f;
+            isGrounded = false;
+        }
+    }
+
+    // --- 4. AXIS-SEPARATED AABB COLLISION RESOLUTION ---
+    float playerWidth = 0.52f; // Slim profile to easily navigate caves and 1x1 shafts
+    float playerHeight = 1.8f;
+    float halfWidth = playerWidth / 2.0f;
+    float skin = 0.02f;
+
+    // --- X Axis Collision & Move ---
+    position.x += velocity.x * deltaTime;
+    {
+        int minX = static_cast<int>(std::floor(position.x - halfWidth + skin));
+        int maxX = static_cast<int>(std::floor(position.x + halfWidth - skin));
+        int minY = static_cast<int>(std::floor(position.y + skin));
+        int maxY = static_cast<int>(std::floor(position.y + playerHeight - skin));
+        int minZ = static_cast<int>(std::floor(position.z - halfWidth + skin));
+        int maxZ = static_cast<int>(std::floor(position.z + halfWidth - skin));
+
+        for (int x = minX; x <= maxX; ++x) {
+            for (int y = minY; y <= maxY; ++y) {
+                for (int z = minZ; z <= maxZ; ++z) {
+                    uint8_t blockId = world.getBlockAt({x, y, z});
+                    if (blockId != 0) {
+                        const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
+                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+
+                        if (velocity.x > 0.0f) {
+                            position.x = static_cast<float>(x) - halfWidth - 0.001f;
+                            velocity.x = 0.0f;
+                        } else if (velocity.x < 0.0f) {
+                            position.x = static_cast<float>(x) + 1.0f + halfWidth + 0.001f;
+                            velocity.x = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Z Axis Collision & Move ---
+    position.z += velocity.z * deltaTime;
+    {
+        int minX = static_cast<int>(std::floor(position.x - halfWidth + skin));
+        int maxX = static_cast<int>(std::floor(position.x + halfWidth - skin));
+        int minY = static_cast<int>(std::floor(position.y + skin));
+        int maxY = static_cast<int>(std::floor(position.y + playerHeight - skin));
+        int minZ = static_cast<int>(std::floor(position.z - halfWidth + skin));
+        int maxZ = static_cast<int>(std::floor(position.z + halfWidth - skin));
+
+        for (int x = minX; x <= maxX; ++x) {
+            for (int y = minY; y <= maxY; ++y) {
+                for (int z = minZ; z <= maxZ; ++z) {
+                    uint8_t blockId = world.getBlockAt({x, y, z});
+                    if (blockId != 0) {
+                        const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
+                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+
+                        if (velocity.z > 0.0f) {
+                            position.z = static_cast<float>(z) - halfWidth - 0.001f;
+                            velocity.z = 0.0f;
+                        } else if (velocity.z < 0.0f) {
+                            position.z = static_cast<float>(z) + 1.0f + halfWidth + 0.001f;
+                            velocity.z = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Y Axis Collision & Move ---
+    position.y += velocity.y * deltaTime;
+    isGrounded = false;
+    {
+        int minX = static_cast<int>(std::floor(position.x - halfWidth + skin));
+        int maxX = static_cast<int>(std::floor(position.x + halfWidth - skin));
+        int minY = static_cast<int>(std::floor(position.y));
+        int maxY = static_cast<int>(std::floor(position.y + playerHeight - skin));
+        int minZ = static_cast<int>(std::floor(position.z - halfWidth + skin));
+        int maxZ = static_cast<int>(std::floor(position.z + halfWidth - skin));
+
+        for (int x = minX; x <= maxX; ++x) {
+            for (int y = minY; y <= maxY; ++y) {
+                for (int z = minZ; z <= maxZ; ++z) {
+                    uint8_t blockId = world.getBlockAt({x, y, z});
+                    if (blockId != 0) {
+                        const auto& prop = BlockRegistry::getInstance().getBlock(blockId);
+                        if (prop.name == "water" || prop.name == "flowing_water" || !prop.isWalkable) continue;
+
+                        if (velocity.y < 0.0f) {
+                            position.y = static_cast<float>(y) + 1.0f;
+                            velocity.y = 0.0f;
+                            isGrounded = true;
+                        } else if (velocity.y > 0.0f) {
+                            position.y = static_cast<float>(y) - playerHeight;
+                            velocity.y = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
 // Keys mods allow (engine.set_player_controls): hunger can stop sprinting, death can stop
 // everything. Applied here, so prediction and what the server is sent always agree.

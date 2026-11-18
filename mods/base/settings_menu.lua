@@ -1,12 +1,9 @@
 -- settings_menu.lua - Settings screen (title screen "Settings", or pause menu "Options...")
 -- ---------------------------------------------------------------------------
--- Three tabs:
+-- Two tabs:
 --   Controls - click a control, then press the new key. Escape cancels.
 --              Keys used by more than one control are shown in red.
 --   Video    - Field of View, Render Distance, VSync (applied immediately).
---   Player   - your name (used in multiplayer and chat). Click the box, type, press Enter.
---   Server   - what other players see in their server list when you host: the description
---              (MOTD), max players and port.
 -- Everything is saved to settings.txt automatically. Everything here is editable.
 --
 -- Engine functions used:
@@ -15,10 +12,6 @@
 --   engine.reset_keybinds()
 --   engine.get_video_settings()        -> { { id, value, min, max, step }, ... }
 --   engine.set_video_setting(id, v)    -> true, or false + reason
---   engine.get_player_name()           -> "Steve"
---   engine.set_player_name(name)       -> true, or false + reason
---   engine.get_server_settings()       -> { motd, max_players, port }
---   engine.set_server_setting(id, v)   -> true, or false + reason   (id: motd, max_players, port)
 --   engine.close_settings()
 --   engine.is_in_game()
 --
@@ -27,7 +20,6 @@
 --   handle_settings_click(mx, my, W, H)
 --   handle_settings_scroll(dy)
 --   handle_settings_key(key, action, mods)   -> true = handled
---   handle_settings_char(codepoint, char)    -> true = handled
 --   on_settings_opened()
 -- ---------------------------------------------------------------------------
 
@@ -60,13 +52,10 @@ local Theme = {
         text            = { 0.88, 0.88, 0.88, 1.00 },
         text_hover      = { 1.00, 1.00, 0.63, 1.00 },
         text_off        = { 0.63, 0.63, 0.63, 1.00 },
-        field_bg        = { 0.00, 0.00, 0.00, 1.00 },
-        field_border    = { 0.63, 0.63, 0.63, 1.00 },
-        field_focus     = { 1.00, 1.00, 1.00, 1.00 },
     },
 
     -- Font metrics at scale 1.0 (PixeloidSans is about 20px tall at scale 1)
-    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
+    font = { char_w = 13, char_h = 20, base_scale = 0.5, y_offset = 0.75 },
     line_gap = 4,
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
@@ -75,9 +64,7 @@ local Theme = {
     key_w = 110,              -- width of the key button on each Controls row
     small_w = 22,             -- the - / + buttons on the Video tab
     button_w = 150, button_h = 20, button_gap = 4,
-    tab_w = 80,
-    name_field_w = 150,       -- text boxes (player name, port)
-    wide_field_w = 200,       -- the server description box
+    tab_w = 100,
 }
 
 local C = Theme.colors
@@ -99,13 +86,9 @@ end
 -- ===========================================================================
 
 local state = {
-    tab = "controls",     -- "controls", "video", "player" or "server"
+    tab = "controls",     -- "controls" or "video"
     binds = {},
     video = {},
-    player = {},
-    server = {},
-    editing = nil,        -- the text item being typed in (nil = none)
-    edit_text = "",       -- what's in the box while typing
     scroll = 0,
     waiting = nil,        -- action waiting for a key press
     message = nil,
@@ -126,18 +109,12 @@ local function rect(x, y, w, h, c)
     ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale)
-    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
-    return #str * Theme.font.char_w * scale
-end
-local function text_height(scale)
-    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
-    return Theme.font.char_h * scale
-end
+local function text_width(str, scale) return #str * Theme.font.char_w * scale end
+local function text_height(scale) return Theme.font.char_h * scale end
 
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
+    y = y + Theme.font.char_h * scale * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
@@ -155,24 +132,6 @@ end
 local function refresh()
     state.binds = (engine and engine.get_keybinds and engine.get_keybinds()) or {}
     state.video = (engine and engine.get_video_settings and engine.get_video_settings()) or {}
-    -- Text items: kind = "text", value, max (length), allowed (pattern for one character)
-    state.player = {
-        { id = "name", kind = "text", label = "Player Name", max = 16, allowed = "^[%w_%-]$",
-          value = (engine and engine.get_player_name and engine.get_player_name()) or "" },
-        -- Protects your name on servers. Never shown or stored - only a hash of it is kept.
-        { id = "password", kind = "text", label = "Server Password", max = 64, allowed = "^[ -~]$",
-          secret = true, value = "",
-          is_set = engine and engine.has_player_password and engine.has_player_password() or false },
-    }
-    local sv = (engine and engine.get_server_settings and engine.get_server_settings()) or {}
-    state.server = {
-        { id = "motd", kind = "text", label = "Description", max = 200, allowed = "^[ -~]$", wide = true,
-          value = sv.motd or "" },
-        { id = "max_players", kind = "number", label = "Max Players",
-          value = sv.max_players or 20, min = 2, max = 200, step = 1 },
-        { id = "port", kind = "text", label = "Port", max = 5, allowed = "^%d$",
-          value = tostring(sv.port or 30000) },
-    }
 end
 
 -- How many controls use each key (to highlight duplicates)
@@ -216,12 +175,10 @@ local function layout(W, H)
     -- Tabs
     local tw = Theme.tab_w * S
     local tabsY = L.noteY + text_height(fs * 0.8) + 6 * S
-    local tx = math.floor((W - (tw * 4 + gap * 3)) / 2)
+    local tx = math.floor((W - (tw * 2 + gap)) / 2)
     L.tabs = {
-        { id = "controls", label = "Controls", x = tx,                  y = tabsY, w = tw, h = bh },
-        { id = "video",    label = "Video",    x = tx + tw + gap,       y = tabsY, w = tw, h = bh },
-        { id = "player",   label = "Player",   x = tx + (tw + gap) * 2, y = tabsY, w = tw, h = bh },
-        { id = "server",   label = "Server",   x = tx + (tw + gap) * 3, y = tabsY, w = tw, h = bh },
+        { id = "controls", label = "Controls", x = tx,            y = tabsY, w = tw, h = bh },
+        { id = "video",    label = "Video",    x = tx + tw + gap, y = tabsY, w = tw, h = bh },
     }
 
     -- Panel with the rows
@@ -269,11 +226,6 @@ local function row_widgets(L, item, rx, ry, rw, rh)
         local kw = Theme.key_w * S
         return { key = { x = rx + rw - kw, y = by, w = kw, h = bh } }
     end
-    if item.kind == "text" then
-        local fw = (item.wide and Theme.wide_field_w or Theme.name_field_w) * S
-        fw = math.min(fw, rw * 0.65)
-        return { field = { x = rx + rw - fw, y = by, w = fw, h = bh } }
-    end
     if item.id == "vsync" then
         local kw = Theme.key_w * S
         return { toggle = { x = rx + rw - kw, y = by, w = kw, h = bh } }
@@ -286,57 +238,7 @@ local function row_widgets(L, item, rx, ry, rw, rh)
 end
 
 local function current_items()
-    if state.tab == "controls" then return state.binds end
-    if state.tab == "player" then return state.player end
-    if state.tab == "server" then return state.server end
-    return state.video
-end
-
--- Saves a setting (text box, +/- or toggle) through the right engine function.
-local function set_value(item, value)
-    if item.id == "name" then return engine.set_player_name(value) end
-    if item.id == "password" then
-        if value == "" then return true end   -- empty = keep the current password
-        return engine.set_player_password(value)
-    end
-    if state.tab == "server" then return engine.set_server_setting(item.id, tostring(value)) end
-    return engine.set_video_setting(item.id, value)
-end
-
--- Saves what's typed. Keeps the box open (with the error shown) if it's not allowed.
-local function commit_edit()
-    if not state.editing then return end
-    local ok, err = set_value(state.editing, state.edit_text)
-    if ok == false then
-        state.message = err
-        return
-    end
-    state.editing = nil
-    state.message = nil
-    refresh()
-end
-
-local function cancel_edit()
-    state.editing = nil
-    state.message = nil
-end
-
-local function draw_text_field(f, item, S, fs)
-    local focused = state.editing ~= nil and state.editing.id == item.id
-    rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
-    rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
-    local value = focused and state.edit_text or tostring(item.value)
-    if item.secret then
-        -- Never show a password: stars while typing, and whether one is set otherwise
-        if focused then value = string.rep("*", #state.edit_text)
-        else value = item.is_set and "********" or "Not set" end
-    end
-    -- Show the end of long text (where you're typing)
-    local max_chars = math.max(1, math.floor((f.w - 8 * S) / (Theme.font.char_w * fs)) - 1)
-    if #value > max_chars then value = value:sub(#value - max_chars + 1) end
-    local blink = focused and (ui.get_time() % 1.0) < 0.5
-    text(value .. (blink and "_" or ""), f.x + 4 * S, f.y + (f.h - text_height(fs)) / 2, fs,
-         focused and C.name or C.text, false, S)
+    return (state.tab == "controls") and state.binds or state.video
 end
 
 -- ===========================================================================
@@ -358,13 +260,11 @@ local function draw_rows(L, mx, my)
         local rx, ry, rw, rh = row_rect(L, row)
         if inside(mx, my, rx, ry, rw, rh) then rect(rx, ry, rw, rh, C.row_hover) end
 
-        local label = item.label or VIDEO_LABELS[item.id] or item.id
+        local label = (state.tab == "controls") and item.label or (VIDEO_LABELS[item.id] or item.id)
         text(label, rx + 4 * S, ry + (rh - text_height(fs)) / 2, fs, C.name, true, S)
 
         local wdg = row_widgets(L, item, rx, ry, rw, rh)
-        if wdg.field then
-            draw_text_field(wdg.field, item, S, fs)
-        elseif wdg.key then
+        if wdg.key then
             local waiting = state.waiting == item.action
             local k = wdg.key
             local color = nil
@@ -396,7 +296,6 @@ function on_settings_opened()
     state.scroll = 0
     state.waiting = nil
     state.message = nil
-    state.editing = nil
     refresh()
 end
 
@@ -417,16 +316,8 @@ function render_settings(W, H)
         note, note_color = state.message, C.error
     elseif state.waiting then
         note, note_color = "Press a key for this control (Escape to cancel).", C.waiting
-    elseif state.editing then
-        note, note_color = "Type, then press Enter (Escape to cancel).", C.waiting
     elseif state.tab == "controls" then
         note = "Click a control, then press a key. Red keys are used more than once."
-    elseif state.tab == "player" then
-        note = "Name: 1-16 letters, numbers, _ or -. The password protects your name on servers."
-    elseif state.tab == "server" then
-        note = engine.has_server_icon and engine.has_server_icon()
-            and "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Icon: server_icon.png found."
-            or "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Add server_icon.png for an icon."
     end
     text_centered(note, W / 2, L.noteY, fs * 0.8, note_color, S)
 
@@ -441,21 +332,6 @@ end
 
 function handle_settings_click(mx, my, W, H)
     local L = layout(W, H)
-
-    -- Clicking anywhere except the box being typed in saves what was typed
-    if state.editing then
-        local items = current_items()
-        for row = 1, L.visible do
-            local item = items[row + state.scroll]
-            if item and item.id == state.editing.id then
-                local rx, ry, rw, rh = row_rect(L, row)
-                local f = row_widgets(L, item, rx, ry, rw, rh).field
-                if f and inside(mx, my, f.x, f.y, f.w, f.h) then return true end
-            end
-        end
-        commit_edit()
-        if state.editing then return true end   -- not allowed: stay in the box
-    end
     state.message = nil
 
     for _, t in ipairs(L.tabs) do
@@ -481,27 +357,22 @@ function handle_settings_click(mx, my, W, H)
         local rx, ry, rw, rh = row_rect(L, row)
         local wdg = row_widgets(L, item, rx, ry, rw, rh)
 
-        if wdg.field and inside(mx, my, wdg.field.x, wdg.field.y, wdg.field.w, wdg.field.h) then
-            state.editing = item
-            state.edit_text = item.secret and "" or tostring(item.value)
-            state.waiting = nil
-            return true
-        elseif wdg.key and inside(mx, my, wdg.key.x, wdg.key.y, wdg.key.w, wdg.key.h) then
+        if wdg.key and inside(mx, my, wdg.key.x, wdg.key.y, wdg.key.w, wdg.key.h) then
             -- Click again to cancel
             state.waiting = (state.waiting == item.action) and nil or item.action
             return true
         elseif wdg.toggle and inside(mx, my, wdg.toggle.x, wdg.toggle.y, wdg.toggle.w, wdg.toggle.h) then
-            local ok, err = set_value(item, (item.value ~= 0) and 0 or 1)
+            local ok, err = engine.set_video_setting(item.id, (item.value ~= 0) and 0 or 1)
             if ok == false then state.message = err end
             refresh()
             return true
         elseif wdg.minus and inside(mx, my, wdg.minus.x, wdg.minus.y, wdg.minus.w, wdg.minus.h) then
-            local ok, err = set_value(item, item.value - item.step)
+            local ok, err = engine.set_video_setting(item.id, item.value - item.step)
             if ok == false then state.message = err end
             refresh()
             return true
         elseif wdg.plus and inside(mx, my, wdg.plus.x, wdg.plus.y, wdg.plus.w, wdg.plus.h) then
-            local ok, err = set_value(item, item.value + item.step)
+            local ok, err = engine.set_video_setting(item.id, item.value + item.step)
             if ok == false then state.message = err end
             refresh()
             return true
@@ -519,19 +390,6 @@ function handle_settings_scroll(dy)
 end
 
 function handle_settings_key(key, action, mods)
-    -- Typing a name
-    if state.editing then
-        if action ~= ui.actions.PRESS and action ~= ui.actions.REPEAT then return true end
-        if key == ui.keys.ESCAPE then
-            cancel_edit()
-        elseif key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
-            commit_edit()
-        elseif key == ui.keys.BACKSPACE then
-            state.edit_text = state.edit_text:sub(1, -2)
-        end
-        return true
-    end
-
     -- Capturing a key for a control
     if state.waiting then
         if action ~= ui.actions.PRESS then return true end
@@ -546,13 +404,4 @@ function handle_settings_key(key, action, mods)
         return true
     end
     return false   -- Escape falls through to C++ (closes settings)
-end
-
-function handle_settings_char(codepoint, ch)
-    local item = state.editing
-    if not item or not ch or ch == "" then return false end
-    if #state.edit_text < (item.max or 32) and ch:match(item.allowed or "^[ -~]$") then
-        state.edit_text = state.edit_text .. ch
-    end
-    return true
 end

@@ -59,17 +59,6 @@ struct BlockProperty {
     bool in_creative = true; // Controls whether the block appears in the creative inventory menu
     std::string pattern = "cube"; // Controls rendering style (e.g. "cube", "plantlike", "door", "custom_model")
 
-    // --- Survival digging (used when the game isn't in creative mode) ---
-    float hardness = -2.0f;       // seconds to dig by hand; 0 = instant, -1 = unbreakable,
-                                  // -2 = not set (guessed from the name, see blockHardness)
-    std::string tool;             // tool type that digs it fastest: "pickaxe", "axe", "shovel"...
-    bool needsTool = false;       // without that tool: slow, and drops nothing (stone, ores)
-    bool dropsSet = false;        // false = drops itself
-    std::string drops;            // item it drops when dug ("" = nothing)
-    // --- If this is a tool ---
-    std::string toolType;         // "pickaxe", "axe", "shovel", "sword"... ("" = not a tool)
-    float toolSpeed = 1.0f;       // how many times faster it digs blocks of its type
-
     // --- Inventory image (like Luanti's inventory_image) ---
     // If set, the creative inventory and hotbar show this flat image instead of the
     // block's 3D cube / face texture. Used for tools and items (stick, hoe, scythe...).

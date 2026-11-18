@@ -28,12 +28,8 @@ local function loadScript(name)
 end
 
 loadScript("fog.lua")           -- fog settings
--- menu.lua is no longer loaded: the title screen is drawn by MainMenu.cpp
 loadScript("chat.lua")          -- chat commands
 loadScript("mods_menu.lua")     -- mods menu
 loadScript("texture_packs.lua") -- texture pack picker
 loadScript("settings_menu.lua") -- settings (controls, video)
 loadScript("world_select.lua")  -- world selection
-loadScript("multiplayer.lua")   -- multiplayer server list
-loadScript("server_manager.lua") -- My Servers (dedicated servers)
-loadScript("player_list.lua")   -- player list (hold Tab)

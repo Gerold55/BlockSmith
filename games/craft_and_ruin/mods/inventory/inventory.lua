@@ -53,7 +53,7 @@ local Theme = {
     --   char_w   : average character width (for centring / tooltip width)
     --   char_h   : line height
     --   y_offset : fraction of char_h to shift text down (the font draws from its baseline)
-    font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
+    font = { char_w = 13, char_h = 14, base_scale = 0.5, y_offset = 0.8 },
 
     -- Sizes in "GUI pixels" (multiplied by the GUI scale)
     cols = 9, rows = 5,
@@ -77,13 +77,10 @@ local Theme = {
 
 local function contains(s, sub) return string.find(s, sub, 1, true) ~= nil end
 
-local function is_item(name)
-    return name == "hoe" or name == "scythe" or name == "stick" or contains(name, "bucket")
-end
+local function is_fluid(name) return contains(name, "water") or contains(name, "lava") end
 
--- Fluid blocks are hidden; the buckets that hold them aren't
-local function is_fluid(name)
-    return (contains(name, "water") or contains(name, "lava")) and not is_item(name)
+local function is_item(name)
+    return name == "hoe" or name == "scythe" or name == "stick"
 end
 
 local function is_nature(name, info)
@@ -106,7 +103,7 @@ local Tabs = {
       filter = function(name, info) return is_nature(name, info) end },
 
     { name = "Items",
-      icons = { "stick", "scythe", "hoe", "bucket", "oak_log" },
+      icons = { "stick", "scythe", "hoe", "oak_log" },
       filter = function(name, info) return is_item(name) end },
 }
 
@@ -161,21 +158,15 @@ end
 
 -- Draws text with `y` meaning the TOP of the text.
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
+    y = y + Theme.font.char_h * scale * Theme.font.y_offset
     if shadow then
         ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
     end
     ui.draw_text(str, x, y, scale, c[1], c[2], c[3], c[4] or 1)
 end
 
-local function text_width(str, scale)
-    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
-    return #str * Theme.font.char_w * scale
-end
-local function text_height(scale)
-    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
-    return Theme.font.char_h * scale
-end
+local function text_width(str, scale) return #str * Theme.font.char_w * scale end
+local function text_height(scale) return Theme.font.char_h * scale end
 
 local function has_icon(name)
     local info = block_info(name)
@@ -389,6 +380,43 @@ function render_creative_inventory(W, H)
         else
             top, visible_h = L.tabTopIdle, L.y - L.tabTopIdle   -- part above the panel
         end
+    end
+
+    -- 3. Main panel
+    draw_panel(L.x, L.y, L.w, L.h, S, C.panel)
+
+    -- 4. Selected tab (drawn after the panel, raised, joined to it)
+    draw_active_tab(tab_x(L, state.tab), L.tabTopActive, L.tabW, L.y, S)
+
+    -- 5. Tab icons + hover
+    local icon_size = Theme.tab_icon * S
+    for i, tab in ipairs(Tabs) do
+        local tx = tab_x(L, i)
+        local top, visible_h
+        if i == state.tab then
+            top, visible_h = L.tabTopActive, L.y - L.tabTopActive
+        else
+            top, visible_h = L.tabTopIdle, L.y - L.tabTopIdle   -- part above the panel
+        end
+
+        local icon = tab_icon(tab)
+        if icon then
+            ui.draw_block_icon(icon,
+                tx + (L.tabW - icon_size) / 2,
+                top + (visible_h - icon_size) / 2 + S,
+                icon_size)
+        end
+
+        if tab_hit(L, i, mx, my) then tooltip = tab.name end
+    end
+
+    -- 6. Title + search box
+    local text_y = L.searchY + (L.searchH - text_height(fs)) / 2
+    local title = (state.search == "") and Tabs[state.tab].name or "Search Results"
+    text(title, L.x + L.m, text_y, fs, C.text_dark, false, S)
+
+    rect(L.searchX, L.searchY, L.searchW, L.searchH, state.search_focused and C.white or C.search_bdr)
+    rect(L.searchX + S, L.searchY + S, L.searchW - 2 * S, L.searchH - 2 * S, C.black)
 
         local icon = tab_icon(tab)
         if icon then
