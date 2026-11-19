@@ -26,6 +26,7 @@
 #include <sol/sol.hpp>
 #include "Sha256.h"
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <unordered_set>
 #include <chrono>
@@ -306,7 +307,10 @@ public:
     TimeLimit(double seconds, const char* what) {
         Deadline& d = deadline();
         m_saved = d;
-        if (seconds <= 0.0 || d.active) return;
+        // (no limit: 0 or less, or not a real number - nothing invalid becomes an integer below;
+        // a limit over a day is a day)
+        if (!std::isfinite(seconds) || seconds <= 0.0 || d.active) return;
+        seconds = std::min(seconds, 86400.0);
         d.active = true;
         d.seconds = seconds;
         d.what = what;

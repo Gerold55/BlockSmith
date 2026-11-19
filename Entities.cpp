@@ -897,7 +897,7 @@ int EntityManager::load(const std::string& worldDir) {
 
 std::vector<uint32_t> EntityManager::trySpawning(float dt, const World& world, const std::vector<glm::vec3>& players,
                                                  const std::function<int(int, int, int)>& lightLevel, bool isDay,
-                                                 bool enabled) {
+                                                 bool enabled, const std::function<bool(int, int, int)>& skyVisible) {
     std::vector<uint32_t> spawned;
     if (!enabled || m_spawnRules.empty() || players.empty()) return spawned;
     m_spawnTimer -= dt;
@@ -947,7 +947,10 @@ std::vector<uint32_t> EntityManager::trySpawning(float dt, const World& world, c
                 if (!room) continue;
                 const int light = lightLevel(x, y, z);
                 if (light < rule.minLight || light > rule.maxLight) continue;
-                if (rule.needsSky && light::sky(world.getLightAt({x, y, z})) < 15) continue;
+                if (rule.needsSky) {
+                    const bool sky = skyVisible ? skyVisible(x, y, z) : light::sky(world.getLightAt({x, y, z})) >= 15;
+                    if (!sky) continue;
+                }
                 spots.push_back(y);
             }
             if (spots.empty()) continue;

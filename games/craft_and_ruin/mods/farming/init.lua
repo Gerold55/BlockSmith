@@ -1,125 +1,304 @@
--- Craft & Ruin Farming Mod (Minecraft-Style + Scythe Harvesting)
+-- Craft & Ruin farming: Minecraft's farming, plus a scythe that replants.
+--
+--   Hoes (wooden, stone): right-click grass or dirt with air above it -> farmland
+--   Farmland: wet with water within 4 blocks (darker), dries out without; bare dry farmland goes
+--     back to dirt; jumping or falling onto it tramples it back to dirt
+--   Seeds: right-click farmland to plant. You find them by breaking tall grass (1 in 8)
+--   Crops grow on random ticks (engine.register_random_tick) the way Minecraft's do: faster on
+--     wet farmland and in neat rows, only with light 9 or more, and they pop off if the farmland
+--     under them goes
+--   Harvest: break a ripe crop for its harvest (wheat: 1 wheat and 0-3 seeds); an unripe one
+--     only gives its seed back. A SCYTHE reaps every ripe crop in the 3x3 patch you click and
+--     replants them (one seed each goes back in the ground) - on anything else it's a normal tool
+--   Bread: 3 wheat in a row
+--
+-- Other mods add crops with farming.register_crop (below).
 
-print("[Mod] Loading Advanced Farming System with Scythe Support...")
+farming = farming or {}
 
--- 1. Register Farmland Blocks
-engine.register_block("farmland_dry", 0.5, 0.4, 0.3, {
-    top = "farmland_dry.png",
-    sides = "dirt.png",
-    bottom = "dirt.png"
-}, nil, {
-    transparent = false,
-    walkable = true,
-    pattern = "cube",
-    in_creative = true,
-    pick = "dirt",                       -- like Minecraft
-})
+local function in_creative() return engine.is_creative and engine.is_creative() end
+local function authority() return not engine.is_authority or engine.is_authority() end
 
-engine.register_block("farmland_wet", 0.35, 0.28, 0.18, {
-    top = "farmland_wet.png",
-    sides = "dirt.png",
-    bottom = "dirt.png"
-}, nil, {
-    transparent = false,
-    walkable = true,
-    pattern = "cube",
-    in_creative = true,
-    pick = "dirt",                       -- like Minecraft
-})
-
--- 2. Register Crops across Growth Stages (Hidden from Creative Inventory)
-engine.register_block("wheat_stage_0", 0.4, 0.8, 0.2, "cw_farming_wheat_1.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
-    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
-})
-engine.register_block("wheat_stage_1", 0.5, 0.9, 0.2, "cw_farming_wheat_2.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
-    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
-})
-engine.register_block("wheat_stage_2", 0.7, 0.95, 0.15, "cw_farming_wheat_3.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
-    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
-})
-engine.register_block("wheat_ripe", 0.95, 0.9, 0.1, "cw_farming_wheat_4.png", nil, {
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", in_creative = false,
-    pick = "wheat_seeds",                -- pick block on a crop gives seeds, like Minecraft
-})
-
--- Register Seeds and Harvested Wheat Item (Visible in Creative)
-engine.register_block("wheat_seeds", 0.4, 0.8, 0.2, "wheat_seeds.png", nil, {
-    transparent = true, pattern = "plantlike", walkable = false, in_creative = true
-})
-engine.register_block("wheat", 0.9, 0.8, 0.1, "wheat_item.png", nil, {
-    transparent = true, pattern = "plantlike", walkable = false, in_creative = true
-})
-
--- Register Scythe Tool (Visible in Creative)
-engine.register_block("scythe", 0.7, 0.7, 0.7, "scythe.png", nil, {
-    transparent = true, pattern = "plantlike", walkable = false, creative = true
-})
-
--- 3. Hoe Tilling Interaction
-local previous_hoe = on_use_hoe
-function on_use_hoe(x, y, z, block_name)
-    if block_name == "grass" or block_name == "dirt" then
-        engine.set_block(x, y, z, "farmland_dry")
-        return true 
-    end
-    if previous_hoe then return previous_hoe(x, y, z, block_name) end
-    return false
+-- Items into the world: where the world is decided (singleplayer, hosting, the server) we make
+-- them; joined to a server, engine.drop_item asks the server to
+local function drop(item, count, x, y, z)
+    if not item or count <= 0 then return end
+    if authority() and entities and entities.drop_item then entities.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5)
+    elseif engine.drop_item then engine.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5) end
 end
 
--- 4. Right-Click Interactions (Planting & Hand Harvesting)
--- Keeps any other mod's right-click working (doors, buckets...): what farming doesn't use is
--- passed on to the version that was there before
-local previous_right_click = on_right_click_block
-function on_right_click_block(x, y, z, block_name, held_item, ...)
-    -- Planting seeds on farmland
-    if block_name == "farmland_dry" or block_name == "farmland_wet" then
-        local above_block = engine.get_block_name(x, y + 1, z)
-        if held_item == "wheat_seeds" and above_block == "air" then
-            engine.set_block(x, y + 1, z, "wheat_stage_0")
-            return true
+local function is_farmland(name) return name == "farmland_dry" or name == "farmland_wet" end
+
+-- ---------------------------------------------------------------------------
+-- Farmland
+-- ---------------------------------------------------------------------------
+engine.register_block("farmland_dry", 1, 1, 1, { top = "cw_farming_soil.png", sides = "cw_dirt.png", bottom = "cw_dirt.png" }, nil, {
+    walkable = true, pattern = "cube", in_creative = true, pick = "dirt", drops = "dirt", hardness = 0.6, tool = "shovel",
+})
+engine.register_block("farmland_wet", 1, 1, 1, { top = "cw_farming_soil_wet.png", sides = "cw_dirt.png", bottom = "cw_dirt.png" }, nil, {
+    walkable = true, pattern = "cube", in_creative = true, pick = "dirt", drops = "dirt", hardness = 0.6, tool = "shovel",
+})
+
+-- ---------------------------------------------------------------------------
+-- Items: tools, seeds, harvest (items have an inventory picture, so they're never placed as
+-- blocks - the old scythe and seeds were plant blocks, which is why they could be put down)
+-- ---------------------------------------------------------------------------
+local function item(name, picture, extra)
+    local opts = { inventory_image = picture }
+    for k, v in pairs(extra or {}) do opts[k] = v end
+    engine.register_block(name, 1, 1, 1, picture, nil, opts)
+end
+item("wooden_hoe", "farming_hoe_wood.png", { tool_type = "hoe" })
+item("stone_hoe", "farming_hoe_stone.png", { tool_type = "hoe" })
+item("scythe", "farming_scythe.png", { tool_type = "scythe" })
+item("wheat_seeds", "cw_farming_seed_wheat.png")
+item("wheat", "farming_wheat.png")
+item("bread", "farming_bread.png")
+
+-- ---------------------------------------------------------------------------
+-- Crops
+-- ---------------------------------------------------------------------------
+-- farming.register_crop{
+--     name = "wheat",
+--     stages = { "wheat_stage_0", "wheat_stage_1", "wheat_stage_2", "wheat_ripe" },   -- block names
+--     textures = { "a.png", "b.png", ... },     -- one per stage (registers the stage blocks)
+--     seed = "wheat_seeds",                     -- what plants it (and what an unripe one gives back)
+--     harvest = { { "wheat", 1, 1 }, { "wheat_seeds", 0, 3 } },   -- a ripe one: item, fewest, most
+--     scythe_replants = true,                   -- a scythe reaps it and plants it again
+-- }
+local crops = {}          -- stage block name -> { def = crop, stage = n }
+local pop_crop            -- (below)
+
+-- ---------------------------------------------------------------------------
+-- Growing: Minecraft's random-tick growth. Each crop gets "growth points": 1, plus the farmland
+-- under it (1 dry, 3 wet), plus a quarter of that for each farmland block around it. The chance
+-- of growing a stage on a random tick is 1 in (25 / points + 1) - doubled here, as our crops have
+-- half Minecraft's 8 stages. Wet farmland in a field: about 1 in 2; one crop on dry: 1 in 13.
+-- ---------------------------------------------------------------------------
+local function growth_points(x, y, z)
+    local points = 1
+    for dx = -1, 1 do for dz = -1, 1 do
+        local n = engine.get_block_name(x + dx, y - 1, z + dz)
+        local g = (n == "farmland_wet") and 3 or (n == "farmland_dry") and 1 or 0
+        if dx ~= 0 or dz ~= 0 then g = g / 4 end
+        points = points + g
+    end end
+    return points
+end
+
+local function grow_tick(x, y, z, name)
+    local c = crops[name]
+    if not c then return end
+    if not is_farmland(engine.get_block_name(x, y - 1, z)) then pop_crop(x, y, z, name) return end
+    if c.stage >= #c.def.stages then return end                       -- ripe
+    if engine.get_light_level and engine.get_light_level(x, y, z) < 9 then return end
+    local chance = 2 / (math.floor(25 / growth_points(x, y, z)) + 1)
+    if math.random() < chance then engine.set_block(x, y, z, c.def.stages[c.stage + 1]) end
+end
+
+farming.crops = {}
+function farming.register_crop(def)
+    assert(def.name and def.stages and def.seed, "farming.register_crop needs name, stages and seed")
+    farming.crops[def.name] = def
+    for i, stage in ipairs(def.stages) do
+        if def.textures and def.textures[i] then
+            engine.register_block(stage, 1, 1, 1, def.textures[i], nil, {
+                transparent = true, walkable = false, selectable = true, pattern = "plantlike",
+                in_creative = false, pick = def.seed, hardness = 0, drops = "",
+            })
         end
+        crops[stage] = { def = def, stage = i }
     end
+    -- it grows on random ticks (Minecraft's way; see grow_tick)
+    if engine.register_random_tick then
+        engine.register_random_tick({ label = def.name .. " grows", nodenames = def.stages, action = grow_tick })
+    end
+    -- seeds plant it on farmland (right-click; the game's - a server has no item uses)
+    if engine.register_item_use then engine.register_item_use(def.seed, function(pointed)
+        local u = pointed.under
+        if not u or not is_farmland(u.name) then return true end   -- seeds only go in farmland
+        if engine.get_block_name(u.x, u.y + 1, u.z) ~= "air" then return true end
+        engine.set_block(u.x, u.y + 1, u.z, def.stages[1])
+        if not in_creative() then
+            if pointed.count > 1 then hotbar.set_slot(pointed.slot, def.seed, pointed.count - 1)
+            else hotbar.set_slot(pointed.slot, "", 0) end
+        end
+        return true
+    end) end
+end
+function farming.is_crop(name) return crops[name] ~= nil end
+function farming.is_ripe(name) local c = crops[name] return c ~= nil and c.stage == #c.def.stages end
 
-    -- Normal right-click harvesting of mature wheat (resets to stage 0 automatically)
-    if block_name == "wheat_ripe" then
-        engine.set_block(x, y, z, "wheat_stage_0")
-        print("[Farming] Harvested wheat! Automatically left seeds in place.")
+farming.register_crop({
+    name = "wheat",
+    stages = { "wheat_stage_0", "wheat_stage_1", "wheat_stage_2", "wheat_ripe" },   -- (the names old worlds use)
+    textures = { "cw_farming_wheat_1.png", "cw_farming_wheat_2.png", "cw_farming_wheat_3.png", "cw_farming_wheat_4.png" },
+    seed = "wheat_seeds",
+    harvest = { { "wheat", 1, 1 }, { "wheat_seeds", 0, 3 } },
+    scythe_replants = true,
+})
+
+-- What a crop gives: ripe -> its harvest; not ripe -> its seed back. `minus_seed` = one seed is
+-- kept back (it goes straight back in the ground - the scythe)
+local function crop_drops(name, minus_seed)
+    local c = crops[name]
+    if not c then return {} end
+    local out = {}
+    if c.stage < #c.def.stages then
+        if not minus_seed then out[#out + 1] = { c.def.seed, 1 } end
+        return out
+    end
+    local seed_kept = not minus_seed
+    for _, h in ipairs(c.def.harvest or {}) do
+        local n = h[2] + math.random(0, math.max(0, (h[3] or h[2]) - h[2]))
+        if minus_seed and h[1] == c.def.seed and not seed_kept then n = n - 1; seed_kept = true end
+        if n > 0 then out[#out + 1] = { h[1], n } end
+    end
+    return out
+end
+
+function pop_crop(x, y, z, name)              -- a crop that can't stay: it breaks (and drops as if broken)
+    engine.set_block(x, y, z, "air")
+    for _, d in ipairs(crop_drops(name, false)) do drop(d[1], d[2], x, y, z) end
+end
+
+-- ---------------------------------------------------------------------------
+-- Farmland: wet near water, dries out, bare dry farmland returns to dirt (random ticks too)
+-- ---------------------------------------------------------------------------
+local function water_near(x, y, z)
+    for dx = -4, 4 do for dz = -4, 4 do for dy = 0, 1 do
+        local n = engine.get_block_name(x + dx, y + dy, z + dz)
+        if n == "water" or n == "flowing_water" then return true end
+    end end end
+    return false
+end
+check_water_nearby = water_near          -- (the old global name, for other mods)
+
+engine.register_random_tick({
+    label = "farmland moisture",
+    nodenames = { "farmland_dry", "farmland_wet" },
+    action = function(x, y, z, name)
+        local above = engine.get_block_name(x, y + 1, z)
+        if engine.is_opaque and engine.is_opaque(x, y + 1, z) then engine.set_block(x, y, z, "dirt") return end
+        if water_near(x, y, z) then
+            if name ~= "farmland_wet" then engine.set_block(x, y, z, "farmland_wet") end
+        elseif name == "farmland_wet" then
+            engine.set_block(x, y, z, "farmland_dry")
+        elseif not crops[above] then
+            engine.set_block(x, y, z, "dirt")                              -- bare and dry: back to dirt
+        end
+    end,
+})
+
+-- The farmland under a crop broken: the crop pops off (where the world is decided; a joined
+-- player's game leaves it to the server)
+local previous_broken = on_block_broken
+function on_block_broken(x, y, z, block, ...)
+    if is_farmland(block) and authority() then
+        local above = engine.get_block_name(x, y + 1, z)
+        if crops[above] then pop_crop(x, y + 1, z, above) end
+    end
+    if previous_broken then return previous_broken(x, y, z, block, ...) end
+end
+
+-- ---------------------------------------------------------------------------
+-- Hoes: till grass and dirt (air above it, like Minecraft)
+-- ---------------------------------------------------------------------------
+local previous_hoe = on_use_hoe
+function on_use_hoe(x, y, z, block_name, ...)
+    if (block_name == "grass" or block_name == "dirt") and engine.get_block_name(x, y + 1, z) == "air" then
+        engine.set_block(x, y, z, "farmland_dry")
         return true
     end
-
-    if previous_right_click then return previous_right_click(x, y, z, block_name, held_item, ...) end
+    if previous_hoe then return previous_hoe(x, y, z, block_name, ...) end
     return false
 end
 
--- 5. Scythe Interaction Hook (Called when left or right-clicking with a scythe)
--- You can wire this into your C++ block break / left-click handler if checking held items!
+-- ---------------------------------------------------------------------------
+-- Harvesting by breaking (survival), and seeds from tall grass
+-- ---------------------------------------------------------------------------
+local previous_dig = on_dig_block
+function on_dig_block(x, y, z, block, item, ...)
+    if crops[block] then
+        for _, d in ipairs(crop_drops(block, false)) do drop(d[1], d[2], x, y, z) end
+        if previous_dig then previous_dig(x, y, z, block, item, ...) end
+        return true                                                         -- (we dropped them)
+    end
+    if block == "short_grass" then
+        if math.random(1, 8) == 1 then drop("wheat_seeds", 1, x, y, z) end   -- Minecraft: 1 in 8
+        if previous_dig then previous_dig(x, y, z, block, item, ...) end
+        return true
+    end
+    if previous_dig then return previous_dig(x, y, z, block, item, ...) end
+    return false
+end
+
+-- ---------------------------------------------------------------------------
+-- The scythe: reaps every ripe crop in the 3x3 patch and replants each (the seed for it is
+-- kept back from the harvest). Anything else: false, and the scythe digs like any tool.
+-- ---------------------------------------------------------------------------
 local previous_scythe = on_use_scythe
-function on_use_scythe(x, y, z, block_name)
-    if block_name ~= "wheat_ripe" and previous_scythe then return previous_scythe(x, y, z, block_name) end
-    if block_name == "wheat_ripe" then
-        -- Instantly harvest the mature crop and reset it back to stage 0
-        -- Without destroying the underlying farmland or requiring manual replanting!
-        engine.set_block(x, y, z, "wheat_stage_0")
-        print("[Scythe] Reaped mature wheat and auto-replanted stage 0!")
-        return true
+function on_use_scythe(x, y, z, block_name, ...)
+    local c = crops[block_name]
+    if c and c.def.scythe_replants and farming.is_ripe(block_name) then
+        local reaped = 0
+        for dx = -1, 1 do for dz = -1, 1 do
+            local n = engine.get_block_name(x + dx, y, z + dz)
+            local cc = crops[n]
+            if cc and cc.def.scythe_replants and farming.is_ripe(n) then
+                for _, d in ipairs(crop_drops(n, true)) do drop(d[1], d[2], x + dx, y, z + dz) end
+                engine.set_block(x + dx, y, z + dz, cc.def.stages[1])
+                reaped = reaped + 1
+            end
+        end end
+        return reaped > 0
     end
+    if previous_scythe then return previous_scythe(x, y, z, block_name, ...) end
     return false
 end
 
--- 6. Helper function for water hydration check
-function check_water_nearby(cx, cy, cz)
-    for dx = -4, 4 do
-        for dy = -1, 1 do
-            for dz = -4, 4 do
-                local neighbor = engine.get_block_name(cx + dx, cy + dy, cz + dz)
-                if neighbor == "water" or neighbor == "flowing_water" then
-                    return true
+-- ---------------------------------------------------------------------------
+-- Trampling: landing on farmland after a fall (or a jump onto it) turns it back to dirt, and
+-- the crop on it pops off (Minecraft). The game watches its own player.
+-- ---------------------------------------------------------------------------
+local falling_speed = 0
+local previous_update = on_update
+function on_update(dt, ...)
+    if engine.get_player_state and engine.is_in_game and engine.is_in_game() then
+        local st = engine.get_player_state()
+        if st then
+            if not st.on_ground then
+                falling_speed = math.min(falling_speed, st.vy or 0)
+            else
+                -- about 1 block or more of fall (Minecraft: more than half a block), not creative
+                if falling_speed < -6.5 and not in_creative() and not st.flying then
+                    local x, y, z = math.floor(st.x), math.floor(st.y - 0.1), math.floor(st.z)
+                    if is_farmland(engine.get_block_name(x, y, z)) then
+                        local above = engine.get_block_name(x, y + 1, z)
+                        engine.set_block(x, y, z, "dirt")
+                        if crops[above] then pop_crop(x, y + 1, z, above) end
+                    end
                 end
+                falling_speed = 0
             end
         end
     end
-    return false
+    if previous_update then return previous_update(dt, ...) end
 end
+
+-- ---------------------------------------------------------------------------
+-- Food, recipes, the creative inventory
+-- ---------------------------------------------------------------------------
+if survival and survival.register_food then survival.register_food("bread", 5, 6) end
+if survival and survival.register_craft then
+    survival.register_craft({ output = "wooden_hoe", recipe = { { "planks_oak", "planks_oak" }, { "", "stick" }, { "", "stick" } } })
+    survival.register_craft({ output = "stone_hoe", recipe = { { "stone", "stone" }, { "", "stick" }, { "", "stick" } } })
+    survival.register_craft({ output = "scythe", recipe = { { "stone", "stone", "stone" }, { "", "", "stick" }, { "", "stick", "" } } })
+    survival.register_craft({ output = "bread", recipe = { { "wheat", "wheat", "wheat" } } })
+end
+if creative and creative.register_tab then
+    creative.register_tab({ name = "Farming", icon = "wooden_hoe",
+        items = { "wooden_hoe", "stone_hoe", "scythe", "wheat_seeds", "wheat", "bread", "farmland_dry", "farmland_wet" } })
+end
+
+print("[Farming] Ready: hoes till, seeds plant, crops grow on random ticks, a scythe reaps and replants")

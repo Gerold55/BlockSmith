@@ -353,9 +353,18 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     c.autosaveSeconds = std::clamp(toInt(kv["autosave_seconds"], c.autosaveSeconds), 10, 3600);
     c.spawnProtection = std::clamp(toInt(kv["spawn_protection"], c.spawnProtection), 0, 10000);
     c.opLevel = std::clamp(toInt(kv["op_level"], c.opLevel), 1, 4);
-    if (kv.count("day_length")) {
-        try { c.dayLengthMinutes = std::clamp(std::stod(kv["day_length"]), 0.5, 100000.0); } catch (...) {}
-    }
+    // A number from server.conf, only if it really is one: "nan", "inf" and the like are refused
+    // (the default stays), so they can never reach the clock or the Lua time limit
+    auto finiteNumber = [&kv](const char* key, double& out) {
+        if (!kv.count(key)) return false;
+        try {
+            const double v = std::stod(kv[key]);
+            if (std::isfinite(v)) { out = v; return true; }
+        } catch (...) {}
+        std::cerr << "[Server] server.conf: " << key << " = \"" << kv[key] << "\" isn't a number - using the default" << std::endl;
+        return false;
+    };
+    if (double v = 0.0; finiteNumber("day_length", v)) c.dayLengthMinutes = std::clamp(v, 0.5, 100000.0);
     if (kv.count("remote_content")) c.remoteContent = toBool(kv["remote_content"], c.remoteContent);
     {
         std::istringstream doms(kv["remote_domains"]);
@@ -368,9 +377,7 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
             if (!d.empty()) c.remoteDomains.push_back(d);
         }
     }
-    if (kv.count("lua_time_limit")) {
-        try { c.luaTimeLimit = std::clamp(std::stod(kv["lua_time_limit"]), 0.0, 600.0); } catch (...) {}
-    }
+    if (double v = 0.0; finiteNumber("lua_time_limit", v)) c.luaTimeLimit = std::clamp(v, 0.0, 600.0);
     c.clientMods = ClientModRules::fromConfig(kv, "client_mods", c.clientMods);
     return c;
 }
@@ -1432,6 +1439,26 @@ int main(int argc, char** argv) {
     ctx.api.timeLimit = config.luaTimeLimit;
     setupLua(lua, ctx);
     // Entities (mobs, dropped items): run here; players' games get them as data (Entities.h)
+    // The server's light query. It keeps no light data (no lighting), so: under open sky, the
+    // sunlight for the time of day; under anything solid that light can't get through, dark.
+    // (With light data it's the real light.) Used by engine.get_light_level and mob spawning,
+    // so both agree - and `sky` says whether the sky is overhead (spawn rules with sky = true).
+    struct ServerLight { int level; bool sky; };
+    auto serverLight = [&world, &dayClock](int x, int y, int z) -> ServerLight {
+        const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+        const int dimming = static_cast<int>(std::lround((1.0f - day) * 11.0f));
+        if (world.lighting()) {
+            const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
+            const int skyNow = std::max(0, light::sky(l) - dimming);
+            return { std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l)))), light::sky(l) >= 15 };
+        }
+        for (int yy = y + 1; yy < CHUNK_HEIGHT; ++yy) {
+            const uint8_t id = world.getBlockAt(glm::ivec3(x, yy, z));
+            const auto& bp = BlockRegistry::getInstance().getBlock(id);
+            if (id != 0 && !bp.isTransparent && !bp.isCutout && bp.isWalkable) return { 0, false };   // (leaves, glass, plants let light through)
+        }
+        return { 15 - dimming, true };
+    };
     EntityManager entityManager;
     EntityLua entityLua;
     {
@@ -1448,12 +1475,8 @@ int main(int argc, char** argv) {
         host.giveItem = [&server](const std::string& name, const std::string& item, int count) {
             return server.sendAction(name, "give", item, std::to_string(count));
         };
-        host.lightLevel = [&world, &dayClock](int x, int y, int z) {
-            const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
-            const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
-            const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
-            return std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l))));
-        };
+        host.lightLevel = [serverLight](int x, int y, int z) { return serverLight(x, y, z).level; };
+        host.skyVisible = [serverLight](int x, int y, int z) { return serverLight(x, y, z).sky; };
         host.isDay = [&dayClock] { const double t = dayClock.time(); return t >= 0.5 && t < 0.98; };
         host.spawningEnabled = [&ruleValue] { return ruleValue("doMobSpawning") != "false"; };
         host.timeLimit = config.luaTimeLimit;
@@ -1470,21 +1493,7 @@ int main(int argc, char** argv) {
     blockMods.loadWorld(worldDir.string());
     // engine.get_light_level(x, y, z): the server keeps no light, so: open sky = sunlight for the
     // time of day, under cover = dark (enough for grass, crops and mob spawning rules)
-    lua["engine"]["get_light_level"] = [&world, &dayClock](int x, int y, int z) -> int {
-        if (world.lighting()) {
-            const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
-            const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
-            const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
-            return std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l))));
-        }
-        for (int yy = y + 1; yy < CHUNK_HEIGHT; ++yy) {
-            const uint8_t id = world.getBlockAt(glm::ivec3(x, yy, z));
-            const auto& bp = BlockRegistry::getInstance().getBlock(id);
-            if (id != 0 && !bp.isTransparent && !bp.isCutout && bp.isWalkable) return 0;   // (leaves, glass, plants let light through)
-        }
-        const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
-        return 15 - static_cast<int>(std::lround((1.0f - day) * 11.0f));
-    };
+    lua["engine"]["get_light_level"] = [serverLight](int x, int y, int z) -> int { return serverLight(x, y, z).level; };
     server.onEntityAct = [&](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
         if (kind == 0) entityLua.punch(id, name, at, item);
         else entityLua.rightClick(id, name, item);
@@ -2281,12 +2290,13 @@ int main(int argc, char** argv) {
             } else if (sub == "add") {
                 double hours = 0.0;
                 try { hours = std::stod(arg); } catch (...) { reply("Usage: time add <hours>"); return; }
+                if (!std::isfinite(hours)) { reply("Usage: time add <hours>"); return; }
                 dayClock.total = std::max(0.0, dayClock.total + hours / 24.0);
                 report();
             } else if (sub == "speed") {
                 double v = -1.0;
                 try { v = std::stod(arg); } catch (...) {}
-                if (v < 0.0 || v > 1000.0) { reply("Usage: time speed <multiplier>   (1 normal, 0 stops time)"); return; }
+                if (!std::isfinite(v) || v < 0.0 || v > 1000.0) { reply("Usage: time speed <multiplier>   (1 normal, 0 stops time)"); return; }
                 dayClock.speed = v;
                 report();
             } else {

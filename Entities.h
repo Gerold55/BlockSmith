@@ -164,10 +164,12 @@ public:
     void addSpawnRule(const SpawnRule& r) { m_spawnRules.push_back(r); }
     const std::vector<SpawnRule>& spawnRules() const { return m_spawnRules; }
     // Every couple of seconds: tries spots around the players. `lightLevel(x,y,z)` = 0..15 now;
-    // `isDay`. Returns the entities it spawned (their on_spawn still has to run).
+    // `isDay`. `skyVisible(x,y,z)`: is the sky overhead there (for rules with needsSky)? Left
+    // empty, the world's own sunlight decides (full sunlight = sky). Returns the entities it
+    // spawned (their on_spawn still has to run).
     std::vector<uint32_t> trySpawning(float dt, const World& world, const std::vector<glm::vec3>& players,
                                       const std::function<int(int, int, int)>& lightLevel, bool isDay,
-                                      bool enabled);
+                                      bool enabled, const std::function<bool(int, int, int)>& skyVisible = {});
 
     // Dropped items: "__item" entities that hold `item` x count
     static constexpr const char* kItemType = "__item";

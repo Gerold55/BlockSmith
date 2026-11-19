@@ -1960,8 +1960,8 @@ local hooks = {
     { "on_player_chat",           "(name, text) -> false to drop it, or new text  a chat line before everyone sees it" },
     { "on_server_start",          "()  the server started (in the game: you started hosting)" },
     { "on_server_stop",           "()  the server is stopping (in the game: you stopped hosting)" },
-    { "on_use_hoe",               "(x, y, z, block)  right-click with a hoe" },
-    { "on_use_scythe",            "(x, y, z, block)  left-click with a scythe" },
+    { "on_use_hoe",               "(x, y, z, block) -> true if used  right-click with a hoe (tool_type \"hoe\")" },
+    { "on_use_scythe",            "(x, y, z, block) -> true if it reaped (else it digs)  left-click with a scythe" },
     { "update_player_animation",  "(dt, is_moving, pitch)" },
     { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
     { "on_char_input",            "(codepoint)  typed text (unicode)" },
@@ -6921,11 +6921,24 @@ int main(int argc, char** argv) {
                     if (targetBlockId != 0) {
                         const auto& targetProp = reg.getBlock(targetBlockId);
                         if (targetProp.isSelectable) {
-                            if (activeItemName.find("scythe") != std::string::npos) {
-                                if (leftClick) {
-                                    sol::protected_function scytheFunc = lua["on_use_scythe"];
-                                    if (scytheFunc.valid()) scytheFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                            // A scythe: on_use_scythe(x, y, z, block) -> true = it reaped something
+                            // (the farming mod: ripe crops, replanted). Otherwise - and on anything
+                            // else - the scythe digs like any tool. After a reap, holding the button
+                            // doesn't then dig the replanted crop.
+                            static bool scytheReaped = false;
+                            if (leftClick) scytheReaped = false;
+                            const bool isScythe = activeItemName.find("scythe") != std::string::npos ||
+                                                  (held && held->toolType == "scythe");
+                            if (isScythe && leftClick) {
+                                sol::protected_function scytheFunc = lua["on_use_scythe"];
+                                if (scytheFunc.valid()) {
+                                    auto r = scytheFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                                    if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_use_scythe: " << err.what() << std::endl; }
+                                    else scytheReaped = r.get_type() == sol::type::boolean && r.get<bool>();
                                 }
+                            }
+                            if (scytheReaped) {
+                                // (reaped: nothing more for this press)
                             } else if (g_Creative) {
                                 if (leftClick) {   // creative: one click, gone
                                     const uint8_t brokenMeta = world.getMetadataAt(hitPos);
@@ -7017,12 +7030,21 @@ int main(int argc, char** argv) {
                     uint8_t targetBlockId = world.getBlockAt(hitPos);
                     if (targetBlockId != 0) {
                         const auto& targetProp = BlockRegistry::getInstance().getBlock(targetBlockId);
-                        if (activeItemName.find("hoe") != std::string::npos) {
+                        // A hoe (tool_type "hoe", or "hoe" in its name): on_use_hoe(x, y, z, block) ->
+                        // true = it did something (tilled the ground). Otherwise the right-click
+                        // carries on as usual (doors, workbenches... still open with a hoe in hand).
+                        bool hoeUsed = false;
+                        const BlockProperty& heldProp = BlockRegistry::getInstance().getBlock(g_Hotbar->getActiveBlockId());
+                        if (activeItemName.find("hoe") != std::string::npos || heldProp.toolType == "hoe") {
                             sol::protected_function hoeFunc = lua["on_use_hoe"];
                             if (hoeFunc.valid()) {
-                                hoeFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                                auto r = hoeFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
+                                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_use_hoe: " << err.what() << std::endl; }
+                                else hoeUsed = r.get_type() == sol::type::boolean && r.get<bool>();
                             }
-                        } else {
+                            if (hoeUsed) g_FirstPerson.swing();
+                        }
+                        if (!hoeUsed) {
                             if (g_ClientMods && !rightRepeat) g_ClientMods->rightClickBlock(hitPos.x, hitPos.y, hitPos.z, targetProp.name);
                             sol::protected_function clickFunc = lua["on_right_click_block"];
                             bool handled = false;

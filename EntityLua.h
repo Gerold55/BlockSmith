@@ -40,6 +40,9 @@ struct EntityLuaHost {
     // Puts items in a player's inventory; false = no room (the item stays on the ground)
     std::function<bool(const std::string& name, const std::string& item, int count)> giveItem;
     std::function<int(int, int, int)> lightLevel;
+    // Is the sky overhead at x, y, z? (spawn rules with sky = true). Left empty: the world's
+    // sunlight decides - a world without light data (the dedicated server) needs this set.
+    std::function<bool(int, int, int)> skyVisible;
     std::function<bool()> isDay;
     std::function<bool()> spawningEnabled = [] { return true; };
     // The game: load the model / animations for a newly registered type (name, its def)
@@ -458,7 +461,8 @@ public:
         const bool day = m_host.isDay ? m_host.isDay() : true;
         auto light = m_host.lightLevel ? m_host.lightLevel : std::function<int(int, int, int)>([](int, int, int) { return 15; });
         for (uint32_t id : mgr.trySpawning(dt, *m_host.world, positions, light, day,
-                                           m_host.spawningEnabled ? m_host.spawningEnabled() : true)) {
+                                           m_host.spawningEnabled ? m_host.spawningEnabled() : true,
+                                           m_host.skyVisible)) {
             activate(id, sol::lua_nil);
         }
         forgetRemoved();

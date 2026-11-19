@@ -26,12 +26,16 @@ struct DayClock {
     double time() const { return total - std::floor(total); }
     // Day 0 is the first day; it becomes day 1 at the first midnight
     int64_t day() const { return total < 1.25 ? 0 : static_cast<int64_t>(std::floor(total - 0.25)); }
-    // Days that pass per real second
-    double rate() const { return secondsPerDay > 0.0 ? speed / secondsPerDay : 0.0; }
+    // Days that pass per real second (0 if the speed or day length isn't a real number)
+    double rate() const {
+        if (!std::isfinite(speed) || !std::isfinite(secondsPerDay) || secondsPerDay <= 0.0) return 0.0;
+        return speed / secondsPerDay;
+    }
 
     void advance(double seconds) {
-        total += seconds * rate();
-        if (total < 0.0) total = 0.0;
+        const double next = total + seconds * rate();
+        if (!std::isfinite(next)) return;          // (never let the clock become NaN / infinite)
+        total = next < 0.0 ? 0.0 : next;
     }
 
     // Jump to a time of day (0..1). forward: the next time it's that time (never back in time),

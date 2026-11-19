@@ -2273,11 +2273,41 @@ end)
 </ul>
 <p>Both run where the world is decided too: in singleplayer, for every player's edits when you host a LAN game, and on the dedicated server. A mod that changes the world from them, like leaf decay, should check <code>engine.is_authority()</code> so it only acts once.</p>
 <p><a id="fn-leafdecay-on_decay"></a><strong>Leaf decay</strong> (the <code>leafdecay</code> mod): when a tree is cut down, its leaves fade away over the next few seconds. A leaf stays while a log is within 6 steps of it through other leaves, and leaves a player placed never decay. You can change <code>leafdecay.settings.distance</code> and <code>leafdecay.settings.delay</code>, or which blocks count with <code>leafdecay.is_leaves</code> and <code>leafdecay.is_log</code>. <code>leafdecay.on_decay(function(x, y, z, leaves) end)</code> runs when a leaf goes.</p>
-<p>Leaves break instantly by hand. Like Minecraft, broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with <code>tool_type = &quot;shears&quot;</code>). Change the drops with <code>leafdecay.register_drops(&quot;leaves_oak&quot;, { { item = &quot;sapling_oak&quot;, chance = 0.05 }, { item = &quot;stick&quot;, chance = 0.02, min = 1, max = 2 } })</code>. There are no dropped items lying in the world yet, so decaying leaves give their drops to the player if they're within 32 blocks.</p>
+<p>Leaves break instantly by hand. Like Minecraft, broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with <code>tool_type = &quot;shears&quot;</code>). Change the drops with <code>leafdecay.register_drops(&quot;leaves_oak&quot;, { { item = &quot;sapling_oak&quot;, chance = 0.05 }, { item = &quot;stick&quot;, chance = 0.02, min = 1, max = 2 } })</code>. Decaying leaves give their drops to the player if they're within 32 blocks.</p>
+<p><a id="farming"></a>### Farming: hoes, crops and the scythe</p>
+<p>Two hooks drive the tools. A hoe or scythe is any item whose <code>tool_type</code> is <code>&quot;hoe&quot;</code> or <code>&quot;scythe&quot;</code>, or whose name contains the word:</p>
 <ul>
-<li><a id="fn-hooks-on_use_hoe"></a><code>on_use_hoe(x, y, z, block)</code></li>
-<li><a id="fn-hooks-on_use_scythe"></a><code>on_use_scythe(x, y, z, block)</code></li>
+<li><a id="fn-hooks-on_use_hoe"></a><code>on_use_hoe(x, y, z, block)</code>: right-click with a hoe. Return true if it did something (tilled the ground); otherwise the right-click carries on as usual, so doors still open with a hoe in hand.</li>
+<li><a id="fn-hooks-on_use_scythe"></a><code>on_use_scythe(x, y, z, block)</code>: left-click with a scythe. Return true if it reaped something. Otherwise the scythe digs the block like any tool.</li>
 </ul>
+<p>Craft &amp; Ruin's <code>farming</code> mod is Minecraft's farming:</p>
+<ul>
+<li><strong>Tilling:</strong> a hoe (wooden or stone) right-clicked on grass or dirt with air above makes farmland.</li>
+<li><strong>Farmland:</strong> it's wet (darker) with water within 4 blocks and dries out without. Bare dry farmland turns back to dirt, and jumping or falling onto farmland tramples it to dirt.</li>
+<li><strong>Seeds:</strong> they plant only on farmland. You get them by breaking tall grass (1 in 8).</li>
+<li><strong>Growing:</strong> crops grow on <a href="#abm">random ticks</a> with Minecraft's formula. They grow faster on wet farmland and in fields, need light 9 or more, and pop off if the farmland under them goes.</li>
+<li><strong>Harvesting by hand:</strong> breaking a ripe crop gives its harvest (wheat: 1 wheat and 0–3 seeds); an unripe one gives its seed back.</li>
+<li><strong>The scythe:</strong> left-click a ripe crop and the scythe reaps every ripe crop in the 3×3 patch around it, then replants them. Each one keeps back a seed from its harvest to go back in the ground. On anything else the scythe is an ordinary tool.</li>
+<li><strong>Recipes:</strong>
+<ul>
+<li>wooden and stone hoes are Minecraft's shape;</li>
+<li>the scythe is 3 stone across the top, with a stick under the right end and one in the middle of the bottom row;</li>
+<li>bread is 3 wheat in a row (5 food).</li>
+</ul>
+</li>
+<li><strong>Creative:</strong> everything is in the &quot;Farming&quot; tab.</li>
+</ul>
+<p><a id="fn-farming-register_crop"></a>Add your own crops with <code>farming.register_crop</code>:</p>
+<pre><code class="language-lua">farming.register_crop({
+    name = &quot;carrot&quot;,
+    stages = { &quot;mymod:carrot_1&quot;, &quot;mymod:carrot_2&quot;, &quot;mymod:carrot_3&quot;, &quot;mymod:carrot_ripe&quot; },  -- block names
+    textures = { &quot;carrot_1.png&quot;, &quot;carrot_2.png&quot;, &quot;carrot_3.png&quot;, &quot;carrot_4.png&quot; },  -- registers the stages
+    seed = &quot;mymod:carrot&quot;,                         -- what plants it (an item: give it an inventory_image)
+    harvest = { { &quot;mymod:carrot&quot;, 2, 4 } },        -- a ripe one: item, fewest, most
+    scythe_replants = true,                        -- a scythe reaps and replants it
+})
+</code></pre>
+<p>The last stage is the ripe one. It grows the same way as wheat. <code>farming.is_crop(name)</code> and <code>farming.is_ripe(name)</code> tell you about a block.</p>
 <h2 id="7-fluids">7. Fluids<a class="hash" href="#7-fluids" aria-label="Link to this section">#</a></h2>
 <p>Any fluid (lava, molten metal, oil) flows like Minecraft water, with its own spread distance, speed, reactions and bucket:</p>
 <p><a id="fn-engine-register_fluid"></a><a id="fn-engine-register_fluid_reaction"></a></p>
@@ -2923,7 +2953,7 @@ end
     max_nearby = 6,              -- not if there are this many of its kind within 48 blocks
 })
 </code></pre>
-<p>The game rule <code>doMobSpawning</code> (<code>/gamerule doMobSpawning false</code>) turns natural spawning off.</p>
+<p>The game rule <code>doMobSpawning</code> (<code>/gamerule doMobSpawning false</code>) turns natural spawning off. On a dedicated server, which keeps no light data, spawning uses the same light as <code>engine.get_light_level</code> there. Under open sky that's sunlight for the time of day; under anything solid it's dark. <code>sky = true</code> means nothing solid is overhead. So monsters spawn in caves and under cover, and animals only in the open.</p>
 <p><strong>Where they stop.</strong> An entity more than 128 blocks from every player, or in a chunk that isn't loaded, waits where it is: no physics, no <code>on_step</code>. Ones with <code>despawn = true</code> are removed when no player is within 128 blocks, or sometimes after 30 seconds with nobody within 32, like Minecraft's monsters. Those are never saved. Everything else is saved with the world (<code>entities.txt</code> in its folder) and comes back with <code>on_spawn(self, saved)</code>. If a mod isn't loaded, its entities are kept in the file untouched until it is.</p>
 <p><a id="dropped-items"></a><strong>Dropped items.</strong> Blocks dug in survival pop out as items, and so do mobs' <code>drops</code>. They bob and spin, join into stacks, and a player picks them up by walking over them. If your inventory is full they stay on the ground, and they disappear after 5 minutes.</p>
 <p>Players drop things the way they do in Minecraft:</p>
@@ -3832,7 +3862,7 @@ end
 </tr>
 <tr>
 <td><code>on_use_hoe(...)</code>, <code>on_use_scythe(...)</code></td>
-<td>tool use</td>
+<td>tool use: return true if used (<a href="#farming">farming</a>)</td>
 </tr>
 <tr>
 <td><code>update_player_animation(dt, moving, pitch)</code></td>

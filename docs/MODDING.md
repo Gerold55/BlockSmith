@@ -1960,9 +1960,39 @@ Both run where the world is decided too: in singleplayer, for every player's edi
 
 <a id="fn-leafdecay-on_decay"></a>**Leaf decay** (the `leafdecay` mod): when a tree is cut down, its leaves fade away over the next few seconds. A leaf stays while a log is within 6 steps of it through other leaves, and leaves a player placed never decay. You can change `leafdecay.settings.distance` and `leafdecay.settings.delay`, or which blocks count with `leafdecay.is_leaves` and `leafdecay.is_log`. `leafdecay.on_decay(function(x, y, z, leaves) end)` runs when a leaf goes.
 
-Leaves break instantly by hand. Like Minecraft, broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with `tool_type = "shears"`). Change the drops with `leafdecay.register_drops("leaves_oak", { { item = "sapling_oak", chance = 0.05 }, { item = "stick", chance = 0.02, min = 1, max = 2 } })`. There are no dropped items lying in the world yet, so decaying leaves give their drops to the player if they're within 32 blocks.
-- <a id="fn-hooks-on_use_hoe"></a>`on_use_hoe(x, y, z, block)`
-- <a id="fn-hooks-on_use_scythe"></a>`on_use_scythe(x, y, z, block)`
+Leaves break instantly by hand. Like Minecraft, broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with `tool_type = "shears"`). Change the drops with `leafdecay.register_drops("leaves_oak", { { item = "sapling_oak", chance = 0.05 }, { item = "stick", chance = 0.02, min = 1, max = 2 } })`. Decaying leaves give their drops to the player if they're within 32 blocks.
+
+<a id="farming"></a>### Farming: hoes, crops and the scythe
+
+Two hooks drive the tools. A hoe or scythe is any item whose `tool_type` is `"hoe"` or `"scythe"`, or whose name contains the word:
+- <a id="fn-hooks-on_use_hoe"></a>`on_use_hoe(x, y, z, block)`: right-click with a hoe. Return true if it did something (tilled the ground); otherwise the right-click carries on as usual, so doors still open with a hoe in hand.
+- <a id="fn-hooks-on_use_scythe"></a>`on_use_scythe(x, y, z, block)`: left-click with a scythe. Return true if it reaped something. Otherwise the scythe digs the block like any tool.
+
+Craft & Ruin's `farming` mod is Minecraft's farming:
+- **Tilling:** a hoe (wooden or stone) right-clicked on grass or dirt with air above makes farmland.
+- **Farmland:** it's wet (darker) with water within 4 blocks and dries out without. Bare dry farmland turns back to dirt, and jumping or falling onto farmland tramples it to dirt.
+- **Seeds:** they plant only on farmland. You get them by breaking tall grass (1 in 8).
+- **Growing:** crops grow on [random ticks](#abm) with Minecraft's formula. They grow faster on wet farmland and in fields, need light 9 or more, and pop off if the farmland under them goes.
+- **Harvesting by hand:** breaking a ripe crop gives its harvest (wheat: 1 wheat and 0–3 seeds); an unripe one gives its seed back.
+- **The scythe:** left-click a ripe crop and the scythe reaps every ripe crop in the 3×3 patch around it, then replants them. Each one keeps back a seed from its harvest to go back in the ground. On anything else the scythe is an ordinary tool.
+- **Recipes:**
+  - wooden and stone hoes are Minecraft's shape;
+  - the scythe is 3 stone across the top, with a stick under the right end and one in the middle of the bottom row;
+  - bread is 3 wheat in a row (5 food).
+- **Creative:** everything is in the "Farming" tab.
+
+<a id="fn-farming-register_crop"></a>Add your own crops with `farming.register_crop`:
+```lua
+farming.register_crop({
+    name = "carrot",
+    stages = { "mymod:carrot_1", "mymod:carrot_2", "mymod:carrot_3", "mymod:carrot_ripe" },  -- block names
+    textures = { "carrot_1.png", "carrot_2.png", "carrot_3.png", "carrot_4.png" },  -- registers the stages
+    seed = "mymod:carrot",                         -- what plants it (an item: give it an inventory_image)
+    harvest = { { "mymod:carrot", 2, 4 } },        -- a ripe one: item, fewest, most
+    scythe_replants = true,                        -- a scythe reaps and replants it
+})
+```
+The last stage is the ripe one. It grows the same way as wheat. `farming.is_crop(name)` and `farming.is_ripe(name)` tell you about a block.
 
 ## 7. Fluids
 
@@ -2469,7 +2499,7 @@ entities.register_spawn({
 })
 ```
 
-The game rule `doMobSpawning` (`/gamerule doMobSpawning false`) turns natural spawning off.
+The game rule `doMobSpawning` (`/gamerule doMobSpawning false`) turns natural spawning off. On a dedicated server, which keeps no light data, spawning uses the same light as `engine.get_light_level` there. Under open sky that's sunlight for the time of day; under anything solid it's dark. `sky = true` means nothing solid is overhead. So monsters spawn in caves and under cover, and animals only in the open.
 
 **Where they stop.** An entity more than 128 blocks from every player, or in a chunk that isn't loaded, waits where it is: no physics, no `on_step`. Ones with `despawn = true` are removed when no player is within 128 blocks, or sometimes after 30 seconds with nobody within 32, like Minecraft's monsters. Those are never saved. Everything else is saved with the world (`entities.txt` in its folder) and comes back with `on_spawn(self, saved)`. If a mod isn't loaded, its entities are kept in the file untouched until it is.
 
@@ -3058,7 +3088,7 @@ Define any of these as globals. Only the ones you need. If another mod may alrea
 | `on_player_chat(name, text)` → `false` or new text | a chat line before everyone sees it (section 17) |
 | `on_server_start()`, `on_server_stop()` | the server starts or stops (section 17) |
 | `on_pick_block(x, y, z, item, meta, block)` → bool | pick block (middle mouse); see [Pick block](#pick-block) |
-| `on_use_hoe(...)`, `on_use_scythe(...)` | tool use |
+| `on_use_hoe(...)`, `on_use_scythe(...)` | tool use: return true if used ([farming](#farming)) |
 | `update_player_animation(dt, moving, pitch)` | every frame in game |
 | `get_water_color(x, z)` | underwater colour |
 | <a id="fn-hooks-on_char_input"></a><a id="fn-hooks-on_scroll_input"></a>`on_char_input(codepoint)`, `on_scroll_input(dx, dy)` | text and mouse wheel |
