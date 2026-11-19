@@ -61,13 +61,39 @@ FetchContent_MakeAvailable(enet)
 # ---------------------------------------------------------------------------
 if (NOT BLOCKSMITH_SERVER_ONLY)
 
-# OpenAL Soft (sound) - from vcpkg if it has it (openal-soft), else downloaded and built
-# the first time CMake configures, like ENet
+# OpenAL Soft (sound), the first of:
+#   1. vcpkg's openal-soft (Windows)
+#   2. the system's OpenAL (Linux / BSD package, e.g. libopenal-dev, openal-soft, openal)
+#   3. downloaded and built the first time CMake configures, like ENet
+# -DBLOCKSMITH_BUNDLED_OPENAL=ON skips 2 and always builds it.
+option(BLOCKSMITH_BUNDLED_OPENAL "Always download and build OpenAL Soft, even if the system has OpenAL" OFF)
 find_package(OpenAL CONFIG QUIET)
+if (NOT TARGET OpenAL::OpenAL AND NOT BLOCKSMITH_BUNDLED_OPENAL AND NOT WIN32 AND NOT APPLE)
+    # (not on macOS: its OpenAL.framework has <OpenAL/al.h>, the game includes <AL/al.h>)
+    find_package(OpenAL MODULE QUIET)
+    if (OPENAL_FOUND)
+        if (NOT TARGET OpenAL::OpenAL)        # (CMake older than 3.25 makes no target)
+            add_library(OpenAL::OpenAL INTERFACE IMPORTED)
+            set_target_properties(OpenAL::OpenAL PROPERTIES
+                INTERFACE_LINK_LIBRARIES "${OPENAL_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${OPENAL_INCLUDE_DIR}")
+        endif()
+        # OPENAL_INCLUDE_DIR is usually .../include/AL; the game includes <AL/al.h>, so the
+        # folder above it is needed too (/usr/local/include on the BSDs isn't searched by default)
+        get_filename_component(_openal_parent "${OPENAL_INCLUDE_DIR}" DIRECTORY)
+        set_property(TARGET OpenAL::OpenAL APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${_openal_parent}")
+        message(STATUS "Sound: the system's OpenAL (${OPENAL_LIBRARY})")
+    endif()
+endif()
 if (TARGET OpenAL::OpenAL)
-    message(STATUS "Sound: OpenAL from vcpkg")
+    if (NOT OPENAL_FOUND)
+        message(STATUS "Sound: OpenAL from vcpkg")
+    endif()
 else()
     message(STATUS "Sound: downloading OpenAL Soft")
+    # No built-in HRTF data: the game doesn't use HRTF, and its rule depends on a file with a
+    # space in its name ("Default HRTF.mhr") that BSD make can't handle
+    set(ALSOFT_EMBED_HRTF_DATA OFF CACHE BOOL "" FORCE)
     set(ALSOFT_UTILS OFF CACHE BOOL "" FORCE)
     set(ALSOFT_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(ALSOFT_TESTS OFF CACHE BOOL "" FORCE)
@@ -138,6 +164,8 @@ add_executable(BlockSmith
     StbVorbis.cpp
     Net.cpp
     Net.h
+    RemoteContent.cpp
+    RemoteContent.h
     PlayerMovement.cpp
     PlayerMovement.h
     BlockDefs.cpp
@@ -206,6 +234,7 @@ add_executable(BlockSmithServer
     Block.cpp
     BlockDefs.cpp
     Net.cpp
+    RemoteContent.cpp
     PlayerMovement.cpp
 )
 
@@ -233,4 +262,29 @@ endif()
 if (NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
+endif()
+
+# ---------------------------------------------------------------------------
+# Online mod content (RemoteContent.cpp): HTTPS downloads of DATA (JSON, text, pictures, sounds)
+# from GitHub and approved sites. Windows: WinHTTP (built in). Elsewhere: libcurl if installed;
+# without it the game still builds and remote.* says downloads aren't available.
+# ---------------------------------------------------------------------------
+if (WIN32)
+    if (TARGET BlockSmith)
+        target_link_libraries(BlockSmith PRIVATE winhttp)
+    endif()
+    target_link_libraries(BlockSmithServer PRIVATE winhttp)
+else()
+    find_package(CURL QUIET)
+    if (CURL_FOUND)
+        message(STATUS "BlockSmith: online mod content uses libcurl")
+        foreach(target BlockSmith BlockSmithServer)
+            if (TARGET ${target})
+                target_link_libraries(${target} PRIVATE CURL::libcurl)
+                target_compile_definitions(${target} PRIVATE BLOCKSMITH_HAS_CURL=1)
+            endif()
+        endforeach()
+    else()
+        message(STATUS "BlockSmith: libcurl not found - online mod content (remote.*) is disabled in this build")
+    endif()
 endif()

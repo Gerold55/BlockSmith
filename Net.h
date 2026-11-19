@@ -11,6 +11,7 @@
 // dedicated (windowless) server.
 
 #include <glm/glm.hpp>
+#include "DayTime.h"
 #include <cstdint>
 #include <deque>
 #include <algorithm>
@@ -171,8 +172,21 @@ public:
     std::function<void(const std::string& name, const std::string& command)> onCommand;
     // Called once someone has joined (e.g. to send them a welcome message). Optional.
     std::function<void(const std::string& name)> onJoin;
-    // A player changed a block (and the server accepted it): for break/place sounds
-    std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onPlayerEdit;
+    // A player changed a block (and the server accepted it): for break/place sounds and mods
+    std::function<void(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onPlayerEdit;
+    // Before a player's block change is applied: "" = allowed, anything else = refused (the
+    // player's game is sent the real block back). The text is shown to the player, except
+    // kSilentRefusal. Optional. (Mods: can_edit_block)
+    std::function<std::string(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> canEdit;
+    static constexpr const char* kSilentRefusal = "\x01";
+    // A player's chat line, before everyone sees it: return false to drop it; `text` may be
+    // changed. Optional. (Mods: on_player_chat)
+    std::function<bool(const std::string& name, std::string& text)> onChat;
+    // Chat and /commands from one player: a burst of kChatBurst, then one every
+    // kChatRefillSeconds. More is dropped; kSpamKickStrikes drops in a row gets them kicked.
+    static constexpr double kChatBurst = 6.0;
+    static constexpr double kChatRefillSeconds = 0.75;
+    static constexpr int kSpamKickStrikes = 25;
     // A chat line to one player only. False if they're not online.
     // ---- Game modes and operators: the server decides. Each player's game follows what it's
     //      told and won't let the player change it themselves (only the server/admins can). ----
@@ -202,7 +216,18 @@ public:
     void setShared(const std::string& key, const std::string& value);
     const std::unordered_map<std::string, std::string>& shared() const { return m_shared; }
 
+    // The time of day (DayTime.h). The owner (the dedicated server, or the game when hosting)
+    // calls this every tick with its clock; players get it when they join, every few seconds,
+    // and at once when it jumps (a "time set") or its speed changes.
+    void setDayTime(const DayClock& clock);
+
 private:
+    void sendDayTime(ENetPeer* peer);
+    DayClock m_dayClock;          // the owner's clock, as of the last setDayTime
+    DayClock m_daySent;           // ...as last sent to everyone, and when
+    double m_daySentAt = 0.0;
+    bool m_hasDayClock = false;
+    float m_dayTimer = 0.0f;
     void sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values);
     struct Client {
         ENetPeer* peer = nullptr;
@@ -232,6 +257,11 @@ private:
         // For F3 / netstats
         int inputsThisSecond = 0, inputsPerSecond = 0;
         int droppedInputs = 0;        // refused because they sent more movement than time allowed
+        // Chat flood limit (kChatBurst...): tokens left, when they were last topped up, strikes
+        double chatTokens = kChatBurst;
+        double chatRefillAt = 0.0;
+        int spamStrikes = 0;
+        double lastSpamWarning = -100.0;
         float movedThisSecond = 0.0f, speed = 0.0f;   // horizontal blocks/second on the server
         double statsWindow = 0.0;
         std::unordered_set<World::ChunkCoord, PairHash> sentChunks;
@@ -245,6 +275,9 @@ private:
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
     void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
+    void sendMessageTo(Client& c, const std::string& text, const glm::vec3& color);
+    static std::string cleanChatText(const std::string& in);
+    bool allowChat(Client& c);
     void dropClient(uint16_t id);
     void sendMode(Client& c);
 
@@ -363,6 +396,9 @@ public:
     bool isOperator() const { return m_isOp; }
     // True once each time the server changes our mode or operator status
     bool takeModeChange() { const bool c = m_modeChanged; m_modeChanged = false; return c; }
+    // The server's time of day, once each time it arrives (older servers never send one: then
+    // the game keeps its own clock)
+    bool takeDayTime(DayClock& out) { if (!m_dayTimeNew) return false; out = m_dayTime; m_dayTimeNew = false; return true; }
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
 
@@ -372,6 +408,8 @@ private:
     void sendEdits();
 
     std::vector<std::string> m_sharedChanges;
+    DayClock m_dayTime;
+    bool m_dayTimeNew = false;
     std::string m_mode;
     bool m_isOp = false;
     bool m_modeChanged = false;

@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
+#include "DayTime.h"
 
 struct PointLight {
     glm::vec3 position;
@@ -17,8 +18,10 @@ public:
     LightingSystem();
     ~LightingSystem();
 
+    // Runs the day clock (call every frame while playing; not while paused in singleplayer)
     void update(float deltaTime);
 
+    // The time of day, 0..1: 0.25 midnight, 0.5 sunrise, 0.75 midday, 0 sunset (DayTime.h)
     float getTimeOfDay() const;
     glm::vec3 getSunDirection() const;
     glm::vec3 getMoonDirection() const;
@@ -43,7 +46,9 @@ public:
     void removePointLight(int id);
     const std::vector<PointLight>& getPointLights() const;
 
-    // State variables
+    // The day clock: saved with the world; on a server, the server's (GameClient::takeDayTime)
+    DayClock clock;
+    // (older: a fixed time set by sky.set_time; kept for code that still sets it. -1 = use the clock)
     float customTimeOfDay = -1.0f;
     int forcedMoonPhase = -1;
     float weatherRainIntensity = 0.0f;

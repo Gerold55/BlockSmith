@@ -29,6 +29,10 @@
 #include "SafeReplace.h"
 #include "ClientModRules.h"
 #include "Auth.h"
+#include "LuaSandbox.h"
+#include "ServerLuaApi.h"
+#include "RemoteLua.h"
+#include "ConsoleInput.h"
 
 #include <sol/sol.hpp>
 #include <cstdio>
@@ -211,6 +215,10 @@ struct ServerConfig {
     std::set<std::string> disabledMods;
     int tickRate = 30;
     int autosaveSeconds = 60;
+    double dayLengthMinutes = 20.0;   // one whole day (DayTime.h); 'time' in the console
+    double luaTimeLimit = 5.0;   // seconds one mod event may run before it's stopped (0 = no limit)
+    bool remoteContent = true;   // mods may download data (JSON, text, pictures, sounds) - never code
+    std::vector<std::string> remoteDomains;   // approved besides GitHub
     ClientModRules clientMods;   // what players' own client mods may do here
 };
 
@@ -279,7 +287,20 @@ void writeDefaultConfig(const fs::path& file, const ServerConfig& c) {
         << "tick_rate = " << c.tickRate << "\n"
         << "# Threads that generate new terrain (0 = automatic: CPU cores - 1)\n"
         << "generator_threads = 0\n"
-        << "autosave_seconds = " << c.autosaveSeconds << "\n";
+        << "autosave_seconds = " << c.autosaveSeconds << "\n"
+        << "# How long a whole day (day + night) lasts, in minutes. 'time' in the console sets the\n"
+        << "# time of day, or stops it ('time speed 0')\n"
+        << "day_length = " << c.dayLengthMinutes << "\n"
+        << "# A mod's event (on_update, on_player_chat...) that runs longer than this many seconds is\n"
+        << "# stopped with an error instead of freezing the server (0 = no limit)\n"
+        << "lua_time_limit = " << c.luaTimeLimit << "\n"
+        << "\n"
+        << "# --- Online mod content ---\n"
+        << "# Mods may download DATA (JSON, text, PNG/JPEG pictures, OGG/WAV sounds) from GitHub\n"
+        << "# (raw files, GitHub Pages) - never code. Each mod lists its sources in its mod.conf.\n"
+        << "remote_content = " << (c.remoteContent ? "true" : "false") << "\n"
+        << "# Other sites mods may download from (comma separated, e.g. example.com, *.mysite.org)\n"
+        << "remote_domains = \n";
 }
 
 ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
@@ -318,6 +339,24 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     }
     c.tickRate = std::clamp(toInt(kv["tick_rate"], c.tickRate), 10, 120);
     c.autosaveSeconds = std::clamp(toInt(kv["autosave_seconds"], c.autosaveSeconds), 10, 3600);
+    if (kv.count("day_length")) {
+        try { c.dayLengthMinutes = std::clamp(std::stod(kv["day_length"]), 0.5, 100000.0); } catch (...) {}
+    }
+    if (kv.count("remote_content")) c.remoteContent = toBool(kv["remote_content"], c.remoteContent);
+    {
+        std::istringstream doms(kv["remote_domains"]);
+        std::string d;
+        while (std::getline(doms, d, ',')) {
+            d = lower(trim(d));
+            if (d.rfind("https://", 0) == 0) d = d.substr(8);
+            if (d.rfind("*.", 0) == 0) d = d.substr(2);
+            while (!d.empty() && d.back() == '/') d.pop_back();
+            if (!d.empty()) c.remoteDomains.push_back(d);
+        }
+    }
+    if (kv.count("lua_time_limit")) {
+        try { c.luaTimeLimit = std::clamp(std::stod(kv["lua_time_limit"]), 0.0, 600.0); } catch (...) {}
+    }
     c.clientMods = ClientModRules::fromConfig(kv, "client_mods", c.clientMods);
     return c;
 }
@@ -546,6 +585,7 @@ struct WorldMeta {
     bool exists = false;
     uint32_t seed = 0;
     std::string game;
+    std::string timeLine;                    // "time=<days> <speed>" (DayTime.h)
     std::vector<std::string> otherLines;
 };
 
@@ -559,6 +599,8 @@ WorldMeta readWorldMeta(const fs::path& file) {
             try { m.seed = static_cast<uint32_t>(std::stoul(line.substr(5))); m.exists = true; } catch (...) {}
         } else if (line.rfind("game=", 0) == 0) {
             m.game = line.substr(5);
+        } else if (line.rfind("time=", 0) == 0) {
+            m.timeLine = line;
         } else if (line.rfind("version=", 0) != 0 && !line.empty()) {
             m.otherLines.push_back(line);
         }
@@ -576,6 +618,7 @@ bool writeWorldMeta(const fs::path& file, const WorldMeta& m) {
         out << "version=1\n";
         if (!m.game.empty()) out << "game=" << m.game << "\n";
         out << "seed=" << m.seed << "\n";
+        if (!m.timeLine.empty()) out << m.timeLine << "\n";
         for (const auto& l : m.otherLines) out << l << "\n";
         if (!out) return false;
     }
@@ -679,12 +722,70 @@ std::deque<std::string> g_ConsoleLines;
 
 void onSignal(int) { g_Running = false; }   // Ctrl+C: save and stop
 
-void consoleThread() {
-    std::string line;
-    while (g_Running && std::getline(std::cin, line)) {
-        std::lock_guard<std::mutex> lock(g_ConsoleMutex);
-        g_ConsoleLines.push_back(line);
+// The prompt (ConsoleInput.h): line editing, history, and Tab completion of commands and their
+// arguments. Completion reads this snapshot, which the main loop refreshes (the console has its
+// own thread, and mustn't touch the server's lists while the main thread changes them).
+console::LineEditor g_Console;
+struct CompletionData {
+    std::vector<std::string> modCommands;   // chat.register_command names
+    std::vector<std::string> players;       // online
+    std::vector<std::string> banned, whitelisted, ops, accounts;
+    std::vector<std::string> modsOn, modsOff;   // "mods disable" / "mods enable" can change these
+};
+std::mutex g_CompletionMutex;
+CompletionData g_Completion;
+
+// The console's commands, in the order 'help' shows them (respawn is the game's own)
+const std::vector<std::string> kConsoleCommands = {
+    "stop", "save", "reload", "tps", "seed", "games", "mods", "motd", "name",
+    "list", "say", "msg", "tell", "kick", "ban", "unban", "pardon", "banlist", "whitelist",
+    "op", "deop", "ops", "password", "gamemode", "gm", "time", "help"};
+
+// What Tab offers: `before` are the words before the one being typed
+std::vector<std::string> completeConsole(const std::vector<std::string>& before, const std::string&) {
+    std::lock_guard<std::mutex> lock(g_CompletionMutex);
+    const CompletionData& d = g_Completion;
+    if (before.empty()) {                                  // the command
+        std::vector<std::string> out = kConsoleCommands;
+        out.insert(out.end(), d.modCommands.begin(), d.modCommands.end());
+        return out;
     }
+    std::string cmd = before[0];
+    for (char& c : cmd) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const size_t arg = before.size();                      // 1 = the first argument
+    auto lowerWord = [&](size_t i) {
+        std::string w = i < before.size() ? before[i] : "";
+        for (char& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return w;
+    };
+    auto join = [](std::vector<std::string> a, const std::vector<std::string>& b) {
+        for (const auto& x : b) if (std::find(a.begin(), a.end(), x) == a.end()) a.push_back(x);
+        return a;
+    };
+    if (arg == 1) {
+        if (cmd == "kick" || cmd == "msg" || cmd == "tell") return d.players;
+        if (cmd == "ban") return join(d.players, d.accounts);
+        if (cmd == "op") return join(join(d.players, d.accounts), d.whitelisted);
+        if (cmd == "deop") return d.ops;
+        if (cmd == "unban" || cmd == "pardon") return d.banned;
+        if (cmd == "whitelist") return {"on", "off", "add", "remove", "list"};
+        if (cmd == "gamemode" || cmd == "gm") return {"survival", "creative"};
+        if (cmd == "password") return {"reset"};
+        if (cmd == "mods") return {"list", "enable", "disable"};
+        if (cmd == "time") return {"set", "add", "speed", "query"};
+        if (cmd == "help") return {};
+    }
+    if (arg == 2) {
+        const std::string sub = lowerWord(1);
+        if (cmd == "whitelist" && sub == "add") return join(d.players, d.accounts);
+        if (cmd == "whitelist" && sub == "remove") return d.whitelisted;
+        if (cmd == "gamemode" || cmd == "gm") return join(d.players, d.accounts);
+        if (cmd == "password" && sub == "reset") return d.accounts;
+        if (cmd == "mods" && sub == "enable") return d.modsOff;
+        if (cmd == "time" && sub == "set") return {"day", "noon", "night", "midnight", "sunrise", "sunset"};
+        if (cmd == "mods" && sub == "disable") return d.modsOn;
+    }
+    return {};
 }
 
 std::string stripTags(const std::string& s) {
@@ -711,7 +812,7 @@ local function noop_table()
     })
 end
 _server_noop = noop_table
-for _, name in ipairs({ "ui", "hotbar", "sky", "clouds", "fog", "underwater", "menu", "sound" }) do
+for _, name in ipairs({ "ui", "hotbar", "sky", "clouds", "fog", "underwater", "menu", "sound", "remote" }) do
     _G[name] = noop_table()
 end
 local function fallback(t)
@@ -726,17 +827,105 @@ struct ServerContext {
     World* world = nullptr;
     GameServer* server = nullptr;
     ServerConfig* config = nullptr;
+    DayClock* clock = nullptr;                // the time of day (sky.get_time / set_time)
     GameInfo game;
     std::vector<std::string> sharedChanged;   // for on_shared_changed
     struct ModCommand { std::string name, usage, description; };
     std::vector<ModCommand> modCommands;      // chat.register_command (listed by help)
+    // engine.get_storage / set_storage: the world's mod_storage.txt (same file as in the game)
+    std::map<std::string, std::string> storage;
+    bool storageDirty = false;
+    ServerLuaApi api;
 };
+
+// mod_storage.txt: "key<TAB>value" lines, \\ \\n \\t escaped (the same as the game's)
+std::string escapeStorage(const std::string& v) {
+    std::string o;
+    for (char ch : v) {
+        if (ch == '\\') o += "\\\\";
+        else if (ch == '\n') o += "\\n";
+        else if (ch == '\t') o += "\\t";
+        else o += ch;
+    }
+    return o;
+}
+std::string unescapeStorage(const std::string& v) {
+    std::string o;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            const char n = v[++i];
+            o += n == 'n' ? '\n' : n == 't' ? '\t' : n;
+        } else {
+            o += v[i];
+        }
+    }
+    return o;
+}
+void loadStorage(const fs::path& file, std::map<std::string, std::string>& out) {
+    out.clear();
+    std::ifstream in(file);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t tab = line.find('\t');
+        if (tab != std::string::npos) out[unescapeStorage(line.substr(0, tab))] = unescapeStorage(line.substr(tab + 1));
+    }
+}
+bool saveStorage(const fs::path& file, const std::map<std::string, std::string>& kv) {
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        for (const auto& [k, v] : kv) out << escapeStorage(k) << '\t' << escapeStorage(v) << '\n';
+        if (!out) return false;
+    }
+    std::error_code ec;
+    return replaceFile(tmp, file, ec);
+}
+
+// The folders a mod's Lua may read (LuaSandbox): the game's folder, the global mods folder(s)
+// and the shared module folders (lualib/ next to mods/, and games/<game>/lualib/)
+std::vector<fs::path> serverModRoots(const std::string& game) {
+    std::vector<fs::path> modRoots;
+    for (const std::string& p : {std::string("mods"), std::string("../mods"), std::string("../../mods"),
+                                 "games/" + game + "/mods", "../../games/" + game + "/mods"}) {
+        std::error_code ec;
+        if (fs::is_directory(p, ec)) modRoots.push_back(p);
+    }
+    return modRoots;
+}
+
+void installSandbox(sol::state& lua, const std::string& game) {
+    std::vector<fs::path> modRoots = serverModRoots(game), libs;
+    for (const std::string& p : {std::string("lualib"), std::string("../lualib"), std::string("../../lualib"),
+                                 "games/" + game + "/lualib", "../../games/" + game + "/lualib"}) {
+        std::error_code ec;
+        if (fs::is_directory(p, ec)) libs.push_back(p);
+    }
+    luasandbox::install(lua, { findFolder("games/" + game) }, modRoots, libs);
+}
 
 // worker = true: a Lua state for a world generator thread. Same mods, but nothing in it
 // may touch the world or the block list (the main thread owns those), and it stays quiet.
 void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
-    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table);
+    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
+                       sol::lib::coroutine, sol::lib::utf8);
+    installSandbox(lua, ctx.config->game);        // require / dofile only inside mods and lualib
+    luasandbox::installTimeLimitHook(lua);
     if (worker) lua["print"] = [](sol::variadic_args) {};
+    else {
+        // print() through std::cout, so it shows above the console prompt instead of through it
+        lua["print"] = [](sol::variadic_args va, sol::this_state ts) {
+            sol::state_view lv(ts);
+            sol::protected_function tostr = lv["tostring"];
+            std::string line;
+            for (auto v : va) {
+                if (!line.empty()) line += "\t";
+                auto r = tostr(v.get<sol::object>());
+                line += r.valid() ? r.get<std::string>() : std::string("?");
+            }
+            std::cout << line << std::endl;
+        };
+    }
 
     lua.new_usertype<ChunkData>("Chunk",
         "set_block", &ChunkData::setBlock, "setBlock", &ChunkData::setBlock,
@@ -789,6 +978,19 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         };
     }
     engine["is_server"] = []() { return true; };
+    if (!worker) {
+        // Mod storage, saved with the world (like engine.get_storage in singleplayer)
+        engine["get_storage"] = [&ctx](const std::string& key, sol::this_state ts) -> sol::object {
+            const auto it = ctx.storage.find(key);
+            if (it == ctx.storage.end()) return sol::make_object(ts, sol::lua_nil);
+            return sol::make_object(ts, it->second);
+        };
+        engine["set_storage"] = [&ctx](const std::string& key, sol::optional<std::string> value) {
+            if (value) ctx.storage[key] = *value; else ctx.storage.erase(key);
+            ctx.storageDirty = true;
+        };
+        ctx.api.addFunctions(engine);             // players: get_online_players, kick_player...
+    }
     engine["get_player_name"] = [&ctx]() { return ctx.config->name; };
     engine["send_chat"] = [&ctx](const std::string& text) {
         ctx.server->broadcastMessage("[Server] " + text, glm::vec3(1.0f));
@@ -858,6 +1060,24 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         chat["send"] = [](sol::variadic_args) {};
     }
     lua.script(kNoopLua);
+    if (!worker) {
+        // The time of day is the server's: sky.get_time / set_time and friends work here (the
+        // rest of sky.* is the game's drawing, and does nothing on a server)
+        sol::table sky = lua["sky"];
+        sky["get_time"] = [&ctx]() { return ctx.clock ? ctx.clock->time() : 0.75; };
+        sky["set_time"] = [&ctx](double t, sol::optional<bool> forward) {
+            if (ctx.clock && std::isfinite(t)) ctx.clock->setTimeOfDay(t, forward.value_or(false));
+        };
+        sky["add_time"] = [&ctx](double hours) {
+            if (ctx.clock && std::isfinite(hours)) ctx.clock->total = std::max(0.0, ctx.clock->total + hours / 24.0);
+        };
+        sky["get_day"] = [&ctx]() { return ctx.clock ? static_cast<double>(ctx.clock->day()) : 0.0; };
+        sky["get_clock"] = [&ctx]() { return ctx.clock ? ctx.clock->clock() : std::string("12:00"); };
+        sky["set_time_speed"] = [&ctx](double v) { if (ctx.clock && std::isfinite(v)) ctx.clock->speed = std::clamp(v, 0.0, 1000.0); };
+        sky["get_time_speed"] = [&ctx]() { return ctx.clock ? ctx.clock->speed : 1.0; };
+        sky["set_day_length"] = [&ctx](double sec) { if (ctx.clock && std::isfinite(sec)) ctx.clock->secondsPerDay = std::clamp(sec, 10.0, 1.0e7); };
+        sky["get_day_length"] = [&ctx]() { return ctx.clock ? ctx.clock->secondsPerDay : 1200.0; };
+    }
 }
 
 void printUsage() {
@@ -1017,6 +1237,12 @@ int main(int argc, char** argv) {
     }
     if (!meta.exists) meta.seed = seedFromText(config.seed);
     meta.game = config.game;
+    // The time of day: carries on where the world left it (a new world: morning)
+    DayClock dayClock;
+    if (!meta.timeLine.empty()) dayClock.loadLine(meta.timeLine);
+    dayClock.secondsPerDay = config.dayLengthMinutes * 60.0;
+    ctx.clock = &dayClock;
+    meta.timeLine = dayClock.saveLine();
     writeWorldMeta(worldDir / "world.dat", meta);
     world.setSaveDirectory(worldDir.string());
     world.setSeed(meta.seed);
@@ -1024,8 +1250,19 @@ int main(int argc, char** argv) {
               << "' (seed " << meta.seed << ")" << std::endl;
 
     // ---- Mods ----
+    loadStorage(worldDir / "mod_storage.txt", ctx.storage);
     sol::state lua;
+    ctx.api.lua = &lua;
+    ctx.api.server = &server;
+    ctx.api.dedicated = true;
+    ctx.api.timeLimit = config.luaTimeLimit;
     setupLua(lua, ctx);
+    // Online content for mods (remote.*): data only, from GitHub and the approved sites
+    remote::Policy remotePolicy;
+    remotePolicy.enabled = config.remoteContent;
+    remotePolicy.extraDomains = config.remoteDomains;
+    RemoteLua remoteContent(lua, confDir / "cache" / "remote", remotePolicy, serverModRoots(config.game),
+                            config.luaTimeLimit);
     int failed = 0;
     for (const auto& file : findModFiles(config.game, config.disabledMods)) {
         lua["g_CurrentModPath"] = file.parent_path().string();
@@ -1089,6 +1326,17 @@ int main(int argc, char** argv) {
     server.modeFor = [&](const std::string& name) { return playerModes.reason(name); };
     server.isOperator = [&](const std::string& name) { return ops.has(name); };
     accounts.load();
+    ctx.api.isOperator = [&](const std::string& name) { return ops.has(name); };
+    ctx.api.rememberMode = [&](const std::string& name, const std::string& mode) {
+        if (mode == config.gameMode) playerModes.remove(name); else playerModes.add(name, mode);
+    };
+    ctx.api.fillServerInfo = [&](sol::table& t) {
+        t["name"] = config.name;
+        t["world"] = config.world;
+        t["tick_rate"] = config.tickRate;
+        t["view_distance"] = config.viewDistance;
+        t["whitelist"] = config.whitelist;
+    };
 
     auto spawnPoint = [&]() {
         const int ground = world.groundHeightAt(config.spawnX, config.spawnZ);
@@ -1099,20 +1347,22 @@ int main(int argc, char** argv) {
         pos = spawnPoint();
         return true;
     };
-    server.onLeave = [&worldDir](const std::string& name, const glm::vec3& pos) { savePlayer(worldDir, name, pos); };
-    // A player broke or placed a block: on_block_broken(x, y, z, block, meta) /
-    // on_block_placed(x, y, z, block) - the same hooks as in singleplayer, so mods like leaf
-    // decay work on servers (the server is the one that decides)
-    server.onPlayerEdit = [&lua](const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
-        auto& reg = BlockRegistry::getInstance();
-        if (FluidRegistry::get().forBlock(oldId) || FluidRegistry::get().forBlock(newId)) return;
-        const char* hookName = newId == 0 ? "on_block_broken" : "on_block_placed";
-        sol::protected_function hook = lua[hookName];
-        if (!hook.valid()) return;
-        auto r = newId == 0 ? hook(pos.x, pos.y, pos.z, reg.getBlock(oldId).name, 0)
-                            : hook(pos.x, pos.y, pos.z, reg.getBlock(newId).name);
-        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] " << hookName << ": " << err.what() << std::endl; }
+    server.onLeave = [&](const std::string& name, const glm::vec3& pos) {
+        savePlayer(worldDir, name, pos);
+        ctx.api.playerLeft(name, pos);
     };
+    // A player broke or placed a block: on_block_broken(x, y, z, block, meta, player) /
+    // on_block_placed(x, y, z, block, player) - the same hooks as in singleplayer, so mods like
+    // leaf decay work on servers (the server is the one that decides)
+    server.onPlayerEdit = [&ctx](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
+        if (FluidRegistry::get().forBlock(oldId) || FluidRegistry::get().forBlock(newId)) return;
+        ctx.api.edited(name, pos, oldId, newId);
+    };
+    // Mods may refuse an edit (can_edit_block) or a chat line (on_player_chat)
+    server.canEdit = [&ctx](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
+        return ctx.api.canEdit(name, pos, oldId, newId);
+    };
+    server.onChat = [&ctx](const std::string& name, std::string& text) { return ctx.api.chat(name, text); };
     std::set<std::string> newAccounts;   // registered while joining (told about it once they're in)
     server.hasAccount = [&](const std::string& name) { return accounts.has(name); };
     server.canJoin = [&](const std::string& name, const net::AuthProof& proof) -> std::string {
@@ -1147,6 +1397,7 @@ int main(int argc, char** argv) {
             for (size_t p; (p = msg.find("{player}")) != std::string::npos;) msg.replace(p, 8, name);
             server.messagePlayer(name, stripTags(msg), glm::vec3(1.0f, 0.85f, 0.3f));
         }
+        const bool newAccount = newAccounts.count(name) > 0;
         if (newAccounts.erase(name)) {
             server.messagePlayer(name, "Your name is now protected by your password on this server.",
                                  glm::vec3(0.6f, 0.9f, 1.0f));
@@ -1156,6 +1407,7 @@ int main(int argc, char** argv) {
         }
         if (ops.has(name)) server.messagePlayer(name, "You are an operator here: type /help for server commands.",
                                                 glm::vec3(0.6f, 0.9f, 1.0f));
+        ctx.api.playerJoined(name, newAccount);
     };
 
     // ---- Network ----
@@ -1166,6 +1418,8 @@ int main(int argc, char** argv) {
         server.setGameTitle(ctx.game.title);
         server.setDefaultMode(config.gameMode);
         server.setShared(ClientModRules::kSharedKey, config.clientMods.encode());   // players' client mods
+        dayClock.secondsPerDay = config.dayLengthMinutes * 60.0;                      // (day_length)
+        server.setDayTime(dayClock);
     };
     server.setServerId(loadOrCreateServerId(confDir / "server_id.txt"));   // passwords are bound to it
     applyLiveSettings();
@@ -1177,20 +1431,30 @@ int main(int argc, char** argv) {
     applyLiveSettings();   // again: starting the server clears shared values
     std::cout << "[Server] '" << config.name << "' is listening on port " << config.port << " (max "
               << config.maxPlayers << " players" << (config.whitelist ? ", whitelist on" : "")
-              << (config.requirePassword ? ", passwords required" : "") << "). Type 'help' for commands." << std::endl;
+              << (config.requirePassword ? ", passwords required" : "") << "). Type 'help' for commands (Tab completes them)." << std::endl;
     if (ops.entries.empty()) {
         std::cout << "[Server] No operators yet: join, then type 'op <your name>' here to manage the server "
                   << "from inside the game" << std::endl;
     }
+    ctx.api.serverStarted();   // on_server_start()
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
-    std::thread(consoleThread).detach();
+    // (filled in properly by the first tick; this is enough to complete commands right away)
+    g_Console.start([](const std::string& line) {
+        std::lock_guard<std::mutex> lock(g_ConsoleMutex);
+        g_ConsoleLines.push_back(line);
+    }, completeConsole);
 
     auto saveAll = [&]() {
         for (const auto& [name, pos] : server.playerPositions()) savePlayer(worldDir, name, pos);
         const int chunks = world.saveAll();
+        meta.timeLine = dayClock.saveLine();
         writeWorldMeta(worldDir / "world.dat", meta);
+        if (ctx.storageDirty) {
+            if (saveStorage(worldDir / "mod_storage.txt", ctx.storage)) ctx.storageDirty = false;
+            else std::cerr << "[Server] Could not save mod_storage.txt (kept in memory, tried again later)" << std::endl;
+        }
         return chunks;
     };
 
@@ -1222,19 +1486,14 @@ int main(int argc, char** argv) {
         // reply)): Lua decides who may use them
         static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed",
             "games", "mods", "motd", "name", "say", "kick", "ban", "unban", "banlist", "whitelist", "op", "deop",
-            "ops", "password", "respawn", "gamemode", "gm"};
+            "ops", "password", "respawn", "gamemode", "gm", "time"};
         if (!builtIn.count(cmd)) {
-            sol::protected_function fn = lua["on_chat_command"];
-            if (fn.valid()) {
-                std::function<void(const std::string&)> luaReply = reply;
-                auto r = fn(line, console ? std::string("(console)") : from, op, luaReply);
-                if (!r.valid()) {
-                    sol::error err = r;
-                    std::cerr << "[Lua] on_chat_command: " << err.what() << std::endl;
-                } else if (r.get_type() == sol::type::boolean && r.get<bool>()) {
-                    return;   // a mod handled it
-                }
-            }
+            std::function<void(const std::string&)> luaReply = reply;
+            bool handled = false;
+            ctx.api.call("on_chat_command", [&](sol::protected_function_result& r) {
+                handled = r.get_type() == sol::type::boolean && r.get<bool>();
+            }, line, console ? std::string("(console)") : from, op, luaReply);
+            if (handled) return;   // a mod handled it
         }
         // /respawn: back to the spawn point (sent by the game after dying when joined)
         if (cmd == "respawn" && !console) {
@@ -1265,6 +1524,7 @@ int main(int argc, char** argv) {
             reply("Players: list, say, msg, kick, ban, unban, banlist, whitelist on|off|add|remove|list");
             reply("Admins:  op <name>, deop <name>, ops, password reset <name>");
             reply("Modes:   gamemode survival|creative [name]   (default for everyone: gamemode in server.conf)");
+            reply("World:   time [set day|noon|night|midnight|hh:mm] [add <hours>] [speed <x>]");
             for (const auto& c : ctx.modCommands) reply("Mods:    " + c.usage + (c.description.empty() ? "" : " - " + c.description));
         } else if (cmd == "stop") {
             reply("Stopping the server...");
@@ -1430,6 +1690,41 @@ int main(int argc, char** argv) {
                 server.messagePlayer(who, "Your game mode is now " + m->second + by, glm::vec3(0.6f, 0.9f, 1.0f));
             }
             std::cout << "[Server] " << who << " -> " << m->second << by << std::endl;
+        } else if (cmd == "time") {
+            // time [set <day|noon|night|midnight|sunrise|sunset|hh:mm|0..1>] [add <hours>] [speed <x>]
+            std::string arg;
+            const std::string sub = lower(firstWord(rest, arg));
+            auto report = [&]() {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf), "Day %lld, %s (time %.3f). A day lasts %g minutes%s.",
+                              static_cast<long long>(dayClock.day()), dayClock.clock().c_str(), dayClock.time(),
+                              dayClock.secondsPerDay / 60.0,
+                              dayClock.speed == 0.0 ? "; time is stopped ('time speed 1' starts it)"
+                              : dayClock.speed == 1.0 ? "" : (", running at " + std::to_string(dayClock.speed).substr(0, 4) + "x").c_str());
+                reply(buf);
+            };
+            if (sub.empty() || sub == "query") {
+                report();
+            } else if (sub == "set") {
+                const double t = DayClock::parseTimeOfDay(trim(arg));
+                if (t < 0.0) { reply("Usage: time set day|noon|night|midnight|sunrise|sunset|<hh:mm>|<0..1>"); return; }
+                dayClock.setTimeOfDay(t, true);     // forward to it, like Minecraft
+                std::cout << "[Server] Time set to " << dayClock.clock() << by << std::endl;
+                report();
+            } else if (sub == "add") {
+                double hours = 0.0;
+                try { hours = std::stod(arg); } catch (...) { reply("Usage: time add <hours>"); return; }
+                dayClock.total = std::max(0.0, dayClock.total + hours / 24.0);
+                report();
+            } else if (sub == "speed") {
+                double v = -1.0;
+                try { v = std::stod(arg); } catch (...) {}
+                if (v < 0.0 || v > 1000.0) { reply("Usage: time speed <multiplier>   (1 normal, 0 stops time)"); return; }
+                dayClock.speed = v;
+                report();
+            } else {
+                reply("Usage: time | time set <day|noon|night|midnight|hh:mm> | time add <hours> | time speed <x>");
+            }
         } else if (cmd == "ops") {
             reply("Operators: " + ops.names());
         } else if (cmd == "password") {
@@ -1460,6 +1755,9 @@ int main(int argc, char** argv) {
     const float tickDt = 1.0f / static_cast<float>(config.tickRate);
     auto nextTick = Clock::now();
     auto lastSave = Clock::now();
+    auto nextCompletionUpdate = Clock::now();               // (console Tab completion)
+    auto nextModListUpdate = Clock::now();
+    std::vector<std::string> completionModsOn, completionModsOff;
     auto lastLagWarning = Clock::now() - std::chrono::seconds(60);
     int ticksThisSecond = 0;
     auto tpsWindow = Clock::now();
@@ -1491,26 +1789,57 @@ int main(int argc, char** argv) {
         world.updateFluids(tickDt);   // each fluid at its own speed (Fluids.h)
 
         // Lua every tick: shared values that changed, then on_update (weather etc.)
+        // (time-limited, and a repeating error is printed once - not every tick)
         if (!ctx.sharedChanged.empty()) {
             std::vector<std::string> changed;
             changed.swap(ctx.sharedChanged);
-            sol::protected_function onShared = lua["on_shared_changed"];
             for (const auto& k : changed) {
-                if (!onShared.valid()) break;
                 const auto it = server.shared().find(k);
-                auto r = onShared(k, it == server.shared().end() ? std::string() : it->second);
-                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_shared_changed: " << err.what() << std::endl; }
+                ctx.api.call("on_shared_changed", [](sol::protected_function_result&) {},
+                             k, it == server.shared().end() ? std::string() : it->second);
             }
         }
-        {
-            sol::protected_function onUpdate = lua["on_update"];
-            if (onUpdate.valid()) {
-                auto r = onUpdate(tickDt);
-                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_update: " << err.what() << std::endl; }
-            }
-        }
+        ctx.api.call("on_update", [](sol::protected_function_result&) {}, tickDt);
+        remoteContent.update();   // finished downloads -> mods' callbacks
+
+        // The time of day runs on the server, and goes to every player (every few seconds, and
+        // at once when it jumps)
+        dayClock.advance(tickDt);
+        server.setDayTime(dayClock);
 
         for (const auto& line : server.takeChat()) std::cout << "[Chat] " << stripTags(line.text) << std::endl;
+
+        // What the console's Tab completion offers: refreshed every second (mods: every 10 s, or
+        // right after a 'mods' command, since that reads the mod folders)
+        if (Clock::now() >= nextCompletionUpdate) {
+            nextCompletionUpdate = Clock::now() + std::chrono::seconds(1);
+            CompletionData d;
+            for (const auto& c : ctx.modCommands) d.modCommands.push_back(c.name);
+            d.players = server.playerNames();
+            auto namesOf = [](const NameList& list) {
+                std::vector<std::string> out;
+                for (const auto& [key, v] : list.entries) out.push_back(v.substr(0, v.find('|')));
+                return out;
+            };
+            d.banned = namesOf(banned);
+            d.whitelisted = namesOf(whitelist);
+            d.ops = namesOf(ops);
+            for (const auto& [key, e] : accounts.entries) d.accounts.push_back(e.name);
+            if (Clock::now() >= nextModListUpdate) {
+                nextModListUpdate = Clock::now() + std::chrono::seconds(10);
+                const auto saved = parseConfig(readConfFile(configFile)).disabledMods;
+                completionModsOn.clear();
+                completionModsOff.clear();
+                for (const auto& m : listServerMods(config.game)) {
+                    if (saved.count(m.id)) completionModsOff.push_back(m.id);
+                    else if (!m.required) completionModsOn.push_back(m.id);
+                }
+            }
+            d.modsOn = completionModsOn;
+            d.modsOff = completionModsOff;
+            std::lock_guard<std::mutex> lock(g_CompletionMutex);
+            g_Completion = std::move(d);
+        }
 
         std::deque<std::string> lines;
         {
@@ -1518,8 +1847,13 @@ int main(int argc, char** argv) {
             lines.swap(g_ConsoleLines);
         }
         for (const std::string& line : lines) {
+            std::string first = trim(line).substr(0, trim(line).find(' '));
+            if (lower(first) == "mods") nextModListUpdate = Clock::now();   // (it may have changed them)
+        }
+        for (const std::string& line : lines) {
             if (!trim(line).empty()) handleCommand(trim(line), consoleReply, "");
         }
+        ctx.api.flush();   // kicks asked for by mods this tick
 
         if (Clock::now() - lastSave >= std::chrono::seconds(config.autosaveSeconds)) {
             const int n = saveAll();
@@ -1550,8 +1884,11 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[Server] Stopping..." << std::endl;
+    ctx.api.serverStopping();   // on_server_stop(): mods save what they keep
+    ctx.api.flush();
     const int chunks = saveAll();
     server.stop("The server is shutting down");
     std::cout << "[Server] Saved " << chunks << " changed chunks. Bye!" << std::endl;
+    g_Console.stop();   // the terminal back to normal
     return 0;
 }

@@ -37,6 +37,20 @@ print("[UI] settings_menu.lua loaded")
 -- THEME
 -- ===========================================================================
 
+local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
+    local ok, m = pcall(require, "textedit")
+    if ok then return m end
+    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
+    local function view(_, t, w, sc)
+        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
+        return t, ui.text_width(t, sc)
+    end
+    return { reset = function() end, focus = function() end, view = view,
+             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
+             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
+             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
+end)()
+
 local Theme = {
     colors = {
         background      = { 0.10, 0.10, 0.10, 1.00 },
@@ -336,18 +350,22 @@ local function draw_text_field(f, item, S, fs)
     local focused = state.editing ~= nil and state.editing.id == item.id
     rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
     rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
-    local value = focused and state.edit_text or tostring(item.value)
-    if item.secret then
-        -- Never show a password: stars while typing, and whether one is set otherwise
-        if focused then value = string.rep("*", #state.edit_text)
-        else value = item.is_set and "********" or "Not set" end
+    local ty = f.y + (f.h - text_height(fs)) / 2
+    if focused then
+        -- What's typed (stars for a password), scrolled so the caret stays in view
+        local shown, caret_x = te.view("settings", state.edit_text, f.w - 8 * S, fs, item.secret and "*" or nil)
+        text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
+        te.draw_caret("settings", f.x + 4 * S + caret_x, ty - S, text_height(fs) + 2 * S,
+                      C.name[1], C.name[2], C.name[3], 1)
+        return
     end
-    -- Show the end of long text (where you're typing)
-    local max_chars = math.max(1, math.floor((f.w - 8 * S) / (Theme.font.char_w * fs)) - 1)
-    if #value > max_chars then value = value:sub(#value - max_chars + 1) end
-    local blink = focused and (ui.get_time() % 1.0) < 0.5
-    text(value .. (blink and "_" or ""), f.x + 4 * S, f.y + (f.h - text_height(fs)) / 2, fs,
-         focused and C.name or C.text, false, S)
+    local value = tostring(item.value)
+    if item.secret then value = item.is_set and "********" or "Not set" end   -- never show a password
+    -- Long text: its start
+    while #value > 1 and (ui.text_width and ui.text_width(value, fs) or #value * 8 * fs) > f.w - 8 * S do
+        value = value:sub(1, -2)
+    end
+    text(value, f.x + 4 * S, ty, fs, C.text, false, S)
 end
 
 -- ===========================================================================
@@ -461,7 +479,10 @@ function handle_settings_click(mx, my, W, H)
             if item and item.id == state.editing.id then
                 local rx, ry, rw, rh = row_rect(L, row)
                 local f = row_widgets(L, item, rx, ry, rw, rh).field
-                if f and inside(mx, my, f.x, f.y, f.w, f.h) then return true end
+                if f and inside(mx, my, f.x, f.y, f.w, f.h) then   -- (the caret goes where you click)
+                    te.focus("settings", state.edit_text, mx - (f.x + 4 * L.S), L.fs, item.secret and "*" or nil)
+                    return true
+                end
             end
         end
         commit_edit()
@@ -495,6 +516,8 @@ function handle_settings_click(mx, my, W, H)
         if wdg.field and inside(mx, my, wdg.field.x, wdg.field.y, wdg.field.w, wdg.field.h) then
             state.editing = item
             state.edit_text = item.secret and "" or tostring(item.value)
+            te.reset("settings")
+            te.focus("settings", state.edit_text)   -- caret at the end
             state.waiting = nil
             return true
         elseif wdg.key and inside(mx, my, wdg.key.x, wdg.key.y, wdg.key.w, wdg.key.h) then
@@ -537,8 +560,9 @@ function handle_settings_key(key, action, mods)
             cancel_edit()
         elseif key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
             commit_edit()
-        elseif key == ui.keys.BACKSPACE then
-            state.edit_text = state.edit_text:sub(1, -2)
+        else
+            -- Left / Right / Home / End / Backspace / Delete (Ctrl: by word)
+            state.edit_text = te.key("settings", state.edit_text, key, action, mods)
         end
         return true
     end
@@ -573,8 +597,8 @@ end
 function handle_settings_char(codepoint, ch)
     local item = state.editing
     if not item or not ch or ch == "" then return false end
-    if #state.edit_text < (item.max or 32) and ch:match(item.allowed or "^[ -~]$") then
-        state.edit_text = state.edit_text .. ch
+    if ch:match(item.allowed or "^[ -~]$") then
+        state.edit_text = te.insert("settings", state.edit_text, ch, item.max or 32)
     end
     return true
 end

@@ -19,6 +19,11 @@
 --                               filter = function(name, info) return name:find("wand") end }
 --   creative.set_category("ruby_lamp", "decoration")     -- one item, any category id
 --
+-- ...or give their own blocks and items a tab of their own in the sidebar (below the
+-- built-in ones), like mods in Minecraft. From the mod's init.lua:
+--   creative.register_tab{ name = "Magic", icon = "wand" }     -- every item this mod registers
+-- See creative.register_tab below for picking the items yourself, or drawing a whole page.
+--
 -- C++ provides ui.draw_rect / draw_text / text_width / text_height / draw_block_icon,
 -- ui.get_all_blocks(), ui.get_block_info(name), ui.get_mouse(), ui.get_time(), ui.keys,
 -- ui.actions and hotbar.* (1-based). It calls render_creative_inventory(W, H),
@@ -30,6 +35,20 @@ print("[UI] inventory.lua loaded")
 -- ===========================================================================
 -- THEME
 -- ===========================================================================
+
+local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
+    local ok, m = pcall(require, "textedit")
+    if ok then return m end
+    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
+    local function view(_, t, w, sc)
+        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
+        return t, ui.text_width(t, sc)
+    end
+    return { reset = function() end, focus = function() end, view = view,
+             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
+             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
+             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
+end)()
 
 local C = {
     dim         = { 0.00, 0.00, 0.00, 0.55 },   -- over the world
@@ -136,6 +155,24 @@ local Categories = {
 }
 
 local overrides = {}       -- item name -> category id (creative.set_category)
+local ModTabs = {}         -- tabs from creative.register_tab, in order (also in Categories)
+
+-- Which mod registered each block. Newer engines say so (ui.get_block_info(name).mod); on older
+-- ones, the blocks registered from here on are noted as they're registered.
+local registered_by = {}
+local function mod_folder() return (g_CurrentModPath or ""):match("([^/\\]+)[/\\]*$") or "" end
+if engine and engine.register_block and not creative_wrapped_register then
+    creative_wrapped_register = true
+    local register_block = engine.register_block
+    engine.register_block = function(name, ...)
+        if type(name) == "string" then registered_by[name] = mod_folder() end
+        return register_block(name, ...)
+    end
+end
+local function mod_of(name, info)
+    if info and info.mod and info.mod ~= "" then return info.mod end
+    return registered_by[name] or ""
+end
 
 creative = creative or {}
 -- creative.register_category{ id, name, icons, filter [, before = "id"] }: a new category
@@ -150,6 +187,67 @@ end
 -- creative.set_category(item, id): put one item in a category
 function creative.set_category(item, id) overrides[item] = id end
 
+local function block_info(name) end   -- (defined below)
+local cat_cache, all_cache_reset
+
+-- creative.register_tab{ name [, id, icon, mod, items, filter, exclusive, draw, width, height] }
+--   A tab of the mod's own in the creative inventory's sidebar, under the built-in ones.
+--   Which items it shows (pick one; the default is the first):
+--     (nothing)      every block and item the calling mod registers
+--     mod = "farming" or { "farming", "farming_plus" }: everything those mods register
+--     items = { "ruby", "ruby_block", "ruby_sword" }: exactly these, in this order
+--     filter = function(name, info) return ... end: your own test
+--   icon      an item shown on the tab (default: its first item)
+--   exclusive true (default): its items are only in this tab, not also in Blocks, Tools...
+--             (they're always in All Items and in search results)
+--   draw      function(f, state): instead of an item grid, a whole page of your own, drawn
+--             with ui_kit (lualib/ui_kit.lua) in the items area; width, height: its size in
+--             units (left out: f.w_units, f.h_units say how much room there is)
+--   Returns the tab's id. Call it again with the same id to replace it.
+function creative.register_tab(def)
+    assert(type(def) == "table" and def.name, "creative.register_tab needs at least { name = ... }")
+    local this_mod = mod_folder()
+    local id = def.id or ("tab:" .. (def.mod and tostring(def.mod) or this_mod) .. ":" .. def.name)
+    local tab = { id = id, name = def.name, icons = def.icon and { def.icon } or nil, tab = true,
+                  exclusive = def.exclusive ~= false, before = def.before }
+    if def.items then
+        local order = {}
+        for i, n in ipairs(def.items) do order[n] = i end
+        tab.order = order
+        tab.filter = function(name) return order[name] ~= nil end
+    elseif def.filter then
+        tab.filter = def.filter
+    else
+        local mods = {}
+        local m = def.mod or this_mod
+        for _, x in ipairs(type(m) == "table" and m or { m }) do mods[x] = true end
+        tab.filter = function(name, info) return mods[mod_of(name, info)] == true end
+    end
+    if def.draw then
+        local ok, kit = pcall(require, "ui_kit")
+        assert(ok, "a creative tab with draw needs lualib/ui_kit.lua: " .. tostring(kit))
+        tab.page = kit.embed{ id = "creative:" .. id, width = def.width, height = def.height,
+                              state = def.state or {}, draw = def.draw }
+        tab.page_units = def.width ~= nil and def.height ~= nil
+        if not def.items and not def.filter and not def.mod then tab.filter = function() return false end end
+    end
+    for i, c in ipairs(Categories) do                     -- replacing one with the same id
+        if c.id == id then table.remove(Categories, i) break end
+    end
+    for i, c in ipairs(ModTabs) do if c.id == id then table.remove(ModTabs, i) break end end
+    ModTabs[#ModTabs + 1] = tab
+    local at = #Categories + 1
+    for i, c in ipairs(Categories) do if c.special then at = i break end end   -- above Inventory
+    table.insert(Categories, at, tab)
+    if all_cache_reset then all_cache_reset() end
+    return id
+end
+
+-- creative.hold(name [, count]): put an item on the cursor, as if picked from the grid (a custom
+-- page uses this, so the player can then put it in the hotbar). creative.get_held() -> name, count
+function creative.hold(name, count) end       -- (defined below, next to the state)
+function creative.get_held() end
+
 -- ===========================================================================
 -- STATE AND CACHES
 -- ===========================================================================
@@ -163,9 +261,19 @@ local state = {
     held = nil,             -- { name, count } on the cursor
 }
 
-local info_cache, cat_cache, all_cache = {}, {}, nil
+local info_cache, all_cache = {}, nil
+cat_cache = {}
+all_cache_reset = function() info_cache, cat_cache, all_cache = {}, {}, nil end
 
-local function block_info(name)
+function creative.hold(name, count)
+    state.held = name and { name = name, count = count or T.stack_size } or nil
+end
+function creative.get_held()
+    if state.held then return state.held.name, state.held.count end
+    return nil
+end
+
+function block_info(name)
     local v = info_cache[name]
     if v == nil then
         v = (ui.get_block_info and ui.get_block_info(name)) or false
@@ -186,9 +294,14 @@ local function category_of(name)
     if c then return c end
     local info = block_info(name)
     c = overrides[name]
-    if not c then
+    if not c then                                         -- mods' own tabs first...
+        for _, tab in ipairs(ModTabs) do
+            if tab.exclusive and tab.filter(name, info) then c = tab.id break end
+        end
+    end
+    if not c then                                         -- ...then the built-in categories
         for _, cat in ipairs(Categories) do
-            if not cat.all and not cat.special and cat.filter(name, info) then c = cat.id break end
+            if not cat.all and not cat.special and not cat.tab and cat.filter(name, info) then c = cat.id break end
         end
     end
     c = c or "misc"
@@ -201,6 +314,13 @@ local function cat_index(id)
     return #Categories
 end
 
+-- Is this item shown in that category / tab?
+local function in_cat(name, cat)
+    if cat.all then return true end
+    if cat.tab and not cat.exclusive then return cat.filter(name, block_info(name)) end
+    return category_of(name) == cat.id
+end
+
 -- Every creative item, in category order (registration order inside each)
 local function all_items()
     if all_cache then return all_cache end
@@ -211,6 +331,10 @@ local function all_items()
     table.sort(list, function(a, b)
         local ca, cb = cat_index(category_of(a.name)), cat_index(category_of(b.name))
         if ca ~= cb then return ca < cb end
+        local tab = Categories[ca]
+        if tab and tab.order then                         -- a tab with a list: its order
+            return (tab.order[a.name] or 0) < (tab.order[b.name] or 0)
+        end
         return a.order < b.order
     end)
     all_cache = {}
@@ -232,7 +356,7 @@ local function shown_items()
         if q ~= "" then
             ok = has(name:lower(), q) or has(pretty(name):lower(), q)
         else
-            ok = cat.all or category_of(name) == cat.id
+            ok = in_cat(name, cat)
         end
         if ok then out[#out + 1] = name end
     end
@@ -242,7 +366,7 @@ end
 local function count_in(cat)
     if cat.all then return #all_items() end
     local n = 0
-    for _, name in ipairs(all_items()) do if category_of(name) == cat.id then n = n + 1 end end
+    for _, name in ipairs(all_items()) do if in_cat(name, cat) then n = n + 1 end end
     return n
 end
 
@@ -449,7 +573,7 @@ local function category_icon(cat)
     end
     if not found and not cat.all and not cat.special then   -- else: the category's first item
         for _, n in ipairs(all_items()) do
-            if category_of(n) == cat.id then found = n break end
+            if in_cat(n, cat) then found = n break end
         end
     end
     cat.icon_cache = found
@@ -528,25 +652,39 @@ local function layout(W, H)
     return L
 end
 
-local function cat_rect(L, i)
-    return L.sideX + 3 * L.S, L.sideY + 3 * L.S + (i - 1) * (L.catH + L.catGap), L.sideW - 6 * L.S, L.catH
-end
-
 -- The sidebar's entries and where they are: categories from the top (empty ones left out),
--- the Inventory tab at the bottom
+-- then mods' tabs under a line, and the Inventory tab pinned to the bottom. When they don't
+-- all fit, the list scrolls (mouse wheel over the sidebar): L.list is the visible part.
 local function sidebar(L)
-    local out, i = {}, 0
+    local S = L.S
+    local x, w, h = L.sideX + 3 * S, L.sideW - 6 * S, L.catH
+    local inv_cat
+    for _, cat in ipairs(Categories) do if cat.special then inv_cat = cat end end
+    local has_inv = inv_cat and survival and survival.inventory
+    local top = L.sideY + 3 * S
+    local bottom = L.sideY + L.sideH - 3 * S - (has_inv and (h + L.catGap + 3 * S) or 0)
+    L.list = { x = L.sideX + S, y = top, w = L.sideW - 2 * S, h = bottom - top }
+
+    local out, y, divider = {}, 0, false
     for _, cat in ipairs(Categories) do
-        if cat.special then
-            if survival and survival.inventory then
-                local x, _, w, h = cat_rect(L, 1)
-                out[#out + 1] = { cat = cat, x = x, y = L.sideY + L.sideH - 3 * L.S - h, w = w, h = h }
+        if not cat.special and (cat.all or cat.page or count_in(cat) > 0) then
+            if cat.tab and not divider then                 -- a line between built-in and mods' tabs
+                divider = true
+                if #out > 0 then
+                    out[#out + 1] = { divider = true, y = y + 3 * S }
+                    y = y + 8 * S
+                end
             end
-        elseif cat.all or count_in(cat) > 0 then
-            i = i + 1
-            local x, y, w, h = cat_rect(L, i)
             out[#out + 1] = { cat = cat, x = x, y = y, w = w, h = h }
+            y = y + h + L.catGap
         end
+    end
+    local total = y - L.catGap
+    L.side_max = math.max(0, total - L.list.h)
+    state.side_scroll = clamp(state.side_scroll or 0, 0, L.side_max)
+    for _, e in ipairs(out) do e.y = e.y + top - state.side_scroll end
+    if has_inv then
+        out[#out + 1] = { cat = inv_cat, x = x, y = L.sideY + L.sideH - 3 * S - h, w = w, h = h, pinned = true }
     end
     return out
 end
@@ -584,9 +722,12 @@ end
 -- RENDER
 -- ===========================================================================
 
+local last_layout = nil     -- (for the mouse wheel, which comes without the window size)
+
 function render_creative_inventory(W, H)
     if not ui or not ui.draw_rect then return end
     local L = layout(W, H)
+    last_layout = L
     local S, fs, small = L.S, L.fs, L.fs_small
     local mx, my = ui.get_mouse()
     local items = shown_items()
@@ -601,10 +742,17 @@ function render_creative_inventory(W, H)
 
     -- Sidebar: categories (those with no items are left out, except All)
     sunken(L.sideX, L.sideY, L.sideW, L.sideH, S, C.panel, C.panel_hi, C.panel_lo)
-    for _, e in ipairs(sidebar(L)) do
+    local entries = sidebar(L)
+    local clipped = false
+    for _, e in ipairs(entries) do
+      if e.divider then
+        rect(L.sideX + 8 * S, e.y, L.sideW - 16 * S, S, C.panel_hi)
+      elseif e.pinned or (e.y + e.h > L.list.y and e.y < L.list.y + L.list.h) then
+        if not e.pinned and not clipped and ui.push_clip then ui.push_clip(L.list.x, L.list.y, L.list.w, L.list.h) clipped = true end
+        if e.pinned and clipped then ui.pop_clip() clipped = false end
         local cat, x, y, w, h = e.cat, e.x, e.y, e.w, e.h
         local selected = (Categories[state.cat] == cat) and state.search == ""
-        local hov = inside(mx, my, x, y, w, h)
+        local hov = inside(mx, my, x, y, w, h) and (e.pinned or inside(mx, my, L.list.x, L.list.y, L.list.w, L.list.h))
         if selected then
             rect(x, y, w, h, C.accent_bg)
             outline(x, y, w, h, S, C.accent_hi)
@@ -621,11 +769,18 @@ function render_creative_inventory(W, H)
             if icon then ui.draw_block_icon(icon, x + 5 * S, y + 4 * S, isz) end
         end
         local tx = x + 10 * S + isz
-        local n = cat.special and "" or tostring(count_in(cat))
+        local n = (cat.special or cat.page) and "" or tostring(count_in(cat))
         local nw = tw(n, small)
         text(fit(cat.name, w - (tx - x) - nw - 8 * S, fs), tx, y + (h - th(fs)) / 2, fs,
              selected and C.text or C.text, true, S)
         text(n, x + w - nw - 5 * S, y + (h - th(small)) / 2, small, selected and C.accent_hi or C.text_faint, false, S)
+      end
+    end
+    if clipped then ui.pop_clip() end
+    if L.side_max > 0 then                                  -- where in the list we are
+        local bh = math.max(12 * S, L.list.h * L.list.h / (L.list.h + L.side_max))
+        local by = L.list.y + (L.list.h - bh) * state.side_scroll / L.side_max
+        rect(L.sideX + L.sideW - 3 * S, by, 2 * S, bh, C.text_faint)
     end
 
     -- Search box
@@ -640,16 +795,24 @@ function render_creative_inventory(W, H)
         text("Search items...", tx, ty, fs, C.text_faint, false, S)
     else
         local avail = sw - (tx - sx) - clear_w - 6 * S
-        local s = state.search
-        while #s > 0 and tw(s .. "_", fs) > avail do s = s:sub(2) end
-        local blink = state.search_focused and (ui.get_time() % 1) < 0.5
-        text(s .. (blink and "_" or ""), tx, ty, fs, C.text, false, S)
+        local shown, caret_x = te.view("creative:search", state.search, avail, fs)
+        text(shown, tx, ty, fs, C.text, false, S)
+        if state.search_focused then
+            te.draw_caret("creative:search", tx + caret_x, ty - S, th(fs) + 2 * S, C.text[1], C.text[2], C.text[3], 1)
+        end
     end
     if state.search ~= "" then
         local hov = inside(mx, my, sx + sw - sh, sy, sh, sh)
         text("x", sx + sw - sh + (sh - tw("x", fs)) / 2, ty, fs, hov and C.text or C.text_dim, false, S)
     end
 
+    local page = state.search == "" and Categories[state.cat].page
+    if page then
+        -- A mod's own page (creative.register_tab with draw), drawn with ui_kit
+        sunken(L.areaX, L.areaY, L.areaW, L.areaH, S, C.panel, C.panel_hi, C.panel_lo)
+        if not Categories[state.cat].page_units then page.unit = 16 * S end
+        page:draw(L.areaX + 4 * S, L.areaY + 4 * S, L.areaW - 8 * S, L.areaH - 8 * S)
+    else
     -- Grid / list buttons
     for _, b in ipairs({ { L.gridBtnX, false }, { L.listBtnX, true } }) do
         local bx, on = b[1], (state.list_view == b[2])
@@ -713,6 +876,7 @@ function render_creative_inventory(W, H)
         tip = { { pretty(hovered), C.text },
                 { Categories[cat_index(category_of(hovered))].name, C.accent_hi, small } }
     end
+    end   -- (not a page)
 
     -- Hotbar
     sunken(L.rx, L.hotY, L.rw, L.hotH, S, C.panel, C.panel_hi, C.panel_lo)
@@ -755,9 +919,11 @@ function handle_creative_click(mx, my, W, H, button, shift)
     local items = shown_items()
     local sy, sh = L.topY, L.topH
 
-    -- Categories
+    local page = state.search == "" and Categories[state.cat].page
+    -- Categories (only the visible part of the scrolling list)
     for _, e in ipairs(sidebar(L)) do
-        if inside(mx, my, e.x, e.y, e.w, e.h) then
+        if not e.divider and inside(mx, my, e.x, e.y, e.w, e.h)
+           and (e.pinned or inside(mx, my, L.list.x, L.list.y, L.list.w, L.list.h)) then
             if e.cat.special then                           -- Inventory: the survival inventory screen
                 local inv = survival and survival.inventory
                 if inv and inv.open_from_creative then
@@ -766,6 +932,7 @@ function handle_creative_click(mx, my, W, H, button, shift)
                 end
                 return
             end
+            if page then page:stop_typing() end
             state.cat = cat_index(e.cat.id)
             state.search, state.search_focused, state.page = "", false, 1
             return
@@ -776,20 +943,30 @@ function handle_creative_click(mx, my, W, H, button, shift)
     if inside(mx, my, L.searchX, sy, L.searchW, sh) then
         if state.search ~= "" and mx >= L.searchX + L.searchW - sh then
             state.search, state.page = "", 1
+            te.reset("creative:search")
+        else                                                  -- the caret goes where you click
+            local tx = L.searchX + 12 * L.S + (L.topH - 10 * L.S)
+            te.focus("creative:search", state.search, mx - tx, L.fs)
         end
         state.search_focused = true
+        if page then page:stop_typing() end
         return
     end
     state.search_focused = false
 
+    -- A mod's page: its ui_kit widgets read the mouse themselves
+    if page and inside(mx, my, L.areaX, L.areaY, L.areaW, L.areaH) then return end
+
     -- View buttons and pager
-    if inside(mx, my, L.gridBtnX, sy, sh, sh) then state.list_view = false state.page = 1 return end
-    if inside(mx, my, L.listBtnX, sy, sh, sh) then state.list_view = true state.page = 1 return end
-    if inside(mx, my, L.prevX, sy, sh, sh) then set_page(state.page - 1, L, #items) return end
-    if inside(mx, my, L.nextX, sy, sh, sh) then set_page(state.page + 1, L, #items) return end
+    if not page then
+        if inside(mx, my, L.gridBtnX, sy, sh, sh) then state.list_view = false state.page = 1 return end
+        if inside(mx, my, L.listBtnX, sy, sh, sh) then state.list_view = true state.page = 1 return end
+        if inside(mx, my, L.prevX, sy, sh, sh) then set_page(state.page - 1, L, #items) return end
+        if inside(mx, my, L.nextX, sy, sh, sh) then set_page(state.page + 1, L, #items) return end
+    end
 
     -- An item: pick up a stack (click the same item again to put it back)
-    if inside(mx, my, L.areaX, L.areaY, L.areaW, L.areaH) then
+    if not page and inside(mx, my, L.areaX, L.areaY, L.areaW, L.areaH) then
         local name = item_at(L, items, mx, my)
         if shift and name and not state.held and hotbar and hotbar.get_slot then
             -- shift-click: a stack straight into the hotbar (the first empty slot)
@@ -826,17 +1003,31 @@ end
 
 -- Mouse wheel: up = previous page, down = next (the last page is clamped while drawing)
 function handle_creative_scroll(dy)
+    local mx, my = ui.get_mouse()
+    local L = last_layout
+    if L and L.list and inside(mx, my, L.sideX, L.sideY, L.sideW, L.sideH) then    -- over the sidebar: scroll it
+        state.side_scroll = clamp((state.side_scroll or 0) - dy * L.catH, 0, L.side_max or 0)
+        return
+    end
+    if state.search == "" and Categories[state.cat].page then return end   -- (a page reads the wheel itself)
     if dy > 0 then state.page = state.page - 1 elseif dy < 0 then state.page = state.page + 1 end
     if state.page < 1 then state.page = 1 end
 end
 
 function handle_creative_key(key, action, mods)
+    local page = state.search == "" and Categories[state.cat].page
+    if page and page:is_typing() then                   -- typing in a mod page's text field
+        if key == ui.keys.ESCAPE and action == ui.actions.PRESS then page:stop_typing() end
+        return true                                      -- E / WASD / Escape don't reach the game
+    end
     if action ~= ui.actions.PRESS and action ~= ui.actions.REPEAT then return state.search_focused end
     if state.search_focused then
-        if key == ui.keys.BACKSPACE and #state.search > 0 then
-            state.search, state.page = state.search:sub(1, -2), 1
-        elseif key == ui.keys.ESCAPE or key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
+        if key == ui.keys.ESCAPE or key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
             state.search_focused = false
+        else                                                 -- Left / Right / Home / End / Backspace / Delete
+            local before = state.search
+            state.search = te.key("creative:search", state.search, key, action, mods)
+            if state.search ~= before then state.page = 1 end
         end
         return true                                          -- typing: E / WASD don't reach the game
     end
@@ -846,19 +1037,26 @@ function handle_creative_key(key, action, mods)
 end
 
 function handle_creative_char(codepoint, ch)
+    local page = state.search == "" and Categories[state.cat].page
+    if page and page:is_typing() then return true end    -- (the page reads typing itself)
     if not state.search_focused then return false end
-    if codepoint >= 32 and codepoint < 127 and #state.search < T.max_search then
-        state.search, state.page = state.search .. ch, 1
+    if codepoint >= 32 and codepoint < 127 then
+        state.search, state.page = te.insert("creative:search", state.search, ch, T.max_search), 1
     end
     return true
 end
 
 function on_creative_opened()
-    info_cache, cat_cache, all_cache = {}, {}, nil      -- pick up blocks registered since last time
+    all_cache_reset()                                    -- pick up blocks registered since last time
     for _, c in ipairs(Categories) do c.icon_cache = nil end
 end
 
 function on_creative_closed()
+    local page = Categories[state.cat] and Categories[state.cat].page
+    if page then
+        page:stop_typing()
+        state.cat = 1                                    -- a mod's page: next time, start on All Items
+    end
     state.search_focused = false
     state.held = nil                                     -- closing drops what's on the cursor
 end

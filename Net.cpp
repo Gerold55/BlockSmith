@@ -62,10 +62,13 @@ enum Msg : uint8_t {
     S_SHARED  = 76,   // u16 count, { str key, str value }   shared values (weather...)
     S_MODE    = 77,   // str gameMode, u8 isOperator   (the server decides; the game follows)
     S_CHALLENGE = 78, // str serverId, str nonce, u8 accountExists   (after C_HELLO; see Auth.h)
+    S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
+                      // (older games ignore it and keep their own sky; no protocol change needed)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
 constexpr int   kChunksPerUpdate     = 4;            // per client per frame
+constexpr float kDayTimeInterval     = 5.0f;         // the time of day goes to everyone this often
 constexpr size_t kMaxChunkBytesInFlight = 512 * 1024; // don't queue more than this per client
 constexpr float kPositionInterval    = 1.0f / 30.0f; // 30 position updates a second
 constexpr float kMaxReach            = 10.0f;        // blocks a player may edit from
@@ -466,6 +469,17 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         if (c.joined && c.hasPosition) streamChunks(c);
     }
 
+    // The time of day, every few seconds
+    if (m_hasDayClock) {
+        m_dayTimer += dt;
+        if (m_dayTimer >= kDayTimeInterval) {
+            m_dayTimer = 0.0f;
+            for (auto& [id, c] : m_clients) if (c.joined) sendDayTime(c.peer);
+            m_daySent = m_dayClock;
+            m_daySentAt = net::clockSeconds();
+        }
+    }
+
     // 5. Positions, 20 times a second
     m_posTimer += dt;
     if (m_posTimer >= kPositionInterval) {
@@ -594,16 +608,28 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
     case C_CHAT: {
         Reader r(data, size);
         std::string text = r.str();
-        if (!r.ok || text.empty()) return;
+        if (!r.ok) return;
         if (text.size() > 256) text.resize(256);
+        text = cleanChatText(text);
+        if (text.empty() || !allowChat(c)) return;
+        if (onChat) {
+            const std::string name = c.name;              // (a mod may kick this player)
+            const uint16_t cid = c.id;
+            if (!onChat(name, text) || text.empty()) return;
+            if (text.size() > 256) text.resize(256);
+            text = cleanChatText(text);
+            if (m_clients.find(cid) == m_clients.end()) return;
+        }
         broadcastChat("<" + c.name + "> " + text, kChatColor);
         break;
     }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
-        if (!r.ok || command.empty()) return;
+        if (!r.ok) return;
         if (command.size() > 256) command.resize(256);
+        command = cleanChatText(command);
+        if (command.empty() || !allowChat(c)) return;
         if (onCommand) {
             const std::string name = c.name;   // the command may kick this player (c gone after)
             onCommand(name, command);
@@ -734,6 +760,9 @@ void GameServer::finishJoin(Client& c, const std::string& name, int view) {
         sendShared(c.peer, std::vector<std::pair<std::string, std::string>>(m_shared.begin(), m_shared.end()));
     }
 
+    // The time of day, so their sky matches everyone's from the start
+    if (m_hasDayClock) sendDayTime(c.peer);
+
     // Their game mode and whether they're an operator
     c.mode = modeFor ? modeFor(name) : std::string();
     if (c.mode.empty()) c.mode = m_defaultMode;
@@ -790,6 +819,34 @@ bool GameServer::teleportPlayer(const std::string& name, const glm::vec3& pos) {
     return false;
 }
 
+void GameServer::sendDayTime(ENetPeer* peer) {
+    Writer w(S_TIME);
+    const double whole = std::floor(m_dayClock.total);
+    w.u32(static_cast<uint32_t>(std::min(whole, 4.0e9)));
+    w.f32(static_cast<float>(m_dayClock.total - whole));
+    w.f32(static_cast<float>(m_dayClock.secondsPerDay));
+    w.f32(static_cast<float>(m_dayClock.speed));
+    sendTo(peer, w);
+}
+
+void GameServer::setDayTime(const DayClock& clock) {
+    // Where players' games think the time is now: what they were last sent, run on since
+    const double now = net::clockSeconds();
+    bool sendNow = !m_hasDayClock || clock.speed != m_daySent.speed || clock.secondsPerDay != m_daySent.secondsPerDay;
+    if (!sendNow) {
+        const double predicted = m_daySent.total + (now - m_daySentAt) * m_daySent.rate();
+        sendNow = std::abs(clock.total - predicted) * clock.secondsPerDay > 2.0;   // a jump (time set / add)
+    }
+    m_dayClock = clock;
+    m_hasDayClock = true;
+    if (sendNow) {
+        m_dayTimer = 0.0f;
+        for (auto& [id, c] : m_clients) if (c.joined) sendDayTime(c.peer);
+        m_daySent = clock;
+        m_daySentAt = now;
+    }
+}
+
 void GameServer::sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values) {
     Writer w(S_SHARED);
     w.u16(static_cast<uint16_t>(values.size()));
@@ -805,6 +862,49 @@ void GameServer::setShared(const std::string& key, const std::string& value) {
     for (auto& [id, c] : m_clients) {
         if (c.joined) sendShared(c.peer, {{key, value}});
     }
+}
+
+void GameServer::sendMessageTo(Client& c, const std::string& text, const glm::vec3& color) {
+    Writer w(S_CHAT);
+    w.str(text);
+    w.f32(color.r); w.f32(color.g); w.f32(color.b);
+    sendTo(c.peer, w);
+}
+
+// Chat from players: no control characters (they could fake new lines or confuse the chat
+// box); UTF-8 letters are kept. Leading/trailing spaces go.
+std::string GameServer::cleanChatText(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char ch : in) {
+        if (ch < 32 || ch == 127) { if (ch == '\t') out += ' '; continue; }
+        out += static_cast<char>(ch);
+    }
+    const size_t a = out.find_first_not_of(' ');
+    if (a == std::string::npos) return "";
+    return out.substr(a, out.find_last_not_of(' ') - a + 1);
+}
+
+// Flood limit for chat and /commands (kChatBurst...). False = drop this one.
+bool GameServer::allowChat(Client& c) {
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (c.chatRefillAt <= 0.0) c.chatRefillAt = now;
+    c.chatTokens = std::min(kChatBurst, c.chatTokens + (now - c.chatRefillAt) / kChatRefillSeconds);
+    c.chatRefillAt = now;
+    if (c.chatTokens >= 1.0) {
+        c.chatTokens -= 1.0;
+        if (c.chatTokens >= kChatBurst - 1.0) c.spamStrikes = 0;   // calmed down
+        return true;
+    }
+    if (++c.spamStrikes >= kSpamKickStrikes) {
+        kick(c, "Kicked for spamming chat");
+        return false;   // (c is gone)
+    }
+    if (now - c.lastSpamWarning > 2.0) {
+        c.lastSpamWarning = now;
+        sendMessageTo(c, "You're sending messages too fast - slow down.", glm::vec3(1.0f, 0.55f, 0.55f));
+    }
+    return false;
 }
 
 bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
@@ -823,6 +923,7 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
     Reader r(data, size);
     const uint16_t count = r.u16();
     std::vector<World::BlockChange> rejected;
+    bool refusalSent = false;
 
     for (uint16_t i = 0; i < count && r.ok; ++i) {
         const glm::ivec3 pos = r.ivec3();
@@ -844,10 +945,25 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
             if (was != 0 && blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) allowed = false;
         }
 
+        // Mods may refuse it (spawn protection, claims...): checked last, for real changes only
+        if (allowed && canEdit && loaded && inReach && blockIdFromName(name, id)) {
+            const uint8_t was = m_world->getBlockAt(pos);
+            if (was != id) {
+                const std::string why = canEdit(c.name, pos, was, id);
+                if (!why.empty()) {
+                    allowed = false;
+                    if (why != kSilentRefusal && !refusalSent) {
+                        sendMessageTo(c, why, glm::vec3(1.0f, 0.55f, 0.55f));
+                        refusalSent = true;   // one message for a whole batch of edits
+                    }
+                }
+            }
+        }
+
         if (allowed && blockIdFromName(name, id) && inReach && loaded) {
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->setBlockWithMetaAt(pos, id, meta);
-            if (onPlayerEdit && oldId != id) onPlayerEdit(pos, oldId, id);
+            if (onPlayerEdit && oldId != id) onPlayerEdit(c.name, pos, oldId, id);
         } else if (loaded) {
             // Undo the player's prediction: send them what's really there
             rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
@@ -1395,6 +1511,18 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_mode = mode;
         m_isOp = op != 0;
         m_modeChanged = true;
+        break;
+    }
+    case S_TIME: {
+        const uint32_t whole = r.u32();
+        const float frac = r.f32();
+        const float secondsPerDay = r.f32();
+        const float speed = r.f32();
+        if (!r.ok) break;
+        m_dayTime.total = static_cast<double>(whole) + std::clamp(static_cast<double>(frac), 0.0, 0.999999);
+        m_dayTime.secondsPerDay = std::clamp(static_cast<double>(secondsPerDay), 0.0, 1.0e7);
+        m_dayTime.speed = std::clamp(static_cast<double>(speed), 0.0, 1000.0);
+        m_dayTimeNew = true;
         break;
     }
     case S_SHARED: {
