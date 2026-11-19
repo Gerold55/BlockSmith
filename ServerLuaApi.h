@@ -8,11 +8,14 @@
 //   on_player_chat(name, text) -> false to drop the line, or a string to replace it
 //   can_edit_block(name, x, y, z, old_block, new_block) -> false[, reason] to refuse
 //   on_block_broken(x, y, z, block, meta, player) / on_block_placed(x, y, z, block, player)
+//   on_player_harvest(name, item, x, y, z)   a joined player used `item` (the scythe) on that
+//       block: the server works out what it does, from its own world (engine.player_set_block)
 //   on_server_start() / on_server_stop()
 // Each call is time-limited (luasandbox::TimeLimit) and errors are printed once until they change.
 //
 // Functions (engine.*): get_online_players, get_player_info, message_player, kick_player,
-// teleport_player, set_player_mode, get_player_mode, is_player_operator, get_server_info.
+// teleport_player, set_player_mode, get_player_mode, is_player_operator, get_server_info,
+// player_set_block (a change made for a joined player, checked like their own edits).
 // Kicks from mods wait until flush() (after the network update), so a mod can never remove a
 // player while the server is still handling that player's packet.
 
@@ -25,6 +28,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -95,6 +99,10 @@ public:
                              blockName(reg, oldId), static_cast<int>(meta), who);
         else call("on_block_placed", [](sol::protected_function_result&) {}, pos.x, pos.y, pos.z,
                   blockName(reg, newId), who);
+    }
+    // A joined player used `item` on the block at pos (C_HARVEST): on_player_harvest
+    void harvest(const std::string& name, const std::string& item, const glm::ivec3& pos) {
+        call("on_player_harvest", [](sol::protected_function_result&) {}, name, item, pos.x, pos.y, pos.z);
     }
     void serverStarted() { call("on_server_start", [](sol::protected_function_result&) {}); }
     void serverStopping() { call("on_server_stop", [](sol::protected_function_result&) {}); }
@@ -189,6 +197,19 @@ public:
         engine["is_player_operator"] = [this](const std::string& name) {
             PlayerInfo p;
             return findPlayer(name, p) ? p.op : (isOperator && isOperator(name));
+        };
+        // engine.player_set_block(name, x, y, z, block) -> true, or false[, reason to show them]:
+        // changes a block for a joined player with exactly the checks their own edits get (within
+        // reach - with a block of slack, for a 3x3 patch -, spawn protection, can_edit_block).
+        // For server-side actions that must only reward what was really allowed: make the change
+        // first, then give what it yields only when this returns true.
+        engine["player_set_block"] = [this](const std::string& name, int x, int y, int z, const std::string& block,
+                                            sol::this_state ts) {
+            sol::state_view lv(ts);
+            std::string why;
+            const bool ok = server && server->running() &&
+                            server->playerSetBlock(name, glm::ivec3(x, y, z), block, &why, 2.0f);
+            return std::make_tuple(ok, why.empty() ? sol::make_object(lv, sol::lua_nil) : sol::make_object(lv, why));
         };
         engine["get_server_info"] = [this](sol::this_state ts) {
             sol::state_view lv(ts);

@@ -20,12 +20,61 @@ local function in_creative() return engine.is_creative and engine.is_creative() 
 local function authority() return not engine.is_authority or engine.is_authority() end
 
 -- Items into the world: where the world is decided (singleplayer, hosting, the server) we make
--- them; joined to a server, engine.drop_item asks the server to
+-- them; joined to a server, engine.drop_item asks the server to. Returns true if the item was
+-- delivered, by each path's own answer: entities.drop_item gives the new item's id (0 or nil =
+-- none was made, e.g. the world is at its entity limit); engine.drop_item gives true / false.
+-- Nothing to drop counts as delivered.
 local function drop(item, count, x, y, z)
-    if not item or count <= 0 then return end
-    if authority() and entities and entities.drop_item then entities.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5)
-    elseif engine.drop_item then engine.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5) end
+    if not item or count <= 0 then return true end
+    if authority() and entities and entities.drop_item then
+        local id = entities.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5)
+        return id ~= nil and id ~= 0
+    elseif engine.drop_item then
+        return engine.drop_item(item, count, x + 0.5, y + 0.25, z + 0.5) == true
+    end
+    return false
 end
+
+-- Harvest rewards that haven't reached the world yet: { item, count, x, y, z }. A batch is
+-- delivered in one go; whatever its drop path doesn't deliver waits here and is retried (once a
+-- second, in on_update) until it is. Each entry leaves the list only once it's delivered, so
+-- nothing is given twice. Entries for the same item at the same spot are merged, up to a stack.
+local undelivered = {}
+local STACK = 64
+
+local function keep_undelivered(item, count, x, y, z)
+    for _, u in ipairs(undelivered) do
+        if u[1] == item and u[3] == x and u[4] == y and u[5] == z and u[2] < STACK then
+            local add = math.min(count, STACK - u[2])
+            u[2] = u[2] + add
+            count = count - add
+            if count <= 0 then return end
+        end
+    end
+    while count > 0 do
+        local n = math.min(count, STACK)
+        undelivered[#undelivered + 1] = { item, n, x, y, z }
+        count = count - n
+    end
+end
+
+-- Delivers a batch of rewards ({ item, count, x, y, z } each); the ones that don't make it are kept
+local function deliver(batch)
+    for _, r in ipairs(batch) do
+        if not drop(r[1], r[2], r[3], r[4], r[5]) then keep_undelivered(r[1], r[2], r[3], r[4], r[5]) end
+    end
+end
+
+-- Tries the waiting rewards again; keeps only the ones still not delivered
+local function retry_undelivered()
+    if #undelivered == 0 then return end
+    local waiting = undelivered
+    undelivered = {}
+    for _, r in ipairs(waiting) do
+        if not drop(r[1], r[2], r[3], r[4], r[5]) then undelivered[#undelivered + 1] = r end
+    end
+end
+farming.undelivered_count = function() return #undelivered end
 
 local function is_farmland(name) return name == "farmland_dry" or name == "farmland_wet" end
 
@@ -236,25 +285,71 @@ end
 -- ---------------------------------------------------------------------------
 -- The scythe: reaps every ripe crop in the 3x3 patch and replants each (the seed for it is
 -- kept back from the harvest). Anything else: false, and the scythe digs like any tool.
+--
+-- Who does it: where the world is decided. Singleplayer (and the host's own player) reaps right
+-- here. A player joined to a server only *asks* (engine.request_harvest); the server's copy of
+-- this mod reaps in on_player_harvest from its own world, replanting each crop with
+-- engine.player_set_block - the same checks as that player's own edits (reach, spawn
+-- protection, can_edit_block) - and only a crop whose replant was allowed gives its harvest. So
+-- a protected field can't be reaped for free, and the change and its reward happen together.
 -- ---------------------------------------------------------------------------
-local previous_scythe = on_use_scythe
-function on_use_scythe(x, y, z, block_name, ...)
-    local c = crops[block_name]
-    if c and c.def.scythe_replants and farming.is_ripe(block_name) then
-        local reaped = 0
-        for dx = -1, 1 do for dz = -1, 1 do
-            local n = engine.get_block_name(x + dx, y, z + dz)
-            local cc = crops[n]
-            if cc and cc.def.scythe_replants and farming.is_ripe(n) then
-                for _, d in ipairs(crop_drops(n, true)) do drop(d[1], d[2], x + dx, y, z + dz) end
-                engine.set_block(x + dx, y, z + dz, cc.def.stages[1])
+local function reapable(name)
+    local c = crops[name]
+    if c and c.def.scythe_replants and farming.is_ripe(name) then return c end
+    return nil
+end
+
+-- Reaps the 3x3 patch around (x, y, z). `player`: on the server, for a joined player (checked);
+-- nil: the local game. Returns how many crops it reaped.
+local function reap(x, y, z, player)
+    local reaped, refusal = 0, nil
+    local rewards = {}                                            -- delivered together, below
+    for dx = -1, 1 do for dz = -1, 1 do
+        local cx, cz = x + dx, z + dz
+        local n = engine.get_block_name(cx, y, cz)
+        local c = reapable(n)
+        if c then
+            local done = true
+            if player then
+                local why
+                done, why = engine.player_set_block(player, cx, y, cz, c.def.stages[1])
+                if not done and why and not refusal then refusal = why end
+            else
+                engine.set_block(cx, y, cz, c.def.stages[1])
+            end
+            if done then                                          -- replanted: now its harvest
+                for _, d in ipairs(crop_drops(n, true)) do rewards[#rewards + 1] = { d[1], d[2], cx, y, cz } end
                 reaped = reaped + 1
             end
-        end end
-        return reaped > 0
+        end
+    end end
+    deliver(rewards)                       -- whatever doesn't reach the world waits (retry_undelivered)
+    if refusal and engine.message_player then engine.message_player(player, refusal, 1, 0.55, 0.55) end
+    return reaped
+end
+
+local previous_scythe = on_use_scythe
+function on_use_scythe(x, y, z, block_name, ...)
+    if reapable(block_name) then
+        if authority() then return reap(x, y, z) > 0 end
+        -- joined to a server: it decides (and the crops and items come from it). This press
+        -- doesn't dig either way.
+        if engine.request_harvest then engine.request_harvest("scythe", x, y, z) end
+        return true
     end
     if previous_scythe then return previous_scythe(x, y, z, block_name, ...) end
     return false
+end
+
+-- The server: a joined player's scythe (engine.request_harvest on their side)
+local previous_harvest = on_player_harvest
+function on_player_harvest(name, item, x, y, z, ...)
+    if engine.player_set_block and type(item) == "string" and item:find("scythe", 1, true)
+       and reapable(engine.get_block_name(x, y, z)) then
+        reap(x, y, z, name)
+        return
+    end
+    if previous_harvest then return previous_harvest(name, item, x, y, z, ...) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -263,7 +358,14 @@ end
 -- ---------------------------------------------------------------------------
 local falling_speed = 0
 local previous_update = on_update
+local retry_timer = 0
 function on_update(dt, ...)
+    -- harvest rewards the world couldn't take yet (full of entities...): try again every second
+    retry_timer = retry_timer + (tonumber(dt) or 0)
+    if retry_timer >= 1 then
+        retry_timer = 0
+        if authority() then retry_undelivered() end
+    end
     if engine.get_player_state and engine.is_in_game and engine.is_in_game() then
         local st = engine.get_player_state()
         if st then

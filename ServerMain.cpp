@@ -353,13 +353,16 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     c.autosaveSeconds = std::clamp(toInt(kv["autosave_seconds"], c.autosaveSeconds), 10, 3600);
     c.spawnProtection = std::clamp(toInt(kv["spawn_protection"], c.spawnProtection), 0, 10000);
     c.opLevel = std::clamp(toInt(kv["op_level"], c.opLevel), 1, 4);
-    // A number from server.conf, only if it really is one: "nan", "inf" and the like are refused
-    // (the default stays), so they can never reach the clock or the Lua time limit
+    // A number from server.conf, only if the whole value is one: "nan", "inf", "5abc" or
+    // "1.5 minutes" are refused (the default stays), so they can never reach the clock or the
+    // Lua time limit. (readConfFile has already trimmed the spaces around it.)
     auto finiteNumber = [&kv](const char* key, double& out) {
         if (!kv.count(key)) return false;
+        const std::string& text = kv[key];
         try {
-            const double v = std::stod(kv[key]);
-            if (std::isfinite(v)) { out = v; return true; }
+            size_t used = 0;
+            const double v = std::stod(text, &used);
+            if (used == text.size() && std::isfinite(v)) { out = v; return true; }
         } catch (...) {}
         std::cerr << "[Server] server.conf: " << key << " = \"" << kv[key] << "\" isn't a number - using the default" << std::endl;
         return false;
@@ -1497,6 +1500,9 @@ int main(int argc, char** argv) {
     server.onEntityAct = [&](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
         if (kind == 0) entityLua.punch(id, name, at, item);
         else entityLua.rightClick(id, name, item);
+    };
+    server.onHarvest = [&ctx](const std::string& name, const std::string& item, const glm::ivec3& pos) {
+        ctx.api.harvest(name, item, pos);
     };
     server.onDropItem = [&](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
         if (BlockRegistry::getInstance().getBlockId(item) == 0) return;

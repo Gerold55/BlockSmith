@@ -1962,6 +1962,7 @@ local hooks = {
     { "on_server_stop",           "()  the server is stopping (in the game: you stopped hosting)" },
     { "on_use_hoe",               "(x, y, z, block) -> true if used  right-click with a hoe (tool_type \"hoe\")" },
     { "on_use_scythe",            "(x, y, z, block) -> true if it reaped (else it digs)  left-click with a scythe" },
+    { "on_player_harvest",        "(name, item, x, y, z)  a joined player's engine.request_harvest (the scythe): the server decides" },
     { "update_player_animation",  "(dt, is_moving, pitch)" },
     { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
     { "on_char_input",            "(codepoint)  typed text (unicode)" },
@@ -4655,6 +4656,17 @@ int main(int argc, char** argv) {
             return dropItemInWorld(item, std::clamp(count.value_or(1), 1, 64 * 64), pos, vel, pickup);
         };
 
+        // engine.request_harvest(item, x, y, z) -> true if asked: joined to a server, asks it to use
+        //   `item` (the scythe) on that block. The server works out what that does from its own
+        //   world, checks the player may change those blocks, and makes the change and whatever it
+        //   yields together (its mods' on_player_harvest). Nothing happens here; the blocks and
+        //   items arrive from the server. Not joined: false (the game does it itself).
+        engineTable["request_harvest"] = [](const std::string& item, int x, int y, int z) {
+            if (g_Client.state() != GameClient::State::Joined || item.empty() || item.size() > 64) return false;
+            g_Client.sendHarvest(item, glm::ivec3(x, y, z));
+            return true;
+        };
+
         // ---- entities.* (EntityLua.h): mobs and dropped items ----
         {
             EntityLuaHost host;
@@ -5481,6 +5493,9 @@ int main(int argc, char** argv) {
             g_Server.onEntityAct = [](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
                 if (kind == 0) g_EntityLua.punch(id, name, at, item);
                 else g_EntityLua.rightClick(id, name, item);
+            };
+            g_Server.onHarvest = [](const std::string& name, const std::string& item, const glm::ivec3& pos) {
+                g_ServerApi.harvest(name, item, pos);
             };
             g_Server.onDropItem = [](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
                 if (BlockRegistry::getInstance().getBlockId(item) == 0) return;
@@ -6734,6 +6749,11 @@ int main(int argc, char** argv) {
                 bool clickUsed = false;
                 const bool leftClick = leftPress && !leftMousePressedLast;
                 const bool rightClick = rightPress && !rightMousePressedLast;
+                // A scythe reaped crops with this press (on_use_scythe returned true): the rest of
+                // the press digs nothing (not the replanted crop either). Cleared at the start of
+                // every new left press, wherever it's aimed (air too), before anything else.
+                static bool scytheReaped = false;
+                if (leftClick) scytheReaped = false;
                 // Holding right-click keeps placing / using, like Minecraft (every 4 ticks = 0.2 s,
                 // engine.set_place_repeat). rightUse = this frame places or uses something.
                 static float rightRepeatTimer = 0.0f;
@@ -6924,9 +6944,7 @@ int main(int argc, char** argv) {
                             // A scythe: on_use_scythe(x, y, z, block) -> true = it reaped something
                             // (the farming mod: ripe crops, replanted). Otherwise - and on anything
                             // else - the scythe digs like any tool. After a reap, holding the button
-                            // doesn't then dig the replanted crop.
-                            static bool scytheReaped = false;
-                            if (leftClick) scytheReaped = false;
+                            // doesn't then dig the replanted crop (scytheReaped, above).
                             const bool isScythe = activeItemName.find("scythe") != std::string::npos ||
                                                   (held && held->toolType == "scythe");
                             if (isScythe && leftClick) {

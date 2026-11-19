@@ -49,6 +49,8 @@ enum Msg : uint8_t {
     C_ENTITY_ACT = 8, // u32 id, u8 kind (0 hit, 1 right-click), str item in hand
     C_DROP    = 9,    // str item, u16 count, f32 x y z, u8 returned [, f32 vx vy vz, f32 pickupDelay]
                       // items dropped next to the player (thrown: with a velocity)
+    C_HARVEST = 10,   // str item in hand, i32 x y z   a tool used on a block (the scythe): the
+                      // server works out what happens there and gives what it yields
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -713,6 +715,21 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         onDropItem(name, item, std::min(count, 64 * 64), p, how);
         break;
     }
+    case C_HARVEST: {
+        Reader r(data, size);
+        const std::string item = r.str();
+        const glm::ivec3 pos = r.ivec3();
+        if (!r.ok || !c.joined || item.empty() || item.size() > 64 || !onHarvest) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.entityActs > 10) return;
+        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+        if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach) return;
+        if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return;
+        const std::string name = c.name;
+        onHarvest(name, item, pos);
+        break;
+    }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
@@ -1016,6 +1033,23 @@ bool GameServer::messagePlayer(const std::string& name, const std::string& text,
     return false;
 }
 
+// Why a player may not make this change ("" = they may): too far away (more than kMaxReach +
+// slack from their eyes) or not loaded, an undiggable block outside creative (silently), then
+// spawn protection and mods (canEdit: their reason, shown to them)
+std::string GameServer::editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, float slack) {
+    const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+    if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach + slack) return kSilentRefusal;
+    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return kSilentRefusal;
+    const uint8_t was = m_world->getBlockAt(pos);
+    // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever the
+    // player's game says
+    if (c.mode != "creative" && id == 0 && was != 0 &&
+        blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) return kSilentRefusal;
+    // Mods may refuse it (spawn protection, claims...): checked last, for real changes only
+    if (canEdit && was != id) return canEdit(c.name, pos, was, id);
+    return "";
+}
+
 void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
     Reader r(data, size);
     const uint16_t count = r.u16();
@@ -1029,42 +1063,21 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         if (!r.ok) break;
 
         uint8_t id = 0;
-        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
-        const bool inReach = glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) <= kMaxReach;
         const bool loaded = m_world->chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
-
-        // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever
-        // the player's game says
-        bool allowed = true;
-        if (loaded && c.mode != "creative" && blockIdFromName(name, id) && id == 0) {
-            const uint8_t was = m_world->getBlockAt(pos);
-            if (was != 0 && blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) allowed = false;
-        }
-
-        // Mods may refuse it (spawn protection, claims...): checked last, for real changes only
-        if (allowed && canEdit && loaded && inReach && blockIdFromName(name, id)) {
-            const uint8_t was = m_world->getBlockAt(pos);
-            if (was != id) {
-                const std::string why = canEdit(c.name, pos, was, id);
-                if (!why.empty()) {
-                    allowed = false;
-                    if (why != kSilentRefusal && !refusalSent) {
-                        sendMessageTo(c, why, glm::vec3(1.0f, 0.55f, 0.55f));
-                        refusalSent = true;   // one message for a whole batch of edits
-                    }
-                }
-            }
-        }
-
-        if (allowed && blockIdFromName(name, id) && inReach && loaded) {
+        const std::string why = blockIdFromName(name, id) ? editRefusal(c, pos, id, 0.0f) : std::string(kSilentRefusal);
+        if (why.empty()) {
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->setBlockWithMetaAt(pos, id, meta);
             if (onPlayerEdit && oldId != id) onPlayerEdit(c.name, pos, oldId, id);
-        } else if (loaded) {
-            // Undo the player's prediction: send them what's really there
-            rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
+            continue;
         }
+        if (why != kSilentRefusal && !refusalSent) {
+            sendMessageTo(c, why, glm::vec3(1.0f, 0.55f, 0.55f));
+            refusalSent = true;   // one message for a whole batch of edits
+        }
+        // Undo the player's prediction: send them what's really there
+        if (loaded) rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
     }
 
     if (!rejected.empty()) {
@@ -1077,6 +1090,26 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         }
         sendTo(c.peer, w);
     }
+}
+
+bool GameServer::playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
+                                std::string* why, float slack) {
+    if (why) why->clear();
+    uint8_t id = 0;
+    if (!blockIdFromName(block, id)) return false;
+    for (auto& [cid, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        const std::string refusal = editRefusal(c, pos, id, std::clamp(slack, 0.0f, 4.0f));
+        if (!refusal.empty()) {
+            if (why && refusal != kSilentRefusal) *why = refusal;
+            return false;
+        }
+        const uint8_t oldId = m_world->getBlockAt(pos);
+        m_world->setBlockWithMetaAt(pos, id, 0);
+        if (onPlayerEdit && oldId != id) onPlayerEdit(name, pos, oldId, id);
+        return true;
+    }
+    return false;   // not online
 }
 
 void GameServer::kick(Client& c, const std::string& reason) {
@@ -2034,6 +2067,14 @@ void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
     w.u32(id);
     w.u8(static_cast<uint8_t>(kind));
     w.str(item);
+    sendTo(m_peer, w);
+}
+
+void GameClient::sendHarvest(const std::string& item, const glm::ivec3& pos) {
+    if (m_state != State::Joined || item.empty() || item.size() > 64) return;
+    Writer w(C_HARVEST);
+    w.str(item);
+    w.i32(pos.x); w.i32(pos.y); w.i32(pos.z);
     sendTo(m_peer, w);
 }
 

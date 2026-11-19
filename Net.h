@@ -240,6 +240,16 @@ public:
     // later); hasVelocity = thrown (Q, a death scatter) with `velocity`; pickupDelay < 0 = usual.
     struct DropInfo { bool returned = false; bool hasVelocity = false; glm::vec3 velocity{0.0f}; float pickupDelay = -1.0f; };
     std::function<void(const std::string& name, const std::string& item, int count, const glm::vec3& pos, const DropInfo& how)> onDropItem;
+    // A player used the tool in their hand on a block (the scythe on a crop). Already checked:
+    // the block is loaded and within their reach, at most 10 a second (with entity hits). The
+    // server works out what happens from its own world (Lua: on_player_harvest).
+    std::function<void(const std::string& name, const std::string& item, const glm::ivec3& pos)> onHarvest;
+    // Changes a block for a joined player with the same checks as their own edits: loaded,
+    // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
+    // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
+    // False = refused or not online; `why` = what to tell them ("" = nothing).
+    bool playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
+                        std::string* why = nullptr, float slack = 0.0f);
 
     // The time of day (DayTime.h). The owner (the dedicated server, or the game when hosting)
     // calls this every tick with its clock; players get it when they join, every few seconds,
@@ -308,6 +318,7 @@ private:
     void handleAuth(Client& c, const uint8_t* data, size_t size);
     void finishJoin(Client& c, const std::string& name, int view);
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
+    std::string editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, float slack);
     void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
     void sendMessageTo(Client& c, const std::string& text, const glm::vec3& color);
@@ -456,6 +467,8 @@ public:
     // returned = it was given to us but didn't fit; velocity (thrown) and pickupDelay (< 0 = usual)
     void sendDropItem(const std::string& item, int count, const glm::vec3& pos, bool returned = false,
                       const glm::vec3* velocity = nullptr, float pickupDelay = -1.0f);
+    // Used `item` on the block at pos (the scythe): the server decides what it does and yields
+    void sendHarvest(const std::string& item, const glm::ivec3& pos);
 
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
