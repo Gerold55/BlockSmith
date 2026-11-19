@@ -556,7 +556,7 @@ public:
     void saveData(Entity& e) {
         callDef(e.id, "on_save", [&](sol::protected_function_result& r) {
             if (r.get_type() == sol::type::string) e.saved = r.get<std::string>();
-            else if (r.get_type() == sol::type::nil || r.get_type() == sol::type::none) e.saved.clear();
+            else if (r.get_type() == sol::type::lua_nil || r.get_type() == sol::type::none) e.saved.clear();
         });
     }
 
