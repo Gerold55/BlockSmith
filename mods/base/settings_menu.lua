@@ -101,6 +101,7 @@ local VIDEO_LABELS = {
     render_distance = "Render Distance",
     vsync           = "VSync",
     main_hand       = "Main Hand",
+    brightness      = "Brightness",
     volume_master   = "Master Volume",
     volume_music    = "Music",
     volume_effects  = "Blocks & Effects",
@@ -111,6 +112,11 @@ local function video_value_text(s)
     if s.id == "vsync" then return (s.value ~= 0) and "On" or "Off" end
     if s.id == "main_hand" then return (s.value ~= 0) and "Left" or "Right" end
     if s.id == "render_distance" then return s.value .. " chunks" end
+    if s.id == "brightness" then          -- Minecraft's words for the ends; the middle is the game's own
+        if s.value <= 0 then return "Moody" elseif s.value >= 100 then return "Bright"
+        elseif s.value == 50 then return "Default" end
+        return s.value .. "%"
+    end
     if s.id:find("^volume_") then return (s.value == 0) and "Off" or (s.value .. "%") end
     return tostring(s.value)
 end

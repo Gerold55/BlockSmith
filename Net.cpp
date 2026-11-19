@@ -45,6 +45,7 @@ enum Msg : uint8_t {
     C_BLOCKS  = 3,    // u16 count, { i32 x y z, str block, u8 meta }
     C_CHAT    = 4,    // str text
     C_COMMAND = 5,    // str command (no slash) - run by the server, answered with S_CHAT
+    C_COMPLETE = 7,   // str text before the cursor ("/give Al") - answered with S_COMPLETE
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -62,6 +63,11 @@ enum Msg : uint8_t {
     S_SHARED  = 76,   // u16 count, { str key, str value }   shared values (weather...)
     S_MODE    = 77,   // str gameMode, u8 isOperator   (the server decides; the game follows)
     S_CHALLENGE = 78, // str serverId, str nonce, u8 accountExists   (after C_HELLO; see Auth.h)
+    S_FALLING = 80,   // u16 count, { i32 x y z, str block, u8 meta }   blocks that started falling
+                      // (the game animates them; their landing is an ordinary S_BLOCKS change)
+    S_ACTION  = 81,   // str action, str a, str b   the server asks the game to do something:
+                      // "give" (item, count), "clear", "kill" (reason)
+    S_COMPLETE = 82,  // str text, u16 count, { str }   what fits the word being typed (Tab)
     S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
                       // (older games ignore it and keep their own sky; no protocol change needed)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
@@ -461,7 +467,10 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
     }
     m_world->setExtraLoadCenters(centers);
 
-    // 3. Block changes (player edits, water, mods) -> everyone who has that chunk
+    // 3. Blocks that started falling (sand, gravel), then block changes (player edits, water,
+    //    mods) -> everyone who has that chunk. Falling first: the block leaves its cell in the
+    //    same update, and players should see it start falling, not a hole.
+    sendFallingStarts(m_world->takeFallingStarts());
     sendBlockChanges(m_world->takeBlockChanges());
 
     // 4. Chunks
@@ -623,6 +632,27 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         broadcastChat("<" + c.name + "> " + text, kChatColor);
         break;
     }
+    case C_COMPLETE: {
+        Reader r(data, size);
+        std::string text = r.str();
+        if (!c.joined || !r.ok || text.size() > 256) return;
+        const double now = net::clockSeconds();
+        if (now - c.completeWindow > 1.0) { c.completeWindow = now; c.completeCount = 0; }
+        if (++c.completeCount > 20) return;           // (a flood: just no answer)
+        std::vector<std::string> list;
+        if (onComplete) {
+            std::string clean = cleanChatText(text);
+            if (!clean.empty() && (text.back() == ' ' || text.back() == '\t')) clean += ' ';   // "/give " = its 1st argument
+            list = onComplete(c.name, clean);
+        }
+        if (list.size() > 200) list.resize(200);
+        Writer w(S_COMPLETE);
+        w.str(text);
+        w.u16(static_cast<uint16_t>(list.size()));
+        for (const auto& x : list) w.str(x);
+        sendTo(c.peer, w);
+        break;
+    }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
@@ -692,6 +722,13 @@ void GameServer::handleAuth(Client& c, const uint8_t* data, size_t size) {
     if (!r.ok || proof.response.size() > 128 || proof.registerKey.size() > 128) { kick(c, "Bad login packet"); return; }
     const std::string name = c.helloName;
 
+    if (canJoinFrom && c.peer) {               // banned IP address (ban-ip)
+        char ip[64] = {0};
+        if (enet_address_get_host_ip(&c.peer->address, ip, sizeof(ip)) == 0) {
+            const std::string reason = canJoinFrom(ip);
+            if (!reason.empty()) { kick(c, reason); return; }
+        }
+    }
     if (canJoin) {
         const std::string reason = canJoin(name, proof);   // banned, not whitelisted, wrong password...
         if (!reason.empty()) { kick(c, reason); return; }
@@ -1076,6 +1113,28 @@ void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes
     }
 }
 
+void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& starts) {
+    if (starts.empty()) return;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined) continue;
+        std::vector<const World::FallingStart*> mine;
+        for (const auto& f : starts) {
+            if (c.sentChunks.count(chunkOf(glm::vec3(f.cell)))) mine.push_back(&f);
+        }
+        for (size_t start = 0; start < mine.size(); start += 4096) {
+            const size_t end = std::min(mine.size(), start + 4096);
+            Writer w(S_FALLING);
+            w.u16(static_cast<uint16_t>(end - start));
+            for (size_t i = start; i < end; ++i) {
+                w.i32(mine[i]->cell.x); w.i32(mine[i]->cell.y); w.i32(mine[i]->cell.z);
+                w.str(blockName(mine[i]->id));
+                w.u8(mine[i]->meta);
+            }
+            sendTo(c.peer, w);
+        }
+    }
+}
+
 void GameServer::sendPositions() {
     struct Entry { uint16_t id; float time; glm::vec3 p; float yaw, pitch; };
     const float serverTime = net::clockSeconds();
@@ -1206,6 +1265,27 @@ std::vector<std::string> GameServer::playerNames() const {
     return out;
 }
 
+std::string GameServer::playerAddress(const std::string& name) const {
+    for (const auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name || !c.peer) continue;
+        char ip[64] = {0};
+        if (enet_address_get_host_ip(&c.peer->address, ip, sizeof(ip)) != 0) return "";
+        return ip;
+    }
+    return "";
+}
+
+bool GameServer::sendAction(const std::string& name, const std::string& action, const std::string& a, const std::string& b) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        Writer w(S_ACTION);
+        w.str(action); w.str(a); w.str(b);
+        sendTo(c.peer, w);
+        return true;
+    }
+    return false;
+}
+
 std::vector<std::pair<std::string, glm::vec3>> GameServer::playerPositions() const {
     std::vector<std::pair<std::string, glm::vec3>> out;
     for (const auto& [id, c] : m_clients) if (c.joined) out.push_back({c.name, c.position});
@@ -1314,6 +1394,8 @@ void GameClient::disconnect() {
 }
 
 void GameClient::finish(const std::string& reason) {
+    m_completeAsked.clear(); m_completeText.clear(); m_completeList.clear();
+    m_completeHave = m_completeArrived = false;
     const bool wasJoined = m_state == State::Joined;
     if (m_host) {
         enet_host_destroy(m_host);
@@ -1513,6 +1595,37 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_modeChanged = true;
         break;
     }
+    case S_FALLING: {
+        if (m_state != State::Joined) return;
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const glm::ivec3 pos = r.ivec3();
+            const std::string name = r.str();
+            const uint8_t meta = r.u8();
+            if (!r.ok) break;
+            uint8_t id = 0;
+            if (blockIdFromName(name, id) && id != 0) m_world->addFallingVisual(pos, id, meta);
+        }
+        break;
+    }
+    case S_COMPLETE: {
+        const std::string text = r.str();
+        const uint16_t count = r.u16();
+        std::vector<std::string> list;
+        for (uint16_t i = 0; i < count && r.ok; ++i) list.push_back(r.str());
+        if (!r.ok) break;
+        m_completeText = text;
+        m_completeList = std::move(list);
+        m_completeHave = m_completeArrived = true;
+        break;
+    }
+    case S_ACTION: {
+        if (m_state != State::Joined) return;
+        Action a;
+        a.action = r.str(); a.a = r.str(); a.b = r.str();
+        if (r.ok && !a.action.empty() && m_actions.size() < 256) m_actions.push_back(std::move(a));
+        break;
+    }
     case S_TIME: {
         const uint32_t whole = r.u32();
         const float frac = r.f32();
@@ -1693,6 +1806,14 @@ void GameClient::sendCommand(const std::string& command) {
     if (m_state != State::Joined || command.empty()) return;
     Writer w(C_COMMAND);
     w.str(command);
+    sendTo(m_peer, w);
+}
+
+void GameClient::requestCompletion(const std::string& text) {
+    if (m_state != State::Joined || text == m_completeAsked) return;
+    m_completeAsked = text;
+    Writer w(C_COMPLETE);
+    w.str(text);
     sendTo(m_peer, w);
 }
 

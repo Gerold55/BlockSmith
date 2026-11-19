@@ -101,6 +101,15 @@ end
 
 local function survival_on() return S.mode == "survival" end
 
+-- Game rules (/gamerule on a server, or in singleplayer): shared values "gamerule.<name>",
+-- "true"/"false". Not set: the default given here (this mod's own settings)
+local function rule(name, default)
+    local v = engine.get_shared and engine.get_shared("gamerule." .. name)
+    if v == nil or v == "" then return default end
+    return v == "true"
+end
+local function keeps_inventory() return rule("keepInventory", settings.keep_inventory) end
+
 -- ---------------------------------------------------------------------------
 -- API
 -- ---------------------------------------------------------------------------
@@ -169,7 +178,7 @@ local function die(reason)
     S.dead = true
     S.death_reason = reason or "died"
     engine.set_player_controls{ move = false, jump = false, sprint = false, sneak = false }
-    if not settings.keep_inventory then
+    if not keeps_inventory() then
         for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
     end
     for _, fn in ipairs(callbacks.death) do pcall(fn, S.death_reason) end
@@ -203,6 +212,14 @@ local function spawn_point()
         if x then return tonumber(x), tonumber(y), tonumber(z) end
     end
     return nil
+end
+
+-- Dies at once, whatever the armour or health (/kill). false in creative mode (nothing to kill).
+function survival.kill(reason)
+    if not survival_on() or S.dead then return false end
+    S.hp = 0
+    die(reason or "was killed")
+    return true
 end
 
 function survival.respawn()
@@ -356,7 +373,7 @@ local function tick(dt)
     end
 
     -- Regeneration and starvation (every 4 s; fast regen when full with saturation)
-    if S.food >= settings.regen_min_food and S.hp < settings.max_hp then
+    if S.food >= settings.regen_min_food and S.hp < settings.max_hp and rule("naturalRegeneration", true) then
         local every = (S.food >= settings.max_food and S.saturation > 0) and 0.5 or 4
         timers.regen = timers.regen + dt
         if timers.regen >= every then timers.regen = 0; survival.heal(1); exhaust(6) end
@@ -383,7 +400,7 @@ local function tick(dt)
         if not was_on_ground and fall_top then
             local fallen = fall_top - p.y
             local dmg = math.floor(fallen - settings.fall_safe)
-            if dmg > 0 then survival.damage(dmg, "fell from a high place") end
+            if dmg > 0 and rule("fallDamage", true) then survival.damage(dmg, "fell from a high place") end
         end
         fall_top = nil
     end
@@ -393,7 +410,10 @@ local function tick(dt)
         S.air = math.max(0, S.air - dt)
         if S.air <= 0 then
             timers.drown = timers.drown + dt
-            if timers.drown >= 1 then timers.drown = 0; survival.damage(2, "drowned") end
+            if timers.drown >= 1 then
+                timers.drown = 0
+                if rule("drowningDamage", true) then survival.damage(2, "drowned") end
+            end
         end
     else
         S.air = math.min(settings.max_air, S.air + dt * 5)   -- comes back quickly
@@ -405,7 +425,10 @@ local function tick(dt)
               or p.head_fluid and settings.fluid_damage[p.head_fluid]
     if hurt then
         timers.fluid = timers.fluid + dt
-        if timers.fluid >= 0.5 then timers.fluid = 0; survival.damage(hurt, "tried to swim in " .. (p.feet_fluid or p.head_fluid)) end
+        if timers.fluid >= 0.5 then
+            timers.fluid = 0
+            if rule("fireDamage", true) then survival.damage(hurt, "tried to swim in " .. (p.feet_fluid or p.head_fluid)) end
+        end
     else
         timers.fluid = 0.5        -- the first touch hurts straight away
     end
@@ -552,7 +575,22 @@ local function close_inventory()
 end
 survival.on_death(function()
     close_inventory()
-    if not settings.keep_inventory and survival.inventory then survival.inventory.clear() end
+    if not keeps_inventory() and survival.inventory then survival.inventory.clear() end
 end)
+
+-- The server's /kill and /clear (GameServer::sendAction): a death with the death screen, and the
+-- whole inventory (not just the hotbar) cleared
+local previous_server_action = on_server_action
+function on_server_action(action, a, b, ...)
+    if action == "kill" then
+        if survival.kill(a ~= "" and a or nil) then return true end
+    elseif action == "clear" then
+        for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
+        if survival.inventory then survival.inventory.clear() end
+        return true
+    end
+    if previous_server_action then return previous_server_action(action, a, b, ...) end
+    return false
+end
 
 print("[Survival] Ready")

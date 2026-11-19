@@ -5,6 +5,9 @@
 --   /time add <hours>
 --   /time speed <x>          1 normal, 2 twice as fast, 0 stops time
 --   /rain                    rain for a bit
+--   /gamerule [rule] [true|false|default], /give <item> [count], /clear, /kill, /tp <x y z>
+--                            in your own world (singleplayer, or hosting); on a server, the
+--                            server's commands of the same names answer instead
 --
 -- The time of day (sky.get_time): 0.25 midnight, 0.5 sunrise, 0.75 midday, 0 sunset.
 -- On someone else's server, the server's clock counts: /time goes to the server (operators).
@@ -40,6 +43,82 @@ local function report(reply)
     reply(line)
 end
 
+-- Game rules in your own world: saved with it, and shared ("gamerule.<name>") so mods - the
+-- survival mod - follow them, the same as on a server
+local RULES = { "doDaylightCycle", "keepInventory", "naturalRegeneration", "fallDamage", "drowningDamage", "fireDamage" }
+local function find_rule(n)
+    for _, r in ipairs(RULES) do if r:lower() == (n or ""):lower() then return r end end
+end
+local function load_rules()
+    local out = {}
+    for k, v in ((engine.get_storage("base:gamerules") or "") .. ";"):gmatch("(%w+)=(%a+);") do out[k] = v end
+    return out
+end
+local function apply_rules(rules)
+    for _, r in ipairs(RULES) do engine.set_shared("gamerule." .. r, rules[r] or "") end
+    if sky.set_time_speed and rules.doDaylightCycle then sky.set_time_speed(rules.doDaylightCycle == "false" and 0 or 1) end
+end
+local rules_applied = false
+local previous_update = on_update
+function on_update(dt, ...)
+    local own = engine.is_in_game() and (not engine.is_authority or engine.is_authority())
+    if own and not rules_applied then rules_applied = true; apply_rules(load_rules()) end
+    if not engine.is_in_game() then rules_applied = false end
+    if previous_update then return previous_update(dt, ...) end
+end
+
+-- A coordinate: a number, or ~ / ~5 (from where you are)
+local function coord(t, base)
+    if not t then return nil end
+    if t:sub(1, 1) == "~" then return base + (tonumber(t:sub(2)) or 0) end
+    return tonumber(t)
+end
+
+-- Tab completion of these commands' arguments (the names come from the registrations below).
+-- on_chat_complete(words, word): words = the words before the one being typed, without the "/".
+-- Hooks chain: each mod adds to what the one before it returned.
+local function item_names()
+    local out = {}
+    if ui and ui.get_all_blocks then
+        for _, b in ipairs(ui.get_all_blocks() or {}) do
+            local n = type(b) == "table" and (b.name or b.id) or b
+            if type(n) == "string" and n ~= "" and n ~= "air" then out[#out + 1] = n end
+        end
+    end
+    table.sort(out)
+    return out
+end
+local TIMES = { "day", "noon", "night", "midnight", "sunrise", "sunset" }
+local previous_complete = on_chat_complete
+function on_chat_complete(words, word, ...)
+    local out = previous_complete and previous_complete(words, word, ...) or {}
+    local function add(list) for _, v in ipairs(list) do out[#out + 1] = v end end
+    local cmd, n = (words[1] or ""):lower(), #words
+    if cmd == "time" then
+        if n == 1 then add({ "set", "add", "speed", "query" }); add(TIMES)
+        elseif n == 2 and words[2]:lower() == "set" then add(TIMES)
+        elseif n == 2 and words[2]:lower() == "speed" then add({ "0", "1", "2" }) end
+    elseif cmd == "gamerule" then
+        if n == 1 then add(RULES)
+        elseif n == 2 and find_rule(words[2]) then add({ "true", "false", "default" }) end
+    elseif cmd == "give" then
+        if n == 1 or (n == 2 and words[2] == "@s") then add(item_names()) end
+    elseif cmd == "tp" or cmd == "teleport" then
+        if n <= 3 then add({ "~" }) end
+    end
+    return out
+end
+
+if chat and chat.register_command then
+    chat.register_command("time", "/time [set|add|speed|query] [value]", "Show or change the time of day")
+    chat.register_command("gamerule", "/gamerule [rule] [true|false|default]", "Show or change the game rules")
+    chat.register_command("give", "/give <item> [count]", "Give yourself an item")
+    chat.register_command("clear", "/clear", "Empty your inventory")
+    chat.register_command("kill", "/kill", "Die and respawn")
+    chat.register_command("tp", "/tp <x y z>", "Teleport (~ = where you are)")
+    chat.register_command("rain", "/rain", "Make it rain for a bit")
+end
+
 function on_chat_command(cmd, player, is_operator, reply)
     reply = reply or function(t) chat.send(t) end
     local name, args = cmd:match("^(%S+)%s*(.*)$")
@@ -73,6 +152,60 @@ function on_chat_command(cmd, player, is_operator, reply)
             if not v or v < 0 then reply("Usage: /time speed <x>   (1 normal, 0 stops time)") return true end
             sky.set_time_speed(v)
             report(reply)
+        end
+        return true
+    end
+
+    local own_world = not engine.is_authority or engine.is_authority()
+    if name == "gamerule" or name == "give" or name == "clear" or name == "kill" or name == "tp" or name == "teleport" then
+        if not own_world then return false end      -- on a server: its own commands answer
+        local a = {}
+        for w in args:gmatch("%S+") do a[#a + 1] = w end
+        if name == "gamerule" then
+            local rules = load_rules()
+            if #a == 0 then
+                for _, r in ipairs(RULES) do reply(r .. " = " .. (rules[r] or "default")) end
+                return true
+            end
+            local rule = find_rule(a[1])
+            if not rule then reply("No game rule called '" .. a[1] .. "'. Type /gamerule for the list.") return true end
+            if not a[2] then reply(rule .. " = " .. (rules[rule] or "default")) return true end
+            local v = a[2]:lower()
+            if v ~= "true" and v ~= "false" and v ~= "default" then reply("A game rule is true, false or default") return true end
+            rules[rule] = (v ~= "default") and v or nil
+            local parts = {}
+            for k, val in pairs(rules) do parts[#parts + 1] = k .. "=" .. val end
+            engine.set_storage("base:gamerules", table.concat(parts, ";"))
+            apply_rules(rules)
+            reply("Game rule " .. rule .. " is now " .. v)
+        elseif name == "give" then
+            local item, count = a[1], tonumber(a[2] or "1")
+            if a[1] == "@s" then item, count = a[2], tonumber(a[3] or "1") end
+            if not item or not count or count < 1 then reply("Usage: /give <item> [count]") return true end
+            if engine.get_block_id(item) == 0 then reply("There's no item called '" .. item .. "'") return true end
+            local left = math.min(count, 4096)
+            while left > 0 do
+                local n = math.min(left, 64)
+                if not engine.give_item(item, n) then break end
+                left = left - n
+            end
+            reply("Gave " .. (math.min(count, 4096) - left) .. " " .. item)
+        elseif name == "clear" then
+            for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
+            if survival and survival.inventory then survival.inventory.clear() end
+            reply("Cleared your inventory")
+        elseif name == "kill" then
+            if survival and survival.kill and survival.kill("gave up") then return true end
+            reply("Nothing to kill here (creative mode, or no survival mod)")
+        else -- tp <x y z>
+            local x0, y0, z0 = engine.get_player_position()
+            local i = (a[1] == "@s") and 2 or 1
+            local x, y, z = coord(a[i], x0), coord(a[i + 1], y0), coord(a[i + 2], z0)
+            if not (x and y and z) then reply("Usage: /tp <x y z>   (~ = where you are, ~5 = 5 more)") return true end
+            if a[i]:sub(1, 1) ~= "~" and not a[i]:find("%.") then x = x + 0.5 end
+            if a[i + 2]:sub(1, 1) ~= "~" and not a[i + 2]:find("%.") then z = z + 0.5 end
+            engine.set_player_position(x, y, z)
+            reply(string.format("Teleported to %.1f, %.1f, %.1f", x, y, z))
         end
         return true
     end

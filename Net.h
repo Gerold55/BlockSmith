@@ -152,6 +152,14 @@ public:
     bool teleportPlayer(const std::string& name, const glm::vec3& pos);
     std::vector<std::pair<std::string, glm::vec3>> playerPositions() const;   // for saving
     bool kickPlayer(const std::string& name, const std::string& reason);
+    // A joined player's IP address ("" if they aren't here) - for ban-ip
+    std::string playerAddress(const std::string& name) const;
+    // Asks a player's game to do something it decides itself: "give" (item, count), "clear",
+    // "kill" (reason). Their game runs it (GameClient::takeActions; mods: on_server_action).
+    bool sendAction(const std::string& name, const std::string& action,
+                    const std::string& a = "", const std::string& b = "");
+    // Asked first when someone joins, with their IP address: "" lets them in, else why not (ban-ip)
+    std::function<std::string(const std::string& ip)> canJoinFrom;
     // Where a returning player should appear (return true + set pos), and a hook for
     // when a player leaves (to save their position). Optional.
     std::function<bool(const std::string& name, glm::vec3& pos)> spawnFor;
@@ -170,6 +178,9 @@ public:
     const std::string& serverId() const { return m_serverId; }
     // A "/command" a player typed (without the slash). Reply with messagePlayer. Optional.
     std::function<void(const std::string& name, const std::string& command)> onCommand;
+    // Tab in a player's chat: the text before their cursor ("/give Al" or "hello Bo") -> what
+    // fits the word they're typing (the server's commands they may use, players, items...)
+    std::function<std::vector<std::string>(const std::string& name, const std::string& text)> onComplete;
     // Called once someone has joined (e.g. to send them a welcome message). Optional.
     std::function<void(const std::string& name)> onJoin;
     // A player changed a block (and the server accepted it): for break/place sounds and mods
@@ -231,6 +242,8 @@ private:
     void sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values);
     struct Client {
         ENetPeer* peer = nullptr;
+        double completeWindow = 0.0;   // (completion requests: at most 20 a second)
+        int completeCount = 0;
         uint16_t id = 0;
         bool joined = false;
         // Between C_HELLO and C_AUTH: the challenge we sent and what they asked for
@@ -283,6 +296,7 @@ private:
 
     void streamChunks(Client& c);
     void sendBlockChanges(const std::vector<World::BlockChange>& changes);
+    void sendFallingStarts(const std::vector<World::FallingStart>& starts);
     void sendPositions();
     void broadcastChat(const std::string& text, const glm::vec3& color);
 
@@ -382,6 +396,15 @@ public:
     void sendChat(const std::string& text);
     // A "/command" (without the slash) for the server to run; it answers in chat.
     void sendCommand(const std::string& command);
+    // Asks the server what fits the word being typed in chat (Tab). The answer comes later:
+    // completionFor(text, out) has it once it's here; takeCompletionArrived() is true once then.
+    void requestCompletion(const std::string& text);
+    bool completionFor(const std::string& text, std::vector<std::string>& out) const {
+        if (text != m_completeText || !m_completeHave) return false;
+        out = m_completeList;
+        return true;
+    }
+    bool takeCompletionArrived() { const bool a = m_completeArrived; m_completeArrived = false; return a; }
     std::vector<net::ChatLine> takeChat();
 
     // Shared values from the server (see GameServer::setShared)
@@ -391,6 +414,9 @@ public:
     }
     // Keys that changed since the last call (in order)
     std::vector<std::string> takeSharedChanges() { std::vector<std::string> out; out.swap(m_sharedChanges); return out; }
+    // What the server asked our game to do (GameServer::sendAction), oldest first
+    struct Action { std::string action, a, b; };
+    std::vector<Action> takeActions() { std::vector<Action> out; out.swap(m_actions); return out; }
     // Game mode the server gave us ("" = not told yet / not online) and whether we're an operator
     const std::string& gameMode() const { return m_mode; }
     bool isOperator() const { return m_isOp; }
@@ -408,6 +434,10 @@ private:
     void sendEdits();
 
     std::vector<std::string> m_sharedChanges;
+    std::vector<Action> m_actions;
+    std::string m_completeText, m_completeAsked;   // what the last answer / question was for
+    std::vector<std::string> m_completeList;
+    bool m_completeHave = false, m_completeArrived = false;
     DayClock m_dayTime;
     bool m_dayTimeNew = false;
     std::string m_mode;

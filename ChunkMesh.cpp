@@ -234,6 +234,42 @@ bool isFaceHidden(const BlockProperty& self, uint8_t selfId, const FluidDef* ren
 
 } // namespace
 
+void ChunkMesh::buildSingleBlock(uint8_t id, const float light[4], std::vector<Vertex>& out) {
+    out.clear();
+    if (id == 0) return;
+    const auto& prop = BlockRegistry::getInstance().getBlock(id);
+    for (int f = 0; f < 6; ++f) {
+        // A face with no texture of its own uses another's, as chunks do
+        int texFace = f;
+        if (prop.faces[texFace].baseLayer < 0) {
+            for (int g : { 2, 4, 0, 1, 5, 3 }) if (prop.faces[g].baseLayer >= 0) { texFace = g; break; }
+        }
+        const auto& faceProp = prop.faces[texFace];
+        const FaceStyle style{
+            prop.defaultTint.r, prop.defaultTint.g, prop.defaultTint.b,
+            static_cast<float>(faceProp.baseLayer),
+            faceProp.overlayLayer >= 0 ? static_cast<float>(faceProp.overlayLayer) : -1.0f,
+            tintFlag(faceProp.tintBase),
+            tintFlag(faceProp.tintOverlay),
+            kFaceShading[f]
+        };
+        float fv[4][3];
+        faceCorners(f, 0.0f, 0.0f, 0.0f, 1.0f, fv);
+        Vertex q[4] = {
+            makeVertex(fv[0][0], fv[0][1], fv[0][2], 0.0f, 1.0f, style),
+            makeVertex(fv[1][0], fv[1][1], fv[1][2], 1.0f, 1.0f, style),
+            makeVertex(fv[2][0], fv[2][1], fv[2][2], 1.0f, 0.0f, style),
+            makeVertex(fv[3][0], fv[3][1], fv[3][2], 0.0f, 0.0f, style),
+        };
+        for (Vertex& v : q) setLight(v, light[0], light[1], light[2], light[3]);
+        pushQuad(out, q);
+    }
+}
+
+void ChunkMesh::uploadVertices(GLuint& vao, GLuint& vbo, const std::vector<Vertex>& verts) {
+    uploadBuffer(vao, vbo, verts);
+}
+
 bool ChunkMesh::smoothLighting = true;
 bool ChunkMesh::ambientOcclusion = true;
 

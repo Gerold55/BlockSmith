@@ -47,6 +47,9 @@ kit.theme = {
     window_title_idle = { 0.24, 0.24, 0.28, 1 },
     window_shadow = { 0, 0, 0, 0.35 },
     drop_hover   = { 0.95, 0.85, 0.45, 0.35 },
+    marquee      = { 0.40, 0.65, 1.00, 0.18 },   -- the box drawn while selecting (f:marquee)
+    marquee_edge = { 0.55, 0.78, 1.00, 0.90 },
+    selected_edge = { 1.00, 0.85, 0.35, 1.00 },  -- around selected windows
 }
 kit.text_size = 0.42     -- capital letters are this many units tall
 
@@ -250,6 +253,7 @@ if ui and ui.draw_rect and not kit.full_engine then
 end
 
 local K = (ui and ui.keys) or {}
+local TITLE_H = 1.0     -- a window's title bar (units)
 
 -- The caret in text fields (lualib/textedit.lua): move it with the arrows, Home / End, a click
 local te_ok, te = pcall(require, "textedit")
@@ -296,7 +300,13 @@ end
 -- ---------------------------------------------------------------------------
 -- (older engines) a press within half a second of the last one, in the same place: a double-click
 local last_press = nil
+local function ctrl_down()
+    if not (ui and ui.is_key_down and ui.keys) then return false end
+    return (ui.keys.LEFT_CONTROL and ui.is_key_down(ui.keys.LEFT_CONTROL)) or
+           (ui.keys.RIGHT_CONTROL and ui.is_key_down(ui.keys.RIGHT_CONTROL)) or false
+end
 local function count_clicks(p)
+    if p.ctrl == nil then p.ctrl = ctrl_down() end
     local now = ui.get_time and ui.get_time() or 0
     if last_press and last_press.button == p.button and now - last_press.t <= 0.5
        and math.abs(p.x - last_press.x) <= 6 and math.abs(p.y - last_press.y) <= 6 then
@@ -763,7 +773,7 @@ function Frame:scroll_area(id, x, y, w, h, content_h, fn)
     local max_scroll = math.max(0, (content_h or h) - h)
     local bar = max_scroll > 0 and 0.35 or 0
     local scroll = host.scrolls[sid] or 0
-    scroll = scroll - self:take_scroll(x, y, w, h) * 1.5
+    -- (the wheel is read after the content: a list or scroll area inside gets it first)
     -- the bar: drag it
     if bar > 0 then
         local th = math.max(0.8, h * h / content_h)
@@ -799,13 +809,25 @@ function Frame:scroll_area(id, x, y, w, h, content_h, fn)
     local ok, err = pcall(fn, child, (host.scrolls[sid] or 0))
     if ui.pop_clip then ui.pop_clip() end
     if not ok then error(err, 0) end
+    -- The wheel, if nothing inside used it (and there's something to scroll)
+    if max_scroll > 0 then
+        local dy = self:take_scroll(x, y, w, h)
+        if dy ~= 0 then host.scrolls[sid] = math.max(0, math.min(max_scroll, host.scrolls[sid] - dy * 1.5)) end
+    end
 end
 
--- A desktop icon: a picture (or an item) with a label under it. Returns "open" on a double-click,
--- "select" on a click, "menu" on a right-click, else nil. opts: selected, item (draw a block/item
--- icon instead of a picture), tooltip
+-- A desktop icon: a picture (or an item) with a label under it. Returns what the player did:
+--   "select"  pressed on it (second value: { ctrl, shift } - Ctrl+click usually adds to a selection)
+--   "open"    double-clicked
+--   "menu"    right-clicked
+-- With opts.movable = true it can also be dragged (yours to move: keep its x, y in your state):
+--   "drag", dx, dy, mods   being dragged: move it (and any other selected icons) by dx, dy units
+--   "drop", mods           let go after a drag (e.g. snap to a grid, save positions)
+--   "click", mods          let go without dragging (e.g. now select only this one)
+-- opts: selected, item (draw a block/item icon), draw = function(px, py, size_px), tooltip, movable
 function Frame:icon(id, x, y, size, picture, label, opts)
     opts = opts or {}
+    local host, sid = self.host_ref, self:sid(id)
     local h = size + 0.9
     local hover = self:hovered(x - 0.2, y - 0.1, size + 0.4, h)
     if opts.selected then self:rect(x - 0.2, y - 0.1, size + 0.4, h, kit.theme.row_selected)
@@ -822,13 +844,140 @@ function Frame:icon(id, x, y, size, picture, label, opts)
     end
     if label then self:label(x - 0.6, y + size + 0.15, label, { size = 0.32, w = size + 1.2, align = "center" }) end
     self:tooltip(x, y, size, size, opts.tooltip)
+
+    -- Being dragged (movable icons): follow the mouse until it's let go
+    local d = host.icondrag
+    if d and d.id == sid then
+        d.seen = host.frame_no
+        if not mouse_down() or host.released then
+            host.icondrag = nil
+            return d.active and "drop" or "click", d.mods
+        end
+        if not d.active and (math.abs(self.mx - d.sx) > 4 or math.abs(self.my - d.sy) > 4) then d.active = true end
+        if d.active then
+            cursor("move")
+            local dx, dy = (self.mx - d.lx) / self.u, (self.my - d.ly) / self.u
+            d.lx, d.ly = self.mx, self.my
+            if dx ~= 0 or dy ~= 0 then return "drag", dx, dy, d.mods end
+        end
+        return nil
+    end
     local c = self:take_click(x - 0.2, y - 0.1, size + 0.4, h, "any")
     if c then
-        if c.button == "right" then return "menu" end
-        return (c.clicks or 1) >= 2 and "open" or "select"
+        local mods = { ctrl = c.ctrl and true or false, shift = c.shift and true or false }
+        if c.button == "right" then return "menu", mods end
+        if (c.clicks or 1) >= 2 then return "open", mods end
+        if opts.movable and c.button == "left" then
+            host.icondrag = { id = sid, sx = c.x, sy = c.y, lx = c.x, ly = c.y, active = false, mods = mods, seen = host.frame_no }
+        end
+        return "select", mods
     end
     return nil
 end
+
+-- A box selection over an area (like dragging on an empty desktop). Call it AFTER the things
+-- in the area (icons, buttons...), so a press on one of them goes to it, not to the box. Press
+-- on empty space and drag: a highlighted box follows the mouse. Returns, every frame of the drag:
+--   box, done, mods
+--   box  = { x, y, w, h } in units (normalised: w, h never negative); nil when not selecting
+--   done = true on the frame the mouse is let go; mods = { ctrl, shift } of the press
+-- A press that isn't dragged returns a box of size 0 with done = true: "clicked on nothing"
+-- (usually: clear the selection). Use kit.overlaps(box, x, y, w, h) to test what's inside.
+-- opts.windows = true: windows the box touches become selected too (see f:selected_windows),
+-- and a plain click on empty space clears the window selection.
+function Frame:marquee(id, x, y, w, h, opts)
+    opts = opts or {}
+    local host, sid = self.host_ref, self:sid(id)
+    local m = host.marquee
+    if not (m and m.id == sid) then
+        local c = self:take_click(x, y, w, h)
+        if not c then return nil end
+        local ux, uy = (c.x - self.cx) / self.u, (c.y - self.cy) / self.u
+        m = { id = sid, x0 = ux, y0 = uy, x1 = ux, y1 = uy, sx = c.x, sy = c.y, active = false,
+              mods = { ctrl = c.ctrl and true or false, shift = c.shift and true or false },
+              base = opts.windows and not c.ctrl and {} or nil }
+        if opts.windows then
+            if not c.ctrl then host.win_selected = {} end
+            m.keep = {}
+            for wid in pairs(host.win_selected) do m.keep[wid] = true end   -- (Ctrl: add to these)
+        end
+        host.marquee = m
+    end
+    m.seen = host.frame_no
+    local done = host.released or not mouse_down()
+    m.x1 = math.max(x, math.min(x + w, (self.mx - self.cx) / self.u))
+    m.y1 = math.max(y, math.min(y + h, (self.my - self.cy) / self.u))
+    if not m.active and (math.abs(self.mx - m.sx) > 4 or math.abs(self.my - m.sy) > 4) then m.active = true end
+    local box
+    if m.active then
+        box = { x = math.min(m.x0, m.x1), y = math.min(m.y0, m.y1), w = math.abs(m.x1 - m.x0), h = math.abs(m.y1 - m.y0) }
+        -- drawn on top of everything (windows included), like a desktop's selection box
+        local f, bx = self, box
+        host.late[#host.late + 1] = function()
+            local px, py = f:px(bx.x, bx.y)
+            local pw, ph = bx.w * f.u, bx.h * f.u
+            ui.draw_rect(px, py, pw, ph, color(kit.theme.marquee))
+            if ui.draw_rect_outline then ui.draw_rect_outline(px, py, pw, ph, 1, color(kit.theme.marquee_edge))
+            else
+                ui.draw_rect(px, py, pw, 1, color(kit.theme.marquee_edge)); ui.draw_rect(px, py + ph - 1, pw, 1, color(kit.theme.marquee_edge))
+                ui.draw_rect(px, py, 1, ph, color(kit.theme.marquee_edge)); ui.draw_rect(px + pw - 1, py, 1, ph, color(kit.theme.marquee_edge))
+            end
+        end
+        if opts.windows then                     -- windows it touches (as it is now)
+            local sel = {}
+            for wid in pairs(m.keep or {}) do sel[wid] = true end
+            for wid, st in pairs(host.windows) do
+                -- (windows shown last frame too: the box is usually drawn before this frame's windows)
+                if st.opts and st.opts.frame ~= false and not st.minimized and (st.seen or 0) >= host.frame_no - 1 then
+                    local th = TITLE_H
+                    if kit.overlaps(box, st.x, st.y, st.w, st.h + th) then sel[wid] = true end
+                end
+            end
+            host.win_selected = sel
+        end
+    else
+        box = { x = m.x0, y = m.y0, w = 0, h = 0 }
+    end
+    if done then host.marquee = nil end
+    return box, done, m.mods
+end
+
+-- Does a box ({ x, y, w, h }) touch the rectangle x, y, w, h? (all in the same units)
+function kit.overlaps(box, x, y, w, h)
+    return box ~= nil and box.x < x + w and x < box.x + box.w and box.y < y + h and y < box.y + box.h
+end
+
+-- A set of selected things (icons, files, items...): yours to keep in your state.
+--   local sel = kit.selection()
+--   sel:set(id, true|false), sel:toggle(id), sel:has(id), sel:clear(), sel:only(id)
+--   sel:count(), sel:list() (ids, sorted)
+function kit.selection()
+    local s = { items = {} }
+    function s:has(id) return self.items[id] == true end
+    function s:set(id, on) self.items[id] = on and true or nil end
+    function s:toggle(id) self:set(id, not self:has(id)) end
+    function s:clear() self.items = {} end
+    function s:only(id) self.items = { [id] = true } end
+    function s:count() local n = 0 for _ in pairs(self.items) do n = n + 1 end return n end
+    function s:list()
+        local out = {}
+        for id in pairs(self.items) do out[#out + 1] = id end
+        table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
+        return out
+    end
+    return s
+end
+
+-- Windows that are selected (a box from f:marquee{ windows = true }, or Ctrl+click on a title
+-- bar). Dragging the title bar of one of them moves them all together.
+function Frame:selected_windows()
+    local out = {}
+    for id in pairs(self.host_ref.win_selected) do if self.host_ref.windows[id] then out[#out + 1] = id end end
+    table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
+    return out
+end
+function Frame:select_window(id, on) self.host_ref.win_selected[id] = on ~= false and true or nil end
+function Frame:clear_window_selection() self.host_ref.win_selected = {} end
 
 -- Opens a menu at x, y (units): f:open_popup(id, x, y). Then every frame:
 --   local choice = f:popup(id, { "Open", "Rename", "-", "Delete" })
@@ -1007,6 +1156,9 @@ local function draw_windows(host, base)
             -- frame: shadow, border, title bar, buttons
             if framed then
                 ui.draw_rect(px + 4, py + 4, pw, ph, color(kit.theme.window_shadow))
+                if host.win_selected[id] then        -- selected: a bright edge (f:marquee, Ctrl+click)
+                    ui.draw_rect(px - 3, py - 3, pw + 6, ph + 6, color(kit.theme.selected_edge))
+                end
                 ui.draw_rect(px - 1, py - 1, pw + 2, ph + 2, color(kit.theme.border))
                 ui.draw_rect(px, py, pw, th * u, color(focused and kit.theme.window_title or kit.theme.window_title_idle))
                 local tf = setmetatable({}, Frame)
@@ -1040,9 +1192,22 @@ local function draw_windows(host, base)
                 -- dragging by the title bar (double-click: maximize)
                 local tp = tf:take_click(0, 0, bx, TITLE)
                 if tp then
-                    if (tp.clicks or 1) >= 2 and o.maximizable ~= false then st.maximized = not st.maximized
+                    if tp.ctrl then                  -- Ctrl+click: add to / take out of the selection
+                        host.win_selected[id] = not host.win_selected[id] or nil
+                    elseif (tp.clicks or 1) >= 2 and o.maximizable ~= false then st.maximized = not st.maximized
                     elseif o.movable ~= false and not st.maximized then
-                        host.wdrag = { id = id, mode = "move", ox = tp.x - px, oy = tp.y - py }
+                        -- One of several selected windows: they all move. Another window: the
+                        -- selection is let go and this one moves alone.
+                        if not host.win_selected[id] then host.win_selected = {} end
+                        local group = {}
+                        for gid in pairs(host.win_selected) do
+                            local g = host.windows[gid]
+                            if gid ~= id and g and not g.maximized and not (g.opts and g.opts.movable == false) then
+                                group[gid] = { x = g.x, y = g.y }
+                            end
+                        end
+                        host.wdrag = { id = id, mode = "move", ox = tp.x - px, oy = tp.y - py,
+                                       sx0 = st.x, sy0 = st.y, group = group }
                     end
                 end
                 if tf:hovered(0, 0, bx, TITLE) and o.movable ~= false and not st.maximized then cursor("move") end
@@ -1084,6 +1249,15 @@ local function draw_windows(host, base)
                 -- keep the title bar reachable
                 st.x = math.max(-st.w + 2, math.min(base.w_units - 2, st.x))
                 st.y = math.max(0, math.min(base.h_units - 1, st.y))
+                -- the other selected windows keep their places relative to this one
+                local dx, dy = st.x - wd.sx0, st.y - wd.sy0
+                for gid, start in pairs(wd.group or {}) do
+                    local g = host.windows[gid]
+                    if g then
+                        g.x = math.max(-g.w + 2, math.min(base.w_units - 2, start.x + dx))
+                        g.y = math.max(0, math.min(base.h_units - 1, start.y + dy))
+                    end
+                end
             else
                 local dx, dy = (base.mx - wd.sx) / u, (base.my - wd.sy) / u
                 if wd.mode == "right" or wd.mode == "corner" then st.w = math.max(o.min_w or 4, wd.sw + dx) end
@@ -1106,6 +1280,7 @@ local function new_host(fields)
     h.scrolls, h.windows, h.popups, h.popup_results = {}, {}, {}, {}
     h.z, h.frame_no = 0, 0
     h.window_rects, h.popup_rects = {}, {}
+    h.win_selected = {}            -- windows selected (f:marquee, Ctrl+click on a title): move together
     return h
 end
 
@@ -1148,6 +1323,9 @@ function Host:run(x, y, w, h, units_w, units_h, unit, draw, state, has_input)
 
     if kit._clear_clips then kit._clear_clips() end
     local ok, err = pcall(draw, f, state)
+    -- A dragged icon or a selection box that wasn't drawn this frame (it went away): forget it
+    if self.icondrag and self.icondrag.seen ~= self.frame_no then self.icondrag = nil end
+    if self.marquee and self.marquee.seen ~= self.frame_no then self.marquee = nil end
     if not ok then
         f:label(0, 0, "This screen has an error - see the console", { color = { 1, 0.5, 0.5 } })
         print("[ui_kit] " .. tostring(self.id) .. ": " .. tostring(err))

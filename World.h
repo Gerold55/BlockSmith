@@ -52,6 +52,19 @@ public:
     // Runs where the world is decided (singleplayer, the host, the server); never when remote.
     void updateFluids(float dt);
     FluidSimulator& fluids() { return *m_fluids; }
+
+    // ---------------- Falling blocks (sand, gravel: register_block's gravity = true) ----------------
+    // A block that starts falling leaves the world and moves smoothly as one of these, then is
+    // placed where it lands. The game draws them (see main.cpp); a server tells its players
+    // when one starts (takeFallingStarts), and their games animate it too (addFallingVisual).
+    struct FallingInfo { uint8_t id; uint8_t meta; glm::vec3 pos; };   // pos: the block's bottom corner
+    std::vector<FallingInfo> fallingBlocks() const;
+    struct FallingStart { glm::ivec3 cell; uint8_t id; uint8_t meta; };
+    std::vector<FallingStart> takeFallingStarts() { std::vector<FallingStart> out; out.swap(m_fallingStarts); return out; }
+    // (remote worlds) a block the server says started falling: shown falling, never placed
+    void addFallingVisual(const glm::ivec3& cell, uint8_t id, uint8_t meta);
+    // Lands every block still in the air at once (before saving a world that's being closed)
+    void finishFalling();
     // Nothing above this block up to the top of the world (rain and snow reach it)
     bool hasSkyAbove(const glm::ivec3& loc) const {
         for (int y = loc.y + 1; y < CHUNK_HEIGHT; ++y) if (getBlockAt(glm::ivec3(loc.x, y, loc.z)) != 0) return false;
@@ -264,10 +277,21 @@ private:
     void lightBlockChanged(const glm::ivec3& loc, uint8_t oldId);
 
     // Falling blocks: cells to check after a change, and blocks on their way down
-    struct FallingBlock { glm::ivec3 pos; float speed; float progress; };
+    struct FallingBlock {
+        int x, z;            // the column it falls in
+        float y;             // its bottom (whole block units: y = 10 is exactly cell 10)
+        float speed;         // blocks per second, downwards
+        uint8_t id, meta;
+        bool visualOnly;     // a remote world's copy: shown, never placed
+        float landedFor;     // (visual copies) seconds resting where it landed, waiting for the server
+    };
     std::vector<glm::ivec3> m_fallChecks;
     std::vector<FallingBlock> m_falling;
+    std::vector<FallingStart> m_fallingStarts;
     void updateFalling(float dt);
+    // Moves one falling block on by dt; true once it has landed (or must stop)
+    bool stepFalling(FallingBlock& f, float dt);
+    void landFalling(const FallingBlock& f, int cellY);
     bool canFallInto(const glm::ivec3& p) const;
     void markLightTouched();
 

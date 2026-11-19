@@ -50,6 +50,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <ctime>
 #include <set>
 #include <sstream>
 #include <string>
@@ -216,6 +217,8 @@ struct ServerConfig {
     int tickRate = 30;
     int autosaveSeconds = 60;
     double dayLengthMinutes = 20.0;   // one whole day (DayTime.h); 'time' in the console
+    int spawnProtection = 16;         // blocks around spawn only operators may change (0 = off)
+    int opLevel = 4;                  // the level 'op <name>' gives when no level is said (1-4)
     double luaTimeLimit = 5.0;   // seconds one mod event may run before it's stopped (0 = no limit)
     bool remoteContent = true;   // mods may download data (JSON, text, pictures, sounds) - never code
     std::vector<std::string> remoteDomains;   // approved besides GitHub
@@ -291,6 +294,12 @@ void writeDefaultConfig(const fs::path& file, const ServerConfig& c) {
         << "# How long a whole day (day + night) lasts, in minutes. 'time' in the console sets the\n"
         << "# time of day, or stops it ('time speed 0')\n"
         << "day_length = " << c.dayLengthMinutes << "\n"
+        << "# Blocks around the spawn point that only operators can change (0 = off). As in\n"
+        << "# Minecraft, it's off while there are no operators.\n"
+        << "spawn_protection = " << c.spawnProtection << "\n"
+        << "# The level 'op <name>' gives: 1 build at spawn, 2 also game commands (gamemode, tp,\n"
+        << "# give, time...), 3 also player commands (kick, ban, op...), 4 everything (stop, reload...)\n"
+        << "op_level = " << c.opLevel << "\n"
         << "# A mod's event (on_update, on_player_chat...) that runs longer than this many seconds is\n"
         << "# stopped with an error instead of freezing the server (0 = no limit)\n"
         << "lua_time_limit = " << c.luaTimeLimit << "\n"
@@ -339,6 +348,8 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     }
     c.tickRate = std::clamp(toInt(kv["tick_rate"], c.tickRate), 10, 120);
     c.autosaveSeconds = std::clamp(toInt(kv["autosave_seconds"], c.autosaveSeconds), 10, 3600);
+    c.spawnProtection = std::clamp(toInt(kv["spawn_protection"], c.spawnProtection), 0, 10000);
+    c.opLevel = std::clamp(toInt(kv["op_level"], c.opLevel), 1, 4);
     if (kv.count("day_length")) {
         try { c.dayLengthMinutes = std::clamp(std::stod(kv["day_length"]), 0.5, 100000.0); } catch (...) {}
     }
@@ -731,15 +742,110 @@ struct CompletionData {
     std::vector<std::string> players;       // online
     std::vector<std::string> banned, whitelisted, ops, accounts;
     std::vector<std::string> modsOn, modsOff;   // "mods disable" / "mods enable" can change these
+    std::vector<std::string> items;             // every block and item (give)
+    std::vector<std::string> bannedIps;
 };
 std::mutex g_CompletionMutex;
 CompletionData g_Completion;
 
 // The console's commands, in the order 'help' shows them (respawn is the game's own)
 const std::vector<std::string> kConsoleCommands = {
-    "stop", "save", "reload", "tps", "seed", "games", "mods", "motd", "name",
-    "list", "say", "msg", "tell", "kick", "ban", "unban", "pardon", "banlist", "whitelist",
-    "op", "deop", "ops", "password", "gamemode", "gm", "time", "help"};
+    "stop", "save", "save-all", "save-on", "save-off", "reload", "tps", "seed", "games", "mods", "motd", "name",
+    "list", "say", "me", "msg", "tell", "kick", "ban", "unban", "pardon", "ban-ip", "pardon-ip", "banlist",
+    "whitelist", "op", "deop", "ops", "password", "gamemode", "gm", "time", "gamerule", "tp", "teleport",
+    "give", "clear", "kill", "setworldspawn", "spawnpoint", "help"};
+
+// Game rules (/gamerule): saved with the world (gamerules.txt) and shared with every player as
+// "gamerule.<name>" (engine.get_shared), so mods - like the survival mod - follow them.
+// doDaylightCycle is the server's own (the clock stops). "" default = the game decides.
+struct GameRuleDef { const char* name; const char* defaultValue; const char* about; };
+const GameRuleDef kGameRules[] = {
+    { "doDaylightCycle",     "true", "the time of day moves on" },
+    { "keepInventory",       "",     "players keep their items when they die (not set: the game decides)" },
+    { "naturalRegeneration", "true", "health comes back when you're well fed" },
+    { "fallDamage",          "true", "falling hurts" },
+    { "drowningDamage",      "true", "running out of air underwater hurts" },
+    { "fireDamage",          "true", "lava (and fire) hurts" },
+};
+const GameRuleDef* findGameRule(const std::string& name) {
+    for (const auto& g : kGameRules) {
+        std::string a = g.name, b = name;
+        for (char& c : a) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (char& c : b) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (a == b) return &g;
+    }
+    return nullptr;
+}
+
+// logs/latest.log next to server.conf: everything the console shows, each line with the time.
+// The previous log is kept as logs/<date>-<n>.log.
+class LogTee : public std::streambuf {
+public:
+    LogTee(std::streambuf* console, std::ofstream* file) : m_console(console), m_file(file) {}
+protected:
+    int overflow(int ch) override {
+        if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+        const char c = static_cast<char>(ch);
+        xsputn(&c, 1);
+        return ch;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        m_console->sputn(s, n);
+        std::lock_guard<std::mutex> lock(mutex());
+        for (std::streamsize i = 0; i < n; ++i) {
+            if (m_atLineStart) { (*m_file) << stamp(); m_atLineStart = false; }
+            m_file->put(s[i]);
+            if (s[i] == '\n') { m_atLineStart = true; m_file->flush(); }
+        }
+        return n;
+    }
+    int sync() override { m_console->pubsync(); return 0; }
+private:
+    static std::mutex& mutex() { static std::mutex m; return m; }
+    static std::string stamp() {
+        const std::time_t t = std::time(nullptr);
+        std::tm tmv{};
+#ifdef _WIN32
+        localtime_s(&tmv, &t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char buf[16];
+        std::strftime(buf, sizeof(buf), "[%H:%M:%S] ", &tmv);
+        return buf;
+    }
+    std::streambuf* m_console;
+    std::ofstream* m_file;
+    bool m_atLineStart = true;
+};
+
+void startLogFile(const fs::path& dir) {
+    std::error_code ec;
+    const fs::path logs = dir / "logs";
+    fs::create_directories(logs, ec);
+    const fs::path latest = logs / "latest.log";
+    if (fs::exists(latest, ec)) {                      // keep the last one: logs/2026-11-19-1.log ...
+        const std::time_t t = std::time(nullptr);
+        std::tm tmv{};
+#ifdef _WIN32
+        localtime_s(&tmv, &t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char day[16];
+        std::strftime(day, sizeof(day), "%Y-%m-%d", &tmv);
+        for (int n = 1; n < 1000; ++n) {
+            const fs::path old = logs / (std::string(day) + "-" + std::to_string(n) + ".log");
+            if (!fs::exists(old, ec)) { fs::rename(latest, old, ec); break; }
+        }
+    }
+    static std::ofstream file(latest, std::ios::trunc);
+    if (!file) { std::cerr << "[Server] Could not write " << latest.string() << std::endl; return; }
+    static LogTee outTee(std::cout.rdbuf(), &file);
+    static LogTee errTee(std::cerr.rdbuf(), &file);
+    std::cout.rdbuf(&outTee);
+    std::cerr.rdbuf(&errTee);
+}
 
 // What Tab offers: `before` are the words before the one being typed
 std::vector<std::string> completeConsole(const std::vector<std::string>& before, const std::string&) {
@@ -762,7 +868,17 @@ std::vector<std::string> completeConsole(const std::vector<std::string>& before,
         for (const auto& x : b) if (std::find(a.begin(), a.end(), x) == a.end()) a.push_back(x);
         return a;
     };
+    std::vector<std::string> targets = d.players;   // player arguments: names or @a @p @r @s
+    for (const char* sel : { "@a", "@p", "@r", "@s" }) targets.push_back(sel);
+    std::vector<std::string> rules;
+    for (const auto& g : kGameRules) rules.push_back(g.name);
     if (arg == 1) {
+        if (cmd == "tp" || cmd == "teleport" || cmd == "give" || cmd == "clear" || cmd == "kill" || cmd == "spawnpoint")
+            return targets;
+        if (cmd == "gamerule") return rules;
+        if (cmd == "ban-ip") return d.players;
+        if (cmd == "pardon-ip") return d.bannedIps;
+        if (cmd == "banlist") return {"players", "ips"};
         if (cmd == "kick" || cmd == "msg" || cmd == "tell") return d.players;
         if (cmd == "ban") return join(d.players, d.accounts);
         if (cmd == "op") return join(join(d.players, d.accounts), d.whitelisted);
@@ -779,7 +895,13 @@ std::vector<std::string> completeConsole(const std::vector<std::string>& before,
         const std::string sub = lowerWord(1);
         if (cmd == "whitelist" && sub == "add") return join(d.players, d.accounts);
         if (cmd == "whitelist" && sub == "remove") return d.whitelisted;
-        if (cmd == "gamemode" || cmd == "gm") return join(d.players, d.accounts);
+        if (cmd == "gamemode" || cmd == "gm") return join(targets, d.accounts);
+        if (cmd == "give") return d.items;
+        if (cmd == "tp" || cmd == "teleport") return targets;
+        if (cmd == "gamerule") {
+            const GameRuleDef* g = findGameRule(before[1]);
+            if (g) return {"true", "false"};
+        }
         if (cmd == "password" && sub == "reset") return d.accounts;
         if (cmd == "mods" && sub == "enable") return d.modsOff;
         if (cmd == "time" && sub == "set") return {"day", "noon", "night", "midnight", "sunrise", "sunset"};
@@ -1006,6 +1128,22 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     };
 
     auto world = lua.create_named_table("world");
+    world["get_falling_blocks"] = [&ctx](sol::this_state ts) {
+        // world.get_falling_blocks() -> { { name, x, y, z }, ... }: sand, gravel... in the air now.
+        // x, y, z: the block's bottom corner (y has a fraction while it falls)
+        sol::state_view lv(ts);
+        sol::table out = lv.create_table();
+        if (ctx.world) {
+            int i = 1;
+            for (const auto& f : ctx.world->fallingBlocks()) {
+                sol::table t = lv.create_table();
+                t["name"] = BlockRegistry::getInstance().getBlock(f.id).name;
+                t["x"] = f.pos.x; t["y"] = f.pos.y; t["z"] = f.pos.z;
+                out[i++] = t;
+            }
+        }
+        return out;
+    };
     world["set_render_distance"] = [](int) {};
     world["get_render_distance"] = [&ctx]() { return ctx.config->viewDistance; };
     world["set_load_budget"] = [&ctx](float ms) { ctx.world->setLoadBudgetMs(ms); };
@@ -1058,6 +1196,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         // Generator threads must not touch the network either (only the main thread may)
         engine["send_chat"] = [](sol::variadic_args) { return false; };
         chat["send"] = [](sol::variadic_args) {};
+        world["get_falling_blocks"] = [](sol::this_state ts) { return sol::state_view(ts).create_table(); };
     }
     lua.script(kNoopLua);
     if (!worker) {
@@ -1202,6 +1341,7 @@ int main(int argc, char** argv) {
                   << "BlockSmithServer --setup to answer a few questions instead." << std::endl;
     }
     const fs::path confDir = configFile.has_parent_path() ? configFile.parent_path() : fs::path(".");
+    startLogFile(confDir);   // logs/latest.log: everything from here on, with the time
     auto readSettings = [&]() {
         auto kv = readConfFile(configFile);
         for (const auto& [k, v] : overrides) kv[k] = v;
@@ -1243,6 +1383,28 @@ int main(int argc, char** argv) {
     dayClock.secondsPerDay = config.dayLengthMinutes * 60.0;
     ctx.clock = &dayClock;
     meta.timeLine = dayClock.saveLine();
+
+    // Game rules (gamerules.txt in the world: "name = value") and players' own spawn points
+    // (spawnpoints.txt: "Name | x y z", set by /spawnpoint)
+    std::map<std::string, std::string> gameRules;
+    {
+        for (const auto& [k, v] : readConfFile(worldDir / "gamerules.txt")) {
+            if (const GameRuleDef* g = findGameRule(k)) gameRules[g->name] = lower(trim(v));
+        }
+    }
+    auto ruleValue = [&](const std::string& name) -> std::string {
+        const auto it = gameRules.find(name);
+        if (it != gameRules.end()) return it->second;
+        const GameRuleDef* g = findGameRule(name);
+        return g ? g->defaultValue : "";
+    };
+    auto saveGameRules = [&]() {
+        std::ofstream out(worldDir / "gamerules.txt", std::ios::trunc);
+        out << "# Game rules ('gamerule' in the console). Removed or empty: the default.\n";
+        for (const auto& [k, v] : gameRules) out << k << " = " << v << "\n";
+    };
+    NameList spawnPoints{worldDir / "spawnpoints.txt", {}};
+    spawnPoints.load();
     writeWorldMeta(worldDir / "world.dat", meta);
     world.setSaveDirectory(worldDir.string());
     world.setSeed(meta.seed);
@@ -1358,13 +1520,27 @@ int main(int argc, char** argv) {
         if (FluidRegistry::get().forBlock(oldId) || FluidRegistry::get().forBlock(newId)) return;
         ctx.api.edited(name, pos, oldId, newId);
     };
-    // Mods may refuse an edit (can_edit_block) or a chat line (on_player_chat)
-    server.canEdit = [&ctx](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
+    // Spawn protection (server.conf spawn_protection), then mods: can_edit_block may refuse an
+    // edit. As in Minecraft it only applies once there are operators, and operators may build.
+    server.canEdit = [&](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) -> std::string {
+        const int r = config.spawnProtection;
+        if (r > 0 && !ops.entries.empty() && !ops.has(name) &&
+            std::abs(pos.x - config.spawnX) <= r && std::abs(pos.z - config.spawnZ) <= r) {
+            return "The area around spawn is protected";
+        }
         return ctx.api.canEdit(name, pos, oldId, newId);
     };
     server.onChat = [&ctx](const std::string& name, std::string& text) { return ctx.api.chat(name, text); };
     std::set<std::string> newAccounts;   // registered while joining (told about it once they're in)
     server.hasAccount = [&](const std::string& name) { return accounts.has(name); };
+    // ban-ip: banned-ips.txt ("1.2.3.4 | reason")
+    NameList bannedIps{confDir / "banned-ips.txt", {}};
+    bannedIps.load();
+    server.canJoinFrom = [&](const std::string& ip) -> std::string {
+        if (!bannedIps.has(ip)) return "";
+        const std::string why = bannedIps.reason(ip);
+        return "Your IP address is banned from this server" + (why.empty() ? std::string() : ": " + why);
+    };
     server.canJoin = [&](const std::string& name, const net::AuthProof& proof) -> std::string {
         if (banned.has(name)) {
             const std::string why = banned.reason(name);
@@ -1420,6 +1596,7 @@ int main(int argc, char** argv) {
         server.setShared(ClientModRules::kSharedKey, config.clientMods.encode());   // players' client mods
         dayClock.secondsPerDay = config.dayLengthMinutes * 60.0;                      // (day_length)
         server.setDayTime(dayClock);
+        for (const auto& g : kGameRules) server.setShared(std::string("gamerule.") + g.name, ruleValue(g.name));
     };
     server.setServerId(loadOrCreateServerId(confDir / "server_id.txt"));   // passwords are bound to it
     applyLiveSettings();
@@ -1459,14 +1636,56 @@ int main(int argc, char** argv) {
     };
 
     double tps = config.tickRate;
+    bool autosaveOn = true;                                 // save-off / save-on
     double slowestTickMs = 0.0, slowestThisWindow = 0.0;   // for 'tps'
 
     // ---- Commands: from the console (everything), or typed in the game as /command
     // (operators: everything except the console-only ones; everyone: help, list, msg) ----
     using Reply = std::function<void(const std::string&)>;
+    // Operator levels, as in Minecraft: 1 builds at spawn, 2 game commands, 3 player management,
+    // 4 everything. ops.txt: "Name | level" (no level: op_level in server.conf). The console is 4.
+    auto levelOf = [&](const std::string& name) {
+        if (!ops.has(name)) return 0;
+        try { return std::clamp(std::stoi(ops.reason(name)), 1, 4); } catch (...) { return config.opLevel; }
+    };
+    static const std::map<std::string, int> kCommandLevel = {
+        {"help", 0}, {"list", 0}, {"msg", 0}, {"tell", 0}, {"me", 0},
+        {"seed", 2}, {"say", 2}, {"tps", 2}, {"gamemode", 2}, {"gm", 2}, {"time", 2}, {"gamerule", 2},
+        {"tp", 2}, {"teleport", 2}, {"give", 2}, {"clear", 2}, {"kill", 2}, {"setworldspawn", 2}, {"spawnpoint", 2},
+        {"kick", 3}, {"ban", 3}, {"unban", 3}, {"pardon", 3}, {"ban-ip", 3}, {"pardon-ip", 3}, {"banlist", 3},
+        {"whitelist", 3}, {"op", 3}, {"deop", 3}, {"ops", 3},
+        {"stop", 4}, {"save", 4}, {"save-all", 4}, {"save-on", 4}, {"save-off", 4}, {"reload", 4}, {"games", 4},
+        {"mods", 4}, {"motd", 4}, {"name", 4}, {"password", 4},
+    };
+
+    // Usage and what it does, for the list Tab shows in players' chat
+    static const std::map<std::string, std::pair<std::string, std::string>> kCommandUsage = {
+        {"list", {"", "Who's online"}}, {"me", {"<action>", "Say what you're doing"}},
+        {"msg", {"<player> <text>", "A private message"}}, {"tell", {"<player> <text>", "A private message"}},
+        {"seed", {"", "The world's seed"}}, {"say", {"<text>", "A message from the server"}},
+        {"tps", {"", "How fast the server is running"}},
+        {"gamemode", {"survival|creative [player]", "Change a game mode"}}, {"gm", {"survival|creative [player]", "Change a game mode"}},
+        {"time", {"set|add|speed|query [value]", "The time of day"}}, {"gamerule", {"[rule] [true|false]", "Show or change the game rules"}},
+        {"tp", {"<player|x y z> [x y z|player]", "Teleport"}}, {"teleport", {"<player|x y z> [x y z|player]", "Teleport"}},
+        {"give", {"<player> <item> [count]", "Give items"}}, {"clear", {"[player]", "Empty an inventory"}},
+        {"kill", {"[player]", "Kill a player"}}, {"setworldspawn", {"[x y z]", "Where new players start"}},
+        {"spawnpoint", {"[player] [x y z]", "Where a player respawns"}},
+        {"kick", {"<player> [reason]", "Remove a player"}}, {"ban", {"<player> [reason]", "Ban a player"}},
+        {"unban", {"<player>", "Lift a ban"}}, {"pardon", {"<player>", "Lift a ban"}},
+        {"ban-ip", {"<player|address> [reason]", "Ban an address"}}, {"pardon-ip", {"<address>", "Lift an address ban"}},
+        {"banlist", {"[players|ips]", "Who's banned"}}, {"whitelist", {"on|off|add|remove|list [player]", "Who may join"}},
+        {"op", {"<player> [level 1-4]", "Make an operator"}}, {"deop", {"<player>", "Remove an operator"}},
+        {"ops", {"", "The operators"}}, {"stop", {"", "Save and stop the server"}}, {"save", {"", "Save the world now"}},
+        {"save-all", {"", "Save the world now"}}, {"save-on", {"", "Turn autosave on"}}, {"save-off", {"", "Turn autosave off"}},
+        {"reload", {"", "Reload the server's lists"}}, {"games", {"", "The games on this server"}},
+        {"mods", {"[list|enable|disable] [id]", "The server's mods"}}, {"motd", {"[text]", "The message of the day"}},
+        {"name", {"[text]", "The server's name"}}, {"password", {"reset <player>", "Reset a player's password"}},
+    };
+
     auto handleCommand = [&](const std::string& line, const Reply& reply, const std::string& from) {
         const bool console = from.empty();
-        const bool op = console || ops.has(from);
+        const bool op = console || ops.has(from);       // (what mods' commands are told)
+        const int level = console ? 4 : levelOf(from);
         std::istringstream ss(line);
         std::string cmd;
         ss >> cmd;
@@ -1486,7 +1705,8 @@ int main(int argc, char** argv) {
         // reply)): Lua decides who may use them
         static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed",
             "games", "mods", "motd", "name", "say", "kick", "ban", "unban", "banlist", "whitelist", "op", "deop",
-            "ops", "password", "respawn", "gamemode", "gm", "time"};
+            "ops", "password", "respawn", "gamemode", "gm", "time", "gamerule", "tp", "teleport", "give", "clear",
+            "kill", "me", "setworldspawn", "spawnpoint", "save-all", "save-on", "save-off", "ban-ip", "pardon-ip"};
         if (!builtIn.count(cmd)) {
             std::function<void(const std::string&)> luaReply = reply;
             bool handled = false;
@@ -1497,6 +1717,12 @@ int main(int argc, char** argv) {
         }
         // /respawn: back to the spawn point (sent by the game after dying when joined)
         if (cmd == "respawn" && !console) {
+            // their own spawn point (/spawnpoint), else the world's
+            if (spawnPoints.has(from)) {
+                std::istringstream sp(spawnPoints.reason(from));
+                float x = 0, y = 0, z = 0;
+                if (sp >> x >> y >> z) { server.teleportPlayer(from, glm::vec3(x, y, z)); return; }
+            }
             const int sx = config.spawnX, sz = config.spawnZ;
             int ground = world.groundHeightAt(sx, sz);
             if (ground < 0) ground = 80;
@@ -1510,28 +1736,113 @@ int main(int argc, char** argv) {
                   (op ? ". Change it with /gamemode survival|creative [name]" : ". Only operators can change it."));
             return;
         }
-        const std::set<std::string> everyone = {"help", "list", "msg"};
-        if (!op && !everyone.count(cmd)) {
-            reply("You need to be an operator to use /" + cmd + ". Commands: /help, /list, /msg");
-            return;
+        {
+            const auto need = kCommandLevel.find(cmd);
+            if (need != kCommandLevel.end() && level < need->second) {
+                reply(level == 0 ? "You need to be an operator to use /" + cmd + ". Type /help for your commands."
+                                 : "/" + cmd + " needs operator level " + std::to_string(need->second) +
+                                   " (yours is " + std::to_string(level) + ")");
+                return;
+            }
         }
         const std::string by = console ? "" : " (by " + from + ")";
+        const std::string who = console ? std::string("Server") : from;
+
+        // ---- Helpers for player arguments and coordinates (Minecraft's) ----
+        auto words = [](const std::string& s) {
+            std::vector<std::string> out;
+            std::istringstream w(s);
+            for (std::string x; w >> x;) out.push_back(x);
+            return out;
+        };
+        auto positionOf = [&](const std::string& name, glm::vec3& out) {
+            for (const auto& [n, p] : server.playerPositions()) if (n == name) { out = p; return true; }
+            return false;
+        };
+        // A player argument: a name, or @a (everyone), @p (the nearest), @r (someone at random),
+        // @s (yourself). Returns "" and the names, or why not.
+        auto resolve = [&](const std::string& tok, std::vector<std::string>& out) -> std::string {
+            out.clear();
+            const auto names = server.playerNames();
+            if (tok == "@s") {
+                if (console) return "The console isn't a player: give a name";
+                out.push_back(from);
+                return "";
+            }
+            if (names.empty()) return "Nobody is online";
+            if (tok == "@a") { out = names; return ""; }
+            if (tok == "@r") {
+                static std::mt19937 rng{std::random_device{}()};
+                out.push_back(names[std::uniform_int_distribution<size_t>(0, names.size() - 1)(rng)]);
+                return "";
+            }
+            if (tok == "@p") {
+                glm::vec3 origin(config.spawnX + 0.5f, 64.0f, config.spawnZ + 0.5f);
+                if (!console) positionOf(from, origin);
+                float best = 1e30f;
+                std::string nearest;
+                for (const auto& [n, p] : server.playerPositions()) {
+                    const glm::vec3 d = p - origin;
+                    if (glm::dot(d, d) < best) { best = glm::dot(d, d); nearest = n; }
+                }
+                if (nearest.empty()) return "Nobody is online";
+                out.push_back(nearest);
+                return "";
+            }
+            for (const auto& n : names) if (lower(n) == lower(tok)) { out.push_back(n); return ""; }
+            return "No player called '" + tok + "' is online";
+        };
+        // A coordinate: a number, or ~ / ~5 (relative to `base`). Whole numbers are block
+        // centres for x and z, as in Minecraft.
+        auto coord = [](const std::string& t, float base, bool centre, float& out) {
+            try {
+                if (!t.empty() && t[0] == '~') { out = base + (t.size() > 1 ? std::stof(t.substr(1)) : 0.0f); return true; }
+                size_t used = 0;
+                const float v = std::stof(t, &used);
+                if (used != t.size()) return false;
+                out = v + ((centre && t.find('.') == std::string::npos) ? 0.5f : 0.0f);
+                return true;
+            } catch (...) { return false; }
+        };
+        auto coords = [&](const std::vector<std::string>& a, size_t i, const glm::vec3& base, glm::vec3& out) {
+            return a.size() >= i + 3 && coord(a[i], base.x, true, out.x) && coord(a[i + 1], base.y, false, out.y) &&
+                   coord(a[i + 2], base.z, true, out.z);
+        };
+        auto fmt = [](const glm::vec3& p) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.1f, %.1f, %.1f", p.x, p.y, p.z);
+            return std::string(buf);
+        };
 
         if (cmd == "help") {
-            if (!op) { reply("Commands: /list, /msg <name> <message>"); return; }
-            reply("Server:  stop, save, reload, tps, seed, games, mods [enable|disable <id>]");
-            reply("Look:    motd [text], name [text]");
-            reply("Players: list, say, msg, kick, ban, unban, banlist, whitelist on|off|add|remove|list");
-            reply("Admins:  op <name>, deop <name>, ops, password reset <name>");
-            reply("Modes:   gamemode survival|creative [name]   (default for everyone: gamemode in server.conf)");
-            reply("World:   time [set day|noon|night|midnight|hh:mm] [add <hours>] [speed <x>]");
-            for (const auto& c : ctx.modCommands) reply("Mods:    " + c.usage + (c.description.empty() ? "" : " - " + c.description));
+            reply("Everyone: list, msg <name> <text>, me <action>, help");
+            if (level >= 2) {
+                reply("Game:     gamemode survival|creative [player], tp <player|x y z> [x y z|player], give <player> <item> [count],");
+                reply("          clear [player], kill [player], time set|add|speed, gamerule [rule] [value], seed, say, tps");
+                reply("          setworldspawn [x y z], spawnpoint [player] [x y z]   (players: a name, @a @p @r @s; ~ = relative)");
+            }
+            if (level >= 3) {
+                reply("Players:  kick, ban, unban, ban-ip, pardon-ip, banlist [players|ips], whitelist on|off|add|remove|list");
+                reply("Admins:   op <name> [level 1-4], deop <name>, ops");
+            }
+            if (level >= 4) {
+                reply("Server:   stop, save (save-all), save-off, save-on, reload, games, mods [enable|disable <id>],");
+                reply("          motd [text], name [text], password reset <name>");
+            }
+            if (level == 0) reply("Operators have more: ask one, or see the server's help.");
+            for (const auto& c : ctx.modCommands) reply("Mods:     " + c.usage + (c.description.empty() ? "" : " - " + c.description));
         } else if (cmd == "stop") {
             reply("Stopping the server...");
             std::cout << "[Server] Stop" << by << std::endl;
             g_Running = false;
-        } else if (cmd == "save") {
+        } else if (cmd == "save" || cmd == "save-all") {
             reply("Saved (" + std::to_string(saveAll()) + " changed chunks)");
+        } else if (cmd == "save-off") {
+            autosaveOn = false;
+            reply("Autosave is off ('save-on' turns it back on; 'save-all' saves now)");
+        } else if (cmd == "save-on") {
+            autosaveOn = true;
+            reply("Autosave is on (every " + std::to_string(config.autosaveSeconds) + " s)");
         } else if (cmd == "tps") {
             char buf[200];
             std::snprintf(buf, sizeof(buf), "Ticks per second: %.1f (target %d), slowest tick %.0f ms",
@@ -1611,8 +1922,7 @@ int main(int argc, char** argv) {
                   (names.empty() ? "" : ": " + all));
         } else if (cmd == "say") {
             const std::string who = console ? "Server" : from;
-            server.broadcastMessage("[" + who + "] " + rest, glm::vec3(1.0f, 0.4f, 1.0f));
-            std::cout << "[Chat] [" << who << "] " << rest << std::endl;
+            server.broadcastMessage("[" + who + "] " + rest, glm::vec3(1.0f, 0.4f, 1.0f));   // (the console shows it: [Chat])
         } else if (cmd == "msg" || cmd == "tell") {
             std::string text;
             const std::string name = firstWord(rest, text);
@@ -1639,7 +1949,9 @@ int main(int argc, char** argv) {
         } else if (cmd == "unban" || cmd == "pardon") {
             reply(banned.remove(rest) ? "Unbanned " + rest : "'" + rest + "' wasn't banned");
         } else if (cmd == "banlist") {
-            reply("Banned: " + banned.names());
+            const std::string which = lower(trim(rest));
+            if (which.empty() || which == "players") reply("Banned players: " + banned.names());
+            if (which.empty() || which == "ips") reply("Banned addresses: " + bannedIps.names());
         } else if (cmd == "whitelist") {
             std::string arg;
             const std::string sub = lower(firstWord(rest, arg));
@@ -1658,10 +1970,19 @@ int main(int argc, char** argv) {
                 reply("Usage: whitelist on|off|add <name>|remove <name>|list");
             }
         } else if (cmd == "op") {
-            if (!net::validPlayerName(rest)) { reply("Usage: op <name>"); return; }
-            ops.add(rest);
-            server.setPlayerOperator(rest, true);
-            reply(rest + " is now an operator");
+            std::string lvl;
+            const std::string name = firstWord(rest, lvl);
+            if (!net::validPlayerName(name)) { reply("Usage: op <name> [level 1-4]"); return; }
+            int newLevel = config.opLevel;
+            if (!lvl.empty()) {
+                try { newLevel = std::stoi(lvl); } catch (...) { newLevel = 0; }
+                if (newLevel < 1 || newLevel > 4) { reply("The level is 1 to 4"); return; }
+            }
+            if (!console && newLevel > level) { reply("You can't give a higher level than your own (" + std::to_string(level) + ")"); return; }
+            ops.add(name, std::to_string(newLevel));
+            server.setPlayerOperator(name, true);
+            reply(name + " is now an operator (level " + std::to_string(newLevel) + ")");
+            const std::string rest = name;      // (the lines below use it)
             server.messagePlayer(rest, "You are now an operator: type /help for server commands.", glm::vec3(0.6f, 0.9f, 1.0f));
             if (!accounts.has(rest)) {
                 reply("Tip: " + rest + " should set a password (Settings > Player) and rejoin, so nobody else can use the name");
@@ -1690,6 +2011,159 @@ int main(int argc, char** argv) {
                 server.messagePlayer(who, "Your game mode is now " + m->second + by, glm::vec3(0.6f, 0.9f, 1.0f));
             }
             std::cout << "[Server] " << who << " -> " << m->second << by << std::endl;
+        } else if (cmd == "me") {
+            if (rest.empty()) { reply("Usage: me <action>"); return; }
+            server.broadcastMessage("* " + who + " " + rest, glm::vec3(1.0f, 1.0f, 1.0f));   // (the console shows it: [Chat])
+        } else if (cmd == "tp" || cmd == "teleport") {
+            // tp <x y z> | tp <player> | tp <players> <x y z> | tp <players> <player>
+            const auto a = words(rest);
+            std::vector<std::string> targets;
+            size_t destAt = 0;
+            if (a.size() == 1 || a.size() == 3) {
+                if (console) { reply("Usage (console): tp <player> <x y z>  or  tp <player> <other player>"); return; }
+                targets.push_back(from);
+            } else if (a.size() == 2 || a.size() == 4) {
+                const std::string err = resolve(a[0], targets);
+                if (!err.empty()) { reply(err); return; }
+                destAt = 1;
+            } else {
+                reply("Usage: tp <x y z> | tp <player> | tp <players> <x y z> | tp <players> <player>");
+                return;
+            }
+            const bool toPlayer = (a.size() - destAt) == 1;
+            glm::vec3 dest(0.0f);
+            if (toPlayer) {
+                std::vector<std::string> d;
+                const std::string err = resolve(a[destAt], d);
+                if (!err.empty()) { reply(err); return; }
+                if (d.size() != 1) { reply("Teleport to one player (not @a)"); return; }
+                positionOf(d[0], dest);
+            }
+            int moved = 0;
+            for (const auto& t : targets) {
+                glm::vec3 base(0.0f), to = dest;
+                positionOf(t, base);
+                if (!toPlayer && !coords(a, destAt, base, to)) { reply("Coordinates are numbers, or ~ for where you are (~5 = 5 more)"); return; }
+                if (server.teleportPlayer(t, to)) {
+                    ++moved;
+                    if (t != from) server.messagePlayer(t, "You were teleported to " + fmt(to) + by, glm::vec3(0.6f, 0.9f, 1.0f));
+                    if (targets.size() == 1) reply("Teleported " + t + " to " + fmt(to));
+                }
+            }
+            if (targets.size() > 1) reply("Teleported " + std::to_string(moved) + " players");
+        } else if (cmd == "give") {
+            // give <players> <item> [count]
+            const auto a = words(rest);
+            if (a.size() < 2 || a.size() > 3) { reply("Usage: give <player> <item> [count]"); return; }
+            std::vector<std::string> targets;
+            const std::string err = resolve(a[0], targets);
+            if (!err.empty()) { reply(err); return; }
+            const std::string item = lower(a[1]);
+            if (BlockRegistry::getInstance().getBlockId(item) == 0) { reply("There's no item called '" + a[1] + "'"); return; }
+            int count = 1;
+            if (a.size() == 3) {
+                try { count = std::stoi(a[2]); } catch (...) { count = 0; }
+                if (count < 1 || count > 64 * 64) { reply("The count is 1 to 4096"); return; }
+            }
+            for (const auto& t : targets) {
+                server.sendAction(t, "give", item, std::to_string(count));
+                reply("Gave " + std::to_string(count) + " " + item + " to " + t);
+            }
+        } else if (cmd == "clear" || cmd == "kill") {
+            // clear [players] / kill [players]
+            std::vector<std::string> targets;
+            if (rest.empty()) {
+                if (console) { reply("Usage (console): " + cmd + " <player>"); return; }
+                targets.push_back(from);
+            } else {
+                const std::string err = resolve(trim(rest), targets);
+                if (!err.empty()) { reply(err); return; }
+            }
+            for (const auto& t : targets) {
+                if (cmd == "clear") {
+                    server.sendAction(t, "clear");
+                    reply("Cleared the inventory of " + t);
+                } else {
+                    server.sendAction(t, "kill", t == from ? "gave up" : "was killed" + by);
+                    reply("Killed " + t);
+                }
+            }
+            if (cmd == "kill") std::cout << "[Server] Killed " << targets.size() << " player(s)" << by << std::endl;
+        } else if (cmd == "setworldspawn") {
+            const auto a = words(rest);
+            glm::vec3 base(config.spawnX + 0.5f, 64.0f, config.spawnZ + 0.5f), at = base;
+            if (!console) positionOf(from, base), at = base;
+            if (!a.empty() && !coords(a, 0, base, at)) { reply("Usage: setworldspawn [x y z]"); return; }
+            if (console && a.empty()) { reply("Usage (console): setworldspawn <x y z>"); return; }
+            config.spawnX = static_cast<int>(std::floor(at.x));
+            config.spawnZ = static_cast<int>(std::floor(at.z));
+            updateConfValue(configFile, "spawn", std::to_string(config.spawnX) + " " + std::to_string(config.spawnZ));
+            reply("The world's spawn is now " + std::to_string(config.spawnX) + ", " + std::to_string(config.spawnZ) +
+                  (config.spawnProtection > 0 ? " (protected " + std::to_string(config.spawnProtection) + " blocks around)" : ""));
+        } else if (cmd == "spawnpoint") {
+            // spawnpoint [players] [x y z]: where they come back after dying
+            const auto a = words(rest);
+            std::vector<std::string> targets;
+            size_t at = 0;
+            if (a.empty() || a.size() == 3) {
+                if (console) { reply("Usage (console): spawnpoint <player> [x y z]"); return; }
+                targets.push_back(from);
+            } else {
+                const std::string err = resolve(a[0], targets);
+                if (!err.empty()) { reply(err); return; }
+                at = 1;
+            }
+            for (const auto& t : targets) {
+                glm::vec3 base(0.0f), p(0.0f);
+                positionOf(t, base);
+                p = base;
+                if (a.size() > at && !coords(a, at, base, p)) { reply("Usage: spawnpoint [player] [x y z]"); return; }
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%.2f %.2f %.2f", p.x, p.y, p.z);
+                spawnPoints.add(t, buf);
+                reply(t + " will now respawn at " + fmt(p));
+            }
+        } else if (cmd == "gamerule") {
+            const auto a = words(rest);
+            if (a.empty()) {
+                for (const auto& g : kGameRules) {
+                    const std::string v = ruleValue(g.name);
+                    reply(std::string(g.name) + " = " + (v.empty() ? "(the game decides)" : v) + "   - " + g.about);
+                }
+                return;
+            }
+            const GameRuleDef* g = findGameRule(a[0]);
+            if (!g) { reply("No game rule called '" + a[0] + "'. Type 'gamerule' for the list."); return; }
+            if (a.size() == 1) {
+                const std::string v = ruleValue(g->name);
+                reply(std::string(g->name) + " = " + (v.empty() ? "(the game decides)" : v));
+                return;
+            }
+            const std::string v = lower(a[1]);
+            if (v != "true" && v != "false" && v != "default") { reply("A game rule is true, false or default"); return; }
+            if (v == "default") gameRules.erase(g->name); else gameRules[g->name] = v;
+            saveGameRules();
+            server.setShared(std::string("gamerule.") + g->name, ruleValue(g->name));
+            reply(std::string("Game rule ") + g->name + " is now " + (ruleValue(g->name).empty() ? "the game's default" : ruleValue(g->name)));
+            std::cout << "[Server] Game rule " << g->name << " = " << v << by << std::endl;
+        } else if (cmd == "ban-ip") {
+            std::string reason;
+            const std::string target = firstWord(rest, reason);
+            if (target.empty()) { reply("Usage: ban-ip <address|player> [reason]"); return; }
+            std::string ip = target;
+            for (const auto& n : server.playerNames()) if (lower(n) == lower(target)) ip = server.playerAddress(n);
+            if (ip.find('.') == std::string::npos && ip.find(':') == std::string::npos) {
+                reply("'" + target + "' isn't an IP address or a player who's online"); return;
+            }
+            bannedIps.add(ip, reason);
+            int kicked = 0;
+            for (const auto& n : server.playerNames()) {
+                if (server.playerAddress(n) == ip) { server.kickPlayer(n, "Your IP address is banned" + (reason.empty() ? std::string() : ": " + reason)); ++kicked; }
+            }
+            reply("Banned the address " + ip + (kicked ? " (kicked " + std::to_string(kicked) + ")" : ""));
+            std::cout << "[Server] Banned IP " << ip << by << std::endl;
+        } else if (cmd == "pardon-ip") {
+            reply(bannedIps.remove(trim(rest)) ? "Unbanned " + trim(rest) : "'" + trim(rest) + "' wasn't banned");
         } else if (cmd == "time") {
             // time [set <day|noon|night|midnight|sunrise|sunset|hh:mm|0..1>] [add <hours>] [speed <x>]
             std::string arg;
@@ -1699,7 +2173,8 @@ int main(int argc, char** argv) {
                 std::snprintf(buf, sizeof(buf), "Day %lld, %s (time %.3f). A day lasts %g minutes%s.",
                               static_cast<long long>(dayClock.day()), dayClock.clock().c_str(), dayClock.time(),
                               dayClock.secondsPerDay / 60.0,
-                              dayClock.speed == 0.0 ? "; time is stopped ('time speed 1' starts it)"
+                              ruleValue("doDaylightCycle") == "false" ? "; time is stopped (gamerule doDaylightCycle)"
+                              : dayClock.speed == 0.0 ? "; time is stopped ('time speed 1' starts it)"
                               : dayClock.speed == 1.0 ? "" : (", running at " + std::to_string(dayClock.speed).substr(0, 4) + "x").c_str());
                 reply(buf);
             };
@@ -1726,7 +2201,12 @@ int main(int argc, char** argv) {
                 reply("Usage: time | time set <day|noon|night|midnight|hh:mm> | time add <hours> | time speed <x>");
             }
         } else if (cmd == "ops") {
-            reply("Operators: " + ops.names());
+            std::string all;
+            for (const auto& [key, v] : ops.entries) {
+                const std::string n = v.substr(0, v.find('|'));
+                all += (all.empty() ? "" : ", ") + n + " (" + std::to_string(levelOf(n)) + ")";
+            }
+            reply("Operators (level): " + (all.empty() ? std::string("(nobody)") : all));
         } else if (cmd == "password") {
             std::string name;
             const std::string sub = lower(firstWord(rest, name));
@@ -1749,6 +2229,67 @@ int main(int argc, char** argv) {
         }, name);
     };
     const Reply consoleReply = [](const std::string& text) { std::cout << text << std::endl; };
+
+    // Tab in a player's chat: the same completions as the console, but only the commands their
+    // operator level allows; mods add their commands' arguments with on_chat_complete(words,
+    // word, player) -> { ... }. Plain chat: the players online.
+    server.onComplete = [&](const std::string& name, const std::string& text) -> std::vector<std::string> {
+        std::vector<std::string> out;
+        if (text.empty() || text[0] != '/') return server.playerNames();
+        const int level = levelOf(name);
+        std::vector<std::string> before;
+        std::string word;
+        {
+            std::string body = text.substr(1), cur;
+            for (char c : body) {
+                if (c == ' ') { if (!cur.empty()) before.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            word = cur;
+        }
+        auto allowed = [&](const std::string& cmd) {
+            const auto it = kCommandLevel.find(lower(cmd));
+            return it == kCommandLevel.end() || level >= it->second;
+        };
+        if (before.empty()) {                        // the command's name, "name\tlabel" (shown in the list)
+            std::set<std::string> seen;
+            auto label = [](const std::string& usage, const std::string& description) {
+                std::string l = usage;
+                for (char& ch : l) if (static_cast<unsigned char>(ch) < 32) ch = ' ';
+                std::string d = description;
+                for (char& ch : d) if (static_cast<unsigned char>(ch) < 32) ch = ' ';
+                return d.empty() ? l : l + "  -  " + d;
+            };
+            for (const auto& c : kConsoleCommands) {
+                if (c == "help" || !allowed(c) || !seen.insert(c).second) continue;
+                const auto u = kCommandUsage.find(c);
+                out.push_back(u == kCommandUsage.end() ? c : c + "\t" + label("/" + c + (u->second.first.empty() ? "" : " " + u->second.first), u->second.second));
+            }
+            for (const auto& c : ctx.modCommands) {          // server mods' commands (chat.register_command)
+                if (!allowed(c.name) || !seen.insert(c.name).second) continue;
+                std::string usage = c.usage.empty() ? "/" + c.name : c.usage;
+                if (usage[0] != '/') usage = "/" + c.name + " " + usage;
+                out.push_back(c.name + "\t" + label(usage, c.description));
+            }
+            return out;
+        }
+        if (!allowed(before[0])) return out;          // (nothing about commands they can't use)
+        if (kCommandLevel.count(lower(before[0]))) out = completeConsole(before, word);
+        ctx.api.call("on_chat_complete", [&](sol::protected_function_result& r) {
+            if (r.get_type() != sol::type::table) return;
+            sol::table t = r;
+            for (size_t i = 1; i <= t.size() && out.size() < 200; ++i) {
+                sol::object v = t[i];
+                if (v.is<std::string>()) out.push_back(v.as<std::string>());
+            }
+        }, sol::as_table(before), word, name);
+        std::vector<std::string> unique;              // (the console's list and mods' can overlap)
+        for (auto& x : out) {
+            if (x.empty() || std::find(unique.begin(), unique.end(), x) != unique.end()) continue;
+            unique.push_back(std::move(x));
+        }
+        return unique;
+    };
 
     // ---- Main loop: fixed ticks, sleeping in between ----
     const auto tick = std::chrono::microseconds(1000000 / config.tickRate);
@@ -1804,8 +2345,13 @@ int main(int argc, char** argv) {
 
         // The time of day runs on the server, and goes to every player (every few seconds, and
         // at once when it jumps)
-        dayClock.advance(tickDt);
-        server.setDayTime(dayClock);
+        const bool daylightCycle = ruleValue("doDaylightCycle") != "false";
+        if (daylightCycle) dayClock.advance(tickDt);
+        {
+            DayClock sent = dayClock;
+            if (!daylightCycle) sent.speed = 0.0;     // (players' games stop it too)
+            server.setDayTime(sent);
+        }
 
         for (const auto& line : server.takeChat()) std::cout << "[Chat] " << stripTags(line.text) << std::endl;
 
@@ -1824,6 +2370,15 @@ int main(int argc, char** argv) {
             d.banned = namesOf(banned);
             d.whitelisted = namesOf(whitelist);
             d.ops = namesOf(ops);
+            d.bannedIps = namesOf(bannedIps);
+            static std::vector<std::string> items;
+            if (items.empty()) {
+                for (int id = 1; id < 256; ++id) {
+                    const std::string& n = BlockRegistry::getInstance().getBlock(static_cast<uint8_t>(id)).name;
+                    if (!n.empty() && n != "air") items.push_back(n);
+                }
+            }
+            d.items = items;
             for (const auto& [key, e] : accounts.entries) d.accounts.push_back(e.name);
             if (Clock::now() >= nextModListUpdate) {
                 nextModListUpdate = Clock::now() + std::chrono::seconds(10);
@@ -1855,7 +2410,7 @@ int main(int argc, char** argv) {
         }
         ctx.api.flush();   // kicks asked for by mods this tick
 
-        if (Clock::now() - lastSave >= std::chrono::seconds(config.autosaveSeconds)) {
+        if (autosaveOn && Clock::now() - lastSave >= std::chrono::seconds(config.autosaveSeconds)) {
             const int n = saveAll();
             if (n > 0) std::cout << "[Server] Autosaved (" << n << " changed chunks)" << std::endl;
             lastSave = Clock::now();
@@ -1886,6 +2441,7 @@ int main(int argc, char** argv) {
     std::cout << "[Server] Stopping..." << std::endl;
     ctx.api.serverStopping();   // on_server_stop(): mods save what they keep
     ctx.api.flush();
+    world.finishFalling();      // sand / gravel still in the air lands first, so none is lost
     const int chunks = saveAll();
     server.stop("The server is shutting down");
     std::cout << "[Server] Saved " << chunks << " changed chunks. Bye!" << std::endl;

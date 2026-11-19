@@ -28,6 +28,13 @@ public:
     void drawOpaque() const;
     void drawTransparent() const;
 
+    // One whole block on its own, as a cube from (0,0,0) to (1,1,1) in this mesh's vertex
+    // format, textured like the same block in the world, with an even light (0..1: sky, then
+    // red, green, blue block light). For blocks drawn outside chunks, e.g. falling sand.
+    static void buildSingleBlock(uint8_t id, const float light[4], std::vector<Vertex>& out);
+    // Puts vertices in a VAO/VBO with this mesh's attribute layout (made the first time)
+    static void uploadVertices(GLuint& vao, GLuint& vbo, const std::vector<Vertex>& verts);
+
     GLuint opaqueVAO = 0, opaqueVBO = 0;
     GLsizei opaqueVertexCount = 0;
     GLuint transparentVAO = 0, transparentVBO = 0;

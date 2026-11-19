@@ -285,7 +285,16 @@ FirstPersonView g_FirstPerson;        // the hand / held block in first person (
 // ---- Block light (Light.h) settings, from Lua (sky.set_min_light etc.) ----
 struct LightSettings {
     float minLight = 0.02f;          // the darkest anything gets (a sealed cave)
-    float brightness = 0.35f;        // 0 = moody (Minecraft's default), 1 = bright
+    float brightness = 0.35f;        // the game's: 0 = moody (Minecraft's default), 1 = bright (sky.set_brightness)
+    float playerBrightness = 0.5f;   // the player's slider (Settings > Video): 0.5 = the game's choice
+    // What's drawn. Below the middle, the player's slider takes the game's brightness down
+    // toward moody; above it, the game's look stays and a gamma lift is added on top of the
+    // final light (u_Gamma), which also brightens caves and nights - like Minecraft's slider.
+    float effectiveBrightness() const {
+        if (playerBrightness <= 0.5f) return brightness * (playerBrightness / 0.5f);
+        return brightness;
+    }
+    float gammaLift() const { return playerBrightness > 0.5f ? (playerBrightness - 0.5f) / 0.5f : 0.0f; }
     float blockLightScale = 1.0f;    // strength of torches and other light sources
     bool heldLight = true;           // holding a light source lights up around you
 };
@@ -1803,6 +1812,8 @@ local hooks = {
     { "set_world_seed",           "(seed)  the world's seed, before any generate_chunk" },
     { "on_update",                "(dt)  every frame" },
     { "on_chat_command",          "(text, player, is_operator, reply) -> true if handled  a /command" },
+    { "on_chat_complete",         "(words, word) -> { ... }  Tab in chat: what fits `word` after the command words `words`" },
+    { "on_server_action",         "(action, a, b) -> true if done  the server asks: give (item, count), clear, kill (reason)" },
     { "on_game_mode",             "(mode, is_operator)  the server set your game mode (mode nil = left the server)" },
     { "on_shared_changed",        "(key, value)  a shared value changed (engine.set_shared; e.g. the weather)" },
     { "render_hud",               "(W, H)  draw HUD pieces every frame in game (hearts, hunger...)" },
@@ -2411,6 +2422,7 @@ const VideoSetting kVideoSettings[] = {
     { "render_distance",  2,  16, 1 },
     { "vsync",            0,   1, 1 },
     { "main_hand",        0,   1, 1 },   // 0 = right, 1 = left (left-handed players)
+    { "brightness",       0, 100, 5 },   // 0 = moody, 50 = the game's own, 100 = bright (Minecraft's gamma)
     { "volume_master",    0, 100, 5 },
     { "volume_music",     0, 100, 5 },
     { "volume_effects",   0, 100, 5 },
@@ -2427,6 +2439,7 @@ int currentVideoSetting(const std::string& id) {
     if (id == "render_distance") return g_WorldInstance ? g_WorldInstance->renderDistance() : settingInt(id, 10);
     if (id == "vsync") return settingInt(id, 1);
     if (id == "main_hand") return settingInt(id, 0);
+    if (id == "brightness") return settingInt(id, 50);
     if (id == "volume_music") return settingInt(id, 60);
     if (id.rfind("volume_", 0) == 0) return settingInt(id, 100);
     return 0;
@@ -2436,6 +2449,7 @@ void applyVideoSetting(const std::string& id, int value) {
     if (id == "fov") g_FieldOfView = static_cast<float>(value);
     else if (id == "render_distance") { if (g_WorldInstance) g_WorldInstance->setRenderDistance(value); }
     else if (id == "vsync") glfwSwapInterval(value ? 1 : 0);
+    else if (id == "brightness") g_LightSettings.playerBrightness = std::clamp(value, 0, 100) / 100.0f;
     else if (id.rfind("volume_", 0) == 0) g_Audio.setVolume(id.substr(7), value / 100.0f);   // master, music...
 }
 
@@ -2869,6 +2883,7 @@ uniform vec4  u_FallbackLight;    // sun, r, g, b (0..1) for everything else
 uniform float u_MinLight;         // the darkest anything gets (sky.set_min_light)
 uniform float u_Brightness;       // 0 = moody, 1 = bright (sky.set_brightness, like Minecraft's slider)
 uniform float u_BlockLightScale;  // how strong block light is (sky.set_block_light_strength)
+uniform float u_Gamma;            // the player's Brightness slider above "Default": 0..1 lift of the final light
 
 // Light level (0..1) -> brightness: Minecraft's curve (each level ~20% dimmer), lifted by u_Brightness
 float lightCurve(float l) {
@@ -2937,7 +2952,13 @@ void main() {
         vec3 blockPart = vec3(lightCurve(L.y), lightCurve(L.z), lightCurve(L.w)) * u_BlockLightScale;
         // Screen blend: torches still show at dusk, and coloured lights mix
         vec3 lightAmount = vec3(1.0f) - (vec3(1.0f) - sunPart) * (vec3(1.0f) - min(blockPart, vec3(1.0f)));
-        lightAmount = max(lightAmount, vec3(u_MinLight));
+        // The player's brightness (gamma), as in Minecraft: on the FINAL light, so dark caves
+        // and nights come up too. The darkest anything gets rises a little (2% -> 8% at full),
+        // then the whole range is lifted with Minecraft's curve: a pitch-black cave ends up
+        // about 28% lit at "Bright", while daylight barely changes.
+        lightAmount = max(lightAmount, vec3(mix(u_MinLight, max(u_MinLight, 0.08f), u_Gamma)));
+        vec3 inv = vec3(1.0f) - clamp(lightAmount, 0.0f, 1.0f);
+        lightAmount = mix(lightAmount, vec3(1.0f) - inv * inv * inv * inv, u_Gamma);
         shadedColor = finalColor.rgb * LightIntensity * lightAmount;
     }
 
@@ -3146,7 +3167,10 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
 }
 
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
-    if (g_ChatSystem && g_ChatSystem->isOpen) return;
+    if (g_ChatSystem && g_ChatSystem->isOpen) {   // the wheel scrolls back through the chat
+        g_ChatSystem->scrollLog(yoffset * 3.0);
+        return;
+    }
     uidraw::addScroll(xoffset, yoffset);          // ui.get_scroll(), for every screen
     EngineContext* ctx = static_cast<EngineContext*>(glfwGetWindowUserPointer(window));
     if (!ctx || !ctx->player) return;
@@ -4174,6 +4198,56 @@ int main(int argc, char** argv) {
             }
         };
 
+        // Tab in chat (ChatSystem::refreshSuggestions): mods' completions for their commands
+        // (on_chat_complete(words, word) -> { ... }), the server's when online (asked, and
+        // shown when its answer comes), and player names in plain chat
+        g_ChatSystem->setCompleter([&lua](const std::string& head, const std::vector<std::string>& before,
+                                          const std::string& word, bool command) {
+            std::vector<ChatSystem::Suggestion> out;
+            // (the server sends "name\tlabel" for command names: the label is what the list shows)
+            auto add = [&out](const std::string& x) {
+                if (x.empty()) return;
+                const size_t tab = x.find('\t');
+                if (tab == std::string::npos) out.push_back({x, ""});
+                else if (tab > 0) out.push_back({x.substr(0, tab), x.substr(tab + 1)});
+            };
+            const bool joined = g_Client.state() == GameClient::State::Joined;
+            if (command && !before.empty()) {
+                try {
+                    sol::protected_function fn = lua["on_chat_complete"];
+                    if (fn.valid()) {
+                        auto r = fn(sol::as_table(before), word);
+                        if (r.valid() && r.get_type() == sol::type::table) {
+                            sol::table t = r;
+                            for (size_t i = 1; i <= t.size() && out.size() < 200; ++i) {
+                                sol::object v = t[i];
+                                if (v.is<std::string>()) add(v.as<std::string>());
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+            if (joined) {
+                std::vector<std::string> remote;
+                if (g_Client.completionFor(head, remote)) { for (const auto& x : remote) add(x); }
+                else g_Client.requestCompletion(head);
+                if (!command) {
+                    add(playerName());
+                    for (const auto& [id, v] : g_Client.players()) add(v.name);
+                }
+            } else {
+                // Our own world (or hosting): player names, and the engine's own /gamemode
+                if (!command) {
+                    add(playerName());
+                    for (const auto& [id, v] : g_Server.players()) add(v.name);
+                } else if (before.size() == 1 && (before[0] == "gamemode" || before[0] == "gm")) {
+                    add("survival"); add("creative");
+                } else if (before.size() == 2 && (before[0] == "gamemode" || before[0] == "gm")) {
+                    for (const auto& [id, v] : g_Server.players()) add(v.name);
+                }
+            }
+            return out;
+        });
         g_ChatSystem->setCommandHandler([&lua](const std::string& command) -> bool {
             // /netstats - frame rate, ping and how often other players' positions arrive
             if (command == "netstats") {
@@ -4254,6 +4328,22 @@ int main(int argc, char** argv) {
         auto worldTable = lua.create_named_table("world");
         worldTable["set_render_distance"] = [](int chunks) { if (g_WorldInstance) g_WorldInstance->setRenderDistance(chunks); };
         worldTable["get_render_distance"] = []() { return g_WorldInstance ? g_WorldInstance->renderDistance() : 10; };
+        worldTable["get_falling_blocks"] = [](sol::this_state ts) {
+        // world.get_falling_blocks() -> { { name, x, y, z }, ... }: sand, gravel... in the air now.
+        // x, y, z: the block's bottom corner (y has a fraction while it falls)
+        sol::state_view lv(ts);
+        sol::table out = lv.create_table();
+        if (g_WorldInstance) {
+            int i = 1;
+            for (const auto& f : g_WorldInstance->fallingBlocks()) {
+                sol::table t = lv.create_table();
+                t["name"] = BlockRegistry::getInstance().getBlock(f.id).name;
+                t["x"] = f.pos.x; t["y"] = f.pos.y; t["z"] = f.pos.z;
+                out[i++] = t;
+            }
+        }
+        return out;
+    };
         worldTable["set_load_budget"]      = [](float ms) { if (g_WorldInstance) g_WorldInstance->setLoadBudgetMs(ms); };
         worldTable["set_mesh_budget"]      = [](float ms) { if (g_WorldRenderer) g_WorldRenderer->setMeshBudgetMs(ms); };
         worldTable["get_loaded_chunks"]   = []() { return g_WorldInstance ? static_cast<int>(g_WorldInstance->loadedChunkCount()) : 0; };
@@ -4905,8 +4995,12 @@ int main(int argc, char** argv) {
 
         engineTable["quit_to_menu"] = [window, &lua]() {
             g_SettingsInGame = false;
-            // Save, then unload the world so the next one starts clean
-            if (g_CurrentGameState == GameState::PLAYING) saveCurrentWorld();
+            // Save, then unload the world so the next one starts clean (blocks still falling
+            // land first, so none is lost in the air)
+            if (g_CurrentGameState == GameState::PLAYING) {
+                if (g_WorldInstance) g_WorldInstance->finishFalling();
+                saveCurrentWorld();
+            }
             const bool wasOnline = g_Client.active();
             if (g_Client.active()) g_Client.disconnect();
             if (g_Server.running()) { g_ServerApi.serverStopping(); g_ServerApi.flush(); g_Server.stop(); }
@@ -5796,7 +5890,8 @@ int main(int argc, char** argv) {
         glUniform1f(glGetUniformLocation(shaderProgram, "u_WeatherLight"), 1.0f);
         glUniform4f(glGetUniformLocation(shaderProgram, "u_FallbackLight"), 1.0f, 0.0f, 0.0f, 0.0f);
         glUniform1f(glGetUniformLocation(shaderProgram, "u_MinLight"), g_LightSettings.minLight);
-        glUniform1f(glGetUniformLocation(shaderProgram, "u_Brightness"), g_LightSettings.brightness);
+        glUniform1f(glGetUniformLocation(shaderProgram, "u_Brightness"), g_LightSettings.effectiveBrightness());
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_Gamma"), g_LightSettings.gammaLift());
         glUniform1f(glGetUniformLocation(shaderProgram, "u_BlockLightScale"), g_LightSettings.blockLightScale);
 
         GLuint sunProgram = glCreateProgram();
@@ -5858,6 +5953,15 @@ int main(int argc, char** argv) {
                 glfwGetCursorPos(win, &e.x, &e.y);
                 scaleCursorToFramebuffer(win, e.x, e.y, fw, fh);
                 uidraw::addMouse(e);
+            }
+            // Chat open: a click on a web address in it ("Open this link?" first)
+            if (g_ChatSystem && g_ChatSystem->isOpen && action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT) {
+                int fw = 0, fh = 0;
+                glfwGetFramebufferSize(win, &fw, &fh);
+                double mx = 0.0, my = 0.0;
+                glfwGetCursorPos(win, &mx, &my);
+                scaleCursorToFramebuffer(win, mx, my, fw, fh);
+                if (g_ChatSystem->handleMouseClick(mx, my, win)) return;
             }
             // Settings > Controls waiting for a new key: any mouse button can be the answer.
             // handle_settings_mouse(code) -> true = used (code = 1000 + button, as keybinds store it)
@@ -6051,6 +6155,38 @@ int main(int argc, char** argv) {
                     g_LightingSystem->customTimeOfDay = -1.0f;
                 }
                 if (g_Server.running()) g_Server.setDayTime(g_LightingSystem->clock);
+            }
+
+            // The server answered a chat completion (Tab): show it
+            if (g_Client.takeCompletionArrived() && g_ChatSystem && g_ChatSystem->isOpen) g_ChatSystem->refreshSuggestions();
+
+            // What the server asked our game to do (/give, /clear, /kill): mods first
+            // (on_server_action(action, a, b) -> true if they did it: the survival mod kills with
+            // its death screen and clears its inventory), then the engine's own way
+            if (g_Client.state() == GameClient::State::Joined) {
+                for (const auto& act : g_Client.takeActions()) {
+                    bool handled = false;
+                    sol::protected_function hook = lua["on_server_action"];
+                    if (hook.valid()) {
+                        auto r = hook(act.action, act.a, act.b);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_server_action: " << err.what() << std::endl; }
+                        else handled = r.get_type() == sol::type::boolean && r.get<bool>();
+                    }
+                    if (handled) continue;
+                    if (act.action == "give") {
+                        int count = 1;
+                        try { count = std::clamp(std::stoi(act.b), 1, 64 * 64); } catch (...) {}
+                        while (count > 0) {                       // in stacks of up to 64
+                            const int n = std::min(count, 64);
+                            if (!giveHotbarItem(act.a, n)) break;
+                            count -= n;
+                        }
+                    } else if (act.action == "clear") {
+                        if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
+                    } else if (act.action == "kill") {
+                        g_Client.sendCommand("respawn");          // (no survival: straight back to spawn)
+                    }
+                }
             }
 
             // Client mods: what the server allows, joining / leaving, and their update(dt)
@@ -6786,11 +6922,42 @@ int main(int argc, char** argv) {
                     glUniform4f(glGetUniformLocation(shaderProgram, "u_FallbackLight"), light::sky(here) / 15.0f,
                                 light::red(here) / 15.0f, light::green(here) / 15.0f, light::blue(here) / 15.0f);
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_MinLight"), g_LightSettings.minLight);
-                    glUniform1f(glGetUniformLocation(shaderProgram, "u_Brightness"), g_LightSettings.brightness);
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_Brightness"), g_LightSettings.effectiveBrightness());
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_Gamma"), g_LightSettings.gammaLift());
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_BlockLightScale"), g_LightSettings.blockLightScale);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 1);
                 }
                 worldRenderer.render(shaderProgram, proj * view, eyePos);
+
+                // Falling blocks (sand, gravel): drawn where they are this frame, as the same
+                // textured cube they are in the world, lit by the light where they are
+                {
+                    const auto falling = world.fallingBlocks();
+                    if (!falling.empty()) {
+                        static GLuint fallVao = 0, fallVbo = 0;
+                        static std::vector<Vertex> verts;
+                        const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+                        glUniform1f(glGetUniformLocation(shaderProgram, "u_ChunkFade"), 1.0f);
+                        glDisable(GL_BLEND);
+                        for (const auto& fb : falling) {
+                            const glm::ivec3 cell(static_cast<int>(std::floor(fb.pos.x)),
+                                                  static_cast<int>(std::floor(fb.pos.y + 0.5f)),
+                                                  static_cast<int>(std::floor(fb.pos.z)));
+                            const uint16_t l = world.getLightAt(cell);
+                            const float lv[4] = { light::sky(l) / 15.0f, light::red(l) / 15.0f,
+                                                  light::green(l) / 15.0f, light::blue(l) / 15.0f };
+                            ChunkMesh::buildSingleBlock(fb.id, lv, verts);
+                            if (verts.empty()) continue;
+                            ChunkMesh::uploadVertices(fallVao, fallVbo, verts);
+                            const glm::mat4 model = glm::translate(glm::mat4(1.0f), fb.pos);
+                            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+                            glBindVertexArray(fallVao);
+                            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+                        }
+                        glBindVertexArray(0);
+                        glEnable(GL_BLEND);
+                    }
+                }
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
 
                 // Other players (multiplayer)
@@ -7334,7 +7501,7 @@ int main(int argc, char** argv) {
         }
 
         // Closing the window (or Quit Game) while playing saves the world first
-        if (g_CurrentGameState == GameState::PLAYING) saveCurrentWorld();
+        if (g_CurrentGameState == GameState::PLAYING) { world.finishFalling(); saveCurrentWorld(); }
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
         world.setGenerator(nullptr);   // the generator's threads stop at the end of this block

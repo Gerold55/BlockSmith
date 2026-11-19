@@ -1537,10 +1537,10 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`creative.get_held`](#fn-creative-hold) · [`creative.hold`](#fn-creative-hold) · [`creative.register_category`](#fn-creative-register_category) · [`creative.register_tab`](#fn-creative-register_tab) · [`creative.set_category`](#fn-creative-set_category)
 
 **ui_kit** (`require("ui_kit")`)  
-[`kit.embed`](#fn-uikit-embed) · [`kit.form`](#fn-uikit-form) · [`kit.theme`](#fn-uikit-theme) · [`form:open`](#fn-uikit-open) · [`f:button`](#fn-uikit-button) · [`f:checkbox`](#fn-uikit-checkbox) · [`f:draggable`](#fn-uikit-draggable) · [`f:dragging`](#fn-uikit-dragging) · [`f:drop_target`](#fn-uikit-drop_target) · [`f:field`](#fn-uikit-field) · [`f:focus_window`](#fn-uikit-focus_window) · [`f:icon`](#fn-uikit-icon) · [`f:image`](#fn-uikit-image) · [`f:item`](#fn-uikit-item) · [`f:label`](#fn-uikit-label) · [`f:list`](#fn-uikit-list) · [`f:maximize_window`](#fn-uikit-maximize_window) · [`f:window_state`](#fn-uikit-window_state) · [`f:popup`](#fn-uikit-popup) · [`f:scroll_area`](#fn-uikit-scroll_area) · [`f:set_work_area`](#fn-uikit-set_work_area) · [`f:slider`](#fn-uikit-slider) · [`f:take_click`](#fn-uikit-take_click) · [`f:take_scroll`](#fn-uikit-take_scroll) · [`f:text`](#fn-uikit-text) · [`f:window`](#fn-uikit-window) · [`f:window_list`](#fn-uikit-window_list)
+[`kit.embed`](#fn-uikit-embed) · [`kit.form`](#fn-uikit-form) · [`kit.theme`](#fn-uikit-theme) · [`form:open`](#fn-uikit-open) · [`f:button`](#fn-uikit-button) · [`f:checkbox`](#fn-uikit-checkbox) · [`f:draggable`](#fn-uikit-draggable) · [`f:dragging`](#fn-uikit-dragging) · [`f:drop_target`](#fn-uikit-drop_target) · [`f:field`](#fn-uikit-field) · [`f:focus_window`](#fn-uikit-focus_window) · [`f:icon`](#fn-uikit-icon) · [`f:image`](#fn-uikit-image) · [`f:item`](#fn-uikit-item) · [`f:label`](#fn-uikit-label) · [`f:list`](#fn-uikit-list) · [`f:maximize_window`](#fn-uikit-maximize_window) · [`f:window_state`](#fn-uikit-window_state) · [`f:popup`](#fn-uikit-popup) · [`f:scroll_area`](#fn-uikit-scroll_area) · [`f:set_work_area`](#fn-uikit-set_work_area) · [`f:slider`](#fn-uikit-slider) · [`f:take_click`](#fn-uikit-take_click) · [`f:take_scroll`](#fn-uikit-take_scroll) · [`f:text`](#fn-uikit-text) · [`f:window`](#fn-uikit-window) · [`f:window_list`](#fn-uikit-window_list) · [`kit.selection`](#fn-uikit-selection) · [`kit.overlaps`](#fn-uikit-overlaps) · [`f:marquee`](#fn-uikit-marquee) · [`f:selected_windows`](#fn-uikit-selected_windows)
 
-**world** (10)  
-[`world.get_cave_settings`](#fn-world-get_cave_settings) · [`world.get_caves_enabled`](#fn-world-get_caves_enabled) · [`world.get_loaded_chunks`](#fn-world-get_loaded_chunks) · [`world.get_pending_chunks`](#fn-world-get_pending_chunks) · [`world.get_render_distance`](#fn-world-get_render_distance) · [`world.set_cave_settings`](#fn-world-set_cave_settings) · [`world.set_caves_enabled`](#fn-world-set_caves_enabled) · [`world.set_load_budget`](#fn-world-set_load_budget) · [`world.set_mesh_budget`](#fn-world-set_mesh_budget) · [`world.set_render_distance`](#fn-world-set_render_distance)
+**world** (11)  
+[`world.get_cave_settings`](#fn-world-get_cave_settings) · [`world.get_caves_enabled`](#fn-world-get_caves_enabled) · [`world.get_falling_blocks`](#fn-world-get_falling_blocks) · [`world.get_loaded_chunks`](#fn-world-get_loaded_chunks) · [`world.get_pending_chunks`](#fn-world-get_pending_chunks) · [`world.get_render_distance`](#fn-world-get_render_distance) · [`world.set_cave_settings`](#fn-world-set_cave_settings) · [`world.set_caves_enabled`](#fn-world-set_caves_enabled) · [`world.set_load_budget`](#fn-world-set_load_budget) · [`world.set_mesh_budget`](#fn-world-set_mesh_budget) · [`world.set_render_distance`](#fn-world-set_render_distance)
 
 **ui** (37)  
 [`ui.draw_block_icon`](#fn-ui-draw_block_icon) · [`ui.draw_button`](#fn-ui-draw_button) · [`ui.draw_circle`](#fn-ui-draw_circle) · [`ui.draw_gradient`](#fn-ui-draw_gradient) · [`ui.draw_image`](#fn-ui-draw_image) · [`ui.draw_line`](#fn-ui-draw_line) · [`ui.draw_pie`](#fn-ui-draw_pie) · [`ui.draw_polygon`](#fn-ui-draw_polygon) · [`ui.draw_rect`](#fn-ui-draw_rect) · [`ui.draw_rect_outline`](#fn-ui-draw_rect_outline) · [`ui.draw_ring`](#fn-ui-draw_ring) · [`ui.draw_rounded_rect`](#fn-ui-draw_rounded_rect) · [`ui.draw_server_icon`](#fn-ui-draw_server_icon) · [`ui.draw_text`](#fn-ui-draw_text) · [`ui.draw_triangle`](#fn-ui-draw_triangle) · [`ui.get_all_blocks`](#fn-ui-get_all_blocks) · [`ui.get_block_info`](#fn-ui-get_block_info) · [`ui.get_button_text_color`](#fn-ui-get_button_text_color) · [`ui.get_clipboard`](#fn-ui-get_clipboard) · [`ui.get_image_size`](#fn-ui-get_image_size) · [`ui.get_key_events`](#fn-ui-get_key_events) · [`ui.get_mouse`](#fn-ui-get_mouse) · [`ui.get_mouse_events`](#fn-ui-get_mouse_events) · [`ui.get_mouse_pos`](#fn-ui-get_mouse_pos) · [`ui.get_scroll`](#fn-ui-get_scroll) · [`ui.get_time`](#fn-ui-get_time) · [`ui.get_typed_text`](#fn-ui-get_typed_text) · [`ui.is_key_down`](#fn-ui-is_key_down) · [`ui.is_mouse_down`](#fn-ui-is_mouse_down) · [`ui.keys`](#fn-ui-keys) · [`ui.mods`](#fn-ui-mods) · [`ui.pop_clip`](#fn-ui-pop_clip) · [`ui.push_clip`](#fn-ui-push_clip) · [`ui.set_clipboard`](#fn-ui-set_clipboard) · [`ui.set_cursor`](#fn-ui-set_cursor) · [`ui.text_height`](#fn-ui-text_height) · [`ui.text_width`](#fn-ui-text_width)
@@ -1579,7 +1579,7 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`model:get_bone`](#fn-model-get_bone) · [`model:reset_pose`](#fn-model-reset_pose) · [`bone:get_rotation`](#fn-bone-get_rotation) · [`bone:set_position`](#fn-bone-set_position) · [`bone:set_rotation`](#fn-bone-set_rotation) · [`anims:get`](#fn-animationset-get) · [`anims:names`](#fn-animationset-names) · [`anim:apply`](#fn-animation-apply) · [`anim:get_length`](#fn-animation-get_length) · [`anim:get_name`](#fn-animation-get_name) · [`anim:is_looping`](#fn-animation-is_looping) · [`anim:set_loop`](#fn-animation-set_loop)
 
 **Hooks (functions you define)** (36)  
-[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
+[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
 
 **weather (mods/weather)** (11)  
 [`weather.get`](#fn-weather-get) · [`weather.get_def`](#fn-weather-get_def) · [`weather.is_cold`](#fn-weather-is_cold) · [`weather.is_cycling`](#fn-weather-is_cycling) · [`weather.list`](#fn-weather-list) · [`weather.on_change`](#fn-weather-on_change) · [`weather.on_lightning`](#fn-weather-on_lightning) · [`weather.register`](#fn-weather-register) · [`weather.set`](#fn-weather-set) · [`weather.set_cycle`](#fn-weather-set_cycle) · [`weather.time_left`](#fn-weather-time_left)
@@ -1730,7 +1730,7 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 | `transparent` | false | see-through; drawn blended (glass, water) |
 | `cutout` | false | see-through pixels cut out, no blending (leaves) |
 | `pattern` | `"cube"` | `"plantlike"` = two crossed pictures (flowers, grass) |
-| `gravity` | false | falls like sand |
+| `gravity` | false | falls like sand: with nothing solid below, it drops smoothly (speeding up, as in Minecraft) and lands on the first solid block. It falls through air, fluids and things you walk through (grass, flowers, torches are crushed). See [`world.get_falling_blocks`](#fn-world-get_falling_blocks). |
 | `tint` | false | tint all faces with r, g, b |
 | `in_creative` | true | listed in the creative inventory |
 | `inventory_image` | none | shows a flat picture in the inventory and hotbar. The block becomes an **item**: right-click never places it |
@@ -1780,6 +1780,7 @@ The mod sets these with `engine.set_block_meta`, so any mod can make door-like b
 | <a id="fn-engine-set_block_meta"></a>`engine.set_block_meta(x, y, z, name, meta)` | block and metadata in one change |
 | <a id="fn-engine-is_replaceable"></a>`engine.is_replaceable(x, y, z)` | air, a fluid or a plant: there's room to put something |
 | <a id="fn-world-get_render_distance"></a><a id="fn-world-set_render_distance"></a>`world.set_render_distance(chunks)` / `get_render_distance()` | |
+| <a id="fn-world-get_falling_blocks"></a>`world.get_falling_blocks()` | the blocks falling right now (sand, gravel...): `{ { name, x, y, z }, ... }`. `x, y, z` is the block's bottom corner; `y` has a fraction while it falls. A falling block isn't in the world (`engine.get_block_name` says air) until it lands. |
 | <a id="fn-world-get_caves_enabled"></a><a id="fn-world-set_caves_enabled"></a>`world.set_caves_enabled(bool)` / `get_caves_enabled()` | built-in caves (turn them off if your mapgen makes its own) |
 | <a id="fn-world-get_loaded_chunks"></a><a id="fn-world-get_pending_chunks"></a>`world.get_loaded_chunks()` / `get_pending_chunks()` | |
 | <a id="fn-world-set_load_budget"></a><a id="fn-world-set_mesh_budget"></a>`world.set_load_budget(ms)` / `set_mesh_budget(ms)` | how much time per frame goes to loading and meshing |
@@ -1939,6 +1940,45 @@ function on_chat_command(text) ... end            -- "/give stone 5" arrives as 
 
 In multiplayer, commands the client doesn't handle go to the server. Server operators have their own commands there (see section 17).
 
+**Links.** Web addresses in chat (`https://...`, `http://...` or `www....`) are drawn as blue, underlined links: a server's voting site, its rules or its forum. With the chat open, clicking one asks first: *Open this link in your browser?*, with the website's name shown on its own so players can see where it really goes. **Open** (Enter) hands it to the player's own browser, **Copy** puts it on the clipboard, **Cancel** (Esc) does nothing. The game itself never downloads or runs anything from a link.
+
+That works for anything that ends up in chat: players' messages, the server's `say` and message of the day, and mods' `chat.send` lines and command replies. For example, a server mod for voting:
+
+```lua
+chat.register_command("vote", "/vote", "Where to vote for this server")
+local previous = on_chat_command
+function on_chat_command(text, player, is_operator, reply, ...)
+    if text == "vote" then
+        reply("Vote for us every day at https://vote.example.com/server/123 - thanks!")
+        return true
+    end
+    if previous then return previous(text, player, is_operator, reply, ...) end
+    return false
+end
+```
+
+Only plain `http`/`https` addresses with an ordinary site name become links. Addresses with spaces, quotes or other unusual characters, and ones like `https://real.site@other.site` (which hide where they really go), are left as plain text.
+
+**Scrolling back.** With the chat open, the mouse wheel or Page Up / Page Down scroll through the last 200 lines; the bar at the right shows where you are. New messages don't move what you're reading. Closing the chat goes back to the newest lines.
+
+<a id="fn-hooks-on_chat_complete"></a>**Tab completion.** In chat, typing `/` lists the commands that fit (with their usage) and Tab fills in the highlighted one; Up/Down pick another (the list scrolls, so every match can be reached). After the command, Tab completes its arguments: game rules, item names, players, `~`. In ordinary chat, Tab completes the names of players online (the first Tab shows the list, or fills the name in if only one fits). On a server, the server is asked as well, so its commands and their arguments show up too, but only the ones your operator level lets you use.
+
+Your commands' arguments come from `on_chat_complete`. Return everything that could go where the word is being typed; the game keeps only what starts with what's been typed so far, so you don't need to filter:
+
+```lua
+-- words: the words before the one being typed ("/warp ho" -> { "warp" }, word = "ho")
+local previous_complete = on_chat_complete              -- keep the other mods' completions
+function on_chat_complete(words, word, player)
+    local out = previous_complete and previous_complete(words, word, player) or {}
+    if words[1] == "warp" and #words == 1 then
+        for name in pairs(warps) do out[#out + 1] = name end
+    end
+    return out
+end
+```
+
+The same hook runs in server mods, where `player` is who pressed Tab (in the game it's `nil`). A server mod's `chat.register_command` commands are listed in players' chat with their usage and description, like the game's own, to players whose operator level allows them (commands only a mod knows about are listed for everyone; check `is_operator` in `on_chat_command` as usual). The base mod completes `/time`, `/gamerule`, `/give` and `/tp`, and the weather mod completes `/weather`.
+
 ## 9. Sky, weather, fog, clouds, underwater
 
 **Weather** is decided entirely in Lua by `mods/weather`. It's Minecraft-like by default: long clear spells, rain, thunderstorms, and snow where your game says it's cold. The engine only draws what that mod asks for:
@@ -2068,7 +2108,7 @@ if engine.get_light_level(x, y + 1, z) <= 7 then spawn_zombie(x, y + 1, z) end
 
 ### How light looks
 
-- <a id="fn-sky-set_brightness"></a>`sky.set_brightness(v)`: 0 = moody (dark nights and caves), 1 = bright, like Minecraft's brightness slider. Default 0.35.
+- <a id="fn-sky-set_brightness"></a>`sky.set_brightness(v)`: 0 = moody (dark nights and caves), 1 = bright, like Minecraft's brightness slider. Default 0.35. This is the *game's* brightness. Players also have a **Brightness** slider (Settings > Video & Sound, saved as `brightness` in settings.txt): in the middle ("Default") they see exactly the game's look; to the left it goes down to fully moody; to the right it lifts the final light the way Minecraft's brightness does, so caves and nights get brighter too (a pitch-black cave is about 28% lit at "Bright", a night about 73%), while daylight stays the same. So a dark, spooky game can set a low value, and a player who finds it too dark can still brighten it.
 - <a id="fn-sky-set_min_light"></a>`sky.set_min_light(v)`: the darkest anything gets, 0–1. Default 0.02; 0 makes sealed caves pitch black.
 - <a id="fn-sky-set_block_light_strength"></a>`sky.set_block_light_strength(v)`: how strong light sources look (default 1; 1.3 for a cosier game, 0.7 for horror).
 - <a id="fn-engine-set_ambient_occlusion"></a><a id="fn-engine-set_smooth_lighting"></a>`engine.set_smooth_lighting(on)`, `engine.set_ambient_occlusion(on)`: both on by default. Changing one redraws every chunk.
@@ -2618,7 +2658,7 @@ Drag and drop isn't only for items: payloads can be anything. Reorder a list (dr
 
 #### Scroll areas, icons and menus
 
-<a id="fn-uikit-scroll_area"></a>`f:scroll_area(id, x, y, w, h, content_h, function(sf, offset) ... end)` shows a `w × h` window onto something `content_h` units tall. Draw the whole content with `sf`, from `(0, 0)` at its top; the kit scrolls it (wheel, or dragging the bar on the right), hides what's outside, and only lets clicks reach what's visible. Any widget works inside: buttons, fields, item slots, even drag and drop.
+<a id="fn-uikit-scroll_area"></a>`f:scroll_area(id, x, y, w, h, content_h, function(sf, offset) ... end)` shows a `w × h` window onto something `content_h` units tall. Draw the whole content with `sf`, from `(0, 0)` at its top; the kit scrolls it (wheel, or dragging the bar on the right), hides what's outside, and only lets clicks reach what's visible. Any widget works inside: buttons, fields, item slots, even drag and drop. Lists and scroll areas inside it get the wheel first when the mouse is over them; the area itself scrolls only when it has more than fits. To make a window's contents scroll when the player makes the window smaller, put them in a scroll area as tall as they need (the `ui_showcase` mod does this for every app).
 ```lua
 f:scroll_area("recipes", 0, 1, 8, 5, #recipes * 1.2, function(sf)
     for i, rec in ipairs(recipes) do
@@ -2627,7 +2667,52 @@ f:scroll_area("recipes", 0, 1, 8, 5, #recipes * 1.2, function(sf)
 end)
 ```
 
-<a id="fn-uikit-icon"></a>`f:icon(id, x, y, size, picture, label [, { selected, item, draw, tooltip }])` is a desktop-style icon: a picture with a label under it (`draw = function(px, py, size_px)` draws your own picture with shapes instead). It returns `"select"` on a click, `"open"` on a double-click, `"menu"` on a right-click, else `nil`. With `item = true`, `picture` is a block or item name, drawn as in inventories.
+<a id="fn-uikit-icon"></a>`f:icon(id, x, y, size, picture, label [, { selected, item, draw, tooltip, movable }])` is a desktop-style icon: a picture with a label under it (`draw = function(px, py, size_px)` draws your own picture with shapes instead; with `item = true`, `picture` is a block or item name, drawn as in inventories). It returns what the player did, and second, `{ ctrl, shift }`:
+- `"select"`: pressed on it;
+- `"open"`: a double-click;
+- `"menu"`: a right-click.
+
+With `movable = true` it can also be dragged; its position is yours, so keep `x, y` in your state:
+- `"drag", dx, dy, mods`: move it (and the other selected icons) by `dx, dy` units this frame;
+- `"drop"`: let go after a drag (snap to a grid, save positions);
+- `"click"`: let go *without* dragging (usually: now select only this one).
+
+#### Selecting several things, and moving them together
+
+<a id="fn-uikit-marquee"></a>`f:marquee(id, x, y, w, h [, { windows = true }])` is the box you drag on an empty desktop to select things. Call it **after** the things in that area (icons, buttons…), so a press on one of them goes to it rather than starting a box. While the player drags from empty space, a highlighted box follows the mouse, drawn over everything. It returns `box, done, mods` every frame of the drag:
+- `box` is `{ x, y, w, h }` in units, or `nil` when nothing is being selected;
+- `done` is `true` on the frame the mouse is let go;
+- a press that isn't dragged gives a box of size 0 with `done = true`: "clicked on nothing", usually *clear the selection*.
+
+<a id="fn-uikit-overlaps"></a>`kit.overlaps(box, x, y, w, h)` tells you whether something is inside the box. With `windows = true`, the windows the box touches are selected too.
+
+<a id="fn-uikit-selection"></a>`kit.selection()` is a set to keep your selection in: `sel:has(id)`, `sel:set(id, on)`, `sel:toggle(id)`, `sel:only(id)`, `sel:clear()`, `sel:count()`, `sel:list()`.
+
+<a id="fn-uikit-selected_windows"></a>**Windows** can be selected too: with the box above, or by **Ctrl+click on a title bar** (again to unselect). Selected windows get a bright edge. Dragging the title bar of any selected window **moves them all together**; dragging an unselected window moves it alone and lets the selection go. From code: `f:selected_windows()`, `f:select_window(id [, false])`, `f:clear_window_selection()`.
+
+A desktop where icons can be box-selected, Ctrl+clicked and dragged as a group:
+```lua
+local sel = state.sel or kit.selection(); state.sel = sel
+for id, p in pairs(state.icons) do                        -- state.icons[id] = { x =, y = }
+    local what, a, b = f:icon(id, p.x, p.y, 1.6, p.picture, p.label, { selected = sel:has(id), movable = true })
+    if what == "select" then
+        if a.ctrl then sel:toggle(id) elseif not sel:has(id) then sel:only(id) end
+    elseif what == "click" and not a.ctrl then sel:only(id)
+    elseif what == "drag" then
+        if not sel:has(id) then sel:only(id) end
+        for _, other in ipairs(sel:list()) do state.icons[other].x = state.icons[other].x + a; state.icons[other].y = state.icons[other].y + b end
+    end
+end
+local box, done, mods = f:marquee("select", 0, 0, f.w_units, f.h_units, { windows = true })
+if box then
+    if box.w == 0 then if done and not mods.ctrl then sel:clear() end
+    else
+        if not mods.ctrl then sel:clear() end
+        for id, p in pairs(state.icons) do if kit.overlaps(box, p.x, p.y, 1.6, 2.5) then sel:set(id, true) end end
+    end
+end
+```
+The `ui_showcase` mod does exactly this, with Ctrl+A to select every icon.
 
 <a id="fn-uikit-popup"></a>**Menus:** `f:open_popup(id, x, y)` opens a menu at `x, y`; then, every frame, `f:popup(id, entries [, { width }])` draws it while it's open and returns the number of the chosen entry (once, and then it closes). `"-"` in `entries` is a separator line. A click anywhere else closes it. Menus are drawn above everything, windows included.
 ```lua
@@ -2844,8 +2929,64 @@ Mods run the same way in singleplayer, when hosting a LAN game, and on the dedic
 
 - <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there.
 - **Server setup:** run `BlockSmithServer --setup` once, or use My Servers in the game.
-- **Settings:** in `server.conf` (name, description and colours, icon, game, world, port, max players, whitelist, passwords, disabled mods, tick rate, world generation threads, `lua_time_limit`).
-- **Operator commands:** `/op`, `/gamemode`, `/time`, `/kick`, `/ban`, `/whitelist`, `/tps`, `/save`, `/stop` and more. `day_length` in `server.conf` sets how many minutes a day lasts (20 by default). Type `help` in the server console. The console completes with **Tab**: commands, then their arguments (online players and known names for `kick`, `ban`, `op` and `msg`, banned names for `unban`, `on/off/add/remove` for `whitelist`, `survival/creative` for `gamemode`, mod ids for `mods enable/disable`, and mods' own commands). Press Tab twice to list the choices. **Up/Down** bring back earlier commands, and what the server prints appears above the line you're typing.
+- **Settings:** in `server.conf` (name, description and colours, icon, game, world, port, max players, whitelist, passwords, disabled mods, tick rate, world generation threads, `lua_time_limit`, `day_length`, `spawn_protection`, `op_level`).
+- **Operator commands:** `/op`, `/gamemode`, `/tp`, `/give`, `/time`, `/gamerule`, `/kick`, `/ban`, `/whitelist`, `/save`, `/stop` and more: see [Server commands](#server-commands). `day_length` in `server.conf` sets how many minutes a day lasts (20 by default). Type `help` in the server console. The console completes with **Tab**: commands, then their arguments (online players and known names for `kick`, `ban`, `op` and `msg`, banned names for `unban`, `on/off/add/remove` for `whitelist`, `survival/creative` for `gamemode`, mod ids for `mods enable/disable`, and mods' own commands). Press Tab twice to list the choices. **Up/Down** bring back earlier commands, and what the server prints appears above the line you're typing.
+
+### Server commands
+
+Commands work like Minecraft's: typed in the server console (no slash), or in chat by players with `/` in front.
+
+**Who may use what: operator levels.** `op <name> [1-4]` makes someone an operator. Without a level they get `op_level` from `server.conf` (default 4). The levels are stored in `ops.txt` and listed by `ops`. The console can do everything.
+
+| level | may | commands |
+|---|---|---|
+| everyone | talk and look | `help`, `list`, `msg`/`tell`, `me` |
+| 1 | build inside spawn protection | |
+| 2 | change the game | `gamemode`, `tp`/`teleport`, `give`, `clear`, `kill`, `time`, `gamerule`, `setworldspawn`, `spawnpoint`, `seed`, `say`, `tps` |
+| 3 | manage players | `kick`, `ban`, `unban`/`pardon`, `ban-ip`, `pardon-ip`, `banlist [players\|ips]`, `whitelist`, `op`, `deop`, `ops` |
+| 4 | run the server | `stop`, `save`/`save-all`, `save-off`, `save-on`, `reload`, `games`, `mods`, `motd`, `name`, `password reset` |
+
+An operator can't give a higher level than their own. Mods' commands get `is_operator` (any level) and decide for themselves.
+
+**Choosing players.** Wherever a command takes a player you can use a name or a target selector:
+- `@a`: everyone;
+- `@p`: the nearest player (to you; from the console, to spawn);
+- `@r`: someone at random;
+- `@s`: yourself.
+
+**Coordinates** are numbers, or `~` for "where the player is" (`~5` is 5 more, `~-2` is 2 less). Whole numbers are block centres for x and z.
+
+| command | does |
+|---|---|
+| `tp <x y z>`, `tp <player>`, `tp <players> <x y z>`, `tp <players> <player>` | teleports (`teleport` is the same) |
+| `give <players> <item> [count]` | items into their hotbar (in stacks of 64; when it's full, a mod's inventory takes the rest) |
+| `clear [players]` | empties their inventory |
+| `kill [players]` | they die (in survival: the death screen; otherwise straight back to spawn) |
+| `me <action>` | `* Name action` in chat |
+| `setworldspawn [x y z]` | moves the world's spawn point (saved in `server.conf`) |
+| `spawnpoint [players] [x y z]` | where those players come back after dying (saved with the world in `spawnpoints.txt`) |
+| `gamerule [rule] [true\|false\|default]` | lists, shows or sets a game rule (below) |
+| `save-off`, `save-on` | autosave off and on (`save-all` saves now) |
+| `ban-ip <address\|player> [reason]`, `pardon-ip <address>` | bans an IP address, kicking anyone on it (`banned-ips.txt`) |
+
+<a id="gamerules"></a>**Game rules** are saved with the world (`gamerules.txt`) and sent to every player:
+
+| rule | default | |
+|---|---|---|
+| `doDaylightCycle` | true | the time of day moves on |
+| `keepInventory` | the game's | players keep their items when they die |
+| `naturalRegeneration` | true | health comes back when you're well fed |
+| `fallDamage` | true | falling hurts |
+| `drowningDamage` | true | running out of air underwater hurts |
+| `fireDamage` | true | lava hurts |
+
+The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too.
+
+<a id="fn-hooks-on_server_action"></a>**`give`, `clear` and `kill` happen in the player's game**, where inventories and health live: the server asks, and the game does it. A mod can do these its own way with `on_server_action(action, a, b)`, returning `true` when it has. `action` is `"give"` (`a` = item, `b` = count), `"clear"` or `"kill"` (`a` = the reason shown on the death screen). The survival mod uses it to kill with its death screen and to clear its inventory too. Chain it like other hooks.
+
+**Spawn protection.** `spawn_protection = 16` in `server.conf`: blocks within that many blocks of the world's spawn can only be changed by operators (0 = off). As in Minecraft, it's off while there are no operators.
+
+**The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
 
 ### Game modes and permissions
 

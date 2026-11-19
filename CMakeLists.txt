@@ -132,6 +132,8 @@ add_executable(BlockSmith
     Model.cpp
     Model.h
     ChatSystem.cpp
+    WebLink.cpp
+    WebLink.h
     ChatSystem.h
     MainMenu.cpp
     MainMenu.h
@@ -207,7 +209,7 @@ endif()
 
 # ENet needs the Windows socket and timer libraries
 if (WIN32)
-    target_link_libraries(BlockSmith PRIVATE ws2_32 winmm)
+    target_link_libraries(BlockSmith PRIVATE ws2_32 winmm shell32)
 endif()
 
 if (TARGET unofficial::lua::lua)

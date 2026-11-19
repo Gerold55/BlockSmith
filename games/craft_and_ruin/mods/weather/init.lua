@@ -112,12 +112,14 @@ weather.register("rain", {
     wind = { 0.6, 0.3 },
     chance = 45, duration = { 180, 540 }, fade = 12,
     cold_variant = "snow",
+    sound = "weather_rain", sound_gain = 0.55,   -- looped, fades with the weather
 })
 weather.register("thunder", {
     light = 0.45, rain = 1.0, sky_tint = { 0.28, 0.31, 0.36, 0.78 },
     precipitation = { type = "rain", intensity = 1.0, fall_speed = 17 },
     wind = { 2.5, 1.2 },
     lightning = 7,
+    sound = "weather_rain", sound_gain = 0.9,
     chance = 12, duration = { 120, 360 }, fade = 10,
     cold_variant = "blizzard",
 })
@@ -169,6 +171,7 @@ local function look_of(def)
         wind = { def.wind[1] or 0, def.wind[2] or 0 },
         lightning = def.lightning,
         precip = p, precip_amount = p and (p.intensity or 0.7) or 0,
+        sound = def.sound, sound_gain = def.sound_gain or 1,
     }
 end
 
@@ -197,6 +200,16 @@ local function blend(a, b, t)
         r.precip, r.precip_amount = pb, b.precip_amount * math.max(0, t * 2 - 1)
     else
         r.precip, r.precip_amount = nil, 0
+    end
+    -- looped sounds: the old one fades out as the new one fades in
+    r.sounds = {}
+    for _, side in ipairs({ { a, 1 - t }, { b, t } }) do
+        local look, w = side[1], side[2]
+        if look.sounds then
+            for name, g in pairs(look.sounds) do r.sounds[name] = (r.sounds[name] or 0) + g * w end
+        elseif look.sound then
+            r.sounds[look.sound] = (r.sounds[look.sound] or 0) + (look.sound_gain or 1) * w
+        end
     end
     return r
 end
@@ -262,6 +275,33 @@ local function on_weather_value(value)
     end
 end
 
+-- Weather sounds (rain...): looped in the "ambient" group, following the fade, and
+-- quieter with a roof over your head (like Minecraft)
+local loops = {}
+local roof = 1
+local function weather_sounds(dt)
+    if is_server or not vis_to or not sound or not sound.play then return end
+    local l = on_screen()
+    local px, py, pz = 0, 0, 0
+    if engine.get_player_position then px, py, pz = engine.get_player_position() end
+    local outside = (not engine.is_outdoors) or engine.is_outdoors(math.floor(px), math.floor(py + 1.6), math.floor(pz))
+    roof = roof + ((outside and 1 or 0.3) - roof) * math.min(1, dt * 3)
+    local want = l.sounds or {}
+    for name, g in pairs(want) do
+        local gain = g * roof
+        if gain > 0.01 then
+            if not loops[name] or not sound.is_playing(loops[name]) then
+                loops[name] = sound.play(name, { loop = true, group = "ambient", gain = gain })
+            elseif loops[name] then
+                sound.set_gain(loops[name], gain)
+            end
+        end
+    end
+    for name, h in pairs(loops) do
+        if not want[name] or want[name] * roof <= 0.01 then sound.stop(h); loops[name] = nil end
+    end
+end
+
 local function lightning(dt)
     if is_server or not vis_to then return end
     local rate = on_screen().lightning   -- flashes per minute
@@ -314,6 +354,7 @@ function on_update(dt)
         apply_look()
     end
     lightning(dt)
+    weather_sounds(dt)
 end
 
 -- /weather [type [seconds]] | list | cycle on|off
@@ -349,6 +390,37 @@ function on_chat_command(text, player, is_operator, reply)
         say(err)
     end
     return true
+end
+
+-- Tab completion: /weather <type|list|cycle>, /weather cycle on|off
+local previous_complete = on_chat_complete
+function on_chat_complete(words, word, ...)
+    local out = previous_complete and previous_complete(words, word, ...) or {}
+    if (words[1] or ""):lower() == "weather" then
+        if #words == 1 then
+            for _, n in ipairs(order) do out[#out + 1] = n end
+            out[#out + 1] = "list"; out[#out + 1] = "cycle"
+        elseif #words == 2 and words[2] == "cycle" then
+            out[#out + 1] = "on"; out[#out + 1] = "off"
+        end
+    end
+    return out
+end
+
+-- ---------------------------------------------------------------------------
+-- The game's moon: its 8 phase pictures (the sky cycles through them, one per day)
+-- ---------------------------------------------------------------------------
+if not is_server and sky and sky.set_moon_textures then
+    sky.set_moon_textures({
+        "textures/moon_1_classic.png",
+        "textures/moon_2_classic.png",
+        "textures/moon_3_classic.png",
+        "textures/moon_4_classic.png",
+        "textures/moon_5_classic.png",
+        "textures/moon_6_classic.png",
+        "textures/moon_7_classic.png",
+        "textures/moon_8_classic.png"
+    })
 end
 
 print("[Weather] Ready: " .. table.concat(order, ", "))
