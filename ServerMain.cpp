@@ -31,6 +31,9 @@
 #include "Auth.h"
 #include "LuaSandbox.h"
 #include "ServerLuaApi.h"
+#include "EntityLua.h"
+#include "BlockModifiers.h"
+#include "Light.h"
 #include "RemoteLua.h"
 #include "ConsoleInput.h"
 
@@ -766,6 +769,8 @@ const GameRuleDef kGameRules[] = {
     { "fallDamage",          "true", "falling hurts" },
     { "drowningDamage",      "true", "running out of air underwater hurts" },
     { "fireDamage",          "true", "lava (and fire) hurts" },
+    { "doMobSpawning",       "true", "mobs appear by themselves (entities.register_spawn)" },
+    { "randomTickSpeed",     "3",    "random blocks per 16x16x16 section per tick: how fast grass spreads, crops grow... (0 = never)" },
 };
 const GameRuleDef* findGameRule(const std::string& name) {
     for (const auto& g : kGameRules) {
@@ -900,6 +905,7 @@ std::vector<std::string> completeConsole(const std::vector<std::string>& before,
         if (cmd == "tp" || cmd == "teleport") return targets;
         if (cmd == "gamerule") {
             const GameRuleDef* g = findGameRule(before[1]);
+            if (g && std::isdigit(static_cast<unsigned char>(g->defaultValue[0]))) return {"0", "3", "10", "default"};
             if (g) return {"true", "false"};
         }
         if (cmd == "password" && sub == "reset") return d.accounts;
@@ -1084,6 +1090,12 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         engine["set_block_meta"] = [&ctx](int x, int y, int z, const std::string& name, int meta) {
             ctx.world->setBlockWithMetaAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name),
                                           static_cast<uint8_t>(meta & 0xFF));
+        };
+        engine["is_opaque"] = [&ctx](int x, int y, int z) {      // (see the game's engine.is_opaque)
+            const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
+            if (id == 0 || FluidRegistry::get().forBlock(id)) return false;
+            const auto& b = BlockRegistry::getInstance().getBlock(id);
+            return b.isWalkable && !b.isTransparent && !b.isCutout;
         };
         engine["is_replaceable"] = [&ctx](int x, int y, int z) {
             const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
@@ -1419,6 +1431,72 @@ int main(int argc, char** argv) {
     ctx.api.dedicated = true;
     ctx.api.timeLimit = config.luaTimeLimit;
     setupLua(lua, ctx);
+    // Entities (mobs, dropped items): run here; players' games get them as data (Entities.h)
+    EntityManager entityManager;
+    EntityLua entityLua;
+    {
+        EntityLuaHost host;
+        host.manager = &entityManager;
+        host.world = &world;
+        host.isAuthority = [] { return true; };
+        host.players = [&server]() { return server.playerPositions(); };
+        host.damagePlayer = [&server](const std::string& name, float amount, const std::string& reason) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%g", amount);
+            server.sendAction(name, "damage", buf, reason);
+        };
+        host.giveItem = [&server](const std::string& name, const std::string& item, int count) {
+            return server.sendAction(name, "give", item, std::to_string(count));
+        };
+        host.lightLevel = [&world, &dayClock](int x, int y, int z) {
+            const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
+            const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+            const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
+            return std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l))));
+        };
+        host.isDay = [&dayClock] { const double t = dayClock.time(); return t >= 0.5 && t < 0.98; };
+        host.spawningEnabled = [&ruleValue] { return ruleValue("doMobSpawning") != "false"; };
+        host.timeLimit = config.luaTimeLimit;
+        entityLua.bind(lua, host);
+    }
+    server.setEntities(&entityManager);
+    // ABMs and LBMs (engine.register_abm / register_lbm)
+    BlockModifiers blockMods;
+    blockMods.timeLimit = config.luaTimeLimit;
+    blockMods.randomTickSpeed = [&ruleValue] {
+        try { return std::stoi(ruleValue("randomTickSpeed")); } catch (...) { return 3; }
+    };
+    blockMods.bind(lua, lua["engine"]);
+    blockMods.loadWorld(worldDir.string());
+    // engine.get_light_level(x, y, z): the server keeps no light, so: open sky = sunlight for the
+    // time of day, under cover = dark (enough for grass, crops and mob spawning rules)
+    lua["engine"]["get_light_level"] = [&world, &dayClock](int x, int y, int z) -> int {
+        if (world.lighting()) {
+            const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
+            const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+            const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
+            return std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l))));
+        }
+        for (int yy = y + 1; yy < CHUNK_HEIGHT; ++yy) {
+            const uint8_t id = world.getBlockAt(glm::ivec3(x, yy, z));
+            const auto& bp = BlockRegistry::getInstance().getBlock(id);
+            if (id != 0 && !bp.isTransparent && !bp.isCutout && bp.isWalkable) return 0;   // (leaves, glass, plants let light through)
+        }
+        const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+        return 15 - static_cast<int>(std::lround((1.0f - day) * 11.0f));
+    };
+    server.onEntityAct = [&](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
+        if (kind == 0) entityLua.punch(id, name, at, item);
+        else entityLua.rightClick(id, name, item);
+    };
+    server.onDropItem = [&](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
+        if (BlockRegistry::getInstance().getBlockId(item) == 0) return;
+        const uint32_t id = how.hasVelocity ? entityManager.dropItem(item, count, at, how.velocity) : entityLua.drop(item, count, at);
+        Entity* e = entityManager.get(id);
+        if (!e) return;
+        if (how.returned) { e->vel = glm::vec3(0.0f); e->pickupDelay = 3.0f; }
+        else if (how.pickupDelay >= 0.0f) e->pickupDelay = how.pickupDelay;
+    };
     // Online content for mods (remote.*): data only, from GitHub and the approved sites
     remote::Policy remotePolicy;
     remotePolicy.enabled = config.remoteContent;
@@ -1436,6 +1514,12 @@ int main(int argc, char** argv) {
         }
     }
     if (failed) std::cerr << "[Mod] " << failed << " mod file(s) failed to load (see above)" << std::endl;
+    // The world's entities, now that the mods have registered their kinds
+    {
+        const int n = entityManager.load(worldDir.string());
+        entityLua.activateAll();
+        if (n > 0) std::cout << "[Server] " << n << " entities" << std::endl;
+    }
 
     // ---- World generation on background threads ----
     // The main thread only ticks; new chunks are generated by worker threads, each with its
@@ -1626,6 +1710,10 @@ int main(int argc, char** argv) {
     auto saveAll = [&]() {
         for (const auto& [name, pos] : server.playerPositions()) savePlayer(worldDir, name, pos);
         const int chunks = world.saveAll();
+        blockMods.saveWorld(worldDir.string());
+        if (!entityManager.save(worldDir.string(), [&](Entity& e) { entityLua.saveData(e); })) {
+            std::cerr << "[Server] Could not save entities.txt" << std::endl;
+        }
         meta.timeLine = dayClock.saveLine();
         writeWorldMeta(worldDir / "world.dat", meta);
         if (ctx.storageDirty) {
@@ -2140,7 +2228,11 @@ int main(int argc, char** argv) {
                 return;
             }
             const std::string v = lower(a[1]);
-            if (v != "true" && v != "false" && v != "default") { reply("A game rule is true, false or default"); return; }
+            const bool numeric = std::isdigit(static_cast<unsigned char>(g->defaultValue[0])) != 0;
+            if (numeric) {
+                bool ok = v == "default" || (!v.empty() && v.size() <= 4 && std::all_of(v.begin(), v.end(), [](char ch) { return std::isdigit(static_cast<unsigned char>(ch)) != 0; }));
+                if (!ok) { reply(std::string(g->name) + " is a number (0 to 9999) or default"); return; }
+            } else if (v != "true" && v != "false" && v != "default") { reply("A game rule is true, false or default"); return; }
             if (v == "default") gameRules.erase(g->name); else gameRules[g->name] = v;
             saveGameRules();
             server.setShared(std::string("gamerule.") + g->name, ruleValue(g->name));
@@ -2341,6 +2433,12 @@ int main(int argc, char** argv) {
             }
         }
         ctx.api.call("on_update", [](sol::protected_function_result&) {}, tickDt);
+        entityLua.step(tickDt);   // mobs move and think, items get picked up, new mobs spawn
+        {                         // ABMs near players, LBMs on chunks that just loaded
+            std::vector<glm::vec3> nearPlayers;
+            for (const auto& p : server.playerPositions()) nearPlayers.push_back(p.second);
+            blockMods.update(tickDt, world, nearPlayers);
+        }
         remoteContent.update();   // finished downloads -> mods' callbacks
 
         // The time of day runs on the server, and goes to every player (every few seconds, and

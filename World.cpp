@@ -340,7 +340,7 @@ void World::loadQueuedChunks(sol::state& lua) {
             switch (loadChunkFromDisk(c.first, c.second, *chunk, &why)) {
             case DiskLoad::Loaded:
                 computeBiomeTint(*chunk, c.first, c.second, &lua);   // saved before biome colours
-                addLoadedChunk(c.first, c.second, std::move(chunk));
+                addLoadedChunk(c.first, c.second, std::move(chunk), true);
                 break;
             case DiskLoad::Missing:                     // deleted since the check: as never saved
             case DiskLoad::Damaged:                     // regenerate (it's replaced when saved)
@@ -419,7 +419,8 @@ void World::noteSeedFailure(const std::string& error) {
               << "), trying again in " << (500 << shift) / 1000.0 << " s: " << error << std::endl;
 }
 
-void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
+void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk, bool fromDisk) {
+    if (!m_remote) m_justLoaded.push_back({ChunkCoord{cx, cz}, fromDisk});
     m_notOnDisk.erase(ChunkCoord{cx, cz});   // loaded now: it may be saved, so probe again next time
     m_diskRetry.erase(ChunkCoord{cx, cz});
     chunk->chunkX = cx;
@@ -523,7 +524,7 @@ bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
     } else {
         computeBiomeTint(*chunk, chunkX, chunkZ, &lua);   // saved before biome colours
     }
-    addLoadedChunk(chunkX, chunkZ, std::move(chunk));
+    addLoadedChunk(chunkX, chunkZ, std::move(chunk), fromDisk);
     return true;
 }
 
@@ -608,6 +609,7 @@ void World::reset() {
     m_loadQueue.clear();
     m_dirty.clear();
     m_unloaded.clear();
+    m_justLoaded.clear();
     m_generating.clear();   // results still on their way carry the old reset count: ignored
     if (m_generator) m_generator->clearQueue();
     ++m_resetCount;

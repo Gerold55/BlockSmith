@@ -80,6 +80,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "LuaSandbox.h"
 #include "UiDraw.h"
 #include "ServerLuaApi.h"
+#include "EntityLua.h"
+#include "BlockModifiers.h"
 #include "RemoteLua.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
@@ -312,6 +314,88 @@ WorldRenderer* g_WorldRenderer = nullptr;   // client-side drawing of g_WorldIns
 // Multiplayer: the server runs inside this game while hosting; the client while joined.
 GameServer g_Server;
 GameClient g_Client;
+
+// ---- Entities (mobs, dropped items): Entities.h / EntityLua.h ----
+// Run here in singleplayer and when hosting; joined to a server, the server runs them and this
+// game only draws what it's told (g_Client.entities()).
+EntityManager g_Entities;
+EntityLua g_EntityLua;
+BlockModifiers g_BlockMods;                      // ABMs and LBMs (BlockModifiers.h)
+struct EntityVisual {                            // a registered type's looks (loaded once)
+    std::shared_ptr<AnimatedModel> model;
+    std::shared_ptr<AnimationSet> anims;
+    float scale = 1.0f;
+};
+std::map<std::string, EntityVisual> g_EntityVisuals;
+struct EntityLook {                              // per entity, this game only: animation clock, red flash
+    uint8_t hurtCount = 0;
+    double hurtUntil = 0.0;
+    std::string anim;
+    double animStart = 0.0;
+    bool seen = false;
+};
+std::unordered_map<uint32_t, EntityLook> g_EntityLooks;
+bool entitiesHere() { return g_Client.state() != GameClient::State::Joined; }   // we run them
+// The light a model gets where it stands (sunlight - dark in caves and at night - and block
+// light), for the model shader's u_LocalLight. Defined below main's helpers.
+glm::vec3 modelLightAt(const glm::vec3& pos);
+
+// Drops items into the world: ours to make (singleplayer, hosting), or asked of the server.
+// pickupDelay: seconds before anyone can pick it up (Minecraft: 2 for thrown items).
+// May this game's player pick items up now? can_pick_up_item(item, count) -> false says no
+// (the survival mod: not while dead). Defined further down (needs the Lua state).
+bool canPickUpItem(const std::string& item, int count);
+
+bool dropItemInWorld(const std::string& item, int count, const glm::vec3& pos, const glm::vec3& vel, float pickupDelay) {
+    if (item.empty() || count <= 0 || BlockRegistry::getInstance().getBlockId(item) == 0) return false;
+    if (entitiesHere()) {
+        Entity* e = g_Entities.get(g_Entities.dropItem(item, count, pos, vel));
+        if (!e) return false;
+        e->pickupDelay = pickupDelay;
+        return true;
+    }
+    if (g_Client.state() == GameClient::State::Joined) {
+        g_Client.sendDropItem(item, count, pos, false, &vel, pickupDelay);
+        return true;
+    }
+    return false;
+}
+
+// What to draw and click this frame: ours, or the server's
+std::vector<EntityView> currentEntityViews() {
+    std::vector<EntityView> out;
+    if (entitiesHere()) {
+        out.reserve(g_Entities.all().size());
+        for (const auto& [id, e] : g_Entities.all()) if (!e.removed) out.push_back(g_Entities.view(e));
+    } else {
+        out.reserve(g_Client.entities().size());
+        for (const auto& [id, v] : g_Client.entities()) out.push_back(v);
+    }
+    return out;
+}
+// The nearest entity (not a dropped item) the ray hits within maxDist, and how far; 0 = none
+uint32_t raycastEntities(const glm::vec3& o, const glm::vec3& d, float maxDist, float& dist) {
+    if (entitiesHere()) return g_Entities.raycast(o, d, maxDist, &dist);
+    uint32_t best = 0;
+    dist = maxDist;
+    for (const auto& [id, v] : g_Client.entities()) {
+        if (v.type == EntityManager::kItemType) continue;
+        const float hw = v.width * 0.5f + 0.05f;
+        const glm::vec3 mn(v.pos.x - hw, v.pos.y, v.pos.z - hw), mx(v.pos.x + hw, v.pos.y + v.height + 0.05f, v.pos.z + hw);
+        float t0 = 0.0f, t1 = dist;
+        bool hit = true;
+        for (int a = 0; a < 3 && hit; ++a) {
+            if (std::fabs(d[a]) < 1e-8f) { if (o[a] < mn[a] || o[a] > mx[a]) hit = false; continue; }
+            float ta = (mn[a] - o[a]) / d[a], tb = (mx[a] - o[a]) / d[a];
+            if (ta > tb) std::swap(ta, tb);
+            t0 = std::max(t0, ta);
+            t1 = std::min(t1, tb);
+            if (t0 > t1) hit = false;
+        }
+        if (hit && t0 < dist) { dist = t0; best = id; }
+    }
+    return best;
+}
 ServerPinger g_Pinger;    // server list: online? description? players?
 LanScanner g_Lan;         // games hosted on the local network (Multiplayer screen)
 std::string g_NetError;
@@ -589,6 +673,10 @@ void saveCurrentWorld() {
     if (!w || w->saveDirectory().empty()) return;
 
     const int written = w->saveAll();
+    g_BlockMods.saveWorld(w->saveDirectory());
+    if (entitiesHere() && !g_Entities.save(w->saveDirectory(), [](Entity& e) { g_EntityLua.saveData(e); })) {
+        std::cerr << "[Save] Could not save entities.txt" << std::endl;
+    }
     {
         std::ofstream f(fs::path(w->saveDirectory()) / "mod_storage.txt");
         for (const auto& [k, v] : g_ModStorage) f << escapeStorage(k) << '\t' << escapeStorage(v) << '\n';
@@ -606,6 +694,32 @@ bool worldBelongsToLoadedGame(const WorldMeta& meta, std::string* why = nullptr)
     if (meta.game.empty() || meta.game == g_LoadedGameFolder) return true;
     if (why) *why = "This world was made with '" + meta.game + "'. Restart the game with that game selected to play it.";
     return false;
+}
+
+bool canPickUpItem(const std::string& item, int count) {
+    if (!g_Lua) return true;
+    sol::protected_function hook = (*g_Lua)["can_pick_up_item"];
+    if (!hook.valid()) return true;
+    auto r = hook(item, count);
+    if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] can_pick_up_item: " << err.what() << std::endl; return true; }
+    return !(r.get_type() == sol::type::boolean && !r.get<bool>());
+}
+
+glm::vec3 modelLightAt(const glm::vec3& pos) {
+    if (!g_WorldInstance) return glm::vec3(1.0f);
+    const uint16_t l = g_WorldInstance->getLightAt(glm::ivec3(glm::floor(pos)));
+    auto curve = [](int level) {          // the world shader's brightness curve (lightCurve)
+        const float x = std::clamp(level / 15.0f, 0.0f, 1.0f);
+        const float v = x / (4.0f - 3.0f * x);
+        const float inv = 1.0f - v;
+        return 1.0f - inv * inv * inv * inv;
+    };
+    float daylight = 1.0f;                // as the world shader: dimmer at night
+    if (g_LightingSystem) daylight = std::clamp(g_LightingSystem->getSunDirection().y * 0.6f + 0.4f, 0.28f, 1.0f);
+    const glm::vec3 sun(curve(light::sky(l)) * daylight);
+    const glm::vec3 block = glm::vec3(curve(light::red(l)), curve(light::green(l)), curve(light::blue(l))) * g_LightSettings.blockLightScale;
+    glm::vec3 lit = glm::vec3(1.0f) - (glm::vec3(1.0f) - sun) * (glm::vec3(1.0f) - glm::min(block, glm::vec3(1.0f)));
+    return glm::max(lit, glm::vec3(std::max(0.1f, g_LightSettings.minLight)));
 }
 
 // Opens g_ActiveWorldName: creates it if new, otherwise restores seed, player and hotbar.
@@ -668,6 +782,18 @@ bool openActiveWorld(World& world, Player& player) {
     } else {
         player.position = glm::vec3(8.0f, 100.0f, 8.0f);
         g_SpawnPlaced = false;
+    }
+
+    // Which chunks the once-only LBMs have already been through
+    g_BlockMods.loadWorld(dir.string());
+
+    // Its mobs and dropped items (their mods' on_spawn gets what on_save gave them)
+    g_EntityLua.reset();
+    g_EntityLooks.clear();
+    {
+        const int n = g_Entities.load(dir.string());
+        g_EntityLua.activateAll();
+        if (n > 0) std::cout << "[World] " << n << " entities" << std::endl;
     }
 
     // Make sure the seed is on disk straight away
@@ -1560,6 +1686,7 @@ const std::vector<KeyAction>& keyActions() {
         { "sneak",     "Sneak",          GLFW_KEY_LEFT_SHIFT },
         { "sprint",    "Sprint",         GLFW_KEY_LEFT_CONTROL },
         { "pick_block", "Pick Block",    kMouseKeyBase + GLFW_MOUSE_BUTTON_MIDDLE },
+        { "drop",      "Drop Item",      GLFW_KEY_Q },
         { "inventory", "Open Inventory", GLFW_KEY_E },
         { "chat",      "Open Chat",      GLFW_KEY_T },
         { "command",   "Open Command",   GLFW_KEY_SLASH },
@@ -1812,6 +1939,8 @@ local hooks = {
     { "set_world_seed",           "(seed)  the world's seed, before any generate_chunk" },
     { "on_update",                "(dt)  every frame" },
     { "on_chat_command",          "(text, player, is_operator, reply) -> true if handled  a /command" },
+    { "on_player_drop",           "(item, count) -> true stops dropping it (Q / Ctrl+Q)" },
+    { "can_pick_up_item",         "(item, count) -> false: the player can't pick items up now (dead...)" },
     { "on_chat_complete",         "(words, word) -> { ... }  Tab in chat: what fits `word` after the command words `words`" },
     { "on_server_action",         "(action, a, b) -> true if done  the server asks: give (item, count), clear, kill (reason)" },
     { "on_game_mode",             "(mode, is_operator)  the server set your game mode (mode nil = left the server)" },
@@ -1942,7 +2071,8 @@ local function noop_table()
     })
 end
 for _, name in ipairs({ "ui", "hotbar", "sky", "clouds", "fog", "underwater", "menu", "chat",
-                        "player", "inventory", "audio", "sound", "input", "settings", "net", "remote" }) do
+                        "player", "inventory", "audio", "sound", "input", "settings", "net", "remote",
+                        "entities", "creative" }) do
     if _G[name] == nil then _G[name] = noop_table() end
 end
 local function fallback(t)
@@ -3149,14 +3279,21 @@ uniform vec3 u_LightDir;
 uniform vec3  u_UnderwaterTint;
 uniform float u_UnderwaterAmount;
 uniform float u_WeatherLight;
+uniform vec3  u_LocalLight;     // entities: the light where they stand (1 = full)
+uniform vec4  u_Tint;           // entities: rgb, a = how much (the red flash when hit)
 
 void main() {
     vec3 norm = normalize(Normal);
-    float diff = max(dot(norm, -u_LightDir), 0.2f);
+    // Minecraft-like shading: tops brightest, sides a little darker, undersides darkest, and a
+    // touch more on the side facing the sun. How bright it is overall is u_LocalLight (the
+    // light where the model stands, and the time of day).
+    float face = 0.78f + 0.22f * norm.y;
+    float diff = face * (0.88f + 0.12f * max(dot(norm, -u_LightDir), 0.0f));
     vec4 texColor = texture(texture_diffuse1, TexCoords);
     if(texColor.a < 0.1) discard;
 
-    vec3 litColor = texColor.rgb * diff * u_WeatherLight * mix(vec3(1.0f), u_UnderwaterTint, u_UnderwaterAmount);
+    vec3 litColor = texColor.rgb * diff * u_WeatherLight * u_LocalLight * mix(vec3(1.0f), u_UnderwaterTint, u_UnderwaterAmount);
+    litColor = mix(litColor, u_Tint.rgb, u_Tint.a);
     FragColor = vec4(litColor, texColor.a);
 }
 )";
@@ -3358,6 +3495,7 @@ int main(int argc, char** argv) {
             GLFWwindow* window;
             ~GlShutdown() {
                 g_ModelInstances.clear();   // placed models free their meshes (OpenGL buffers) here
+                g_EntityVisuals.clear();
                 delete g_Hotbar;         g_Hotbar = nullptr;
                 delete g_FontRenderer;   g_FontRenderer = nullptr;
                 delete g_ChatSystem;     g_ChatSystem = nullptr;
@@ -3675,6 +3813,8 @@ int main(int argc, char** argv) {
         glLinkProgram(modelShaderProgram);
         glUseProgram(modelShaderProgram);
         glUniform1f(glGetUniformLocation(modelShaderProgram, "u_WeatherLight"), 1.0f);   // full light until weather says otherwise
+        glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LocalLight"), 1.0f, 1.0f, 1.0f);
+        glUniform4f(glGetUniformLocation(modelShaderProgram, "u_Tint"), 0.0f, 0.0f, 0.0f, 0.0f);
 
         // ------------------------------------------------------------------
         // ui.* table
@@ -4494,6 +4634,110 @@ int main(int argc, char** argv) {
             if (it != g_ModelInstances.end()) it->second.visible = visible;
         };
         engineTable["remove_model"] = [](int id) { g_ModelInstances.erase(id); };
+
+        // engine.drop_item(item, count [, x, y, z [, vx, vy, vz [, pickup_delay]]]) -> true if dropped
+        //   Into the world as an item to pick up. Without a position: thrown from your eyes the way
+        //   you look, as Q does (pickup delay 2 s). Works joined to a server too (it makes it).
+        engineTable["drop_item"] = [](const std::string& item, sol::optional<int> count, sol::optional<float> x,
+                                      sol::optional<float> y, sol::optional<float> z, sol::optional<float> vx,
+                                      sol::optional<float> vy, sol::optional<float> vz, sol::optional<float> delay) {
+            if (!g_PlayerInstance) return false;
+            const Player& pl = *g_PlayerInstance;
+            const glm::vec3 look = glm::normalize(glm::vec3(std::cos(glm::radians(pl.yaw)) * std::cos(glm::radians(pl.pitch)),
+                                                            std::sin(glm::radians(pl.pitch)),
+                                                            std::sin(glm::radians(pl.yaw)) * std::cos(glm::radians(pl.pitch))));
+            glm::vec3 pos = pl.position + glm::vec3(0.0f, 1.32f, 0.0f);   // eyes, a little lower (Minecraft)
+            glm::vec3 vel = look * 6.0f + glm::vec3(0.0f, 2.0f, 0.0f);
+            float pickup = 2.0f;
+            if (x && y && z) { pos = glm::vec3(*x, *y, *z); vel = glm::vec3(0.0f, 2.0f, 0.0f); pickup = 0.5f; }
+            if (vx && vy && vz) vel = glm::vec3(*vx, *vy, *vz);
+            if (delay) pickup = std::clamp(*delay, 0.0f, 10.0f);
+            return dropItemInWorld(item, std::clamp(count.value_or(1), 1, 64 * 64), pos, vel, pickup);
+        };
+
+        // ---- entities.* (EntityLua.h): mobs and dropped items ----
+        {
+            EntityLuaHost host;
+            host.manager = &g_Entities;
+            host.isAuthority = [] { return entitiesHere(); };
+            host.players = [] {
+                std::vector<std::pair<std::string, glm::vec3>> out;
+                if (g_PlayerInstance && g_CurrentGameState == GameState::PLAYING) out.push_back({playerName(), g_PlayerInstance->position});
+                if (g_Server.running()) for (const auto& p : g_Server.playerPositions()) out.push_back(p);
+                return out;
+            };
+            // Hurting a player: theirs to decide (the survival mod's on_server_action "damage")
+            host.damagePlayer = [&lua](const std::string& name, float amount, const std::string& reason) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%g", amount);
+                if (name == playerName()) {
+                    sol::protected_function hook = lua["on_server_action"];
+                    if (hook.valid()) {
+                        auto r = hook("damage", std::string(buf), reason);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_server_action: " << err.what() << std::endl; }
+                    }
+                } else if (g_Server.running()) {
+                    g_Server.sendAction(name, "damage", buf, reason);
+                }
+            };
+            host.giveItem = [](const std::string& name, const std::string& item, int count) {
+                if (name == playerName()) return canPickUpItem(item, count) && giveHotbarItem(item, count);
+                return g_Server.running() && g_Server.sendAction(name, "give", item, std::to_string(count));
+            };
+            host.lightLevel = [](int x, int y, int z) {
+                const uint16_t l = g_WorldInstance ? g_WorldInstance->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
+                float day = 1.0f;
+                if (g_LightingSystem) day = std::max(0.0f, std::min(1.0f, g_LightingSystem->getSunDirection().y * 2.0f + 0.5f));
+                const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
+                return std::max(skyNow, std::max(light::red(l), std::max(light::green(l), light::blue(l))));
+            };
+            host.isDay = [] {
+                if (!g_LightingSystem) return true;
+                const double t = g_LightingSystem->clock.time();
+                return t >= 0.5 && t < 0.98;
+            };
+            host.spawningEnabled = [] {
+                const auto it = g_SharedValues.find("gamerule.doMobSpawning");
+                return it == g_SharedValues.end() || it->second != "false";
+            };
+            // Each type's looks: its model, texture and animations (from the mod's folder)
+            host.onRegister = [](const std::string& name, const sol::table& def) {
+                EntityVisual v;
+                const std::string modelFile = def.get_or("model", std::string());
+                v.scale = def.get_or("scale", 1.0f);
+                if (!modelFile.empty()) {
+                    const std::string resolved = resolveAssetPath(modelFile, "models");
+                    if (resolved.empty()) {
+                        std::cerr << "[Entities] " << name << ": model not found: " << modelFile
+                                  << " (looked in the mod's folder and its models/ folder)" << std::endl;
+                    } else {
+                        v.model = std::make_shared<AnimatedModel>();
+                        v.model->loadFromFile(resolved);
+                        const std::string tex = def.get_or("texture", v.model->textureHint);
+                        if (!tex.empty()) {
+                            const std::string texPath = resolveAssetPath(tex, "textures");
+                            v.model->texture = loadStandardTexture(texPath.empty() ? tex : texPath);
+                        }
+                    }
+                }
+                const std::string animFile = def.get_or("animations", std::string());
+                if (!animFile.empty()) {
+                    const std::string resolved = resolveAssetPath(animFile, "models");
+                    auto set = std::make_shared<AnimationSet>();
+                    if (!resolved.empty() && set->loadFromFile(resolved)) v.anims = set;
+                    else std::cerr << "[Entities] " << name << ": animations not found: " << animFile << std::endl;
+                }
+                g_EntityVisuals[name] = v;
+            };
+            g_EntityLua.bind(lua, host);
+        }
+        // engine.register_random_tick / register_abm / register_lbm: how the world changes by itself
+        g_BlockMods.bind(lua, engineTable);
+        g_BlockMods.randomTickSpeed = [] {       // the randomTickSpeed game rule (shared by /gamerule)
+            const auto it = g_SharedValues.find("gamerule.randomTickSpeed");
+            if (it == g_SharedValues.end() || it->second.empty()) return 3;
+            try { return std::stoi(it->second); } catch (...) { return 3; }
+        };
         engineTable["is_third_person"] = []() { return g_ThirdPerson; };
 
         engineTable["set_block"] = [](int x, int y, int z, const std::string& blockName) {
@@ -4548,6 +4792,15 @@ int main(int argc, char** argv) {
         // list_fluids (Fluids.cpp)
         addFluidLuaApi(lua, engineTable, []() { return g_WorldInstance; });
         // engine.is_replaceable(x, y, z): air, a fluid or a plant - room to put something
+        // engine.is_opaque(x, y, z) -> true for a solid block light can't pass (stone, dirt...):
+        // not air, water, plants, leaves or glass. (Grass under one turns to dirt.)
+        engineTable["is_opaque"] = [](int x, int y, int z) {
+            if (!g_WorldInstance) return false;
+            const uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
+            if (id == 0 || FluidRegistry::get().forBlock(id)) return false;
+            const auto& b = BlockRegistry::getInstance().getBlock(id);
+            return b.isWalkable && !b.isTransparent && !b.isCutout;
+        };
         engineTable["is_replaceable"] = [](int x, int y, int z) {
             if (!g_WorldInstance) return false;
             const uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
@@ -5010,6 +5263,10 @@ int main(int argc, char** argv) {
                 g_WorldInstance->setSaveDirectory("");
             }
             g_ModelInstances.clear();   // models placed in the old world
+            g_Entities.clear();         // and its entities (saved just above)
+            g_BlockMods.clearWorld();
+            g_EntityLua.reset();
+            g_EntityLooks.clear();
             // The hotbar belongs to that world (saved just above): nothing of it stays behind
             if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
             g_ModStorage.clear();       // (so does mod storage - the next world loads its own)
@@ -5219,6 +5476,20 @@ int main(int argc, char** argv) {
                 g_Server.setDefaultMode(it != g_ModStorage.end() && !it->second.empty() ? it->second : std::string("survival"));
             }
             g_Server.onJoin = [](const std::string& name) { g_ServerApi.playerJoined(name); };
+            // Entities: the other players see ours, and can hit them and drop items
+            g_Server.setEntities(&g_Entities);
+            g_Server.onEntityAct = [](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
+                if (kind == 0) g_EntityLua.punch(id, name, at, item);
+                else g_EntityLua.rightClick(id, name, item);
+            };
+            g_Server.onDropItem = [](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
+                if (BlockRegistry::getInstance().getBlockId(item) == 0) return;
+                const uint32_t id = how.hasVelocity ? g_Entities.dropItem(item, count, at, how.velocity) : g_EntityLua.drop(item, count, at);
+                Entity* e = g_Entities.get(id);
+                if (!e) return;
+                if (how.returned) { e->vel = glm::vec3(0.0f); e->pickupDelay = 3.0f; }
+                else if (how.pickupDelay >= 0.0f) e->pickupDelay = how.pickupDelay;
+            };
             g_Server.onLeave = [](const std::string& name, const glm::vec3& pos) { g_ServerApi.playerLeft(name, pos); };
             g_Server.onChat = [](const std::string& name, std::string& text) { return g_ServerApi.chat(name, text); };
             g_Server.canEdit = [](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
@@ -6176,10 +6447,15 @@ int main(int argc, char** argv) {
                     if (act.action == "give") {
                         int count = 1;
                         try { count = std::clamp(std::stoi(act.b), 1, 64 * 64); } catch (...) {}
-                        while (count > 0) {                       // in stacks of up to 64
+                        const bool canTake = canPickUpItem(act.a, count);     // (not while dead...)
+                        while (count > 0 && canTake) {            // in stacks of up to 64
                             const int n = std::min(count, 64);
                             if (!giveHotbarItem(act.a, n)) break;
                             count -= n;
+                        }
+                        // No room: back on the ground at our feet (picked up again when there's room)
+                        if (count > 0 && g_PlayerInstance) {
+                            g_Client.sendDropItem(act.a, count, g_PlayerInstance->position + glm::vec3(0.0f, 0.5f, 0.0f), true);
                         }
                     } else if (act.action == "clear") {
                         if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
@@ -6212,6 +6488,19 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+            }
+
+            // Entities: move, think (their mods' on_step), get picked up, spawn. Ours to run in
+            // singleplayer (not while paused) and when hosting (always: the others still play).
+            if (g_CurrentGameState == GameState::PLAYING && g_WorldInstance && entitiesHere() &&
+                (!g_Paused || g_Server.running())) {
+                g_EntityLua.setWorld(g_WorldInstance);
+                g_EntityLua.step(std::min(deltaTime, 0.1f));
+                // ABMs (grass spreading, crops...) near players; LBMs on chunks that just loaded
+                std::vector<glm::vec3> nearPlayers;
+                if (g_PlayerInstance) nearPlayers.push_back(g_PlayerInstance->position);
+                if (g_Server.running()) for (const auto& p : g_Server.playerPositions()) nearPlayers.push_back(p.second);
+                g_BlockMods.update(std::min(deltaTime, 0.25f), *g_WorldInstance, nearPlayers);
             }
 
             int width, height;
@@ -6472,6 +6761,45 @@ int main(int argc, char** argv) {
                 }
                 if (g_MoveKeyMask == 0) clickUsed = true;   // frozen (e.g. dead): no digging or placing
 
+                // Drop (Q, Settings > Controls): one of what's in your hand, thrown the way you look;
+                // Ctrl+Q the whole stack. Held down, it keeps dropping (like Minecraft).
+                // on_player_drop(item, count) -> true stops it (a mod's own rules)
+                {
+                    static bool dropWasDown = false;
+                    static float dropRepeat = 0.0f;
+                    const bool dropDown = isActionDown(window, "drop");
+                    bool doDrop = false;
+                    if (dropDown && !dropWasDown) { doDrop = true; dropRepeat = 0.4f; }
+                    else if (dropDown) {
+                        dropRepeat -= deltaTime;
+                        if (dropRepeat <= 0.0f) { doDrop = true; dropRepeat = 0.1f; }
+                    }
+                    dropWasDown = dropDown;
+                    const HotbarSlot inHand = g_Hotbar->getSlot(g_Hotbar->activeSlot);
+                    if (doDrop && g_MoveKeyMask != 0 && inHand.blockId != 0 && inHand.count > 0) {
+                        const bool wholeStack = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                                                glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+                        const int n = wholeStack ? inHand.count : 1;
+                        const std::string itemName = BlockRegistry::getInstance().getBlock(inHand.blockId).name;
+                        bool stopped = false;
+                        sol::protected_function hook = lua["on_player_drop"];
+                        if (hook.valid()) {
+                            auto r = hook(itemName, n);
+                            if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_player_drop: " << err.what() << std::endl; }
+                            else stopped = r.get_type() == sol::type::boolean && r.get<bool>();
+                        }
+                        if (!stopped) {
+                            const glm::vec3 look = rayDir;
+                            if (dropItemInWorld(itemName, n, player.position + glm::vec3(0.0f, 1.32f, 0.0f),
+                                                look * 6.0f + glm::vec3(0.0f, 2.0f, 0.0f), 2.0f)) {
+                                g_Hotbar->setSlot(g_Hotbar->activeSlot, inHand.count - n > 0 ? inHand.blockId : 0,
+                                                  std::max(0, inHand.count - n));
+                                g_FirstPerson.swing();
+                            }
+                        }
+                    }
+                }
+
                 // Pick block (middle mouse by default, Settings > Controls): the block you're looking
                 // at goes into your hand. on_pick_block(x, y, z, block, meta) -> true = a mod did it
                 // (the survival mod takes it from your inventory); otherwise, in creative, the engine
@@ -6483,6 +6811,38 @@ int main(int argc, char** argv) {
                         pickBlock(lua, world, rayResult.blockPos);
                     }
                     pickWasDown = pickDown;
+                }
+
+                // An entity in front of the block you're looking at: a click hits it (left) or
+                // uses it (right) instead, and nothing behind it is dug or placed on
+                {
+                    float entityDist = 0.0f;
+                    const uint32_t aimed = raycastEntities(rayOrigin, rayDir, 4.5f, entityDist);
+                    float blockDist = 1e9f;
+                    if (rayResult.hit) {
+                        const glm::vec3 mn(rayResult.blockPos), mx = mn + glm::vec3(1.0f);
+                        float t0 = 0.0f, t1 = 1e9f;
+                        for (int a = 0; a < 3; ++a) {
+                            if (std::fabs(rayDir[a]) < 1e-8f) continue;
+                            float ta = (mn[a] - rayOrigin[a]) / rayDir[a], tb = (mx[a] - rayOrigin[a]) / rayDir[a];
+                            if (ta > tb) std::swap(ta, tb);
+                            t0 = std::max(t0, ta);
+                            t1 = std::min(t1, tb);
+                        }
+                        blockDist = t0;
+                    }
+                    if (aimed != 0 && entityDist < blockDist && !clickUsed) {
+                        if (leftClick) {
+                            if (entitiesHere()) g_EntityLua.punch(aimed, playerName(), player.position, activeItemName);
+                            else g_Client.sendEntityAct(aimed, 0, activeItemName);
+                        } else if (rightClick) {
+                            g_FirstPerson.swing();
+                            if (entitiesHere()) g_EntityLua.rightClick(aimed, playerName(), activeItemName);
+                            else g_Client.sendEntityAct(aimed, 1, activeItemName);
+                        }
+                        clickUsed = true;            // (holding the button doesn't dig behind it)
+                        rayResult.hit = false;       // no block outline behind it either
+                    }
                 }
 
                 auto& reg = BlockRegistry::getInstance();
@@ -6542,7 +6902,15 @@ int main(int argc, char** argv) {
                     if (handled) return;
                     if (blockNeedsTool(block) && !rightTool(block)) return;   // stone by hand: nothing
                     const std::string drop = block.dropsSet ? block.drops : block.name;
-                    if (!drop.empty()) giveHotbarItem(drop, 1);
+                    // It pops out as an item to pick up (walk over it), like Minecraft
+                    if (!drop.empty()) {
+                        const glm::vec3 at = glm::vec3(pos) + glm::vec3(0.5f, 0.25f, 0.5f);
+                        if (entitiesHere()) {
+                            if (!g_EntityLua.drop(drop, 1, at)) giveHotbarItem(drop, 1);
+                        } else {
+                            g_Client.sendDropItem(drop, 1, at);
+                        }
+                    }
                 };
 
                 g_Dig.cooldown = std::max(0.0f, g_Dig.cooldown - deltaTime);
@@ -6927,7 +7295,10 @@ int main(int argc, char** argv) {
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_BlockLightScale"), g_LightSettings.blockLightScale);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 1);
                 }
-                worldRenderer.render(shaderProgram, proj * view, eyePos);
+                // Solid blocks and plants now; water, glass and the like at the very end (after
+                // mobs, items, players, particles), so whatever is in or behind the water is seen
+                // through it rather than drawn over it
+                worldRenderer.renderOpaque(shaderProgram, proj * view, eyePos);
 
                 // Falling blocks (sand, gravel): drawn where they are this frame, as the same
                 // textured cube they are in the world, lit by the light where they are
@@ -6956,6 +7327,94 @@ int main(int argc, char** argv) {
                         }
                         glBindVertexArray(0);
                         glEnable(GL_BLEND);
+                    }
+                }
+                // Entities this frame (ours or the server's), and dropped items: a small spinning,
+                // bobbing copy of the block, or a flat picture for items and plants. Mobs whose
+                // model isn't known here (a server-only mod) are a plain box the size of their hitbox.
+                const std::vector<EntityView> entityViews = currentEntityViews();
+                {
+                    static GLuint itemVao = 0, itemVbo = 0;
+                    static std::vector<Vertex> verts;
+                    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+                    auto& breg = BlockRegistry::getInstance();
+                    const float now = static_cast<float>(glfwGetTime());
+                    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+                    bool any = false;
+                    for (const EntityView& v : entityViews) {
+                        const bool item = v.type == EntityManager::kItemType;
+                        if (!item && g_EntityVisuals.count(v.type) && g_EntityVisuals[v.type].model) continue;
+                        uint8_t id = item ? breg.getBlockId(v.item) : breg.getBlockId("stone");
+                        if (id == 0 && !item) id = 1;
+                        if (id == 0) continue;
+                        const glm::ivec3 cell(glm::floor(v.pos + glm::vec3(0.0f, 0.3f, 0.0f)));
+                        const uint16_t l = world.getLightAt(cell);
+                        const float lv[4] = { light::sky(l) / 15.0f, light::red(l) / 15.0f, light::green(l) / 15.0f, light::blue(l) / 15.0f };
+                        const BlockProperty& bp = breg.getBlock(id);
+                        const bool flat = item && (bp.inventoryLayer >= 0 || bp.pattern == "plantlike");
+                        glm::mat4 model(1.0f);
+                        if (flat) {
+                            int layer = bp.inventoryLayer;
+                            bool tint = false;
+                            if (layer < 0) for (int f : { 0, 2, 4, 1, 5, 3 }) if (layer < 0 && bp.faces[f].baseLayer >= 0) { layer = bp.faces[f].baseLayer; tint = bp.faces[f].tintBase; }
+                            const glm::vec3 c = tint ? bp.defaultTint : glm::vec3(1.0f);
+                            auto mk = [&](float x, float y, float u, float w, float shade) {
+                                Vertex vx{};
+                                vx.posX = x; vx.posY = y; vx.posZ = 0.0f;
+                                vx.tintR = c.r; vx.tintG = c.g; vx.tintB = c.b;
+                                vx.texCoordX = u; vx.texCoordY = w;
+                                vx.baseLayer = static_cast<float>(layer); vx.overlayLayer = -1.0f;
+                                vx.tintBase = tint ? 1.0f : 0.0f; vx.tintOverlay = 0.0f;
+                                vx.faceShading = shade;
+                                vx.lightSky = lv[0]; vx.lightR = lv[1]; vx.lightG = lv[2]; vx.lightB = lv[3];
+                                return vx;
+                            };
+                            const Vertex a = mk(-0.5f, 0.0f, 0, 1, 1.0f), b = mk(0.5f, 0.0f, 1, 1, 1.0f),
+                                         cc = mk(0.5f, 1.0f, 1, 0, 1.0f), d = mk(-0.5f, 1.0f, 0, 0, 1.0f);
+                            verts = { a, b, cc, a, cc, d };
+                            Vertex a2 = a, b2 = b, c2 = cc, d2 = d;
+                            for (Vertex* vv : { &a2, &b2, &c2, &d2 }) vv->faceShading = 0.8f;
+                            verts.insert(verts.end(), { b2, a2, d2, b2, d2, c2 });
+                            const float bob = std::sin(now * 2.5f + static_cast<float>(v.id)) * 0.05f;
+                            model = glm::translate(glm::mat4(1.0f), v.pos + glm::vec3(0.0f, 0.08f + bob, 0.0f));
+                            model = glm::rotate(model, glm::radians(v.yaw + now * 60.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                            model = glm::scale(model, glm::vec3(0.45f));
+                        } else {
+                            ChunkMesh::buildSingleBlock(id, lv, verts);
+                            if (item) {
+                                const float bob = std::sin(now * 2.5f + static_cast<float>(v.id)) * 0.05f;
+                                model = glm::translate(glm::mat4(1.0f), v.pos + glm::vec3(0.0f, 0.1f + bob, 0.0f));
+                                model = glm::rotate(model, glm::radians(v.yaw + now * 60.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                                model = glm::scale(model, glm::vec3(0.25f));
+                            } else {
+                                model = glm::translate(glm::mat4(1.0f), v.pos);
+                                model = glm::rotate(model, glm::radians(-v.yaw), glm::vec3(0.0f, 1.0f, 0.0f));
+                                model = glm::scale(model, glm::vec3(v.width, v.height, v.width));
+                            }
+                            model = glm::translate(model, glm::vec3(-0.5f, 0.0f, -0.5f));
+                        }
+                        if (verts.empty()) continue;
+                        if (!any) {
+                            glUniform1f(glGetUniformLocation(shaderProgram, "u_ChunkFade"), 1.0f);
+                            glDisable(GL_BLEND);
+                            glDisable(GL_CULL_FACE);
+                            any = true;
+                        }
+                        ChunkMesh::uploadVertices(itemVao, itemVbo, verts);
+                        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+                        glBindVertexArray(itemVao);
+                        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+                        // two or more: a second one, a little apart (like Minecraft's stacks)
+                        if (v.itemCount > 1 && item) {
+                            const glm::mat4 second = glm::translate(glm::mat4(1.0f), glm::vec3(0.12f, 0.1f, 0.08f)) * model;
+                            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(second));
+                            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+                        }
+                    }
+                    if (any) {
+                        glBindVertexArray(0);
+                        glEnable(GL_BLEND);
+                        if (cullWas) glEnable(GL_CULL_FACE);
                     }
                 }
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
@@ -6988,6 +7447,10 @@ int main(int argc, char** argv) {
                 modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw + 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 
                 // Player model: only in third person (in first person the camera is inside its head)
+                {
+                    const glm::vec3 lit = modelLightAt(player.position + glm::vec3(0.0f, 1.0f, 0.0f));
+                    glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LocalLight"), lit.r, lit.g, lit.b);
+                }
                 if (g_ThirdPerson) {
                     try {
                         sol::object modelObj = lua["g_PlayerModel"];
@@ -7003,10 +7466,77 @@ int main(int argc, char** argv) {
                 // Models placed from Lua with engine.add_model (mobs etc.)
                 for (const auto& [id, inst] : g_ModelInstances) {
                     if (!inst.visible || !inst.model) continue;
+                    const glm::vec3 lit = modelLightAt(inst.position + glm::vec3(0.0f, 0.5f, 0.0f));
+                    glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LocalLight"), lit.r, lit.g, lit.b);
                     glm::mat4 m = glm::translate(glm::mat4(1.0f), inst.position);
                     m = glm::rotate(m, glm::radians(inst.yaw), glm::vec3(0.0f, 1.0f, 0.0f));
                     m = glm::scale(m, glm::vec3(inst.scale));
                     inst.model->draw(modelShaderProgram, m);
+                }
+
+                // Mobs with models: each posed with its own animation (the time since it started),
+                // lit by the light where it stands, and flashing red for a moment when hit.
+                // Models face -z (north) at rest, the way Blockbench makes Bedrock entities; yaw 0
+                // = facing +x (east), 90 = +z (south).
+                {
+                    const double now = glfwGetTime();
+                    const GLint localLight = glGetUniformLocation(modelShaderProgram, "u_LocalLight");
+                    const GLint tintLoc = glGetUniformLocation(modelShaderProgram, "u_Tint");
+                    std::unordered_set<uint32_t> present;
+                    for (const EntityView& v : entityViews) {
+                        present.insert(v.id);
+                        EntityLook& look = g_EntityLooks[v.id];
+                        if (look.seen && v.hurtCount != look.hurtCount) look.hurtUntil = now + 0.35;
+                        look.hurtCount = v.hurtCount;
+                        if (!look.seen || v.anim != look.anim) { look.anim = v.anim; look.animStart = now; }
+                        look.seen = true;
+                        auto vis = g_EntityVisuals.find(v.type);
+                        if (vis == g_EntityVisuals.end() || !vis->second.model) continue;
+                        AnimatedModel& model = *vis->second.model;
+                        model.resetPose();
+                        if (!v.anim.empty() && vis->second.anims) {
+                            for (const auto& a : vis->second.anims->animations) {
+                                if (!a || a->name != v.anim) continue;
+                                float t = static_cast<float>((now - look.animStart) * v.animSpeed);
+                                if (a->length > 0.0f) t = v.animLoop ? std::fmod(std::max(t, 0.0f), a->length) : std::min(t, a->length);
+                                a->apply(model, t);
+                                break;
+                            }
+                        }
+                        // light where it stands (sunlight in caves is dark; torches light it)
+                        const glm::vec3 lit = modelLightAt(v.pos + glm::vec3(0.0f, std::min(v.height * 0.5f, 1.0f), 0.0f));
+                        glUniform3f(localLight, lit.r, lit.g, lit.b);
+                        if (now < look.hurtUntil) glUniform4f(tintLoc, 1.0f, 0.15f, 0.1f, 0.45f);
+                        else glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+                        glm::mat4 m = glm::translate(glm::mat4(1.0f), v.pos);
+                        m = glm::rotate(m, glm::radians(-v.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                        m = glm::scale(m, glm::vec3(vis->second.scale));
+                        model.draw(modelShaderProgram, m);
+                    }
+                    glUniform3f(localLight, 1.0f, 1.0f, 1.0f);
+                    glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+                    for (auto it = g_EntityLooks.begin(); it != g_EntityLooks.end();) {
+                        if (present.count(it->first)) ++it; else it = g_EntityLooks.erase(it);
+                    }
+                }
+
+                // See-through blocks last (water, glass...): everything else is already drawn, so
+                // the half of a cow under the water is seen through it, tinted like the lake bed
+                {
+                    glUseProgram(shaderProgram);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
+                    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+                    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_IsGUI"), 0);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_Unlit"), 0);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 1);
+                    glEnable(GL_DEPTH_TEST);
+                    glDepthFunc(GL_LESS);
+                    worldRenderer.renderTransparent(shaderProgram);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }
 
                 if (isCursorDisabled && (!g_ChatSystem || !g_ChatSystem->isOpen) && rayResult.hit) {
@@ -7292,6 +7822,30 @@ int main(int argc, char** argv) {
                             g_FontRenderer->renderText(fontProgram, tag.text, x, tag.y, scale, scale,
                                                        glm::vec4(1.0f), screen);
                         }
+                    }
+                }
+
+                // Name tags above entities that have one (self:set_nametag), within 24 blocks
+                if (g_FontRenderer) {
+                    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
+                    const glm::mat4 vp = proj * view;
+                    const Dimensions2D screen{width, height};
+                    bool started = false;
+                    for (const EntityView& v : entityViews) {
+                        if (v.nametag.empty()) continue;
+                        const glm::vec3 head = v.pos + glm::vec3(0.0f, v.height + 0.35f, 0.0f);
+                        if (glm::distance(head, camPos) > 24.0f) continue;
+                        const glm::vec4 clip = vp * glm::vec4(head, 1.0f);
+                        if (clip.w <= 0.05f) continue;
+                        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+                        if (ndc.x < -1.2f || ndc.x > 1.2f || ndc.y < -1.2f || ndc.y > 1.2f) continue;
+                        if (!started) { resetUIRenderState(); glUseProgram(fontProgram); started = true; }
+                        const float scale = 0.5f;
+                        const float tw = g_FontRenderer->textWidth(v.nametag, scale, screen);
+                        const float x = (ndc.x * 0.5f + 0.5f) * width - tw * 0.5f;
+                        const float y = (1.0f - (ndc.y * 0.5f + 0.5f)) * height;
+                        g_FontRenderer->renderText(fontProgram, v.nametag, x + 2.0f, y + 2.0f, scale, scale, glm::vec4(0.0f, 0.0f, 0.0f, 0.8f), screen);
+                        g_FontRenderer->renderText(fontProgram, v.nametag, x, y, scale, scale, glm::vec4(1.0f), screen);
                     }
                 }
 

@@ -164,6 +164,16 @@ public:
     std::vector<ChunkCoord> takeDirtyChunks();
     // Chunks unloaded since the last call.
     std::vector<ChunkCoord> takeUnloadedChunks();
+    // Chunks that arrived since the last call (the world's own: not a joined player's copy):
+    // { coordinate, true = loaded from its save file / false = newly generated }. For LBMs.
+    std::vector<std::pair<ChunkCoord, bool>> takeLoadedChunks() { std::vector<std::pair<ChunkCoord, bool>> out; out.swap(m_justLoaded); return out; }
+    // Every chunk loaded right now
+    std::vector<ChunkCoord> loadedChunkCoords() const {
+        std::vector<ChunkCoord> out;
+        out.reserve(chunks.size());
+        for (const auto& c : chunks) out.push_back(c.first);
+        return out;
+    }
     // Goes up every reset(), so anything caching chunk data knows to throw it all away.
     unsigned resetCount() const { return m_resetCount; }
 
@@ -199,7 +209,7 @@ private:
     void unloadDistantChunks();
     bool wantedChunk(const ChunkCoord& c) const;   // inside some player's area (+ margin)
     void collectGenerated();
-    void addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk);
+    void addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk, bool fromDisk = false);
     void recordChange(const glm::ivec3& loc);
     void ensureLuaSeeded(sol::state& lua);
 
@@ -266,6 +276,7 @@ private:
     // Change tracking
     std::unordered_set<ChunkCoord, PairHash> m_dirty;
     std::vector<ChunkCoord> m_unloaded;
+    std::vector<std::pair<ChunkCoord, bool>> m_justLoaded;   // (takeLoadedChunks)
     unsigned m_resetCount = 0;
 
     std::unique_ptr<FluidSimulator> m_fluids;

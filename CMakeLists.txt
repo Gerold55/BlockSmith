@@ -165,6 +165,11 @@ add_executable(BlockSmith
     Audio.h
     StbVorbis.cpp
     Net.cpp
+    Entities.cpp
+    BlockModifiers.cpp
+    BlockModifiers.h
+    Entities.h
+    EntityLua.h
     Net.h
     RemoteContent.cpp
     RemoteContent.h
@@ -236,6 +241,11 @@ add_executable(BlockSmithServer
     Block.cpp
     BlockDefs.cpp
     Net.cpp
+    Entities.cpp
+    BlockModifiers.cpp
+    BlockModifiers.h
+    Entities.h
+    EntityLua.h
     RemoteContent.cpp
     PlayerMovement.cpp
 )

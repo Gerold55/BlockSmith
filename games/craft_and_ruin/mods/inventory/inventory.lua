@@ -997,8 +997,14 @@ function handle_creative_click(mx, my, W, H, button, shift)
         end
     end
 
-    -- Outside the window while carrying something: throw it away
-    if state.held and not inside(mx, my, L.x, L.y, L.w, L.h) then state.held = nil end
+    -- Outside the window while carrying something: drop it into the world, like Minecraft (left
+    -- click: the whole stack, right click: one). An older engine without drop_item: thrown away.
+    if state.held and not inside(mx, my, L.x, L.y, L.w, L.h) then
+        local n = button == "right" and 1 or state.held.count
+        if engine.drop_item then engine.drop_item(state.held.name, n) end
+        state.held.count = state.held.count - n
+        if state.held.count <= 0 then state.held = nil end
+    end
 end
 
 -- Mouse wheel: up = previous page, down = next (the last page is clamped while drawing)

@@ -26,6 +26,13 @@ public:
 
     // Draws all visible chunk meshes (opaque then transparent).
     void render(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye);
+    // The same in two halves, so everything else in the world (mobs, items, players,
+    // particles...) can be drawn between them: solid blocks and plants first, then - after
+    // everything else - water, glass and other see-through blocks, so what's under the water
+    // is seen through it instead of drawn over it. renderTransparent uses the chunks
+    // renderOpaque found visible this frame.
+    void renderOpaque(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye);
+    void renderTransparent(GLuint shaderProgram);
 
     // Fraction (0..1) of chunks within `radius` of pos that are loaded, meshed and on the GPU.
     float areaReadyProgress(const World& world, const glm::vec3& pos, int radius) const;
@@ -55,6 +62,10 @@ private:
     void uploadMeshes();
     float chunkFade(const ChunkCoord& c) const;
     void drawList(GLuint shaderProgram, std::vector<Visible>& list) const;
+    void collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list);
+    void drawOpaque(GLuint shaderProgram, std::vector<Visible>& list) const;
+    void drawTransparent(GLuint shaderProgram, const std::vector<Visible>& list) const;
+    std::vector<Visible> m_visible;     // this frame's chunks (renderOpaque -> renderTransparent)
 
     std::unordered_map<ChunkCoord, std::unique_ptr<ChunkMesh>, PairHash> m_meshes;
     std::unordered_set<ChunkCoord, PairHash> m_needsMesh;     // waiting to be (re)built

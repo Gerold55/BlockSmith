@@ -23,6 +23,7 @@
 #include <vector>
 #include "World.h"
 #include "PlayerMovement.h"
+#include "Entities.h"
 
 typedef struct _ENetHost ENetHost;
 typedef struct _ENetPeer ENetPeer;
@@ -227,6 +228,19 @@ public:
     void setShared(const std::string& key, const std::string& value);
     const std::unordered_map<std::string, std::string>& shared() const { return m_shared; }
 
+    // Entities (mobs, dropped items): the owner's EntityManager. Players get what's near them:
+    // what each one is and looks like (when it appears or changes) and where it is, 20 times a
+    // second. Their games only draw them; nothing else of the entity is sent.
+    void setEntities(EntityManager* entities) { m_entityManager = entities; }
+    // A player hit (kind 0) or right-clicked (kind 1) an entity, holding `item`. Already checked:
+    // it exists and is within their reach, and they aren't clicking faster than 10 times a second.
+    std::function<void(const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& playerPos)> onEntityAct;
+    // A player's game dropped items (a block they dug, or thrown out): checked to be next to them
+    // How it was dropped: `returned` = it didn't fit in their inventory (picked up again a little
+    // later); hasVelocity = thrown (Q, a death scatter) with `velocity`; pickupDelay < 0 = usual.
+    struct DropInfo { bool returned = false; bool hasVelocity = false; glm::vec3 velocity{0.0f}; float pickupDelay = -1.0f; };
+    std::function<void(const std::string& name, const std::string& item, int count, const glm::vec3& pos, const DropInfo& how)> onDropItem;
+
     // The time of day (DayTime.h). The owner (the dedicated server, or the game when hosting)
     // calls this every tick with its clock; players get it when they join, every few seconds,
     // and at once when it jumps (a "time set") or its speed changes.
@@ -278,7 +292,15 @@ private:
         float movedThisSecond = 0.0f, speed = 0.0f;   // horizontal blocks/second on the server
         double statsWindow = 0.0;
         std::unordered_set<World::ChunkCoord, PairHash> sentChunks;
+        // Entities this player's game knows about: what we last told it
+        struct KnownEntity { uint32_t version = 0; glm::vec3 pos{0.0f}; float yaw = 0.0f; };
+        std::unordered_map<uint32_t, KnownEntity> knownEntities;
+        double entityActWindow = 0.0;     // (hits / right-clicks / drops: at most 10 / 30 a second)
+        int entityActs = 0, drops = 0;
     };
+    void sendEntities();
+    EntityManager* m_entityManager = nullptr;
+    float m_entityTimer = 0.0f;
 
     void handlePacket(Client& c, const uint8_t* data, size_t size);
     void sendStatus(ENetPeer* peer);
@@ -425,6 +447,16 @@ public:
     // The server's time of day, once each time it arrives (older servers never send one: then
     // the game keeps its own clock)
     bool takeDayTime(DayClock& out) { if (!m_dayTimeNew) return false; out = m_dayTime; m_dayTimeNew = false; return true; }
+    // Entities near us (mobs, dropped items), where they are this frame (drawn a little in the
+    // past, smoothly, like other players)
+    const std::unordered_map<uint32_t, EntityView>& entities() const { return m_entityViews; }
+    // Hit (kind 0) or right-click (kind 1) an entity, holding `item`; the server decides what happens
+    void sendEntityAct(uint32_t id, int kind, const std::string& item);
+    // Drop items into the world next to us (what we dug, or threw out); the server makes them
+    // returned = it was given to us but didn't fit; velocity (thrown) and pickupDelay (< 0 = usual)
+    void sendDropItem(const std::string& item, int count, const glm::vec3& pos, bool returned = false,
+                      const glm::vec3* velocity = nullptr, float pickupDelay = -1.0f);
+
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
 
@@ -467,6 +499,12 @@ private:
     std::vector<net::ChatLine> m_chat;
     std::unordered_map<std::string, std::string> m_shared;
     float m_posTimer = 0.0f;
+
+    struct EntitySnap { double time; glm::vec3 pos; float yaw; };
+    std::unordered_map<uint32_t, EntityView> m_entityViews;
+    std::unordered_map<uint32_t, std::deque<EntitySnap>> m_entitySnaps;
+    void interpolateEntities(double renderTime);
+    void syncClock(float serverTime);
 
     // Prediction & reconciliation
     struct PendingInput { uint32_t seq; MoveInput input; float dt; };

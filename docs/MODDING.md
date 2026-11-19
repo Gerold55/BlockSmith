@@ -60,7 +60,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [1. Folders](#1-folders)
    - [2. Your first mod](#2-your-first-mod)
    - [3. Blocks and items](#3-blocks-and-items)
-   - [4. Changing the world](#4-changing-the-world)
+   - [4. Changing the world](#4-changing-the-world) (and [random ticks, ABMs, LBMs](#abm))
    - [5. World generation](#5-world-generation)
    - [6. Items that do things](#6-items-that-do-things)
    - [7. Fluids](#7-fluids)
@@ -70,6 +70,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [11. Survival: health, hunger, digging](#11-survival-health-hunger-digging)
    - [12. Sound](#12-sound)
    - [13. Models](#13-models)
+   - [13a. Mobs and other entities](#13a-mobs-and-other-entities)
    - [14. UI: menus and screens](#14-ui-menus-and-screens)
    - [15. Hotbar](#15-hotbar)
    - [16. Hooks the engine calls](#16-hooks-the-engine-calls)
@@ -1032,72 +1033,52 @@ Try it with `/weather sandstorm`. The weather mod already sends the change to ev
 
 ## C14. A mob with a model and an animation
 
-A cow that wanders around and plays its walk animation. Make the model and animation in Blockbench: export the model as *Bedrock Geometry* (`cow.geo.json`) and the animation with *Export Bedrock Animations* (`cow.animation.json`). Put both in your mod's `models/` folder and the skin in `textures/`.
+A cow that wanders around, plays its walk animation, runs away when you hit it, and drops beef when it dies. Make the model and animation in Blockbench: export the model as *Bedrock Geometry* (`cow.geo.json`) and the animations with *Export Bedrock Animations* (`cow.animation.json`). Put both in your mod's `models/` folder and the skin in `textures/`. Build it facing north (-z), the way Blockbench starts a Bedrock entity.
 
 ```lua
-local model = engine.load_model("cow.geo.json", "cow.png")
-local anims = engine.load_animations("cow.animation.json")
-local walk = anims and (anims:get("walk") or anims:get())
-if walk then walk:set_loop(true) end
+entities.register("mymod:cow", {
+    hitbox = { 0.9, 1.4 },                      -- width, height in blocks
+    health = 10,
+    model = "cow.geo.json", texture = "cow.png", animations = "cow.animation.json",
+    drops = { { "beef", 1, 3 } },               -- item, fewest, most
 
-local cow = nil         -- { id, x, y, z, yaw, target_yaw, timer }
-local t = 0
+    on_spawn = function(self)
+        self.timer = 0                           -- your own fields: self stays the same table
+    end,
 
-local function ground_at(x, z, from_y)
-    for y = from_y + 3, from_y - 6, -1 do
-        if engine.get_block_name(math.floor(x), y, math.floor(z)) ~= "air" then return y + 1 end
-    end
-    return nil
-end
+    on_step = function(self, dt)                 -- every tick
+        if self.panic and self.panic > 0 then    -- just hit: run
+            self.panic = self.panic - dt
+            if self:path_state() ~= "following" then self:wander(8, 3) end   -- run somewhere
+            self:set_animation("walk", 2)        -- twice as fast
+            return
+        end
+        self.timer = self.timer - dt
+        if self.timer <= 0 and self:path_state() ~= "following" then
+            self.timer = math.random(3, 7)       -- every few seconds: go somewhere else
+            if math.random() < 0.5 then self:wander(10, 1) end   -- a spot it can reach, round trees
+        end
+        self:set_animation(self:path_state() == "following" and "walk" or "idle")
+    end,
 
-local previous_update = on_update
-function on_update(dt, ...)
-    if previous_update then previous_update(dt, ...) end
-    if not model then return end
+    on_punch = function(self, player, item, damage)
+        self.panic = 3
+        self:stop()
+        -- return true here to stop the engine taking the damage and knocking it back
+    end,
+})
 
-    -- Spawn one cow near the player the first time
-    if not cow then
-        local px, py, pz = engine.get_player_position()
-        local y = ground_at(px + 4, pz, math.floor(py))
-        if not y then return end
-        cow = { x = px + 4, y = y, z = pz, yaw = 0, target_yaw = 0, timer = 0 }
-        cow.id = engine.add_model(model, cow.x, cow.y, cow.z, cow.yaw)
-    end
-
-    -- Every few seconds, pick a new direction
-    cow.timer = cow.timer - dt
-    if cow.timer <= 0 then
-        cow.target_yaw = math.random(0, 359)
-        cow.timer = math.random(3, 7)
-    end
-    cow.yaw = cow.yaw + (cow.target_yaw - cow.yaw) * math.min(1, dt * 3)   -- turn smoothly
-
-    -- Walk forward, and stay on the ground
-    local speed = 1.2
-    local nx = cow.x + math.cos(math.rad(cow.yaw)) * speed * dt
-    local nz = cow.z + math.sin(math.rad(cow.yaw)) * speed * dt
-    local ny = ground_at(nx, nz, cow.y)
-    if ny and math.abs(ny - cow.y) <= 1 then
-        cow.x, cow.y, cow.z = nx, ny, nz
-    else
-        cow.timer = 0                          -- a wall or a drop: turn around next frame
-    end
-    engine.move_model(cow.id, cow.x, cow.y, cow.z, cow.yaw)
-
-    -- Animate
-    t = t + dt
-    if walk then
-        model:reset_pose()
-        walk:apply(model, t)
-    end
-end
+-- Cows spawn by themselves on grass in daylight, a few at a time
+entities.register_spawn({ name = "mymod:cow", on = { "grass" }, min_light = 9, sky = true,
+                          chance = 0.25, group = { 2, 4 }, max_nearby = 6 })
 ```
 
 **Things to know:**
-- **Yaw** is in degrees. Yaw 0 faces +x (east), 90 faces +z.
-- **Poses are shared.** Every copy you place with `engine.add_model` uses the same model, so they all share one pose. For cows that move out of step, load the model once per cow.
-- **Moving bones yourself:** `local head = model:get_bone("head")`, then `head:set_rotation(x, y, z)` (degrees) or `head:set_position(x, y, z)`. Do it after `walk:apply` to add to the animation.
-- **Multiplayer:** models are drawn only in your own game. This simple cow lives only on your screen; for a cow everyone sees, the authority decides where it is and shares that with `engine.set_shared`.
+- **Yaw** is in degrees. Yaw 0 faces +x (east), 90 faces +z (south).
+- **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
+- **Each cow animates on its own.** Animations play from when you set them, so cows walk out of step.
+- **Spawn one yourself:** `entities.spawn("mymod:cow", x, y, z)`.
+- The `mobs` mod that comes with BlockSmith has a full cow and a zombie (one that chases you and burns in the sun) to copy from. Everything is in [Reference §13a](#13a-mobs-and-other-entities).
 
 ## C15. Your own terrain
 
@@ -1528,7 +1509,7 @@ Type in the search box (in `MODDING.html`) or use your browser's find (Ctrl+F) t
 Every function and hook, by table, each linking to where it's explained. `lua_api.txt` (written by the engine at startup) lists what your build has.
 
 **engine** (131)  
-[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
+[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
 
 **remote** (8)  
 [`remote.check_url`](#fn-remote-check_url) · [`remote.fetch`](#fn-remote-fetch) · [`remote.get_cached`](#fn-remote-get_cached) · [`remote.is_available`](#fn-remote-is_available) · [`remote.null`](#fn-remote-null) · [`remote.refresh`](#fn-remote-refresh) · [`remote.unwatch`](#fn-remote-unwatch) · [`remote.watch`](#fn-remote-watch)
@@ -1537,7 +1518,7 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`creative.get_held`](#fn-creative-hold) · [`creative.hold`](#fn-creative-hold) · [`creative.register_category`](#fn-creative-register_category) · [`creative.register_tab`](#fn-creative-register_tab) · [`creative.set_category`](#fn-creative-set_category)
 
 **ui_kit** (`require("ui_kit")`)  
-[`kit.embed`](#fn-uikit-embed) · [`kit.form`](#fn-uikit-form) · [`kit.theme`](#fn-uikit-theme) · [`form:open`](#fn-uikit-open) · [`f:button`](#fn-uikit-button) · [`f:checkbox`](#fn-uikit-checkbox) · [`f:draggable`](#fn-uikit-draggable) · [`f:dragging`](#fn-uikit-dragging) · [`f:drop_target`](#fn-uikit-drop_target) · [`f:field`](#fn-uikit-field) · [`f:focus_window`](#fn-uikit-focus_window) · [`f:icon`](#fn-uikit-icon) · [`f:image`](#fn-uikit-image) · [`f:item`](#fn-uikit-item) · [`f:label`](#fn-uikit-label) · [`f:list`](#fn-uikit-list) · [`f:maximize_window`](#fn-uikit-maximize_window) · [`f:window_state`](#fn-uikit-window_state) · [`f:popup`](#fn-uikit-popup) · [`f:scroll_area`](#fn-uikit-scroll_area) · [`f:set_work_area`](#fn-uikit-set_work_area) · [`f:slider`](#fn-uikit-slider) · [`f:take_click`](#fn-uikit-take_click) · [`f:take_scroll`](#fn-uikit-take_scroll) · [`f:text`](#fn-uikit-text) · [`f:window`](#fn-uikit-window) · [`f:window_list`](#fn-uikit-window_list) · [`kit.selection`](#fn-uikit-selection) · [`kit.overlaps`](#fn-uikit-overlaps) · [`f:marquee`](#fn-uikit-marquee) · [`f:selected_windows`](#fn-uikit-selected_windows)
+[`kit.embed`](#fn-uikit-embed) · [`kit.form`](#fn-uikit-form) · [`kit.theme`](#fn-uikit-theme) · [`form:open`](#fn-uikit-open) · [`f:button`](#fn-uikit-button) · [`f:button_width`](#fn-uikit-button_width) · [`f:text_width`](#fn-uikit-text_width) · [`f:checkbox`](#fn-uikit-checkbox) · [`f:draggable`](#fn-uikit-draggable) · [`f:dragging`](#fn-uikit-dragging) · [`f:drop_target`](#fn-uikit-drop_target) · [`f:field`](#fn-uikit-field) · [`f:focus_window`](#fn-uikit-focus_window) · [`f:icon`](#fn-uikit-icon) · [`f:image`](#fn-uikit-image) · [`f:item`](#fn-uikit-item) · [`f:label`](#fn-uikit-label) · [`f:list`](#fn-uikit-list) · [`f:maximize_window`](#fn-uikit-maximize_window) · [`f:window_state`](#fn-uikit-window_state) · [`f:popup`](#fn-uikit-popup) · [`f:scroll_area`](#fn-uikit-scroll_area) · [`f:set_work_area`](#fn-uikit-set_work_area) · [`f:slider`](#fn-uikit-slider) · [`f:take_click`](#fn-uikit-take_click) · [`f:take_scroll`](#fn-uikit-take_scroll) · [`f:text`](#fn-uikit-text) · [`f:window`](#fn-uikit-window) · [`f:window_list`](#fn-uikit-window_list) · [`kit.selection`](#fn-uikit-selection) · [`kit.icon_grid`](#fn-uikit-icon_grid) · [`kit.overlaps`](#fn-uikit-overlaps) · [`f:marquee`](#fn-uikit-marquee) · [`f:selected_windows`](#fn-uikit-selected_windows)
 
 **world** (11)  
 [`world.get_cave_settings`](#fn-world-get_cave_settings) · [`world.get_caves_enabled`](#fn-world-get_caves_enabled) · [`world.get_falling_blocks`](#fn-world-get_falling_blocks) · [`world.get_loaded_chunks`](#fn-world-get_loaded_chunks) · [`world.get_pending_chunks`](#fn-world-get_pending_chunks) · [`world.get_render_distance`](#fn-world-get_render_distance) · [`world.set_cave_settings`](#fn-world-set_cave_settings) · [`world.set_caves_enabled`](#fn-world-set_caves_enabled) · [`world.set_load_budget`](#fn-world-set_load_budget) · [`world.set_mesh_budget`](#fn-world-set_mesh_budget) · [`world.set_render_distance`](#fn-world-set_render_distance)
@@ -1550,6 +1531,9 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 
 **chat** (2)  
 [`chat.register_command`](#fn-chat-register_command) · [`chat.send`](#fn-chat-send)
+
+**entities** (13, and the `self` functions)  
+[`entities.register`](#fn-entities-register) · [`entities.spawn`](#fn-entities-spawn) · [`entities.get`](#fn-entities-get) · [`entities.get_all`](#fn-entities-get) · [`entities.in_radius`](#fn-entities-in_radius) · [`entities.nearest_player`](#fn-entities-nearest_player) · [`entities.get_players`](#fn-entities-get_players) · [`entities.damage_player`](#fn-entities-damage_player) · [`entities.drop_item`](#fn-entities-drop_item) · [`entities.get_attack_damage`](#fn-entities-get_attack_damage) · [`entities.register_spawn`](#fn-entities-register_spawn) · [`entities.line_of_sight`](#fn-entities-line_of_sight) · [`entities.find_path`](#fn-entities-find_path) · [`self:go_to`](#fn-entity-go_to) · [`self:wander`](#fn-entity-wander) · [`self:path_state`](#fn-entity-path_state) · [`self:can_see`](#fn-entity-can_see) · [`self:find_land`](#fn-entity-find_land) · [`self:is_blocked`](#fn-entity-is_blocked) · [`self:walk`](#fn-entity-walk) · [`self:walk_to`](#fn-entity-walk_to) · [`self:set_animation`](#fn-entity-set_animation) · [`self:damage`](#fn-entity-damage) · [`self:get_pos`](#fn-entity-get_pos)
 
 **sky** (35)  
 [`sky.add_light`](#fn-sky-add_light) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
@@ -1579,7 +1563,7 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`model:get_bone`](#fn-model-get_bone) · [`model:reset_pose`](#fn-model-reset_pose) · [`bone:get_rotation`](#fn-bone-get_rotation) · [`bone:set_position`](#fn-bone-set_position) · [`bone:set_rotation`](#fn-bone-set_rotation) · [`anims:get`](#fn-animationset-get) · [`anims:names`](#fn-animationset-names) · [`anim:apply`](#fn-animation-apply) · [`anim:get_length`](#fn-animation-get_length) · [`anim:get_name`](#fn-animation-get_name) · [`anim:is_looping`](#fn-animation-is_looping) · [`anim:set_loop`](#fn-animation-set_loop)
 
 **Hooks (functions you define)** (36)  
-[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
+[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`can_pick_up_item`](#fn-hooks-can_pick_up_item) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_player_drop`](#fn-hooks-on_player_drop) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
 
 **weather (mods/weather)** (11)  
 [`weather.get`](#fn-weather-get) · [`weather.get_def`](#fn-weather-get_def) · [`weather.is_cold`](#fn-weather-is_cold) · [`weather.is_cycling`](#fn-weather-is_cycling) · [`weather.list`](#fn-weather-list) · [`weather.on_change`](#fn-weather-on_change) · [`weather.on_lightning`](#fn-weather-on_lightning) · [`weather.register`](#fn-weather-register) · [`weather.set`](#fn-weather-set) · [`weather.set_cycle`](#fn-weather-set_cycle) · [`weather.time_left`](#fn-weather-time_left)
@@ -1779,11 +1763,77 @@ The mod sets these with `engine.set_block_meta`, so any mod can make door-like b
 | <a id="fn-engine-get_metadata"></a>`engine.get_metadata(x, y, z)` | 0–255 |
 | <a id="fn-engine-set_block_meta"></a>`engine.set_block_meta(x, y, z, name, meta)` | block and metadata in one change |
 | <a id="fn-engine-is_replaceable"></a>`engine.is_replaceable(x, y, z)` | air, a fluid or a plant: there's room to put something |
+| <a id="fn-engine-is_opaque"></a>`engine.is_opaque(x, y, z)` | a solid block light can't get through (stone, dirt, planks); false for air, water, plants, leaves and glass |
 | <a id="fn-world-get_render_distance"></a><a id="fn-world-set_render_distance"></a>`world.set_render_distance(chunks)` / `get_render_distance()` | |
 | <a id="fn-world-get_falling_blocks"></a>`world.get_falling_blocks()` | the blocks falling right now (sand, gravel...): `{ { name, x, y, z }, ... }`. `x, y, z` is the block's bottom corner; `y` has a fraction while it falls. A falling block isn't in the world (`engine.get_block_name` says air) until it lands. |
 | <a id="fn-world-get_caves_enabled"></a><a id="fn-world-set_caves_enabled"></a>`world.set_caves_enabled(bool)` / `get_caves_enabled()` | built-in caves (turn them off if your mapgen makes its own) |
 | <a id="fn-world-get_loaded_chunks"></a><a id="fn-world-get_pending_chunks"></a>`world.get_loaded_chunks()` / `get_pending_chunks()` | |
 | <a id="fn-world-set_load_budget"></a><a id="fn-world-set_mesh_budget"></a>`world.set_load_budget(ms)` / `set_mesh_budget(ms)` | how much time per frame goes to loading and meshing |
+
+<a id="abm"></a>### Blocks that change by themselves: random ticks, ABMs and LBMs
+
+There are three ways, and all of them run only where the world is decided: singleplayer, the game when hosting, and the dedicated server. Everyone else just sees the blocks change.
+
+<a id="fn-engine-register_random_tick"></a>**Random ticks (Minecraft's way): the smoothest.** Every game tick (20 a second), the engine picks 3 random blocks in every 16×16×16 section of the chunks near players. If a picked block is a kind with a random tick, its action runs. On average each block is picked about every 68 seconds. Because the work is spread evenly over every tick, grass creeps outwards a block at a time and crops grow steadily, rather than everything changing at once every few seconds. This is how Minecraft's grass, crops, saplings, leaves and ice work. The `randomTickSpeed` game rule (3 by default, 0 = off) sets how many blocks are picked: `/gamerule randomTickSpeed 10` makes everything grow about three times faster.
+
+```lua
+engine.register_random_tick({
+    label = "grass spreads and dies",
+    nodenames = { "grass" },
+    action = function(x, y, z, name, meta)
+        if engine.is_opaque(x, y + 1, z) then engine.set_block(x, y, z, "dirt") return end   -- covered
+        if engine.get_light_level(x, y + 1, z) < 9 then return end
+        for _ = 1, 4 do                                       -- Minecraft: 4 tries nearby
+            local tx, ty, tz = x + math.random(-1, 1), y + math.random(-3, 1), z + math.random(-1, 1)
+            if engine.get_block_name(tx, ty, tz) == "dirt" and not engine.is_opaque(tx, ty + 1, tz) then
+                engine.set_block(tx, ty, tz, "grass")
+            end
+        end
+    end,
+})
+```
+Use random ticks for slow, natural change. Use an ABM (below) when a block should check its surroundings every few seconds, or when porting a Luanti mod.
+
+<a id="fn-engine-register_abm"></a>**ABM (Active Block Modifier):** every `interval` seconds, each block of the given kinds near a player (within 3 chunks) has a 1-in-`chance` chance of running your action. Grass spreading, crops growing, fire, lava cooling and moss creeping are typical jobs.
+
+```lua
+engine.register_abm({
+    label = "grass spreads onto dirt",       -- shown if the action has an error
+    nodenames = { "dirt" },                  -- the blocks it acts on
+    neighbors = { "grass" },                 -- only if one of these is among the 26 around it (optional)
+    without_neighbors = { "lava" },          -- ...and none of these (optional)
+    interval = 6,                            -- seconds between rounds
+    chance = 15,                             -- 1 in 15 matching blocks each round
+    min_y = 0, max_y = 255,                  -- (optional)
+    action = function(x, y, z, name, meta)
+        if not engine.is_opaque(x, y + 1, z) and engine.get_light_level(x, y + 1, z) >= 9 then
+            engine.set_block(x, y, z, "grass")
+        end
+    end,
+})
+```
+The engine looks through the area around players a few chunks per tick, so lots of blocks and lots of ABMs don't cause a lag spike. A block changed by one action is checked again before the next runs on it.
+
+<a id="fn-engine-register_lbm"></a>**LBM (Loading Block Modifier):** runs on blocks of the given kinds when their chunk is **loaded from its save file**.
+- With `run_at_every_load = false` (the default) it runs **once per chunk, ever**: for upgrading old worlds, such as replacing a block your mod renamed. Chunks generated after the LBM existed never need it, so they're only noted. Which chunks it has done is kept with the world (`lbm_done.txt`), so give each LBM a lasting, unique `name`.
+- With `run_at_every_load = true` it runs every time such a chunk is loaded from disk: to catch up on things like timers.
+
+```lua
+engine.register_lbm({
+    name = "mymod:old_lamps",                -- unique, and never change it
+    nodenames = { "mymod:lamp_old" },
+    run_at_every_load = false,
+    action = function(x, y, z, name, meta)
+        engine.set_block(x, y, z, "mymod:lamp")
+    end,
+})
+```
+
+Craft & Ruin's `grass` mod (`games/craft_and_ruin/mods/grass`) is Minecraft's grass, on a random tick:
+- a grass block with something solid (or water, or lava) on top turns back to dirt;
+- with light 9 or more above it, it tries 4 random spots nearby (one block each way, from 3 below to 1 above), and dirt there with an open top and light 4 or more becomes grass.
+
+On a dedicated server, which keeps no light, `engine.get_light_level` is open sky (sunlight for the time of day) or dark under cover.
 
 ## 5. World generation
 
@@ -2299,6 +2349,155 @@ end
 
 The Craft & Ruin player mod (`mods/player/animations.lua`) plays its walk cycle this way. It fades in when you start moving, plays faster when you sprint, and fades out when you stop.
 
+For mobs, use `entities` instead ([§13a](#13a-mobs-and-other-entities)). The engine places them, animates each one separately, and shows them to everyone in multiplayer.
+
+## 13a. Mobs and other entities
+
+An **entity** is anything that moves around the world by itself: mobs, and items dropped on the ground. You describe a kind of entity with `entities.register`; the engine moves it (gravity, collisions with blocks, walking, water), draws it, saves it with the world, and lets players hit and right-click it. Your functions decide what it does.
+
+**Who runs them.** Your game in singleplayer and when you host a LAN game; the server on a dedicated server. That's where `on_step`, `on_punch` and the other functions run, and where `entities.spawn` works. Everyone else's game only receives *data* about each entity it can see (its kind, where it is, its animation, its name tag) and draws it. No Lua is ever sent. So register your entities in a mod that **both** the server and the players have: the server needs the behaviour, players need the model. A kind of entity a player's game doesn't know (a server-only mod) is drawn as a plain box of its hitbox's size.
+
+<a id="fn-entities-register"></a>
+```lua
+entities.register("mymod:goat", {
+    -- shape and physics
+    hitbox = { 0.9, 1.3 },       -- width (square footprint) and height, in blocks
+    health = 10,
+    step_height = 0.6,           -- walks up ledges this high (0.6 = slabs, not full blocks)
+    auto_jump = true,            -- walking into a 1-block step jumps it
+    gravity = true,              -- false: it floats where you put it (set_velocity moves it)
+    collides = true,             -- false: passes through blocks
+    knockback = true,            -- pushed back when hit
+    despawn = false,             -- true: removed when no player is near, and never saved (monsters)
+    -- looks (the games that draw it)
+    model = "goat.geo.json",     -- .geo.json (Bedrock / Blockbench) or .b3d, from your mod's models/
+    texture = "goat.png",
+    animations = "goat.animation.json",
+    scale = 1,
+    -- when it dies
+    drops = { { "mutton", 1, 2 }, { "wool", 0, 1 } },   -- item, fewest, most
+    -- what it does (the authority only)
+    on_spawn = function(self, saved) end,            -- saved: what on_save returned last time (or nil)
+    on_step = function(self, dt) end,                -- every tick while a player is within 128 blocks
+    on_punch = function(self, player, item, damage) end,   -- return true: no damage, no knockback
+    on_right_click = function(self, player, item) end,
+    on_death = function(self, killer) end,           -- return true: it stays alive after all
+    on_save = function(self) return "some text" end, -- kept with the world
+})
+```
+
+Names need a `mymod:` prefix. Names starting with `__` are the engine's (`__item` is a dropped item).
+
+**`self`** is a table that stays the same for the whole life of the entity: put your own fields on it (`self.target = name`). `self.id` and `self.name` (its kind) are set for you. Its functions:
+
+| | |
+|---|---|
+| <a id="fn-entity-get_pos"></a>`self:get_pos()` / `set_pos(x, y, z)` | its feet, centred |
+| <a id="fn-entity-get_velocity"></a>`self:get_velocity()` / `set_velocity(x, y, z)` / `add_velocity(x, y, z)` | blocks per second (set_velocity stops walking) |
+| <a id="fn-entity-get_yaw"></a>`self:get_yaw()` / `set_yaw(degrees)` | which way it faces: 0 = +x (east), 90 = +z (south) |
+| <a id="fn-entity-go_to"></a>`self:go_to(x, y, z [, speed])` | **finds a way there and follows it** (below). Fine to call every tick; false if there's no way at all |
+| <a id="fn-entity-wander"></a>`self:wander([radius [, speed]])` | walks to a random spot it can reach within `radius` (8) blocks, never into water. In water it heads for the nearest land instead. False if nowhere was found |
+| <a id="fn-entity-find_land"></a>`self:find_land([radius])` | the nearest dry land it can get to: x, y, z (or nil) |
+| <a id="fn-entity-path_state"></a>`self:path_state()` | `"following"` (on its way), `"arrived"`, `"partial"` (got as near as it could), `"stuck"` or `"none"` |
+| <a id="fn-entity-can_see"></a>`self:can_see(x, y, z)` / `can_see_player(name)` | a ray from its eyes through the blocks: true if nothing solid is in the way |
+| <a id="fn-entity-walk"></a>`self:walk(speed)` / `stop()` | walks straight ahead at `speed` blocks/s (no path), jumping a 1-block step only if its body fits on top; `stop()` also ends a path |
+| <a id="fn-entity-is_blocked"></a>`self:is_blocked()` | walked into something it couldn't step or jump over this tick |
+| <a id="fn-entity-walk_to"></a>`self:walk_to(x, z [, speed [, near]])` | turns and walks straight towards a point (no path); true once within `near` (1) blocks |
+| <a id="fn-entity-look_at"></a>`self:look_at(x, z)` | turns to face a point |
+| <a id="fn-entity-set_animation"></a>`self:set_animation(name [, speed [, loop]])` / `get_animation()` | plays an animation from the `animations` file, from its start. The same name again carries on. `loop = false` plays it once and holds the end. |
+| <a id="fn-entity-set_nametag"></a>`self:set_nametag(text)` | shown above it ("" = none) |
+| <a id="fn-entity-get_health"></a>`self:get_health()` / `set_health(h)` / `get_max_health()` | 0 health = it dies |
+| <a id="fn-entity-damage"></a>`self:damage(amount [, attacker])` | hurts it like a hit: red flash, knockback away from the attacker (a player name) |
+| <a id="fn-entity-remove"></a>`self:remove()` / `is_alive()` | gone straight away (no drops, no on_death) |
+| <a id="fn-entity-is_on_ground"></a>`self:is_on_ground()` / `is_in_water()` | |
+| <a id="fn-entity-distance_to"></a>`self:distance_to(x, y, z)` / `nearest_player([max])` | |
+
+Everything else:
+
+| | |
+|---|---|
+| <a id="fn-entities-spawn"></a>`entities.spawn(name, x, y, z [, data])` | a new one; `data` goes to its `on_spawn`. Returns its `self` (nil on a player's game when joined to a server) |
+| <a id="fn-entities-get"></a>`entities.get(id)`, `entities.get_all([name])` | `self` tables |
+| <a id="fn-entities-in_radius"></a>`entities.in_radius(x, y, z, r [, name])` | entities within `r` blocks |
+| <a id="fn-entities-nearest_player"></a>`entities.nearest_player(x, y, z [, max])` | name, x, y, z, distance (or nil) |
+| <a id="fn-entities-get_players"></a>`entities.get_players()` | `{ {name=, x=, y=, z=}, ... }`, everyone in the world |
+| <a id="fn-entities-line_of_sight"></a>`entities.line_of_sight(x1, y1, z1, x2, y2, z2)` | true if a straight line between the points passes no solid block |
+| <a id="fn-entities-find_path"></a>`entities.find_path(name, x1, y1, z1, x2, y2, z2)` | the route an entity of kind `name` would take: `{ {x=,y=,z=}, ... }` (feet positions), and whether it reaches the end |
+| <a id="fn-entities-damage_player"></a>`entities.damage_player(name, amount [, reason])` | hurts a player (their game's survival mod takes it, armour and all). `reason` is shown when they die: `"was slain by a zombie"` |
+| <a id="fn-entities-drop_item"></a>`entities.drop_item(item, count, x, y, z)` | an item on the ground that players pick up by walking over it |
+| <a id="fn-entities-get_attack_damage"></a>`entities.get_attack_damage(item, player)` | how hard a hit with `item` is: swords 4 + material (stone 5, iron 6, diamond 7), axes 3 + material, a hand 1. Replace the function to change it. |
+| <a id="fn-entities-register_spawn"></a>`entities.register_spawn{ ... }` | spawning by itself (below) |
+
+<a id="entity-paths"></a>**Finding the way.** `self:go_to` plans a route over the blocks (A*) for that entity's size, then walks it:
+- It goes **around** trees, walls and holes instead of into them.
+- It never tries a gap lower than its height: a 1.9-tall zombie won't jump at a 1-block opening.
+- It climbs a 1-block step only where there's room to jump and to stand on top.
+- It walks off ledges of up to 3 blocks.
+- It swims across water only when there's no reasonable way round. Swimming costs a lot more than walking, so it goes around a pond rather than through it. In water it swims along the surface (it doesn't dive) and climbs out onto the bank.
+- It never walks into lava or fire.
+- The route is straightened where it can, so it doesn't zig-zag along the grid.
+
+If the target can't be reached it goes as near as it can (`"partial"`). If something gets in the way it plans again, and after a couple of tries it gives up (`"stuck"`). Chasing is cheap: calling `go_to` every tick only plans again when the target moves more than a block, and at most about 3 times a second. A search looks at up to 1500 blocks, enough for routes of about 30–40 blocks; further targets get a partial route towards them.
+
+```lua
+on_step = function(self, dt)
+    local name, px, py, pz = entities.nearest_player(self:get_pos())
+    if name and self:can_see(px, py + 1.6, pz) then
+        self:go_to(px, py, pz, 2.4)                 -- chase: round obstacles, through doorways
+    elseif self:path_state() ~= "following" then
+        self:wander(10, 1)                          -- wander somewhere reachable
+    end
+    self:set_animation(self:path_state() == "following" and "walk" or "idle")
+end
+```
+
+<a id="entity-water"></a>**In water.** A mob floats with about half its body under the surface (legs down, back and head out) and swims at about half its walking speed. In water shallower than that it just stands on the bottom. Dropped items float on top. A mob that ends up in water (knocked in, or spawned there) and calls `wander` heads for the nearest land first, which is what the cows in the `mobs` mod do.
+
+<a id="entity-spawning"></a>**Spawning by itself.** Every couple of seconds the engine tries a few spots 24–48 blocks from each player, in loaded chunks, and spawns there when all of a rule's conditions hold. There are never more than 40 spawned (`despawn = true`) mobs around one player.
+
+```lua
+entities.register_spawn({
+    name = "mymod:goat",
+    on = { "grass", "stone" },   -- standing on one of these (left out: anything solid)
+    min_light = 9, max_light = 15,   -- engine.get_light_level there (monsters: max_light = 7)
+    sky = true,                  -- only where the sky is overhead
+    when = "day",                -- "day", "night" or "any"
+    min_y = 40, max_y = 200,
+    chance = 0.3,                -- of spawning when a spot qualifies
+    group = { 2, 4 },            -- how many together (or one number)
+    max_nearby = 6,              -- not if there are this many of its kind within 48 blocks
+})
+```
+
+The game rule `doMobSpawning` (`/gamerule doMobSpawning false`) turns natural spawning off.
+
+**Where they stop.** An entity more than 128 blocks from every player, or in a chunk that isn't loaded, waits where it is: no physics, no `on_step`. Ones with `despawn = true` are removed when no player is within 128 blocks, or sometimes after 30 seconds with nobody within 32, like Minecraft's monsters. Those are never saved. Everything else is saved with the world (`entities.txt` in its folder) and comes back with `on_spawn(self, saved)`. If a mod isn't loaded, its entities are kept in the file untouched until it is.
+
+<a id="dropped-items"></a>**Dropped items.** Blocks dug in survival pop out as items, and so do mobs' `drops`. They bob and spin, join into stacks, and a player picks them up by walking over them. If your inventory is full they stay on the ground, and they disappear after 5 minutes.
+
+Players drop things the way they do in Minecraft:
+- **Q** (Settings > Controls, "Drop Item") throws one of what's in your hand the way you're looking. **Ctrl+Q** throws the whole stack. Holding Q keeps dropping.
+- In an inventory screen, **clicking outside the window** while holding a stack drops it: left click the whole stack, right click one. This works in both the survival and the creative inventory.
+- **When you die**, everything you carried scatters on the ground, unless `keepInventory` is on (Craft & Ruin's survival mod keeps it by default).
+- Thrown items can't be picked up for 2 seconds, so you don't catch them straight back.
+- You can't pick anything up while dead.
+
+<a id="fn-engine-drop_item"></a>From a mod: `engine.drop_item(item, count [, x, y, z [, vx, vy, vz [, pickup_delay]]])`. Without a position, the item is thrown from the player's eyes like Q does. It works when joined to a server too, where the server makes the item. `entities.drop_item` (the authority only) makes one with a little pop instead.
+
+<a id="fn-hooks-on_player_drop"></a><a id="fn-hooks-can_pick_up_item"></a>Two hooks:
+- `on_player_drop(item, count)`: return true to stop a drop, for items that can't be dropped.
+- `can_pick_up_item(item, count)`: return false and the player doesn't pick items up. The survival mod uses it while you're dead.
+
+**Players and entities.** Left-click hits the entity you're looking at (within 4.5 blocks), right-click uses it. Nothing is dug or placed behind it. A hit runs `on_punch`; unless that returns true, the engine takes `damage` off its health, knocks it back, makes it flash red, and stops it being hit again for half a second. At 0 health `on_death` runs, its `drops` fall, and it's gone. On a server, hits are checked: the player has to be within reach, and no more than 10 a second.
+
+**Models.** Build them facing north (-z), as Blockbench does for Bedrock entities. Animations are played by name, and each entity runs its own from when you set it. Mobs are lit by the light where they stand: dark in caves and at night, lit by torches.
+
+The `mobs` mod that comes with BlockSmith (`mods/mobs`) is a complete example:
+- **Cows** wander on grass, run when hit, and drop beef and leather.
+- **Zombies** come out in the dark, chase the nearest player they can see (and where they last saw you), hit for 3, and burn in sunlight.
+- **Spawn eggs** are in the creative inventory's Mobs tab.
+- **`/summon cow|zombie [count]`** works for operators.
+
 ## 14. UI: menus and screens
 
 How BlockSmith UI works, compared with Luanti's formspecs, is explained in [L11](#l11-screens-and-menus-how-blocksmith-ui-works). This section is the complete reference:
@@ -2529,7 +2728,9 @@ The title screen's pages and the pause menu are drawn by Lua files in the base m
 |---|---|
 | <a id="fn-uikit-label"></a>`f:label(x, y, text [, { size, color, w, align }])` | its width. `align` = `"center"` or `"right"` within `w`. `size` is the capital height in units (default 0.42). |
 | <a id="fn-uikit-text"></a>`f:text(x, y, w, text [, opts])` | the height used: a paragraph wrapped to `w` (`\n` starts a new line) |
-| <a id="fn-uikit-button"></a>`f:button(id, x, y, w, h, label [, { disabled, danger, selected, tooltip }])` | `true` on the frame it's clicked |
+| <a id="fn-uikit-button"></a>`f:button(id, x, y, w, h, label [, { disabled, danger, selected, tooltip }])` | `true` on the frame it's clicked. The label always stays inside the button: if it's too long it's drawn smaller (down to 70%), then cut short with "...", and the full text goes in the tooltip |
+| <a id="fn-uikit-button_width"></a>`f:button_width(label [, h])` | how wide a button of height `h` needs to be for `label` (units), to make buttons that fit their text |
+| <a id="fn-uikit-text_width"></a>`f:text_width(text [, size])` / `f:fit_text(text, size, max_w)` | text width in units; text and size that fit `max_w` (smaller, then cut with "...") |
 | <a id="fn-uikit-field"></a>`f:field(id, x, y, w, h, text [, { placeholder, max_length, password, numeric }])` | `text, submitted`: the current text, and `true` when Enter is pressed in it. Click it to type; Tab moves to the next field; Escape leaves it. |
 | <a id="fn-uikit-checkbox"></a>`f:checkbox(id, x, y, label, value)` | the new value |
 | <a id="fn-uikit-slider"></a>`f:slider(id, x, y, w, value [, { min, max, step }])` | the new value (click or drag) |
@@ -2687,6 +2888,24 @@ With `movable = true` it can also be dragged; its position is yours, so keep `x,
 <a id="fn-uikit-overlaps"></a>`kit.overlaps(box, x, y, w, h)` tells you whether something is inside the box. With `windows = true`, the windows the box touches are selected too.
 
 <a id="fn-uikit-selection"></a>`kit.selection()` is a set to keep your selection in: `sel:has(id)`, `sel:set(id, on)`, `sel:toggle(id)`, `sel:only(id)`, `sel:clear()`, `sel:count()`, `sel:list()`.
+
+<a id="fn-uikit-icon_grid"></a>**Icons that never overlap.** Like a real desktop, `kit.icon_grid` gives every icon a cell of its own. Icons are dragged freely, and when they're let go each one snaps to the nearest *free* cell. Drop an icon on another and it goes to the nearest empty cell instead.
+```lua
+local grid = state.grid or kit.icon_grid{ cell_w = 3, cell_h = 3 }; state.grid = grid
+grid:set_area(0, 0, f.w_units, f.h_units - 2)          -- every frame: where icons may go
+for _, id in ipairs(my_apps) do
+    if not state.icons[id] then grid:add(state.icons, id) end   -- new: first free cell, down then across
+end
+grid:keep_in(state.icons, dragging and sel:list())    -- the screen got smaller: move them back in
+if dragging then                                       -- outlines where the dragged ones will land
+    for id, p in pairs(grid:preview(state.icons, sel:list())) do
+        f:rect(p.x - 0.2, p.y - 0.1, 2, 2.5, { 1, 1, 1, 0.08 })
+    end
+end
+-- ...f:icon as below; on "drag" set dragging = true, and on "drop":
+grid:arrange(state.icons, sel:list())                  -- each to the nearest free cell
+```
+The showcase's desktop (`mods/ui_showcase`) works this way.
 
 <a id="fn-uikit-selected_windows"></a>**Windows** can be selected too: with the box above, or by **Ctrl+click on a title bar** (again to unselect). Selected windows get a bright edge. Dragging the title bar of any selected window **moves them all together**; dragging an unselected window moves it alone and lets the selection go. From code: `f:selected_windows()`, `f:select_window(id [, false])`, `f:clear_window_selection()`.
 
@@ -2979,6 +3198,8 @@ An operator can't give a higher level than their own. Mods' commands get `is_ope
 | `fallDamage` | true | falling hurts |
 | `drowningDamage` | true | running out of air underwater hurts |
 | `fireDamage` | true | lava hurts |
+| `doMobSpawning` | true | mobs appear by themselves ([§13a](#entity-spawning)) |
+| `randomTickSpeed` | 3 | blocks picked per 16×16×16 section per tick ([random ticks](#abm)): how fast grass spreads and crops grow. 0 = never |
 
 The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too.
 

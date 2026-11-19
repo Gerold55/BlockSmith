@@ -45,13 +45,15 @@ end
 
 -- Game rules in your own world: saved with it, and shared ("gamerule.<name>") so mods - the
 -- survival mod - follow them, the same as on a server
-local RULES = { "doDaylightCycle", "keepInventory", "naturalRegeneration", "fallDamage", "drowningDamage", "fireDamage" }
+local RULES = { "doDaylightCycle", "keepInventory", "naturalRegeneration", "fallDamage", "drowningDamage", "fireDamage", "doMobSpawning",
+                "randomTickSpeed" }
+local NUMERIC = { randomTickSpeed = "3" }      -- rules that are numbers (their default)
 local function find_rule(n)
     for _, r in ipairs(RULES) do if r:lower() == (n or ""):lower() then return r end end
 end
 local function load_rules()
     local out = {}
-    for k, v in ((engine.get_storage("base:gamerules") or "") .. ";"):gmatch("(%w+)=(%a+);") do out[k] = v end
+    for k, v in ((engine.get_storage("base:gamerules") or "") .. ";"):gmatch("(%w+)=(%w+);") do out[k] = v end
     return out
 end
 local function apply_rules(rules)
@@ -100,7 +102,9 @@ function on_chat_complete(words, word, ...)
         elseif n == 2 and words[2]:lower() == "speed" then add({ "0", "1", "2" }) end
     elseif cmd == "gamerule" then
         if n == 1 then add(RULES)
-        elseif n == 2 and find_rule(words[2]) then add({ "true", "false", "default" }) end
+        elseif n == 2 and find_rule(words[2]) then
+            add(NUMERIC[find_rule(words[2])] and { "0", "3", "10", "default" } or { "true", "false", "default" })
+        end
     elseif cmd == "give" then
         if n == 1 or (n == 2 and words[2] == "@s") then add(item_names()) end
     elseif cmd == "tp" or cmd == "teleport" then
@@ -171,7 +175,9 @@ function on_chat_command(cmd, player, is_operator, reply)
             if not rule then reply("No game rule called '" .. a[1] .. "'. Type /gamerule for the list.") return true end
             if not a[2] then reply(rule .. " = " .. (rules[rule] or "default")) return true end
             local v = a[2]:lower()
-            if v ~= "true" and v ~= "false" and v ~= "default" then reply("A game rule is true, false or default") return true end
+            if NUMERIC[rule] then
+                if v ~= "default" and not v:match("^%d%d?%d?%d?$") then reply(rule .. " is a number (0 to 9999) or default") return true end
+            elseif v ~= "true" and v ~= "false" and v ~= "default" then reply("A game rule is true, false or default") return true end
             rules[rule] = (v ~= "default") and v or nil
             local parts = {}
             for k, val in pairs(rules) do parts[#parts + 1] = k .. "=" .. val end

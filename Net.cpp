@@ -46,6 +46,9 @@ enum Msg : uint8_t {
     C_CHAT    = 4,    // str text
     C_COMMAND = 5,    // str command (no slash) - run by the server, answered with S_CHAT
     C_COMPLETE = 7,   // str text before the cursor ("/give Al") - answered with S_COMPLETE
+    C_ENTITY_ACT = 8, // u32 id, u8 kind (0 hit, 1 right-click), str item in hand
+    C_DROP    = 9,    // str item, u16 count, f32 x y z, u8 returned [, f32 vx vy vz, f32 pickupDelay]
+                      // items dropped next to the player (thrown: with a velocity)
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -68,6 +71,11 @@ enum Msg : uint8_t {
     S_ACTION  = 81,   // str action, str a, str b   the server asks the game to do something:
                       // "give" (item, count), "clear", "kill" (reason)
     S_COMPLETE = 82,  // str text, u16 count, { str }   what fits the word being typed (Tab)
+    S_ENTITY_INFO = 83, // f32 serverTime, u16 count, { u32 id, str type, f32 x y z, f32 yaw, str anim,
+                        //   f32 animSpeed, u8 loop, str nametag, str item, u16 itemCount, u8 hurtCount,
+                        //   f32 width height, f32 health maxHealth }   (new to you, or changed)
+    S_ENTITIES = 84,  // f32 serverTime, u16 count, { u32 id, f32 x y z, f32 yaw }   where they are now
+    S_ENTITY_GONE = 85, // u16 count, { u32 id }   removed, or out of your range
     S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
                       // (older games ignore it and keep their own sky; no protocol change needed)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
@@ -495,6 +503,12 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         m_posTimer = std::fmod(m_posTimer, kPositionInterval);
         sendPositions();
     }
+    // Entities, 20 times a second
+    m_entityTimer += dt;
+    if (m_entityTimer >= 0.05f) {
+        m_entityTimer = std::fmod(m_entityTimer, 0.05f);
+        sendEntities();
+    }
 
     // Let LAN players see this game, every 1.5 seconds
     m_lanTimer -= dt;
@@ -651,6 +665,52 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         w.u16(static_cast<uint16_t>(list.size()));
         for (const auto& x : list) w.str(x);
         sendTo(c.peer, w);
+        break;
+    }
+    case C_ENTITY_ACT: {
+        Reader r(data, size);
+        const uint32_t id = r.u32();
+        const uint8_t kind = r.u8();
+        const std::string item = r.str();
+        if (!r.ok || !c.joined || kind > 1 || item.size() > 64 || !m_entityManager || !onEntityAct) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.entityActs > 10) return;
+        const Entity* e = m_entityManager->get(id);
+        if (!e) return;
+        const EntityType* t = m_entityManager->type(e->type);
+        const float reach = 6.0f + (t ? std::max(t->width, t->height) : 1.0f);
+        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+        const glm::vec3 centre = e->pos + glm::vec3(0.0f, t ? t->height * 0.5f : 0.5f, 0.0f);
+        if (glm::distance(eye, centre) > reach) return;           // too far (or cheating)
+        const std::string name = c.name;
+        const glm::vec3 where = c.position;
+        onEntityAct(name, id, kind, item, where);
+        break;
+    }
+    case C_DROP: {
+        Reader r(data, size);
+        const std::string item = r.str();
+        const int count = r.u16();
+        const glm::vec3 p = r.vec3f();
+        GameServer::DropInfo how;
+        how.returned = r.u8() != 0;
+        if (r.ok && r.n - r.p >= 16) {                 // thrown (newer games)
+            const glm::vec3 v = r.vec3f();
+            const float delay = r.f32();
+            if (r.ok) {
+                how.hasVelocity = true;
+                how.velocity = glm::clamp(v, glm::vec3(-12.0f), glm::vec3(12.0f));
+                how.pickupDelay = std::clamp(delay, -1.0f, 10.0f);
+            }
+        }
+        if (!r.ok || !c.joined || item.empty() || item.size() > 64 || count <= 0 || !onDropItem) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.drops > 30) return;
+        if (glm::distance(p, c.position + glm::vec3(0.0f, 1.0f, 0.0f)) > 8.0f) return;
+        const std::string name = c.name;
+        onDropItem(name, item, std::min(count, 64 * 64), p, how);
         break;
     }
     case C_COMMAND: {
@@ -1181,6 +1241,81 @@ void GameServer::sendPositions() {
     }
 }
 
+// Each player's game gets the entities within its range: what they are when they come into
+// range (or change: animation, name tag, a hit...), where they are when they move, and that
+// they've gone when they're removed or out of range.
+void GameServer::sendEntities() {
+    if (!m_entityManager) return;
+    const auto& all = m_entityManager->all();
+    const float serverTime = net::clockSeconds();
+    for (auto& [cid, c] : m_clients) {
+        if (!c.joined || !c.hasPosition) continue;
+        const float range = std::min(96.0f, (c.viewDistance + 1) * static_cast<float>(CHUNK_WIDTH));
+        Writer info(S_ENTITY_INFO), pos(S_ENTITIES), gone(S_ENTITY_GONE);
+        info.f32(serverTime);
+        info.u16(0);
+        pos.f32(serverTime);
+        pos.u16(0);
+        gone.u16(0);
+        uint16_t nInfo = 0, nPos = 0, nGone = 0;
+        auto flush = [&](Writer& w, uint16_t n, size_t countAt, bool reliable) {
+            if (n == 0) return;
+            w.d[countAt] = n & 0xFF;
+            w.d[countAt + 1] = n >> 8;
+            sendTo(c.peer, w, reliable);
+        };
+        for (const auto& [id, e] : all) {
+            if (e.removed) continue;
+            const glm::vec2 d(e.pos.x - c.position.x, e.pos.z - c.position.z);
+            if (glm::length(d) > range) continue;
+            auto known = c.knownEntities.find(id);
+            if (known == c.knownEntities.end() || known->second.version != e.version) {
+                if (info.d.size() > 60000) continue;      // the rest next time
+                const EntityView v = m_entityManager->view(e);
+                info.u32(id);
+                info.str(v.type);
+                info.f32(v.pos.x); info.f32(v.pos.y); info.f32(v.pos.z);
+                info.f32(v.yaw);
+                info.str(v.anim);
+                info.f32(v.animSpeed);
+                info.u8(v.animLoop ? 1 : 0);
+                info.str(v.nametag);
+                info.str(v.item);
+                info.u16(static_cast<uint16_t>(std::clamp(v.itemCount, 0, 65535)));
+                info.u8(v.hurtCount);
+                info.f32(v.width); info.f32(v.height);
+                info.f32(v.health); info.f32(v.maxHealth);
+                ++nInfo;
+                c.knownEntities[id] = {e.version, e.pos, e.yaw};
+            } else if (glm::distance(known->second.pos, e.pos) > 0.002f || std::fabs(known->second.yaw - e.yaw) > 0.1f) {
+                if (nPos >= 3000) continue;
+                pos.u32(id);
+                pos.f32(e.pos.x); pos.f32(e.pos.y); pos.f32(e.pos.z);
+                pos.f32(e.yaw);
+                ++nPos;
+                known->second.pos = e.pos;
+                known->second.yaw = e.yaw;
+            }
+        }
+        // Gone: removed, or now out of range
+        for (auto it = c.knownEntities.begin(); it != c.knownEntities.end();) {
+            auto e = all.find(it->first);
+            bool keep = e != all.end() && !e->second.removed;
+            if (keep) {
+                const glm::vec2 d(e->second.pos.x - c.position.x, e->second.pos.z - c.position.z);
+                keep = glm::length(d) <= range + 8.0f;     // (a little slack: no flicker at the edge)
+            }
+            if (keep || nGone >= 3000) { ++it; continue; }
+            gone.u32(it->first);
+            ++nGone;
+            it = c.knownEntities.erase(it);
+        }
+        flush(gone, nGone, 1, true);
+        flush(info, nInfo, 5, true);
+        flush(pos, nPos, 5, false);
+    }
+}
+
 void GameServer::broadcastChat(const std::string& text, const glm::vec3& color) {
     m_chat.push_back({text, color});
     for (auto& [id, c] : m_clients) {
@@ -1389,6 +1524,8 @@ void GameClient::disconnect() {
     m_peer = nullptr;
     m_state = State::Idle;
     m_views.clear();
+    m_entityViews.clear();
+    m_entitySnaps.clear();
     m_mode.clear(); m_isOp = false; m_modeChanged = true;   // our own game decides again
     std::cout << "[Client] Disconnected" << std::endl;
 }
@@ -1404,6 +1541,8 @@ void GameClient::finish(const std::string& reason) {
     }
     m_state = State::Idle;
     m_views.clear();
+    m_entityViews.clear();
+    m_entitySnaps.clear();
     if (!m_mode.empty() || m_isOp) { m_mode.clear(); m_isOp = false; m_modeChanged = true; }
     m_ended = true;
     if (!m_kickReason.empty()) m_endReason = m_kickReason;
@@ -1482,6 +1621,7 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             m_interpDelay += std::clamp(target - m_interpDelay, -step * 0.10, step * 0.25);
         }
         if (m_clockSynced) interpolatePlayers(m_views, net::clockSeconds() + m_clockOffset - m_interpDelay);
+        if (m_clockSynced) interpolateEntities(net::clockSeconds() + m_clockOffset - m_interpDelay);
     }
     if (m_host) enet_host_flush(m_host);
 }
@@ -1683,12 +1823,7 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         const float serverTime = r.f32();
         const uint16_t count = r.u16();
         if (!r.ok) return;
-        // Estimate the server's clock. A packet can't arrive before it was sent, so the
-        // largest (server time - our time) seen is the best estimate; drift down slowly.
-        const double sample = serverTime - net::clockSeconds();
-        if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
-        else m_clockOffset += (sample - m_clockOffset) * 0.01;
-        m_clockSynced = true;
+        syncClock(serverTime);
 
         for (uint16_t i = 0; i < count && r.ok; ++i) {
             const uint16_t id = r.u16();
@@ -1699,6 +1834,73 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
             if (!r.ok) break;
             auto it = m_views.find(id);
             if (it != m_views.end()) pushSnapshot(it->second, time, p, yaw, pitch);
+        }
+        break;
+    }
+    case S_ENTITY_INFO: {
+        const float serverTime = r.f32();
+        if (r.ok) syncClock(serverTime);
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            EntityView v;
+            v.id = r.u32();
+            v.type = r.str();
+            v.pos = r.vec3f();
+            v.yaw = r.f32();
+            v.anim = r.str();
+            v.animSpeed = r.f32();
+            v.animLoop = r.u8() != 0;
+            v.nametag = r.str();
+            v.item = r.str();
+            v.itemCount = r.u16();
+            v.hurtCount = r.u8();
+            v.width = r.f32();
+            v.height = r.f32();
+            v.health = r.f32();
+            v.maxHealth = r.f32();
+            if (!r.ok) break;
+            auto& snaps = m_entitySnaps[v.id];
+            auto it = m_entityViews.find(v.id);
+            if (it == m_entityViews.end()) {
+                snaps.clear();
+                m_entityViews[v.id] = v;
+            } else {
+                // keep the smoothed position; everything else is new
+                const glm::vec3 shownPos = it->second.pos;
+                const float shownYaw = it->second.yaw;
+                it->second = v;
+                it->second.pos = shownPos;
+                it->second.yaw = shownYaw;
+            }
+            if (snaps.empty() || serverTime > snaps.back().time) snaps.push_back({serverTime, v.pos, v.yaw});
+            while (snaps.size() > 64) snaps.pop_front();
+        }
+        break;
+    }
+    case S_ENTITIES: {
+        const float serverTime = r.f32();
+        if (r.ok) syncClock(serverTime);
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const uint32_t id = r.u32();
+            const glm::vec3 p = r.vec3f();
+            const float yaw = r.f32();
+            if (!r.ok) break;
+            if (!m_entityViews.count(id)) continue;          // its info hasn't arrived yet
+            auto& snaps = m_entitySnaps[id];
+            if (!snaps.empty() && serverTime <= snaps.back().time) continue;
+            snaps.push_back({serverTime, p, yaw});
+            while (snaps.size() > 64) snaps.pop_front();
+        }
+        break;
+    }
+    case S_ENTITY_GONE: {
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const uint32_t id = r.u32();
+            if (!r.ok) break;
+            m_entityViews.erase(id);
+            m_entitySnaps.erase(id);
         }
         break;
     }
@@ -1815,6 +2017,66 @@ void GameClient::requestCompletion(const std::string& text) {
     Writer w(C_COMPLETE);
     w.str(text);
     sendTo(m_peer, w);
+}
+
+// Estimate the server's clock. A packet can't arrive before it was sent, so the largest
+// (server time - our time) seen is the best estimate; drift down slowly.
+void GameClient::syncClock(float serverTime) {
+    const double sample = serverTime - net::clockSeconds();
+    if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
+    else m_clockOffset += (sample - m_clockOffset) * 0.01;
+    m_clockSynced = true;
+}
+
+void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
+    if (m_state != State::Joined) return;
+    Writer w(C_ENTITY_ACT);
+    w.u32(id);
+    w.u8(static_cast<uint8_t>(kind));
+    w.str(item);
+    sendTo(m_peer, w);
+}
+
+void GameClient::sendDropItem(const std::string& item, int count, const glm::vec3& pos, bool returned,
+                              const glm::vec3* velocity, float pickupDelay) {
+    if (m_state != State::Joined || item.empty() || count <= 0) return;
+    Writer w(C_DROP);
+    w.str(item);
+    w.u16(static_cast<uint16_t>(std::min(count, 65535)));
+    w.f32(pos.x); w.f32(pos.y); w.f32(pos.z);
+    w.u8(returned ? 1 : 0);
+    if (velocity) {
+        w.f32(velocity->x); w.f32(velocity->y); w.f32(velocity->z);
+        w.f32(pickupDelay);
+    }
+    sendTo(m_peer, w);
+}
+
+// Like the other players: each entity where it was at renderTime, between the two updates
+// around it (a jump of more than 8 blocks is a teleport: no sliding across the map)
+void GameClient::interpolateEntities(double renderTime) {
+    for (auto& [id, v] : m_entityViews) {
+        auto it = m_entitySnaps.find(id);
+        if (it == m_entitySnaps.end() || it->second.empty()) continue;
+        auto& snaps = it->second;
+        while (snaps.size() > 2 && snaps[1].time < renderTime - 0.5) snaps.pop_front();
+        if (renderTime <= snaps.front().time || snaps.size() == 1) {
+            const auto& sn = renderTime <= snaps.front().time ? snaps.front() : snaps.back();
+            v.pos = sn.pos; v.yaw = sn.yaw;
+            continue;
+        }
+        if (renderTime >= snaps.back().time) {
+            v.pos = snaps.back().pos; v.yaw = snaps.back().yaw;
+            continue;
+        }
+        size_t i = 1;
+        while (i < snaps.size() && snaps[i].time < renderTime) ++i;
+        const auto& a = snaps[i - 1];
+        const auto& b = snaps[i];
+        const float t = static_cast<float>((renderTime - a.time) / std::max(b.time - a.time, 1e-6));
+        v.pos = glm::distance(a.pos, b.pos) > 8.0f ? (t < 0.5f ? a.pos : b.pos) : glm::mix(a.pos, b.pos, t);
+        v.yaw = lerpAngle(a.yaw, b.yaw, t);
+    }
 }
 
 void GameClient::sendChat(const std::string& text) {

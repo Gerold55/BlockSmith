@@ -426,6 +426,29 @@ function Frame:label(x, y, text, opts)
     return tw
 end
 
+-- How wide text is, in units (at `size` units tall; default kit.text_size)
+function Frame:text_width(text, size)
+    local s = text_scale(self.u, size or kit.text_size)
+    return (ui.text_width and ui.text_width(tostring(text), s) or #tostring(text) * 8) / self.u
+end
+
+-- Text that fits `max_w` units: drawn smaller (down to 70%), then cut short with "..."
+-- Returns the text and the size to draw it at.
+function Frame:fit_text(text, size, max_w)
+    text = tostring(text or "")
+    if max_w <= 0 or self:text_width(text, size) <= max_w then return text, size end
+    local smaller = size * math.max(0.7, max_w / self:text_width(text, size))
+    if self:text_width(text, smaller) <= max_w then return text, smaller end
+    local chars = utf8 and utf8.len(text) or #text
+    while chars > 1 do
+        chars = chars - 1
+        local cut = utf8 and text:sub(1, (utf8.offset(text, chars + 1) or (#text + 1)) - 1) or text:sub(1, chars)
+        local try = cut:gsub("%s+$", "") .. "..."
+        if self:text_width(try, smaller) <= max_w then return try, smaller end
+    end
+    return "...", smaller
+end
+
 local function wrap_lines(self, w, text, opts)
     opts = opts or {}
     local size = opts.size or kit.text_size
@@ -495,11 +518,22 @@ function Frame:button(id, x, y, w, h, label, opts)
     local r, g, b = 1, 1, 1
     if ui.get_button_text_color then r, g, b = ui.get_button_text_color(hover) end
     if opts.disabled then r, g, b = r * 0.55, g * 0.55, b * 0.55 end
+    -- The label always stays inside the button: smaller if it has to be, then cut short (the
+    -- whole text is in the tooltip then)
     local size = opts.size or math.min(kit.text_size, h * 0.42)
-    self:label(x, y + (h - size) / 2, label or "", { size = size, color = { r, g, b }, w = w, align = "center" })
-    self:tooltip(x, y, w, h, opts.tooltip)
+    local text, fitted = self:fit_text(label or "", size, w - 0.5)
+    self:label(x, y + (h - fitted) / 2, text, { size = fitted, color = { r, g, b }, w = w, align = "center" })
+    local tip = opts.tooltip
+    if text ~= tostring(label or "") then tip = tip and (tostring(label) .. " - " .. tip) or tostring(label) end
+    self:tooltip(x, y, w, h, tip)
     if opts.disabled then return false end
     return self:take_click(x, y, w, h) ~= nil
+end
+
+-- The width a button needs for its label (units), for laying out buttons that fit their text
+function Frame:button_width(label, h, opts)
+    local size = (opts and opts.size) or math.min(kit.text_size, (h or 1) * 0.42)
+    return self:text_width(label or "", size) + 1.0
 end
 
 function Frame:checkbox(id, x, y, label, value, opts)
@@ -966,6 +1000,127 @@ function kit.selection()
         return out
     end
     return s
+end
+
+-- A desktop's icon grid: like a real desktop, every icon has a cell of its own and icons never
+-- overlap. Icons are dragged freely; when they're let go each snaps to the nearest FREE cell
+-- (dropped on another icon: the nearest empty cell instead). Positions stay in your state as
+-- positions[id] = { x = ..., y = ... } (the icon's top-left, in units), as f:icon wants them.
+--   local grid = kit.icon_grid{ cell_w = 3, cell_h = 3 }      -- spacing (units)
+--   grid:set_area(x, y, w, h)          every frame: the part of the desktop icons may use
+--   grid:add(positions, id)            a new icon: the first free cell (down, then across)
+--   grid:arrange(positions, moving)    after a drop: `moving` = the ids just dropped (a list);
+--                                      also tidies icons left off the grid or outside the area
+--   grid:preview(positions, moving)    where those would land now: { [id] = { x, y } } (to draw
+--                                      outlines while dragging)
+--   grid:keep_in(positions, skip)      icons outside a shrunken area move back in (skip: ids
+--                                      being dragged; call every frame)
+function kit.icon_grid(opts)
+    opts = opts or {}
+    local g = { cell_w = opts.cell_w or 3, cell_h = opts.cell_h or 3,
+                x = 0, y = 0, cols = 1, rows = 1, pad_x = opts.pad_x or 1, pad_y = opts.pad_y or 0.8 }
+    function g:set_area(x, y, w, h)
+        self.x, self.y = x + self.pad_x, y + self.pad_y
+        self.cols = math.max(1, math.floor((w - self.pad_x) / self.cell_w))
+        self.rows = math.max(1, math.floor((h - self.pad_y) / self.cell_h))
+    end
+    function g:xy(col, row) return self.x + col * self.cell_w, self.y + row * self.cell_h end
+    function g:cell(x, y)                     -- the cell nearest a position (in the grid)
+        local col = math.floor((x - self.x) / self.cell_w + 0.5)
+        local row = math.floor((y - self.y) / self.cell_h + 0.5)
+        return math.max(0, math.min(self.cols - 1, col)), math.max(0, math.min(self.rows - 1, row))
+    end
+    local function key(c, r) return c .. ":" .. r end
+    local function on_grid(self, p)           -- exactly in a cell, inside the area?
+        local c, r = self:cell(p.x, p.y)
+        local gx, gy = self:xy(c, r)
+        return math.abs(gx - p.x) < 0.01 and math.abs(gy - p.y) < 0.01, c, r
+    end
+    -- The free cell nearest (col, row): rings outwards, nearest first
+    function g:free_near(col, row, taken)
+        local best, bd
+        local maxr = math.max(self.cols, self.rows)
+        for r = 0, maxr do
+            for dc = -r, r do for dr = -r, r do
+                if math.max(math.abs(dc), math.abs(dr)) == r then
+                    local c, rr = col + dc, row + dr
+                    if c >= 0 and c < self.cols and rr >= 0 and rr < self.rows and not taken[key(c, rr)] then
+                        local d = (dc * self.cell_w) ^ 2 + (dr * self.cell_h) ^ 2
+                        if not bd or d < bd then best, bd = { c, rr }, d end
+                    end
+                end
+            end end
+            if best and r * math.min(self.cell_w, self.cell_h) > math.sqrt(bd) then break end
+        end
+        return best and best[1], best and best[2]
+    end
+    local function sorted_ids(t)
+        local ids = {}
+        for id in pairs(t) do ids[#ids + 1] = id end
+        table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+        return ids
+    end
+    -- The work: icons not moving keep their cells; the moving ones (and any off the grid) go to
+    -- the free cell nearest where they are. Returns { [id] = { x, y } } for those.
+    local function solve(self, positions, moving, skip)
+        local is_moving, taken, out, pending = {}, {}, {}, {}
+        for _, id in ipairs(moving or {}) do is_moving[id] = true end
+        for _, id in ipairs(sorted_ids(positions)) do
+            if not is_moving[id] and not (skip and skip[id]) then
+                local ok, c, r = on_grid(self, positions[id])
+                if ok and not taken[key(c, r)] then taken[key(c, r)] = id
+                else pending[#pending + 1] = id end
+            end
+        end
+        -- the moving ones first (in reading order: the one at the top-left gets its cell first)
+        local order = {}
+        for _, id in ipairs(moving or {}) do if positions[id] then order[#order + 1] = id end end
+        table.sort(order, function(a, b)
+            local pa, pb = positions[a], positions[b]
+            if math.abs(pa.y - pb.y) > 0.01 then return pa.y < pb.y end
+            return pa.x < pb.x
+        end)
+        for _, id in ipairs(pending) do order[#order + 1] = id end
+        for _, id in ipairs(order) do
+            local p = positions[id]
+            local c, r = self:cell(p.x, p.y)
+            c, r = self:free_near(c, r, taken)
+            if c then
+                taken[key(c, r)] = id
+                local x, y = self:xy(c, r)
+                out[id] = { x = x, y = y }
+            end
+        end
+        return out
+    end
+    function g:arrange(positions, moving)
+        for id, p in pairs(solve(self, positions, moving)) do positions[id].x, positions[id].y = p.x, p.y end
+    end
+    function g:preview(positions, moving) return solve(self, positions, moving) end
+    function g:keep_in(positions, skip)
+        local skipset = {}
+        for _, id in ipairs(skip or {}) do skipset[id] = true end
+        for id, p in pairs(solve(self, positions, {}, skipset)) do positions[id].x, positions[id].y = p.x, p.y end
+    end
+    function g:add(positions, id)
+        local taken = {}
+        for other, p in pairs(positions) do
+            if other ~= id then local ok, c, r = on_grid(self, p) if ok then taken[key(c, r)] = true end end
+        end
+        for c = 0, self.cols - 1 do                -- down the first column, then the next
+            for r = 0, self.rows - 1 do
+                if not taken[key(c, r)] then
+                    local x, y = self:xy(c, r)
+                    positions[id] = { x = x, y = y }
+                    return positions[id]
+                end
+            end
+        end
+        local x, y = self:xy(0, 0)                  -- (no room: on top of the first, as a last resort)
+        positions[id] = { x = x, y = y }
+        return positions[id]
+    end
+    return g
 end
 
 -- Windows that are selected (a box from f:marquee{ windows = true }, or Ctrl+click on a title

@@ -179,6 +179,24 @@ local function die(reason)
     S.death_reason = reason or "died"
     engine.set_player_controls{ move = false, jump = false, sprint = false, sneak = false }
     if not keeps_inventory() then
+        -- Everything you carried falls where you died, scattered (Minecraft), and can be picked
+        -- up again for 5 minutes. (An older engine without drop_item: it's just lost.)
+        if engine.drop_item then
+            local px, py, pz = engine.get_player_position()
+            local stacks = {}
+            for i = 1, hotbar.get_slot_count() do
+                local name, count = hotbar.get_slot(i)
+                if name and name ~= "" and (count or 0) > 0 then stacks[#stacks + 1] = { name = name, count = count } end
+            end
+            if survival.inventory and survival.inventory.all_stacks then
+                for _, s in ipairs(survival.inventory.all_stacks()) do stacks[#stacks + 1] = s end
+            end
+            for _, s in ipairs(stacks) do
+                local a = math.random() * math.pi * 2
+                local speed = math.random() * 2.5
+                engine.drop_item(s.name, s.count, px, py + 1.2, pz, math.cos(a) * speed, 3 + math.random() * 2, math.sin(a) * speed, 0.5)
+            end
+        end
         for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
     end
     for _, fn in ipairs(callbacks.death) do pcall(fn, S.death_reason) end
@@ -578,12 +596,23 @@ survival.on_death(function()
     if not keeps_inventory() and survival.inventory then survival.inventory.clear() end
 end)
 
+-- No picking up items while dead (they stay on the ground for when you're back)
+local previous_can_pick_up = can_pick_up_item
+function can_pick_up_item(item, count, ...)
+    if S.dead then return false end
+    if previous_can_pick_up then return previous_can_pick_up(item, count, ...) end
+    return true
+end
+
 -- The server's /kill and /clear (GameServer::sendAction): a death with the death screen, and the
 -- whole inventory (not just the hotbar) cleared
 local previous_server_action = on_server_action
 function on_server_action(action, a, b, ...)
     if action == "kill" then
         if survival.kill(a ~= "" and a or nil) then return true end
+    elseif action == "damage" then          -- a mob hit us (entities.damage_player)
+        survival.damage(tonumber(a) or 1, b ~= "" and b or "was hurt")
+        return true
     elseif action == "clear" then
         for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
         if survival.inventory then survival.inventory.clear() end
