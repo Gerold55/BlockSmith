@@ -173,7 +173,8 @@ std::string blockName(uint8_t id) {
 
 // "" = air. Returns false for a block this game doesn't have.
 bool blockIdFromName(const std::string& name, uint8_t& id) {
-    if (name.empty()) { id = 0; return true; }
+    // "" and "air" are air (id 0 - which getBlockId also returns for unknown names)
+    if (name.empty() || name == "air") { id = 0; return true; }
     id = BlockRegistry::getInstance().getBlockId(name);
     return id != 0;
 }
@@ -1035,18 +1036,21 @@ bool GameServer::messagePlayer(const std::string& name, const std::string& text,
 
 // Why a player may not make this change ("" = they may): too far away (more than kMaxReach +
 // slack from their eyes) or not loaded, an undiggable block outside creative (silently), then
-// spawn protection and mods (canEdit: their reason, shown to them)
-std::string GameServer::editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, float slack) {
+// spawn protection and mods (canEdit: their reason, shown to them). `id` and `meta` are what the
+// player asks for; canEdit runs when either differs from what's stored.
+std::string GameServer::editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, uint8_t meta, float slack) {
     const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
     if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach + slack) return kSilentRefusal;
     if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return kSilentRefusal;
     const uint8_t was = m_world->getBlockAt(pos);
+    const uint8_t wasMeta = m_world->getMetadataAt(pos);
     // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever the
     // player's game says
     if (c.mode != "creative" && id == 0 && was != 0 &&
         blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) return kSilentRefusal;
-    // Mods may refuse it (spawn protection, claims...): checked last, for real changes only
-    if (canEdit && was != id) return canEdit(c.name, pos, was, id);
+    // Mods may refuse it (spawn protection, claims...): checked last, for real changes only - a
+    // different block, or new metadata on the same one (opening a door, filling a tank...)
+    if (canEdit && (was != id || wasMeta != meta)) return canEdit(c.name, pos, was, wasMeta, id, meta);
     return "";
 }
 
@@ -1065,7 +1069,7 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         uint8_t id = 0;
         const bool loaded = m_world->chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
-        const std::string why = blockIdFromName(name, id) ? editRefusal(c, pos, id, 0.0f) : std::string(kSilentRefusal);
+        const std::string why = blockIdFromName(name, id) ? editRefusal(c, pos, id, meta, 0.0f) : std::string(kSilentRefusal);
         if (why.empty()) {
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->setBlockWithMetaAt(pos, id, meta);
@@ -1093,19 +1097,23 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
 }
 
 bool GameServer::playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
-                                std::string* why, float slack) {
+                                std::string* why, float slack, uint8_t meta) {
     if (why) why->clear();
     uint8_t id = 0;
     if (!blockIdFromName(block, id)) return false;
     for (auto& [cid, c] : m_clients) {
         if (!c.joined || c.name != name) continue;
-        const std::string refusal = editRefusal(c, pos, id, std::clamp(slack, 0.0f, 4.0f));
+        const std::string refusal = editRefusal(c, pos, id, meta, std::clamp(slack, 0.0f, 4.0f));
         if (!refusal.empty()) {
             if (why && refusal != kSilentRefusal) *why = refusal;
             return false;
         }
+        // (unloaded or out of reach was refused above.) Already exactly this block and metadata:
+        // nothing changes, so it's no change to report - false, with no reason to show
         const uint8_t oldId = m_world->getBlockAt(pos);
-        m_world->setBlockWithMetaAt(pos, id, 0);
+        const uint8_t oldMeta = m_world->getMetadataAt(pos);
+        if (oldId == id && oldMeta == meta) return false;
+        m_world->setBlockWithMetaAt(pos, id, meta);
         if (onPlayerEdit && oldId != id) onPlayerEdit(name, pos, oldId, id);
         return true;
     }

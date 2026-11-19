@@ -1075,7 +1075,7 @@ entities.register_spawn({ name = "mymod:cow", on = { "grass" }, min_light = 9, s
 
 **Things to know:**
 - **Yaw** is in degrees. Yaw 0 faces +x (east), 90 faces +z (south).
-- **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
+- **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, bumping into each other and into players (overlapping mobs are nudged apart, as in Minecraft), jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
 - **Each cow animates on its own.** Animations play from when you set them, so cows walk out of step.
 - **Spawn one yourself:** `entities.spawn("mymod:cow", x, y, z)`.
 - The `mobs` mod that comes with BlockSmith has a full cow and a zombie (one that chases you and burns in the sun) to copy from. Everything is in [Reference §13a](#13a-mobs-and-other-entities).
@@ -1536,10 +1536,10 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`entities.register`](#fn-entities-register) · [`entities.spawn`](#fn-entities-spawn) · [`entities.get`](#fn-entities-get) · [`entities.get_all`](#fn-entities-get) · [`entities.in_radius`](#fn-entities-in_radius) · [`entities.nearest_player`](#fn-entities-nearest_player) · [`entities.get_players`](#fn-entities-get_players) · [`entities.damage_player`](#fn-entities-damage_player) · [`entities.drop_item`](#fn-entities-drop_item) · [`entities.get_attack_damage`](#fn-entities-get_attack_damage) · [`entities.register_spawn`](#fn-entities-register_spawn) · [`entities.line_of_sight`](#fn-entities-line_of_sight) · [`entities.find_path`](#fn-entities-find_path) · [`self:go_to`](#fn-entity-go_to) · [`self:wander`](#fn-entity-wander) · [`self:path_state`](#fn-entity-path_state) · [`self:can_see`](#fn-entity-can_see) · [`self:find_land`](#fn-entity-find_land) · [`self:is_blocked`](#fn-entity-is_blocked) · [`self:walk`](#fn-entity-walk) · [`self:walk_to`](#fn-entity-walk_to) · [`self:set_animation`](#fn-entity-set_animation) · [`self:damage`](#fn-entity-damage) · [`self:get_pos`](#fn-entity-get_pos)
 
 **sky** (35)  
-[`sky.add_light`](#fn-sky-add_light) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
+[`sky.add_light`](#fn-sky-add_light) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.lightning_bolt`](#fn-sky-lightning_bolt) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
 
 **clouds** (9)  
-[`clouds.set_cell_size`](#fn-clouds-set_cell_size) · [`clouds.set_color`](#fn-clouds-set_color) · [`clouds.set_height`](#fn-clouds-set_height) · [`clouds.set_night_color`](#fn-clouds-set_night_color) · [`clouds.set_scroll_speed`](#fn-clouds-set_scroll_speed) · [`clouds.set_texture`](#fn-clouds-set_texture) · [`clouds.set_thickness`](#fn-clouds-set_thickness) · [`clouds.set_threshold`](#fn-clouds-set_threshold) · [`clouds.set_weather`](#fn-clouds-set_weather)
+[`clouds.set_cell_size`](#fn-clouds-set_cell_size) · [`clouds.set_clump`](#fn-clouds-set_clump) · [`clouds.set_color`](#fn-clouds-set_color) · [`clouds.set_height`](#fn-clouds-set_height) · [`clouds.set_night_color`](#fn-clouds-set_night_color) · [`clouds.set_scroll_speed`](#fn-clouds-set_scroll_speed) · [`clouds.set_texture`](#fn-clouds-set_texture) · [`clouds.set_thickness`](#fn-clouds-set_thickness) · [`clouds.set_threshold`](#fn-clouds-set_threshold) · [`clouds.set_weather`](#fn-clouds-set_weather)
 
 **fog** (8)  
 [`fog.set_day_color`](#fn-fog-set_day_color) · [`fog.set_density`](#fn-fog-set_density) · [`fog.set_enabled`](#fn-fog-set_enabled) · [`fog.set_exponential`](#fn-fog-set_exponential) · [`fog.set_night_color`](#fn-fog-set_night_color) · [`fog.set_rain_scale`](#fn-fog-set_rain_scale) · [`fog.set_range`](#fn-fog-set_range) · [`fog.set_sunset_color`](#fn-fog-set_sunset_color)
@@ -2024,6 +2024,61 @@ engine.register_fluid_reaction{ fluid = "lava", touching = "water",
 
 <a id="fn-engine-get_fluid"></a><a id="fn-engine-is_fluid_source"></a><a id="fn-engine-list_fluids"></a>`engine.get_fluid(x, y, z)`, `engine.is_fluid_source(x, y, z)` and `engine.list_fluids()` read fluids. The full guide is **`docs/FLUIDS.md`**. `mods/lava` is a complete example.
 
+<a id="tanks"></a>### Liquids in tanks (like Tinkers' Construct)
+
+The engine draws blocks with <a id="fn-block-tank"></a>`pattern = "tank"` as a see-through box with liquid inside. The block's metadata says how full it is, from 0 (empty) to 16 (full). The liquid is drawn with the fluid block's own pictures, so a water tank looks like water and a lava tank like lava, and it rises and falls as the metadata changes:
+
+```lua
+engine.register_block("mymod:vat_water", 1, 1, 1, "vat.png", nil, {
+    pattern = "tank",
+    tank = {
+        fluid = "water",                  -- the block whose pictures fill it ("" or nothing: empty)
+        box = { 0, 0, 0, 16, 16, 16 },    -- the outer box, in pixels (0..16): any size, e.g. a small vat
+        inset = 1,                        -- wall thickness in pixels: the liquid sits this far inside
+        stream = false,                   -- true: a thin stream falls out of the bottom (a spout pouring)
+        floor = 1,                        -- where the liquid starts, in pixels (default: the inset); 13 = a
+                                          --   shallow mould near the top, like a casting table
+        shell = true,                     -- false: draw only the liquid, no box (the inside of a smeltery)
+        fluid2 = nil,                     -- a second liquid layered on top of `fluid` (see below)
+    },
+    light = 13, light_color = "#ff9a40",  -- optional: a lava tank glows
+})
+engine.set_block_meta(x, y, z, "mymod:vat_water", 8)    -- half full
+```
+
+The box's picture is cut to size like Minecraft's non-cube blocks, and see-through pixels show the liquid. Give the block one entry per liquid ("vat_water", "vat_lava"...) and change block and metadata together with `engine.set_block_meta`. On the server, block and metadata are saved and sent like any other block.
+
+<a id="fn-block-tank-layers"></a>**Two liquids in one block (layers):** with `fluid2`, the block shows `fluid` at the bottom and `fluid2` on top of it. The metadata then holds both heights, in 16ths of the block:
+- the low 4 bits are where the lower liquid ends (1 to 15);
+- the high 4 bits are where the upper liquid ends, minus 1 (0 to 15, meaning 1 to 16).
+
+For example, `engine.set_block_meta(x, y, z, "mymod:layer_gold__iron", 6 + 16 * 15)` puts gold up to 6/16, then iron up to the top. A container taller than one block uses one block per height, so any number of layers can be stacked. Each block shows the one or two that meet inside it.
+
+**The `tanks` mod** (`mods/tanks`) is a complete example:
+- **Capacity:** a tank holds 4 buckets (4000 mB) of one liquid.
+- **Buckets:** right-click a tank with a full bucket to pour it in, and with an empty bucket to take a bucket out. With an empty hand you see how much is in it.
+- **Spout:** under a tank, a spout pours it into the tank below, 250 mB at a time, while you watch the stream. Right-click the spout to start or stop it.
+- **Liquids:** lava tanks glow, and any fluid with a bucket gets tanks.
+- **For other mods:** <a id="fn-tanks-get"></a><a id="fn-tanks-set"></a><a id="fn-tanks-register_fluid"></a><a id="fn-tanks-start_pouring"></a>`tanks.get(x, y, z)` returns the fluid and mB, `tanks.set(x, y, z, fluid, mB)` changes it, `tanks.register_fluid(fluid, source_block [, light, light_color])` adds a liquid, and `tanks.start_pouring(x, y, z)` starts a spout.
+
+<a id="smeltery"></a>**The `smeltery` mod** (`mods/smeltery`) is a working smeltery like Tinkers' Construct's, built from these blocks:
+- **Building it:** a floor of Seared Bricks, and walls of Seared Bricks or Seared Glass around an empty space from 1×1 to 7×7, up to 8 high. A Smeltery Controller goes in a wall, and a lava tank in a wall (or a lava bucket on the controller) is the fuel.
+- **Melting:** right-click the controller with ore, ingots or metal blocks to put them in. Iron, gold and copper ores, ingots and blocks come with the mod, and ore gives 2 ingots. The metals melt into **layers**, stacked in the order they melted, and you can see them through Seared Glass.
+- **Alloying:** copper and gold make rose gold, 3 to 1.
+- **The controller's screen:** right-click it with an empty hand. It shows what's melting, the layers drawn to scale, and the fuel. Click a layer to move it to the bottom.
+- **Casting:** a Smeltery Drain in a wall, with a Faucet outside it, pours the bottom layer into a Casting Table (one ingot, 144 mB) or a Casting Basin (one block, 1296 mB) under the faucet. It cools solid and you right-click to take it. Sneak + right-click tips out a part-filled cast.
+- **How the layers are drawn:** the inside of the smeltery is filled with shell-less tank blocks, each with one liquid or two layers.
+- **For other mods:** <a id="fn-smeltery-add_melting"></a><a id="fn-smeltery-fill"></a><a id="fn-smeltery-insert"></a>
+  - `smeltery.add_melting(item, metal, mB, seconds)` makes another item meltable;
+  - `smeltery.fill(x, y, z, { {metal, mB}, ... } [, fuel])` sets what's inside;
+  - `smeltery.insert(x, y, z, item [, count])` puts items in to melt;
+  - `smeltery.open_screen(x, y, z)` opens the controller's screen.
+- **Where it runs:** singleplayer, or when you host a LAN game.
+
+<a id="fn-buckets-register_target"></a>**Buckets on your own blocks:** the buckets mod passes clicks on other mods' blocks to them. `buckets.register_target(function(pointed, bucket_item, fluid) ... end)` is asked first: `fluid` is the bucket's fluid, or nil for an empty bucket, and returning true means you used the click. Helpers:
+- <a id="fn-buckets-swap_held"></a>`buckets.swap_held(pointed, new_item)` turns the held bucket into another item, so a full bucket becomes `buckets.EMPTY` and the other way round;
+- `buckets.fluid_of(bucket_item)` and `buckets.bucket_of(fluid)` convert between them.
+
 ## 8. Chat commands
 
 <a id="fn-engine-send_chat"></a>
@@ -2086,6 +2141,7 @@ The same hook runs in server mods, where `player` is who pressed Tab (in the gam
 | <a id="fn-sky-set_sky_tint"></a>`sky.set_sky_tint(r, g, b, a)` | colour laid over the sky (grey rain, dark storm) |
 | <a id="fn-sky-get_light"></a><a id="fn-sky-set_light"></a>`sky.set_light(level)` / `get_light()` | sunlight on the world: 1 = normal, 0.5 = stormy |
 | <a id="fn-sky-flash"></a>`sky.flash(strength, seconds)` | a lightning flash |
+| <a id="fn-sky-lightning_bolt"></a>`sky.lightning_bolt(x, z [, top_y [, seconds]])` | a visible lightning bolt from the clouds (or `top_y`) down to the ground at x, z. It is jagged and branching and flickers for `seconds` (default 0.45). It is only drawn: it starts no fire and does no damage. The weather mod's thunderstorms use it with `sky.flash`. |
 | <a id="fn-engine-is_outdoors"></a>`engine.is_outdoors(x, y, z)` | nothing above, so rain reaches it |
 
 Using the weather mod:
@@ -2131,7 +2187,16 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
 - <a id="fn-clouds-set_color"></a><a id="fn-clouds-set_night_color"></a>`clouds.set_color(r,g,b)`, `set_night_color(r,g,b)`
 - <a id="fn-clouds-set_cell_size"></a><a id="fn-clouds-set_height"></a><a id="fn-clouds-set_scroll_speed"></a><a id="fn-clouds-set_thickness"></a><a id="fn-clouds-set_threshold"></a>`clouds.set_height(y)`, `set_thickness(t)`, `set_cell_size(c)`, `set_threshold(t)`, `set_scroll_speed(v)`
 - <a id="fn-clouds-set_texture"></a>`clouds.set_texture(path)`
-- <a id="fn-clouds-set_weather"></a>`clouds.set_weather(name, seconds)` fades to a weather over that many seconds
+- <a id="fn-clouds-set_weather"></a>`clouds.set_weather(name, seconds)` fades to a weather's clouds over that many seconds, and returns false for an unknown name. During the change, clouds form or melt away cell by cell. The weathers:
+  - `"clear"`: no clouds at all.
+  - `"cloudy"`: scattered white clouds.
+  - `"rain"`: thicker grey clouds.
+  - `"thunder"` (or `"storm"`): one huge, dark, low, thick storm cloud over everything.
+  - `"snow"`: clouds bunched together into big soft-grey masses.
+  - `"blizzard"`: like snow, thicker and darker.
+
+  The weather mod does this for you: each weather it registers names its clouds (`clouds = "rain"`).
+- <a id="fn-clouds-set_clump"></a>`clouds.set_clump(0..1)`: how bunched together the clouds are, from 0 (scattered puffs) to 1 (big masses).
 
 **Fog:**
 - <a id="fn-fog-set_enabled"></a><a id="fn-fog-set_exponential"></a>`fog.set_enabled(bool)`, `set_exponential(bool)`
@@ -2141,7 +2206,7 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
 **Underwater:**
 - <a id="fn-underwater-set_deep_color"></a><a id="fn-underwater-set_shallow_color"></a>`underwater.set_shallow_color(r,g,b)`, `set_deep_color(r,g,b)`
 - <a id="fn-underwater-set_full_depth"></a><a id="fn-underwater-set_visibility"></a>`underwater.set_visibility(shallow_blocks, deep_blocks)`, `set_full_depth(blocks)`
-- <a id="fn-underwater-set_fade"></a><a id="fn-underwater-set_tint_strength"></a>`underwater.set_fade(in_seconds, out_seconds)`, `set_tint_strength(0..1)`
+- <a id="fn-underwater-set_fade"></a><a id="fn-underwater-set_tint_strength"></a>`underwater.set_fade(in_seconds, out_seconds)`, `set_tint_strength(0..1)`. The tint colours everything like the water, however close, so a small pool looks underwater too. The fog only shows on things far away. The default strength is 0.42.
 
 <a id="fn-hooks-get_water_color"></a>Define `get_water_color(x, z)` to return `{ r, g, b, deep_r, deep_g, deep_b }` per place, for example by biome.
 
@@ -2187,6 +2252,7 @@ engine.register_block("murky_water", 1, 1, 1, "murky.png", nil, {
 | `light` | Light the block gives off: a level 0–15 (coloured by `light_color`), or `{ r, g, b }` levels. `light = 0` turns off a guessed light (below). |
 | `light_color` | Colour of `light`: `{ r, g, b }` (0–255 or 0–1) or `"#rrggbb"`. Default white. |
 | `light_filter` | Colour of light let through, for stained glass: `{ r, g, b }`. Default `{ 1, 1, 1 }`. |
+| `tint_view` | Looking through the block tints everything behind it in its picture's colour, like stained glass. Blocks, water, mobs and the sky are all tinted, at any time of day, and several panes in a row multiply. On by default for a see-through (`transparent`) block with a `light_filter`; `tint_view = false` turns it off and `true` turns it on without a filter. How strong the tint is depends on how opaque the picture is: a half-transparent picture tints fully, and white or fully clear pixels let everything through. Light passing through is only coloured by `light_filter`; sunlight isn't coloured. |
 | `light_absorb` | Light lost per block passing through, like Minecraft's light opacity. Sunlight going straight down loses only this; sideways, at least 1 is always lost. Default 1 for water, other fluids and leaves (sunlight reaches about 15 blocks deep), otherwise 0. Set `0` for crystal-clear water. |
 
 **Which blocks stop light:** solid, non-transparent blocks with `pattern = "cube"`. Transparent blocks, cutout blocks (leaves), plants, fluids, doors and models let light through.
@@ -2414,6 +2480,8 @@ entities.register("mymod:goat", {
     gravity = true,              -- false: it floats where you put it (set_velocity moves it)
     collides = true,             -- false: passes through blocks
     knockback = true,            -- pushed back when hit
+    solid = true,                -- bumps into other mobs and players instead of walking through them
+                                 --   (false: passes through, e.g. ghosts or tiny critters)
     despawn = false,             -- true: removed when no player is near, and never saved (monsters)
     -- looks (the games that draw it)
     model = "goat.geo.json",     -- .geo.json (Bedrock / Blockbench) or .b3d, from your mod's models/
@@ -3099,7 +3167,7 @@ Define any of these as globals. Only the ones you need. If another mod may alrea
 | `on_right_click_block(x, y, z, block, item, sneaking, repeat)` → bool | right-click on a block |
 | `on_block_broken(x, y, z, block, meta, player)` | a player broke a block |
 | `on_block_placed(x, y, z, block, player)` | a player placed a block |
-| `can_edit_block(player, x, y, z, old_block, new_block)` → `false[, reason]` | before a player's change on a server or LAN game: refuse it (section 17) |
+| `can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` → `false[, reason]` | before a player's change (block or metadata) on a server or LAN game: refuse it (section 17) |
 | `on_player_join(name, info)`, `on_player_leave(name, x, y, z)` | players joining and leaving (section 17) |
 | `on_player_chat(name, text)` → `false` or new text | a chat line before everyone sees it (section 17) |
 | `on_server_start()`, `on_server_stop()` | the server starts or stops (section 17) |
@@ -3132,7 +3200,7 @@ These run wherever the world is: on the dedicated server, and in the game for si
 | <a id="fn-hooks-on_player_join"></a>`on_player_join(name, info)` | someone joined. `info.operator`, `info.mode` (`"survival"`/`"creative"`), `info.new_account` (they just protected their name with a password) | |
 | <a id="fn-hooks-on_player_leave"></a>`on_player_leave(name, x, y, z)` | someone left (or was kicked), and where they were | |
 | <a id="fn-hooks-on_player_chat"></a>`on_player_chat(name, text)` | a chat line, **before** anyone sees it | `false` drops it; a string replaces it; nothing lets it through |
-| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block)` | a player is about to break or place a block (also for changes a mod makes for them with `engine.player_set_block`) | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
+| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` | a player is about to change a block: break or place one, or change only its metadata (opening a door, filling a tank). It is also asked for changes a mod makes for them with `engine.player_set_block`. `old_meta` is what is stored now and `new_meta` what they ask for (0..255). | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
 | `on_player_harvest(name, item, x, y, z)` | a joined player asked to use `item` on that block ([`engine.request_harvest`](#fn-engine-request_harvest); the scythe) | |
 | <a id="fn-hooks-on_server_start"></a>`on_server_start()` | the dedicated server is ready for players (in the game: you started hosting) | |
 | <a id="fn-hooks-on_server_stop"></a>`on_server_stop()` | the server is stopping, before the world is saved (in the game: you stopped hosting) | |
@@ -3178,7 +3246,7 @@ end
 | <a id="fn-engine-message_player"></a>`engine.message_player(name, text [, r, g, b])` | a chat line only they see (colour 0..1 or 0..255). True if they're online. |
 | <a id="fn-engine-kick_player"></a>`engine.kick_player(name [, reason])` | disconnects them (right after the current event, never in the middle of it). True if they're online. |
 | <a id="fn-engine-teleport_player"></a>`engine.teleport_player(name, x, y, z)` | moves them |
-| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block)` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). Use it for anything a player earns from a change, and give the reward only on true. |
+| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block [, meta])` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). It also returns false, with no reason, when the block and metadata are already exactly what was asked for: nothing changed. Use it for anything a player earns from a change, and give the reward only on true. |
 | <a id="fn-engine-set_player_mode"></a><a id="fn-engine-get_player_mode"></a>`engine.set_player_mode(name, "survival"\|"creative")`, `engine.get_player_mode(name)` | their game mode. On the dedicated server, a change is remembered in `gamemodes.txt`. |
 | <a id="fn-engine-is_player_operator"></a>`engine.is_player_operator(name)` | is that player an operator? (LAN guests never are; you are, in your own world) |
 | <a id="fn-engine-get_server_info"></a>`engine.get_server_info()` | `{ dedicated, running, online, game, max_players, name, world, ... }` |

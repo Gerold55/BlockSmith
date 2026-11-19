@@ -14,7 +14,8 @@
 --                         fall_speed = 3, size = 0.06, streaks = false },
 --       wind = { 6, 1 },                               -- blocks/s, x and z
 --       lightning = 0,                                 -- flashes per minute
---       clouds = nil,                                  -- optional: clouds.set_weather(name)
+--       clouds = nil,                                  -- optional: clouds.set_weather(name): "clear" (none),
+--                                                      -- "cloudy", "rain", "thunder", "snow", "blizzard"
 --       chance = 5,                                    -- how often the cycle picks it (0 = never)
 --       duration = { 120, 300 },                       -- seconds, min and max
 --       fade = 15,                                     -- seconds to fade in
@@ -101,10 +102,12 @@ weather.register("clear", {
     chance = 0,                     -- the cycle comes back to clear by itself (see pick_next)
     duration = { 600, 1500 },       -- 10 - 25 minutes
     fade = 15,
+    clouds = "clear",               -- the clouds melt away
 })
 weather.register("cloudy", {
     light = 0.85, rain = 0.1, sky_tint = { 0.62, 0.66, 0.7, 0.3 },
     chance = 30, duration = { 240, 600 }, fade = 20,
+    clouds = "cloudy",
 })
 weather.register("rain", {
     light = 0.68, rain = 0.75, sky_tint = { 0.45, 0.5, 0.55, 0.55 },
@@ -113,9 +116,12 @@ weather.register("rain", {
     chance = 45, duration = { 180, 540 }, fade = 12,
     cold_variant = "snow",
     sound = "weather_rain", sound_gain = 0.55,   -- looped, fades with the weather
+    clouds = "rain",
 })
 weather.register("thunder", {
-    light = 0.45, rain = 1.0, sky_tint = { 0.28, 0.31, 0.36, 0.78 },
+    -- a huge dark storm cloud overhead; it gets dark out, and lightning strikes from it
+    light = 0.3, rain = 1.0, sky_tint = { 0.16, 0.18, 0.22, 0.85 },
+    clouds = "thunder",
     precipitation = { type = "rain", intensity = 1.0, fall_speed = 17 },
     wind = { 2.5, 1.2 },
     lightning = 7,
@@ -128,12 +134,14 @@ weather.register("snow", {
     precipitation = { type = "snow", intensity = 0.7 },
     wind = { 0.4, 0.2 },
     chance = 0, duration = { 240, 600 }, fade = 15,      -- comes from rain's cold_variant
+    clouds = "snow",                                     -- the clouds bunch together
 })
 weather.register("blizzard", {
     light = 0.6, rain = 0.9, sky_tint = { 0.8, 0.82, 0.86, 0.75 },
     precipitation = { type = "snow", intensity = 1.0, fall_speed = 4, sway = 1.2 },
     wind = { 5, 2 },
     chance = 0, duration = { 120, 300 }, fade = 10,
+    clouds = "blizzard",
 })
 
 -- Clear most of the time; after bad weather it usually clears up again.
@@ -235,6 +243,8 @@ local function apply_look()
     end
 end
 
+local clouds_shown = nil   -- the cloud look last applied (nil: not yet)
+
 -- Show weather `name` (or its cold variant here), fading over `fade` seconds
 local function show(name, fade)
     local def = types[name]
@@ -251,7 +261,11 @@ local function show(name, fade)
     shown_name = def.name
     vis_fade = math.max(fade or 0, 0)
     vis_t = vis_fade > 0 and 0 or 1
-    if def.clouds and clouds and clouds.set_weather then clouds.set_weather(def.clouds, vis_fade) end
+    clouds_shown = nil
+    if def.clouds and clouds and clouds.set_weather then
+        -- (false = the clouds don't exist yet - the world is still loading: tried again each update)
+        if clouds.set_weather(def.clouds, vis_fade) ~= false then clouds_shown = def.clouds end
+    end
     if def.cloud_color and clouds and clouds.set_color then
         clouds.set_color(def.cloud_color[1], def.cloud_color[2], def.cloud_color[3])
     end
@@ -302,6 +316,15 @@ local function weather_sounds(dt)
     end
 end
 
+-- The clouds for what's on screen, once they exist (the first weather often comes while the
+-- world is still loading)
+local function catch_up_clouds()
+    if is_server or clouds_shown or not shown_name or not (clouds and clouds.set_weather) then return end
+    local def = types[shown_name]
+    if not def or not def.clouds then clouds_shown = true return end
+    if clouds.set_weather(def.clouds, 0) ~= false then clouds_shown = def.clouds end
+end
+
 local function lightning(dt)
     if is_server or not vis_to then return end
     local rate = on_screen().lightning   -- flashes per minute
@@ -316,6 +339,8 @@ local function lightning(dt)
     if engine.get_player_position then px, _, pz = engine.get_player_position() end
     local ang, dist = math.random() * 6.283, 20 + math.random() * 80
     local lx, lz = px + math.cos(ang) * dist, pz + math.sin(ang) * dist
+    -- the bolt itself, from the storm cloud down to the ground there
+    if sky.lightning_bolt then sky.lightning_bolt(lx, lz, nil, double_flash and 0.6 or 0.45) end
     for _, fn in ipairs(lightning_callbacks) do pcall(fn, lx, lz) end
 end
 
@@ -353,6 +378,7 @@ function on_update(dt)
         vis_t = math.min(1, vis_t + dt / math.max(vis_fade, 0.01))
         apply_look()
     end
+    catch_up_clouds()
     lightning(dt)
     weather_sounds(dt)
 end

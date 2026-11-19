@@ -27,6 +27,9 @@ public:
 
     void drawOpaque() const;
     void drawTransparent() const;
+    // See-through blocks that tint the view (stained glass, tintView): their faces again, for
+    // the colour-filter pass (WorldRenderer multiplies what's behind them by their colour)
+    void drawTint() const;
 
     // One whole block on its own, as a cube from (0,0,0) to (1,1,1) in this mesh's vertex
     // format, textured like the same block in the world, with an even light (0..1: sky, then
@@ -39,6 +42,8 @@ public:
     GLsizei opaqueVertexCount = 0;
     GLuint transparentVAO = 0, transparentVBO = 0;
     GLsizei transparentVertexCount = 0;
+    GLuint tintVAO = 0, tintVBO = 0;
+    GLsizei tintVertexCount = 0;
 
     bool meshReadyForUpload = false;   // built on the CPU, not yet on the GPU
     bool everUploaded = false;         // has reached the GPU at least once
@@ -46,4 +51,5 @@ public:
 private:
     std::vector<Vertex> cpuOpaqueVertices;
     std::vector<Vertex> cpuTransparentVertices;
+    std::vector<Vertex> cpuTintVertices;
 };

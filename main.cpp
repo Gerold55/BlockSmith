@@ -114,8 +114,10 @@ struct UnderwaterSettings {
     float       fullDepth         = 48.0f;   // depth where it's fully "deep"
     float       fadeInSeconds     = 0.6f;
     float       fadeOutSeconds    = 0.4f;
-    float       tintStrength      = 0.15f;   // how much everything is coloured blue
-    float       fogStartFraction  = 0.2f;    // fog starts this far (of the visibility) away
+    // How much everything is coloured like the water, however close: this is what makes a small
+    // pool look underwater too (the fog alone only shows on things far away, as in the ocean)
+    float       tintStrength      = 0.42f;
+    float       fogStartFraction  = 0.04f;   // fog starts this far (of the visibility) away
     // Colours set from Lua (underwater.set_shallow_color / set_deep_color). If not, they come
     // from the water block itself (its texture and tint), so being underwater looks like the water.
     bool        colorsFromLua     = false;
@@ -1954,7 +1956,7 @@ local hooks = {
     { "on_right_click_block",     "(x, y, z, block, held_item, sneaking, repeat) -> true if handled" },
     { "on_block_broken",          "(x, y, z, block, meta, player)  a player broke a block (after it's gone)" },
     { "on_block_placed",          "(x, y, z, block, player)  a player placed a block" },
-    { "can_edit_block",           "(player, x, y, z, old_block, new_block) -> false[, reason] to refuse  a player's change, on servers and LAN games" },
+    { "can_edit_block",           "(player, x, y, z, old_block, new_block, old_meta, new_meta) -> false[, reason] to refuse  a player's change (block or metadata), on servers and LAN games" },
     { "on_player_join",           "(name, info)  someone joined (info: operator, mode, new_account)" },
     { "on_player_leave",          "(name, x, y, z)  someone left" },
     { "on_player_chat",           "(name, text) -> false to drop it, or new text  a chat line before everyone sees it" },
@@ -3006,6 +3008,7 @@ uniform vec3  u_UnderwaterTint;
 uniform float u_UnderwaterAmount;
 uniform float u_WeatherLight;
 uniform float u_ChunkFade;
+uniform int   u_TintPass;         // 1 = stained glass as a colour filter (multiply blending; WorldRenderer::drawTint)
 
 // Block light (Light.h). Chunks carry light per corner; anything else drawn with this shader
 // (other players, particles...) uses the light where the camera is.
@@ -3117,6 +3120,14 @@ void main() {
         } else {
             fogFactor = clamp((u_FogEnd - dist) / max(u_FogEnd - u_FogStart, 0.001), 0.0, 1.0);
         }
+    }
+
+    if (u_TintPass == 1) {
+        // The glass's own colour, not lit (a filter works the same at night), stronger where the
+        // picture is more opaque; clear or white parts let everything through. Fades with fog.
+        vec3 filterRgb = mix(vec3(1.0), finalColor.rgb, clamp(finalColor.a * 2.2, 0.0, 1.0));
+        FragColorOut = vec4(mix(vec3(1.0), filterRgb, fogFactor), 1.0);
+        return;
     }
 
     vec3 finalRgb = mix(u_FogColor, shadedColor, fogFactor);
@@ -4245,6 +4256,22 @@ int main(int argc, char** argv) {
         skyTable["flash"] = [](float strength, sol::optional<float> seconds) {
             g_Weather.flash(strength, seconds.value_or(0.35f));
         };
+        // sky.lightning_bolt(x, z [, top_y [, seconds]]): a bolt from the clouds (or top_y) down to
+        // the ground at x, z, flickering for `seconds` (0.45). Only drawn: no fire, no damage (mods
+        // decide that on the server). Pair it with sky.flash for the light.
+        skyTable["lightning_bolt"] = [](float x, float z, sol::optional<float> topY, sol::optional<float> seconds) {
+            if (!std::isfinite(x) || !std::isfinite(z)) return false;
+            float ground = g_PlayerPosition.y;
+            if (g_WorldInstance) {
+                const int g = g_WorldInstance->groundHeightAt(static_cast<int>(std::floor(x)), static_cast<int>(std::floor(z)));
+                if (g >= 0) ground = static_cast<float>(g);
+            }
+            float top = topY.value_or(g_Clouds ? g_Clouds->settings().height : ground + 80.0f);
+            if (!std::isfinite(top)) return false;
+            top = std::max(top, ground + 20.0f);
+            g_Weather.strike(glm::vec3(x, top, z), glm::vec3(x, ground, z), seconds.value_or(0.45f));
+            return true;
+        };
 
         // Moving lights (not tied to a block): sky.add_light(x, y, z, r, g, b, radius, intensity) -> id,
         // sky.move_light(id, x, y, z [, r, g, b, radius, intensity]), sky.remove_light(id).
@@ -4307,8 +4334,15 @@ int main(int argc, char** argv) {
             if (!g_Clouds) return;
             CloudSettings s = g_Clouds->settings(); s.texturePath = path; g_Clouds->setSettings(s);
         };
-        cloudTable["set_weather"] = [](const std::string& name, float seconds) {
-            if (g_Clouds) g_Clouds->setWeather(name, seconds);
+        // clouds.set_weather(name, seconds) -> true if known: "clear" (none), "cloudy", "rain",
+        // "thunder"/"storm" (one huge dark mass), "snow", "blizzard" (bunched together)
+        cloudTable["set_weather"] = [](const std::string& name, sol::optional<float> seconds) {
+            return g_Clouds && g_Clouds->setWeather(name, seconds.value_or(0.0f));
+        };
+        // clouds.set_clump(0..1): 0 scattered puffs, 1 bunched into big masses
+        cloudTable["set_clump"] = [](float v) {
+            if (!g_Clouds || !std::isfinite(v)) return;
+            CloudSettings s = g_Clouds->settings(); s.clump = std::clamp(v, 0.0f, 1.0f); g_Clouds->setSettings(s);
         };
 
         auto fogTable = lua.create_named_table("fog");
@@ -5507,8 +5541,9 @@ int main(int argc, char** argv) {
             };
             g_Server.onLeave = [](const std::string& name, const glm::vec3& pos) { g_ServerApi.playerLeft(name, pos); };
             g_Server.onChat = [](const std::string& name, std::string& text) { return g_ServerApi.chat(name, text); };
-            g_Server.canEdit = [](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
-                return g_ServerApi.canEdit(name, pos, oldId, newId);
+            g_Server.canEdit = [](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t oldMeta,
+                                  uint8_t newId, uint8_t newMeta) {
+                return g_ServerApi.canEdit(name, pos, oldId, oldMeta, newId, newMeta);
             };
             g_Server.onCommand = [](const std::string& name, const std::string& command) {
                 // Mods' commands first (on_chat_command; LAN guests are never operators)
@@ -7202,11 +7237,11 @@ int main(int argc, char** argv) {
             const glm::vec3 underwaterFog = glm::mix(water.shallow, water.deep, depthT);
             const float underwaterVis = glm::mix(g_Underwater.shallowVisibility, g_Underwater.deepVisibility, depthT);
 
-            // A gentle cool tint (white mixed with a little fog colour): colours stay readable
-            const glm::vec3 underwaterTint = glm::mix(
-                glm::vec3(0.85f, 0.95f, 1.0f),
-                glm::normalize(underwaterFog),
-                0.25f);
+            // The water's own colour on everything, near or far (brightened so it tints rather than
+            // darkens; a little white kept so colours stay readable)
+            const glm::vec3 fogHue = underwaterFog / glm::max(glm::max(underwaterFog.r, underwaterFog.g),
+                                                              glm::max(underwaterFog.b, 0.001f));
+            const glm::vec3 underwaterTint = glm::mix(glm::vec3(0.85f, 0.95f, 1.0f), fogHue, 0.75f);
             const float tintAmount = blend * g_Underwater.tintStrength;
 
             const glm::vec3 skyClear(0.5f, 0.8f, 0.95f);
@@ -7727,6 +7762,7 @@ int main(int argc, char** argv) {
                 if (blend < 0.5f) {
                     g_Weather.drawPrecipitation(view, proj, eyePos, glm::clamp(sunDir.y * 2.0f + 0.5f, 0.0f, 1.0f));
                 }
+                if (blend < 0.5f) g_Weather.drawBolts(view, proj, eyePos);
                 g_Weather.drawFlash();
 
                 // ---------------- First-person hand (FirstPerson.h) ----------------

@@ -1,10 +1,10 @@
 # Game settings. Edited from the Settings screen.
-brightness = 100
+brightness = 50
 client_mods = 
 firewall_ok_game = 1
 fov = 70
 key_forward = 87
 lan_server_id = ccbce16ecf0815f00cea0408a0413933
 player_name = Gerold55
-render_distance = 10
+render_distance = 8
 vsync = 1

@@ -370,6 +370,7 @@ void EntityManager::step(float dt, const World& world, const std::vector<glm::ve
     if (dt <= 0.0f) return;
     dt = std::min(dt, 0.1f);
     FluidRegistry::get().ensureFresh();
+    std::vector<Entity*> active;     // moved this step (for pushing each other apart, below)
     for (auto& [id, e] : m_entities) {
         if (e.removed) continue;
         const EntityType* t = type(e.type);
@@ -401,7 +402,9 @@ void EntityManager::step(float dt, const World& world, const std::vector<glm::ve
         if (e.repathCooldown > 0.0f) e.repathCooldown -= dt;
         followPath(e, *t, dt, world);
         moveAndCollide(e, *t, dt, world);
+        active.push_back(&e);
     }
+    pushApart(dt, world, players, active);
 
     // Dropped items next to each other become one stack
     std::vector<Entity*> items;
@@ -429,6 +432,79 @@ void EntityManager::step(float dt, const World& world, const std::vector<glm::ve
         } else {
             ++it;
         }
+    }
+}
+
+// Minecraft's entity pushing: mobs don't walk through each other or through players. Each step,
+// any two solid bodies whose boxes overlap are moved apart along the line between their centres
+// (sideways only), a good part of the overlap at a time, so crowds shuffle and spread out smoothly
+// instead of snapping. The heavier one (bigger box) moves less; players and entities that can't
+// be pushed (knockback = false) don't move at all - the other one gets out of the way. The moves
+// go through block collision, so nothing is pushed into a wall. Dropped items aren't solid.
+void EntityManager::pushApart(float dt, const World& world, const std::vector<glm::vec3>& players,
+                              const std::vector<Entity*>& active) {
+    struct Body { Entity* e; const EntityType* t; glm::vec3 pos; float hw, h, weight; bool movable; glm::vec2 push{0.0f}; };
+    std::vector<Body> bodies;
+    bodies.reserve(active.size() + players.size());
+    for (Entity* e : active) {
+        const EntityType* t = type(e->type);
+        if (!t || t->isItem || !t->solid || !t->collides || e->removed) continue;
+        bodies.push_back(Body{e, t, e->pos, t->width * 0.5f, t->height, t->width * t->width * t->height, t->pushable});
+    }
+    if (bodies.empty()) return;
+    for (const auto& p : players) bodies.push_back(Body{nullptr, nullptr, p, 0.3f, 1.8f, 1.0f, false});
+
+    // Neighbours through a grid of 2-block cells (no n^2 over every entity)
+    auto cellKey = [](int cx, int cz) { return (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cz); };
+    std::unordered_map<int64_t, std::vector<size_t>> grid;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        grid[cellKey(static_cast<int>(std::floor(bodies[i].pos.x / 2.0f)), static_cast<int>(std::floor(bodies[i].pos.z / 2.0f)))].push_back(i);
+    }
+    const float rate = std::min(1.0f, 12.0f * dt);   // share of the overlap undone this step
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        Body& a = bodies[i];
+        const int cx = static_cast<int>(std::floor(a.pos.x / 2.0f)), cz = static_cast<int>(std::floor(a.pos.z / 2.0f));
+        for (int dx = -1; dx <= 1; ++dx) for (int dz = -1; dz <= 1; ++dz) {
+            auto it = grid.find(cellKey(cx + dx, cz + dz));
+            if (it == grid.end()) continue;
+            for (size_t j : it->second) {
+                if (j <= i) continue;
+                Body& b = bodies[j];
+                if (!a.movable && !b.movable) continue;
+                // overlapping in height?
+                if (a.pos.y >= b.pos.y + b.h || b.pos.y >= a.pos.y + a.h) continue;
+                // ...and across (boxes): how far they overlap on x and on z
+                const float ox = a.hw + b.hw - std::fabs(b.pos.x - a.pos.x);
+                const float oz = a.hw + b.hw - std::fabs(b.pos.z - a.pos.z);
+                if (ox <= 0.0f || oz <= 0.0f) continue;
+                glm::vec2 n(b.pos.x - a.pos.x, b.pos.z - a.pos.z);
+                float len = glm::length(n);
+                if (len < 1e-4f) {                        // exactly on top of each other: any way
+                    const float ang = random01() * 6.2831853f;
+                    n = glm::vec2(std::cos(ang), std::sin(ang));
+                } else {
+                    n /= len;
+                }
+                const float overlap = std::min(std::min(ox, oz), 0.6f) * rate;
+                float shareA = 0.5f, shareB = 0.5f;
+                if (!a.movable) { shareA = 0.0f; shareB = 1.0f; }
+                else if (!b.movable) { shareA = 1.0f; shareB = 0.0f; }
+                else { shareA = b.weight / (a.weight + b.weight); shareB = 1.0f - shareA; }
+                a.push -= n * (overlap * shareA);
+                b.push += n * (overlap * shareB);
+            }
+        }
+    }
+    for (Body& b : bodies) {
+        if (!b.e || !b.movable || (b.push.x == 0.0f && b.push.y == 0.0f)) continue;
+        Entity& e = *b.e;
+        const glm::vec3 mn0(-b.hw, 0.0f, -b.hw), mx0(b.hw, b.h, b.hw);
+        const float px = sweep(world, e.pos + mn0, e.pos + mx0, 0, b.push.x);
+        e.pos.x += px;
+        const float pz = sweep(world, e.pos + mn0, e.pos + mx0, 2, b.push.y);
+        e.pos.z += pz;
+        // ...and a little of it as speed, so walking into each other doesn't keep re-overlapping
+        if (dt > 0.0f) { e.vel.x += px / dt * 0.15f; e.vel.z += pz / dt * 0.15f; }
     }
 }
 

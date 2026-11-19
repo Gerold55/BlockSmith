@@ -6,7 +6,8 @@
 //   on_player_join(name, info)          info = { operator, mode, new_account }
 //   on_player_leave(name, x, y, z)
 //   on_player_chat(name, text) -> false to drop the line, or a string to replace it
-//   can_edit_block(name, x, y, z, old_block, new_block) -> false[, reason] to refuse
+//   can_edit_block(name, x, y, z, old_block, new_block, old_meta, new_meta) -> false[, reason] to
+//       refuse (asked when the block or its metadata changes)
 //   on_block_broken(x, y, z, block, meta, player) / on_block_placed(x, y, z, block, player)
 //   on_player_harvest(name, item, x, y, z)   a joined player used `item` (the scythe) on that
 //       block: the server works out what it does, from its own world (engine.player_set_block)
@@ -76,7 +77,8 @@ public:
         return keep;
     }
     // "" = allowed; a reason (or GameServer::kSilentRefusal) = refused
-    std::string canEdit(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
+    std::string canEdit(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t oldMeta,
+                        uint8_t newId, uint8_t newMeta) {
         std::string refusal;
         auto& reg = BlockRegistry::getInstance();
         call("can_edit_block", [&](sol::protected_function_result& r) {
@@ -88,7 +90,8 @@ public:
                 refusal = r.get<std::string>(1);
                 if (refusal.empty()) refusal = GameServer::kSilentRefusal;
             }
-        }, name, pos.x, pos.y, pos.z, blockName(reg, oldId), blockName(reg, newId));
+        }, name, pos.x, pos.y, pos.z, blockName(reg, oldId), blockName(reg, newId),
+           static_cast<int>(oldMeta), static_cast<int>(newMeta));
         return refusal;
     }
     // A change was made by `name` ("" = not a player): on_block_broken / on_block_placed
@@ -198,17 +201,19 @@ public:
             PlayerInfo p;
             return findPlayer(name, p) ? p.op : (isOperator && isOperator(name));
         };
-        // engine.player_set_block(name, x, y, z, block) -> true, or false[, reason to show them]:
+        // engine.player_set_block(name, x, y, z, block [, meta]) -> true, or false[, reason to show them]:
         // changes a block for a joined player with exactly the checks their own edits get (within
         // reach - with a block of slack, for a 3x3 patch -, spawn protection, can_edit_block).
         // For server-side actions that must only reward what was really allowed: make the change
-        // first, then give what it yields only when this returns true.
+        // first, then give what it yields only when this returns true. It's false (no reason) when
+        // the block and metadata are already exactly that: nothing changed, so nothing was earned.
         engine["player_set_block"] = [this](const std::string& name, int x, int y, int z, const std::string& block,
-                                            sol::this_state ts) {
+                                            sol::optional<int> meta, sol::this_state ts) {
             sol::state_view lv(ts);
             std::string why;
+            const uint8_t m = static_cast<uint8_t>(std::clamp(meta.value_or(0), 0, 255));
             const bool ok = server && server->running() &&
-                            server->playerSetBlock(name, glm::ivec3(x, y, z), block, &why, 2.0f);
+                            server->playerSetBlock(name, glm::ivec3(x, y, z), block, &why, 2.0f, m);
             return std::make_tuple(ok, why.empty() ? sol::make_object(lv, sol::lua_nil) : sol::make_object(lv, why));
         };
         engine["get_server_info"] = [this](sol::this_state ts) {

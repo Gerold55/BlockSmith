@@ -189,7 +189,10 @@ public:
     // Before a player's block change is applied: "" = allowed, anything else = refused (the
     // player's game is sent the real block back). The text is shown to the player, except
     // kSilentRefusal. Optional. (Mods: can_edit_block)
-    std::function<std::string(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> canEdit;
+    // Asked for every real change: a different block, or the same block with different metadata
+    // (a door opening, a tank filling), with what's stored now and what's asked for.
+    std::function<std::string(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t oldMeta,
+                              uint8_t newId, uint8_t newMeta)> canEdit;
     static constexpr const char* kSilentRefusal = "\x01";
     // A player's chat line, before everyone sees it: return false to drop it; `text` may be
     // changed. Optional. (Mods: on_player_chat)
@@ -247,9 +250,11 @@ public:
     // Changes a block for a joined player with the same checks as their own edits: loaded,
     // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
     // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
-    // False = refused or not online; `why` = what to tell them ("" = nothing).
+    // False = refused, not online, or nothing to change (the block and metadata are already
+    // exactly that); `why` = what to tell them ("" = nothing).
+    // `meta` is the metadata to set (checked like the block: a metadata-only change is a change).
     bool playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
-                        std::string* why = nullptr, float slack = 0.0f);
+                        std::string* why = nullptr, float slack = 0.0f, uint8_t meta = 0);
 
     // The time of day (DayTime.h). The owner (the dedicated server, or the game when hosting)
     // calls this every tick with its clock; players get it when they join, every few seconds,
@@ -318,7 +323,7 @@ private:
     void handleAuth(Client& c, const uint8_t* data, size_t size);
     void finishJoin(Client& c, const std::string& name, int view);
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
-    std::string editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, float slack);
+    std::string editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, uint8_t meta, float slack);
     void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
     void sendMessageTo(Client& c, const std::string& text, const glm::vec3& color);

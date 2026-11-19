@@ -1621,13 +1621,14 @@ int main(int argc, char** argv) {
     };
     // Spawn protection (server.conf spawn_protection), then mods: can_edit_block may refuse an
     // edit. As in Minecraft it only applies once there are operators, and operators may build.
-    server.canEdit = [&](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId) -> std::string {
+    server.canEdit = [&](const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t oldMeta,
+                         uint8_t newId, uint8_t newMeta) -> std::string {
         const int r = config.spawnProtection;
         if (r > 0 && !ops.entries.empty() && !ops.has(name) &&
             std::abs(pos.x - config.spawnX) <= r && std::abs(pos.z - config.spawnZ) <= r) {
             return "The area around spawn is protected";
         }
-        return ctx.api.canEdit(name, pos, oldId, newId);
+        return ctx.api.canEdit(name, pos, oldId, oldMeta, newId, newMeta);
     };
     server.onChat = [&ctx](const std::string& name, std::string& text) { return ctx.api.chat(name, text); };
     std::set<std::string> newAccounts;   // registered while joining (told about it once they're in)

@@ -31,6 +31,9 @@ struct EntityType {
     bool collides = true;        // stopped by blocks (false: flies through everything)
     bool autoJump = true;        // walking into a 1-block step jumps it
     bool pushable = true;        // knocked back when hit
+    // Bumps into other entities and players instead of walking through them (Minecraft's entity
+    // pushing): overlapping bodies are nudged apart. false: passes through (ghosts, small critters)
+    bool solid = true;
     bool despawn = false;        // removed when no player is near (most hostile mobs)
     bool isItem = false;         // a dropped item (engine-made, "__item")
     // Looks (only the games that draw it use these)
@@ -203,6 +206,9 @@ public:
 
 private:
     void followPath(Entity& e, const EntityType& t, float dt, const World& world);
+    // Overlapping solid entities (and players) nudged apart, through block collision
+    void pushApart(float dt, const World& world, const std::vector<glm::vec3>& players,
+                   const std::vector<Entity*>& active);
     void moveAndCollide(Entity& e, const EntityType& t, float dt, const World& world);
     std::map<std::string, EntityType> m_types;
     std::unordered_map<uint32_t, Entity> m_entities;

@@ -151,7 +151,8 @@ inline bool isCutout(const BlockProperty& p) {
 
 inline bool canWaterlog(const BlockProperty& p) {
     // Doors use their metadata for facing/open, not for "waterlogged"
-    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door";
+    // (doors and tanks use their metadata for other things: facing, how full)
+    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door" && p.pattern != "tank";
 }
 
 // Fluids never hide what's next to them (even opaque ones like lava: their surface is
@@ -278,11 +279,14 @@ ChunkMesh::~ChunkMesh() {
     if (opaqueVBO != 0)      glDeleteBuffers(1, &opaqueVBO);
     if (transparentVAO != 0) glDeleteVertexArrays(1, &transparentVAO);
     if (transparentVBO != 0) glDeleteBuffers(1, &transparentVBO);
+    if (tintVAO != 0)        glDeleteVertexArrays(1, &tintVAO);
+    if (tintVBO != 0)        glDeleteBuffers(1, &tintVBO);
 }
 
 void ChunkMesh::generateMeshData(const ChunkData& data) {
     cpuOpaqueVertices.clear();
     cpuTransparentVertices.clear();
+    cpuTintVertices.clear();
 
     auto& registry = BlockRegistry::getInstance();
     FluidRegistry::get().refresh();   // block ids by name: never stale
@@ -477,6 +481,108 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         }
     };
 
+    // A box (block coordinates inside the cell, 0..1), textured like a pixel-exact cut of the
+    // block's pictures (as Minecraft draws non-cube blocks): each face shows the part of the
+    // picture its position covers. `texProp` gives the pictures; `allTop` uses its top picture on
+    // every face (liquids look like their surface all round). Faces on the cell's edge next to a
+    // solid block are skipped; `doubleSided` also draws the inside (the far glass of a tank).
+    auto emitBox = [&](int x, int y, int z, const glm::vec3& mn, const glm::vec3& mx, const BlockProperty& texProp,
+                       bool allTop, bool doubleSided, std::vector<Vertex>& buf, bool tintView, bool skipTop, bool skipBottom) {
+        for (int f = 0; f < 6; ++f) {
+            if ((f == 2 && skipTop) || (f == 3 && skipBottom)) continue;
+            // on the cell's edge, against a solid block: hidden
+            const bool onEdge = (f == 0 && mx.x >= 1.0f) || (f == 1 && mn.x <= 0.0f) || (f == 2 && mx.y >= 1.0f) ||
+                                (f == 3 && mn.y <= 0.0f) || (f == 4 && mx.z >= 1.0f) || (f == 5 && mn.z <= 0.0f);
+            if (onEdge) {
+                const uint8_t nid = data.getBlock(x + kFaceOffset[f][0], y + kFaceOffset[f][1], z + kFaceOffset[f][2]);
+                if (nid != 0 && isOpaqueSolid(registry.getBlock(nid))) continue;
+            }
+            int texFace = allTop ? 2 : f;
+            if (texProp.faces[texFace].baseLayer < 0) {
+                for (int g : { 2, 4, 0, 1, 5, 3 }) if (texProp.faces[g].baseLayer >= 0) { texFace = g; break; }
+            }
+            const auto& fp = texProp.faces[texFace];
+            if (fp.baseLayer < 0) continue;
+            const FaceStyle style{ texProp.defaultTint.r, texProp.defaultTint.g, texProp.defaultTint.b,
+                                   static_cast<float>(fp.baseLayer),
+                                   fp.overlayLayer >= 0 ? static_cast<float>(fp.overlayLayer) : -1.0f,
+                                   tintFlag(fp.tintBase), tintFlag(fp.tintOverlay), kFaceShading[f] };
+            float unit[4][3];
+            faceCorners(f, 0.0f, 0.0f, 0.0f, 1.0f, unit);
+            Vertex q[4];
+            for (int i = 0; i < 4; ++i) {
+                const float px = mn.x + unit[i][0] * (mx.x - mn.x);
+                const float py = mn.y + unit[i][1] * (mx.y - mn.y);
+                const float pz = mn.z + unit[i][2] * (mx.z - mn.z);
+                float u, v;
+                switch (f) {
+                case 0:  u = 1.0f - pz; v = 1.0f - py; break;   // +X
+                case 1:  u = pz;        v = 1.0f - py; break;   // -X
+                case 4:  u = px;        v = 1.0f - py; break;   // +Z
+                case 5:  u = 1.0f - px; v = 1.0f - py; break;   // -Z
+                case 2:  u = px;        v = pz;        break;   // top
+                default: u = px;        v = 1.0f - pz; break;   // bottom
+                }
+                q[i] = makeVertex(x + px, y + py, z + pz, u, v, style);
+            }
+            applyBiomeTint(q, 4, texProp.biomeTint);
+            lightCell(q, 4, x, y, z);
+            if (doubleSided) pushDoubleSided(buf, q); else pushQuad(buf, q);
+            if (tintView) pushQuad(cpuTintVertices, q);
+        }
+    };
+
+    // Tanks (pattern "tank"): the liquid inside first, as full as the metadata says (0..16),
+    // drawn with the liquid block's own pictures; then the see-through shell around it. A spout
+    // (tank.stream) also has a thin stream falling out of its bottom.
+    auto emitTank = [&](int x, int y, int z, const BlockProperty& prop) {
+        const glm::vec3 mn(prop.tankBox[0], prop.tankBox[1], prop.tankBox[2]);
+        const glm::vec3 mx(prop.tankBox[3], prop.tankBox[4], prop.tankBox[5]);
+        const uint8_t meta = data.getLocalMetadata(x, y, z);
+        const uint8_t fluidId = prop.tankFluid.empty() ? 0 : registry.getBlockId(prop.tankFluid);
+        const uint8_t fluid2Id = prop.tankFluid2.empty() ? 0 : registry.getBlockId(prop.tankFluid2);
+        auto bufFor = [&](const BlockProperty& liquid) -> std::vector<Vertex>& {
+            return (liquid.isTransparent && !isCutout(liquid)) ? cpuTransparentVertices : cpuOpaqueVertices;
+        };
+        if (fluidId != 0) {
+            const BlockProperty& liquid = registry.getBlock(fluidId);
+            auto& lbuf = bufFor(liquid);
+            const float in = prop.tankInset;
+            const float floorY = mn.y + (prop.tankFloor >= 0.0f ? prop.tankFloor : in);
+            const glm::vec3 lmn(mn.x + in, floorY, mn.z + in);
+            const glm::vec3 top(mx.x - in, mx.y - in, mx.z - in);
+            if (lmn.x < top.x && lmn.y < top.y && lmn.z < top.z) {
+                if (fluid2Id != 0) {
+                    // Two layers: heights in 16ths of the block (see BlockProperty::tankFluid2)
+                    const float lowTop = std::max(lmn.y, std::min(top.y, static_cast<float>(meta & 15) / 16.0f));
+                    const float highTop = std::max(lowTop, std::min(top.y, static_cast<float>((meta >> 4) + 1) / 16.0f));
+                    if (lowTop > lmn.y)
+                        emitBox(x, y, z, lmn, glm::vec3(top.x, lowTop, top.z), liquid, true, false, lbuf, false, false, true);
+                    if (highTop > lowTop) {
+                        const BlockProperty& upper = registry.getBlock(fluid2Id);
+                        emitBox(x, y, z, glm::vec3(lmn.x, lowTop, lmn.z), glm::vec3(top.x, highTop, top.z), upper, true,
+                                false, bufFor(upper), false, false, lowTop > lmn.y);
+                    }
+                } else {
+                    const int level = std::min(16, static_cast<int>(meta & 0x1F));
+                    if (level > 0) {
+                        const glm::vec3 lmx(top.x, lmn.y + (top.y - lmn.y) * (static_cast<float>(level) / 16.0f), top.z);
+                        emitBox(x, y, z, lmn, lmx, liquid, true, false, lbuf, false, false, false);
+                    }
+                }
+            }
+            if (prop.tankStream && mn.y > 0.0f) {
+                const float c0 = (mn.x + mx.x) * 0.5f, c1 = (mn.z + mx.z) * 0.5f, w = 1.5f / 16.0f;
+                emitBox(x, y, z, glm::vec3(c0 - w, 0.0f, c1 - w), glm::vec3(c0 + w, mn.y, c1 + w), liquid, true, false,
+                        lbuf, false, true, true);
+            }
+        }
+        if (!prop.tankShell) return;
+        const bool blended = !isCutout(prop);
+        emitBox(x, y, z, mn, mx, prop, false, true, blended ? cpuTransparentVertices : cpuOpaqueVertices,
+                blended && prop.tintView, false, false);
+    };
+
     auto emitCube = [&](int x, int y, int z, uint8_t blockId, const BlockProperty& selfProp,
                         const BlockProperty& renderProp, const FluidDef* renderingFluid) {
         const bool renderingWater = renderingFluid != nullptr;   // any fluid
@@ -558,6 +664,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
             if (selfProp.pattern == "cube" || renderingWater) lightFace(q, f, x, y, z);
             else lightCell(q, 4, x, y, z);
             pushQuad(buf, q);
+            if (blended && renderProp.tintView && !renderingWater) pushQuad(cpuTintVertices, q);
         }
     };
 
@@ -572,6 +679,10 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
 
                 if (prop.pattern == "door") {
                     emitDoor(x, y, z, prop);
+                    continue;
+                }
+                if (prop.pattern == "tank") {
+                    emitTank(x, y, z, prop);
                     continue;
                 }
                 if (isPlantLike(prop)) {
@@ -597,9 +708,11 @@ void ChunkMesh::uploadMesh() {
 
     opaqueVertexCount      = static_cast<GLsizei>(cpuOpaqueVertices.size());
     transparentVertexCount = static_cast<GLsizei>(cpuTransparentVertices.size());
+    tintVertexCount        = static_cast<GLsizei>(cpuTintVertices.size());
 
     uploadBuffer(opaqueVAO,      opaqueVBO,      cpuOpaqueVertices);
     uploadBuffer(transparentVAO, transparentVBO, cpuTransparentVertices);
+    if (tintVertexCount > 0 || tintVAO != 0) uploadBuffer(tintVAO, tintVBO, cpuTintVertices);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
@@ -607,6 +720,7 @@ void ChunkMesh::uploadMesh() {
     // The GPU has its own copy now; free the CPU-side vertices
     std::vector<Vertex>().swap(cpuOpaqueVertices);
     std::vector<Vertex>().swap(cpuTransparentVertices);
+    std::vector<Vertex>().swap(cpuTintVertices);
 
     meshReadyForUpload = false;
     everUploaded = true;
@@ -616,6 +730,13 @@ void ChunkMesh::drawOpaque() const {
     if (opaqueVertexCount == 0 || opaqueVAO == 0) return;
     glBindVertexArray(opaqueVAO);
     glDrawArrays(GL_TRIANGLES, 0, opaqueVertexCount);
+    glBindVertexArray(0);
+}
+
+void ChunkMesh::drawTint() const {
+    if (tintVertexCount == 0 || tintVAO == 0) return;
+    glBindVertexArray(tintVAO);
+    glDrawArrays(GL_TRIANGLES, 0, tintVertexCount);
     glBindVertexArray(0);
 }
 

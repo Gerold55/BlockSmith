@@ -15,6 +15,7 @@ struct CloudSettings {
     float     fadeStart  = 250.0f;   // distance where fog fade begins
     float     fadeEnd    = 450.0f;   // distance where clouds fully fade to fog
     float     darken     = 0.0f;    // 0..1, multiplies color for storm darkening
+    float     clump      = 0.0f;    // 0 = scattered puffs, 1 = bunched into big masses (snow, storms)
     std::string texturePath;            // optional; empty = flat color
 };
 
@@ -28,7 +29,10 @@ public:
     // Lua-facing setters. Geometry-affecting values mark the mesh dirty.
     void setSettings(const CloudSettings& s);
     const CloudSettings& settings() const { return m_settings; }
-    void setWeather(const std::string& name, float transitionSeconds);
+    // Weather looks: "clear" (no clouds), "cloudy", "rain", "thunder" (also "storm": one huge dark,
+    // low, thick mass), "snow", "blizzard" (bunched together). Changes fade over transitionSeconds:
+    // clouds form or dissolve cell by cell. False for an unknown name.
+    bool setWeather(const std::string& name, float transitionSeconds);
 
     void update(float dt);   // advances weather interpolation
     void render(const glm::mat4& view, const glm::mat4& proj,

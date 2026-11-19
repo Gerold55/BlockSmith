@@ -65,6 +65,8 @@ private:
     void collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list);
     void drawOpaque(GLuint shaderProgram, std::vector<Visible>& list) const;
     void drawTransparent(GLuint shaderProgram, const std::vector<Visible>& list) const;
+    // Stained glass seen through: what's already drawn behind it is multiplied by its colour
+    void drawTint(GLuint shaderProgram, const std::vector<Visible>& list) const;
     std::vector<Visible> m_visible;     // this frame's chunks (renderOpaque -> renderTransparent)
 
     std::unordered_map<ChunkCoord, std::unique_ptr<ChunkMesh>, PairHash> m_meshes;

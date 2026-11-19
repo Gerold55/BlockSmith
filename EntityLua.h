@@ -218,6 +218,7 @@ public:
             t.collides = def.get_or("collides", t.collides);
             t.autoJump = def.get_or("auto_jump", t.autoJump);
             t.pushable = def.get_or("knockback", t.pushable);
+            t.solid = def.get_or("solid", t.solid);
             t.despawn = def.get_or("despawn", t.despawn);
             t.model = def.get_or("model", std::string());
             t.texture = def.get_or("texture", std::string());

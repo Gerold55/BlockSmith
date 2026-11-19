@@ -51,6 +51,11 @@ public:
     float worldLight() const { return m_light + m_flash * 0.9f; }
 
     void flash(float strength, float seconds);
+    // A lightning bolt from `top` (the cloud base) down to `ground`: a jagged bright line with a
+    // few branches, flickering for `seconds`. The sky flash is separate (flash()).
+    void strike(const glm::vec3& top, const glm::vec3& ground, float seconds = 0.45f);
+    // The bolts, after the world (additive glow; hills in front hide them)
+    void drawBolts(const glm::mat4& view, const glm::mat4& proj, const glm::vec3& camera);
 
     // Each frame. `daylight` 0..1 darkens precipitation at night.
     void update(float dt, const glm::vec3& camera, const World& world);
@@ -61,6 +66,9 @@ public:
 
 private:
     struct Particle { glm::vec3 pos; float phase; };
+    struct Bolt { std::vector<glm::vec3> points; std::vector<std::pair<int, int>> segments; std::vector<float> width;
+                  float age = 0.0f, life = 0.45f; };
+    std::vector<Bolt> m_bolts;
     void respawn(Particle& p, const glm::vec3& camera, bool anywhereInHeight);
     int surfaceY(int x, int z, const glm::vec3& camera, const World& world);   // first block below the sky
 

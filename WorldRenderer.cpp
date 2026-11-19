@@ -201,9 +201,37 @@ void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visi
     glDepthMask(GL_TRUE);
 }
 
+// Tinting glass (BlockProperty::tintView): after everything behind it is drawn, its faces again
+// with multiply blending - the shader's u_TintPass gives each pixel the glass's colour as a
+// filter (white where it's clear) - so the world, water, mobs and sky seen through it take its
+// colour, at any time of day. Several panes in a row multiply, like real glass.
+void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& list) const {
+    bool any = false;
+    for (const auto& v : list) if (v.mesh->tintVertexCount > 0) { any = true; break; }
+    if (!any) return;
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    const GLint tintLoc  = glGetUniformLocation(shaderProgram, "u_TintPass");
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_DST_COLOR, GL_ZERO);              // result = what's there x the glass colour
+    if (tintLoc >= 0) glUniform1i(tintLoc, 1);
+    for (const auto& v : list) {
+        if (v.mesh->tintVertexCount > 0 && v.mesh->tintVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, v.origin, v.fade);
+            v.mesh->drawTint();
+        }
+    }
+    if (tintLoc >= 0) glUniform1i(tintLoc, 0);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_TRUE);
+}
+
 void WorldRenderer::drawList(GLuint shaderProgram, std::vector<Visible>& list) const {
     drawOpaque(shaderProgram, list);
     drawTransparent(shaderProgram, list);
+    drawTint(shaderProgram, list);
 }
 
 void WorldRenderer::collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list) {
@@ -238,6 +266,7 @@ void WorldRenderer::renderOpaque(GLuint shaderProgram, const glm::mat4& viewProj
 
 void WorldRenderer::renderTransparent(GLuint shaderProgram) {
     drawTransparent(shaderProgram, m_visible);
+    drawTint(shaderProgram, m_visible);
     m_visible.clear();     // (meshes may be thrown away before the next frame)
 }
 
