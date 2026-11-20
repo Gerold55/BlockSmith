@@ -1,2 +1,3 @@
 # Mods switched on/off on the Mods screen. Changes apply when the game restarts.
 mobs = true
+ui_showcase = false

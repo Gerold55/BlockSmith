@@ -332,11 +332,16 @@ std::map<std::string, EntityVisual> g_EntityVisuals;
 struct EntityLook {                              // per entity, this game only: animation clock, red flash
     uint8_t hurtCount = 0;
     double hurtUntil = 0.0;
+    glm::vec3 pos{0.0f};                         // where it was last seen, and its size (for its "poof")
+    float width = 0.6f, height = 1.0f;
+    bool item = false;
     std::string anim;
     double animStart = 0.0;
     bool seen = false;
 };
 std::unordered_map<uint32_t, EntityLook> g_EntityLooks;
+class ParticleSystem;
+ParticleSystem* g_Particles = nullptr;   // the game's particles (made with the GL context)
 bool entitiesHere() { return g_Client.state() != GameClient::State::Joined; }   // we run them
 // The light a model gets where it stands (sunlight - dark in caves and at night - and block
 // light), for the model shader's u_LocalLight. Defined below main's helpers.
@@ -1398,12 +1403,17 @@ int loadTextureToLayer(const std::string& path) {
         int w, h, n;
         if (!stbi_info(finalPath.c_str(), &w, &h, &n)) return -1;   // unreadable image
     }
+    // The same picture file used by several blocks (or particles) shares one layer
+    static std::unordered_map<std::string, int> layerOfFile;
+    const std::string fileKey = found ? fs::path(finalPath).lexically_normal().generic_string() : ("?" + path);
+    if (auto it = layerOfFile.find(fileKey); it != layerOfFile.end() && it->second < g_NextTextureLayer) return it->second;
     if (g_NextTextureLayer >= MAX_TEXTURE_LAYERS) {
         std::cerr << "[Texture] Out of texture layers (max " << MAX_TEXTURE_LAYERS << "): " << path << std::endl;
         return -1;
     }
 
     const int layer = g_NextTextureLayer++;
+    layerOfFile[fileKey] = layer;
     if (static_cast<int>(g_LayerSources.size()) <= layer) g_LayerSources.resize(layer + 1);
     g_LayerSources[layer] = TextureSource{ path, found ? finalPath : "" };
     uploadLayer(layer, g_LayerSources[layer]);
@@ -1657,6 +1667,7 @@ struct ModelInstance {
 std::map<int, ModelInstance> g_ModelInstances;   // models placed with engine.add_model
 int g_NextModelInstance = 1;
 bool g_ThirdPerson = false;                      // F5 camera (the player model is only drawn in third person)
+bool g_ThirdPersonFront = false;                 // ...in front of the player, looking back at them (F5 twice)
 
 // ===========================================================================
 // Settings (settings.txt next to the mods folder) and key bindings
@@ -2913,6 +2924,170 @@ void HeldLight::update(const World& w) {
     else g_LightingSystem->updatePointLight(id, pos, color, radius, 0.9f);
 }
 
+// ---- Particles: pictures by name, block bits, and Lua's particle definitions ----
+// A particle picture's texture layer by file name ("particle_flame.png"), -1 if there's no such
+// picture. Loaded the first time it's asked for (from any mod's folder) and kept.
+int particleTexture(const std::string& name) {
+    static std::unordered_map<std::string, int> cache;
+    if (name.empty() || name.size() > 128) return -1;
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+    int layer = -1;
+    const std::string indexed = indexedTexture(name);
+    if (!indexed.empty() || fs::exists(name)) layer = loadTextureToLayer(name);
+    cache[name] = layer;
+    return layer;
+}
+int particleSprite(const char* what) { return particleTexture(std::string("particle_") + what + ".png"); }
+// The picture a block's bits show: its side (or any face it has)
+int blockParticleLayer(uint8_t id) {
+    if (id == 0) return -1;
+    const auto& prop = BlockRegistry::getInstance().getBlock(id);
+    for (int f : { 4, 0, 2, 1, 5, 3 }) if (prop.faces[f].baseLayer >= 0) return prop.faces[f].baseLayer;
+    return -1;
+}
+
+bool readParticleVec(const sol::object& o, glm::vec3& out, float limit) {
+    if (!o.is<sol::table>()) return false;
+    sol::table t = o.as<sol::table>();
+    float v[3];
+    const char* keys[3] = { "x", "y", "z" };
+    for (int i = 0; i < 3; ++i) {
+        sol::optional<float> n = t[keys[i]];
+        if (!n) n = t.get<sol::optional<float>>(i + 1);
+        if (!n || !std::isfinite(*n)) return false;
+        v[i] = std::clamp(*n, -limit, limit);
+    }
+    out = glm::vec3(v[0], v[1], v[2]);
+    return true;
+}
+bool readParticleColor(const sol::object& o, glm::vec3& out) {
+    if (o.is<std::string>()) {
+        std::string hex = o.as<std::string>();
+        if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
+        if (hex.size() != 6 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return false;
+        const unsigned long v = std::strtoul(hex.c_str(), nullptr, 16);
+        out = glm::vec3(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f);
+        return true;
+    }
+    glm::vec3 c;
+    if (!readParticleVec(o, c, 255.0f)) return false;
+    if (c.x > 1.0f || c.y > 1.0f || c.z > 1.0f) c /= 255.0f;
+    out = glm::clamp(c, glm::vec3(0.0f), glm::vec3(1.0f));
+    return true;
+}
+// A Lua particle definition (see particles.spawn) -> spec, how many, and the random spread
+bool readParticleDef(sol::table def, ParticleSpec& s, int& amount, glm::vec3& spread, glm::vec3& velSpread) {
+    sol::object posObj = def["pos"];
+    if (!readParticleVec(posObj, s.pos, 1.0e7f)) {
+        sol::optional<float> x = def["x"], y = def["y"], z = def["z"];
+        if (!x || !y || !z || !std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z)) return false;
+        s.pos = glm::vec3(*x, *y, *z);
+    }
+    readParticleVec(def["velocity"], s.vel, 100.0f);
+    s.acc = glm::vec3(0.0f);
+    if (!readParticleVec(def["acceleration"], s.acc, 200.0f)) {
+        const float g = def.get_or("gravity", 0.0f);
+        if (std::isfinite(g)) s.acc = glm::vec3(0.0f, -std::clamp(g, -200.0f, 200.0f), 0.0f);
+    }
+    auto num = [&](const char* key, float fallback, float lo, float hi) {
+        const float v = def.get_or(key, fallback);
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    s.drag = num("drag", 0.0f, 0.0f, 50.0f);
+    s.life = num("life", 1.0f, 0.01f, 60.0f);
+    s.size = num("size", 0.1f, 0.005f, 4.0f);
+    s.sizeEnd = def["size_end"].valid() ? num("size_end", s.size, 0.0f, 4.0f) : -1.0f;
+    readParticleColor(def["color"], s.color);
+    glm::vec3 ce;
+    if (readParticleColor(def["color_end"], ce)) s.colorEnd = ce;
+    s.glow = def.get_or("glow", false);
+    s.collide = def.get_or("collide", true);
+    s.bounce = def.get_or("bounce", false);
+    s.frames.clear();
+    sol::object tex = def["texture"];
+    if (tex.is<std::string>()) {
+        const int l = particleTexture(tex.as<std::string>());
+        if (l >= 0) s.frames.push_back(l);
+    } else if (tex.is<sol::table>()) {
+        for (const auto& kv : tex.as<sol::table>()) {
+            if (!kv.second.is<std::string>() || s.frames.size() >= 32) continue;
+            const int l = particleTexture(kv.second.as<std::string>());
+            if (l >= 0) s.frames.push_back(l);
+        }
+    } else if (sol::optional<std::string> block = def["block"]) {
+        const uint8_t id = BlockRegistry::getInstance().getBlockId(*block);
+        const int l = blockParticleLayer(id);
+        if (l >= 0) {
+            s.frames.push_back(l);
+            s.piece = true;
+            const auto& prop = BlockRegistry::getInstance().getBlock(id);
+            for (const auto& f : prop.faces) if (f.baseLayer == l && f.tintBase) { s.color *= prop.defaultTint; break; }
+        }
+    }
+    if (s.frames.empty()) return false;
+    amount = std::clamp(def.get_or("amount", 1), 1, 512);
+    readParticleVec(def["spread"], spread, 64.0f);
+    readParticleVec(def["velocity_spread"], velSpread, 100.0f);
+    spread = glm::abs(spread); velSpread = glm::abs(velSpread);
+    return true;
+}
+
+// particles.register_ambient: Minecraft's "animate tick" - each frame some random blocks near
+// the player are looked at, and those of these kinds run their action (smoke from torches...)
+struct AmbientEffect {
+    std::vector<std::string> names;
+    sol::protected_function action;
+    std::string label;
+};
+std::vector<AmbientEffect> g_AmbientEffects;
+size_t g_AmbientResolvedFor = 0;
+std::vector<std::vector<int>> g_AmbientByBlock;   // block id -> effects
+
+void runAmbientEffects(const World& world, const glm::vec3& player, float dt) {
+    if (g_AmbientEffects.empty() || dt <= 0.0f) return;
+    auto& reg = BlockRegistry::getInstance();
+    const size_t blocks = reg.getAllBlocks().size();
+    if (g_AmbientResolvedFor != blocks || g_AmbientByBlock.size() != 256) {
+        g_AmbientResolvedFor = blocks;
+        g_AmbientByBlock.assign(256, {});
+        for (size_t i = 0; i < g_AmbientEffects.size(); ++i) {
+            for (const auto& n : g_AmbientEffects[i].names) {
+                const uint8_t id = reg.getBlockId(n);
+                if (id != 0) g_AmbientByBlock[id].push_back(static_cast<int>(i));
+            }
+        }
+    }
+    static std::mt19937 rng(1234567u);
+    static float owed = 0.0f;
+    // about 3 looks a second at each block within 16 (33^3 blocks): ~110,000 a second, of which
+    // this many each frame (it's cheap: the action only runs for the kinds that have one)
+    owed += 110000.0f * std::min(dt, 0.1f);
+    int samples = static_cast<int>(owed);
+    owed -= static_cast<float>(samples);
+    samples = std::min(samples, 12000);
+    std::uniform_int_distribution<int> d(-16, 16);
+    const glm::ivec3 c(glm::floor(player));
+    int calls = 0;
+    for (int i = 0; i < samples && calls < 64; ++i) {
+        const glm::ivec3 p(c.x + d(rng), c.y + d(rng), c.z + d(rng));
+        if (p.y < 0 || p.y >= CHUNK_HEIGHT) continue;
+        const uint8_t id = world.getBlockAt(p);
+        if (id == 0 || g_AmbientByBlock[id].empty()) continue;
+        const std::string& name = reg.getBlock(id).name;
+        for (int e : g_AmbientByBlock[id]) {
+            ++calls;
+            luasandbox::TimeLimit limit(0.05, "particles ambient");
+            auto r = g_AmbientEffects[static_cast<size_t>(e)].action(p.x, p.y, p.z, name);
+            if (!r.valid()) {
+                static std::string lastError;
+                sol::error err = r;
+                if (lastError != err.what()) { lastError = err.what(); std::cerr << "[Particles] " << g_AmbientEffects[static_cast<size_t>(e)].label << ": " << err.what() << std::endl; }
+            }
+        }
+    }
+}
+
 const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec3 aPos;
@@ -3714,7 +3889,10 @@ int main(int argc, char** argv) {
                 }
 
                 if (key == keyForAction("third_person")) {
-                    g_ThirdPerson = !g_ThirdPerson;
+                    // Like Minecraft: first person -> behind the player -> in front of them -> first person
+                    if (!g_ThirdPerson) { g_ThirdPerson = true; g_ThirdPersonFront = false; }
+                    else if (!g_ThirdPersonFront) g_ThirdPersonFront = true;
+                    else { g_ThirdPerson = false; g_ThirdPersonFront = false; }
                     return;
                 }
 
@@ -4043,7 +4221,9 @@ int main(int argc, char** argv) {
         lua.new_usertype<AnimatedModel>("Model",
             "get_bone", &AnimatedModel::getBone,
             // model:reset_pose() - every bone back to the pose in the model file
-            "reset_pose", &AnimatedModel::resetPose
+            "reset_pose", &AnimatedModel::resetPose,
+            // model:is_loaded() - false when the file was missing or broken (load_model still returns a model)
+            "is_loaded", [](const AnimatedModel& m) { return m.loaded; }
         );
 
         // ---- Animations (Bedrock / Blockbench .animation.json) ----
@@ -4344,6 +4524,81 @@ int main(int argc, char** argv) {
             if (!g_Clouds || !std::isfinite(v)) return;
             CloudSettings s = g_Clouds->settings(); s.clump = std::clamp(v, 0.0f, 1.0f); g_Clouds->setSettings(s);
         };
+
+        // ---- particles.* (ParticleSystem.h): Minecraft-style particles, drawn by this game only ----
+        //   particles.spawn{ pos = {x,y,z}, velocity = {x,y,z}, gravity = 12 (or acceleration = {x,y,z}),
+        //       drag = 0, life = 1, size = 0.1, size_end, color = "#ff8800" / {r,g,b}, color_end,
+        //       texture = "particle_flame.png" (or { frames... } played over its life), or
+        //       block = "stone" (bits of that block), glow = false, collide = true, bounce = false,
+        //       amount = 1, spread = {x,y,z} (random around pos), velocity_spread = {x,y,z} }
+        //   particles.add_spawner{ ...the same, plus rate = 10 (a second), time = 0 (seconds, 0 =
+        //       until removed), follow_player = false, life = {min, max}, size = {min, max} } -> id
+        //   particles.remove_spawner(id)
+        //   particles.register_ambient{ nodenames = {...}, action = function(x, y, z, block) end }:
+        //       blocks near the player are picked at random every frame (Minecraft's "animate
+        //       tick": each block within 16 about 3 times a second); action runs for these kinds,
+        //       e.g. torches puffing smoke, lava popping. Particles never leave this game.
+        {
+            auto particleTable = lua.create_named_table("particles");
+            particleTable["spawn"] = [](sol::table def) {
+                ParticleSpec s;
+                int amount = 1;
+                glm::vec3 spread(0.0f), velSpread(0.0f);
+                if (!g_Particles || !readParticleDef(def, s, amount, spread, velSpread)) return false;
+                if (amount <= 1 && spread == glm::vec3(0.0f) && velSpread == glm::vec3(0.0f)) g_Particles->spawn(s);
+                else g_Particles->burst(s, amount, spread, velSpread);
+                return true;
+            };
+            particleTable["add_spawner"] = [](sol::table def, sol::this_state ts) -> sol::object {
+                sol::state_view lv(ts);
+                ParticleSpawner sp;
+                int amount = 1;
+                glm::vec3 spread(0.0f), velSpread(0.0f);
+                if (!g_Particles || !readParticleDef(def, sp.spec, amount, spread, velSpread)) return sol::make_object(lv, sol::lua_nil);
+                sp.minPos = -spread; sp.maxPos = spread;
+                sp.minVel = -velSpread; sp.maxVel = velSpread;
+                auto range = [&](const char* key, float& lo, float& hi, float def0, float maxV) {
+                    sol::object o = def[key];
+                    if (o.is<sol::table>()) {
+                        sol::table t = o.as<sol::table>();
+                        lo = t.get_or(1, def0); hi = t.get_or(2, lo);
+                    } else if (o.is<double>()) {
+                        lo = hi = static_cast<float>(o.as<double>());
+                    } else {
+                        lo = hi = def0;
+                    }
+                    if (!std::isfinite(lo) || !std::isfinite(hi)) lo = hi = def0;
+                    lo = std::clamp(lo, 0.01f, maxV); hi = std::clamp(std::max(lo, hi), 0.01f, maxV);
+                };
+                range("life", sp.minLife, sp.maxLife, 1.0f, 60.0f);
+                range("size", sp.minSize, sp.maxSize, 0.1f, 4.0f);
+                sp.spec.size = sp.minSize;
+                const float rate = def.get_or("rate", 10.0f);
+                const float time = def.get_or("time", 0.0f);
+                sp.rate = std::isfinite(rate) ? std::clamp(rate, 0.0f, 1000.0f) : 10.0f;
+                sp.time = std::isfinite(time) ? std::clamp(time, 0.0f, 3600.0f) : 0.0f;
+                sp.followPlayer = def.get_or("follow_player", false);
+                const int id = g_Particles->addSpawner(sp);
+                return id < 0 ? sol::make_object(lv, sol::lua_nil) : sol::make_object(lv, id);
+            };
+            particleTable["remove_spawner"] = [](int id) { if (g_Particles) g_Particles->removeSpawner(id); };
+            particleTable["count"] = []() { return g_Particles ? static_cast<int>(g_Particles->count()) : 0; };
+            particleTable["register_ambient"] = [](sol::table def) {
+                AmbientEffect a;
+                if (sol::optional<sol::table> names = def["nodenames"]) {
+                    for (const auto& kv : *names) if (kv.second.is<std::string>()) a.names.push_back(kv.second.as<std::string>());
+                }
+                sol::object fn = def["action"];
+                if (a.names.empty() || fn.get_type() != sol::type::function) {
+                    std::cerr << "[Particles] register_ambient needs nodenames and an action function" << std::endl;
+                    return;
+                }
+                a.action = fn.as<sol::protected_function>();
+                a.label = def.get_or("label", std::string("ambient"));
+                g_AmbientEffects.push_back(std::move(a));
+                g_AmbientResolvedFor = 0;
+            };
+        }
 
         auto fogTable = lua.create_named_table("fog");
         fogTable["set_enabled"]      = [](bool on) { g_Fog.enabled = on; };
@@ -4785,6 +5040,17 @@ int main(int argc, char** argv) {
             try { return std::stoi(it->second); } catch (...) { return 3; }
         };
         engineTable["is_third_person"] = []() { return g_ThirdPerson; };
+        // engine.get_camera_mode() -> "first", "back" or "front"; engine.set_camera_mode(mode) (F5 cycles them)
+        engineTable["get_camera_mode"] = []() -> std::string {
+            return !g_ThirdPerson ? "first" : (g_ThirdPersonFront ? "front" : "back");
+        };
+        engineTable["set_camera_mode"] = [](const std::string& mode) {
+            if (mode == "first")      { g_ThirdPerson = false; g_ThirdPersonFront = false; }
+            else if (mode == "back")  { g_ThirdPerson = true;  g_ThirdPersonFront = false; }
+            else if (mode == "front") { g_ThirdPerson = true;  g_ThirdPersonFront = true; }
+            else return false;
+            return true;
+        };
 
         engineTable["set_block"] = [](int x, int y, int z, const std::string& blockName) {
             if (g_WorldInstance) {
@@ -4908,6 +5174,13 @@ int main(int argc, char** argv) {
         // ---- First-person hand (FirstPerson.h) ----
         // engine.set_first_person_hand(on): show the held block / arm in first person (default on)
         engineTable["set_first_person_hand"] = [](bool on) { g_FirstPerson.enabled = on; };
+        // engine.set_third_person_item(on [, right_bone [, left_bone]]): show what's held in the
+        // player model's hand in F5 (default on), and which bone is the hand (its bottom end)
+        engineTable["set_third_person_item"] = [](bool on, sol::optional<std::string> r, sol::optional<std::string> l) {
+            g_FirstPerson.showInThirdPerson = on;
+            if (r) g_FirstPerson.rightHandBones.insert(g_FirstPerson.rightHandBones.begin(), *r);
+            if (l) g_FirstPerson.leftHandBones.insert(g_FirstPerson.leftHandBones.begin(), *l);
+        };
         // engine.set_first_person_arm({ right = "bone", left = "bone", color = { r, g, b } }):
         // which bone of g_PlayerModel is the arm shown when the hand is empty (with everything
         // attached to it), and the colour of the plain arm used if the model has none
@@ -5317,6 +5590,7 @@ int main(int argc, char** argv) {
             if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
             g_ModStorage.clear();       // (so does mod storage - the next world loads its own)
             g_ThirdPerson = false;
+            g_ThirdPersonFront = false;
             g_Paused = false;
             g_Inventory.setCreativeOpen(false);
             g_CurrentGameState = wasOnline ? GameState::MULTIPLAYER : GameState::MENU;
@@ -6145,6 +6419,10 @@ int main(int argc, char** argv) {
             auto editSound = [](const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
                 FluidRegistry::get().ensureFresh();
                 if (FluidRegistry::get().forBlock(oldId) || FluidRegistry::get().forBlock(newId)) return;
+                // someone else broke it: its bits fly too
+                if (newId == 0 && oldId != 0 && g_Particles) {
+                    g_Particles->spawnBreakParticles(glm::vec3(pos), oldId, static_cast<float>(blockParticleLayer(oldId)));
+                }
                 const glm::vec3 at = glm::vec3(pos) + glm::vec3(0.5f);
                 if (newId == 0) playBlockSound(oldId, "dug", at);
                 else playBlockSound(newId, "place", at);
@@ -6245,7 +6523,9 @@ int main(int argc, char** argv) {
         glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
 
         Player player;
-        ParticleSystem particles;   // block-break particles (needs the GL context, so created here)
+        ParticleSystem particles;   // particles (ParticleSystem.h; needs the GL context, so created here)
+        g_Particles = &particles;
+        struct ParticlesGone { ~ParticlesGone() { g_Particles = nullptr; } } particlesGone;
         PlayerAvatars playerAvatars;   // other players in multiplayer
         player.position = glm::vec3(8.0f, 100.0f, 8.0f);
 
@@ -6622,6 +6902,7 @@ int main(int argc, char** argv) {
                         world.reset();
                         g_ModelInstances.clear();
                         g_ThirdPerson = false;
+                        g_ThirdPersonFront = false;
                         g_Paused = false;
                         g_SettingsInGame = false;
                         g_Inventory.setCreativeOpen(false);
@@ -6728,6 +7009,74 @@ int main(int argc, char** argv) {
                                 playBlockSound(ground, "footstep", player.position, sneaking ? 0.3f : 0.6f);
                                 stepDistance = 0.0f;
                             }
+                            // Particles, Minecraft's way: a puff of the ground's bits on landing (more
+                            // the harder the fall), and a trail of them while sprinting
+                            const int groundLayer = blockParticleLayer(ground);
+                            if (!wasGrounded && fallSpeed > 6.0f) {
+                                particles.spawnFootParticles(player.position, ground, static_cast<float>(groundLayer),
+                                                             std::min(60, static_cast<int>((fallSpeed - 5.0f) * 5.0f)),
+                                                             std::min(3.0f, fallSpeed * 0.12f));
+                            }
+                            static float sprintOwed = 0.0f;
+                            const float speedNow = deltaTime > 0.0f ? glm::length(moved) / deltaTime : 0.0f;
+                            if ((g_LastMoveKeys & MoveInput::Sprint) != 0 && speedNow > 4.0f && !sneaking) {
+                                for (sprintOwed += deltaTime * 20.0f; sprintOwed >= 1.0f; sprintOwed -= 1.0f) {
+                                    particles.spawnFootParticles(player.position, ground, static_cast<float>(groundLayer), 1, 0.6f);
+                                }
+                            }
+                        }
+                    }
+                    // Water: a splash when you drop in, bubbles while your head is under
+                    {
+                        static bool feetWasWet = false;
+                        static float bubbleOwed = 0.0f;
+                        auto wetAt = [&](const glm::vec3& p) {
+                            const uint8_t id = world.getBlockAt(glm::ivec3(glm::floor(p)));
+                            return id != 0 && isWaterBlockName(BlockRegistry::getInstance().getBlock(id).name);
+                        };
+                        const bool feetWet = wetAt(player.position + glm::vec3(0.0f, 0.1f, 0.0f));
+                        if (feetWet && !feetWasWet && fallSpeed > 3.0f) {
+                            // the surface: up from the feet while it's water
+                            glm::vec3 top = player.position;
+                            for (int i = 0; i < 4 && wetAt(top + glm::vec3(0.0f, 1.0f, 0.0f)); ++i) top.y += 1.0f;
+                            top.y = std::floor(top.y) + 0.95f;
+                            const int splash = particleSprite("splash");
+                            if (splash >= 0) {
+                                ParticleSpec sp;
+                                sp.frames = { splash };
+                                sp.pos = top;
+                                sp.vel = glm::vec3(0.0f, 3.2f, 0.0f);          // a spray up, falling back
+                                sp.acc = glm::vec3(0.0f, -14.0f, 0.0f);
+                                sp.life = 0.6f; sp.size = 0.12f;
+                                sp.collide = false;
+                                particles.burst(sp, std::min(60, static_cast<int>(fallSpeed * 4.0f)), glm::vec3(0.5f, 0.0f, 0.5f),
+                                                glm::vec3(1.6f, 1.4f, 1.6f));
+                            }
+                            const int bubble = particleSprite("bubble");
+                            if (bubble >= 0) {
+                                ParticleSpec b;
+                                b.frames = { bubble };
+                                b.pos = player.position + glm::vec3(0.0f, 0.5f, 0.0f);
+                                b.acc = glm::vec3(0.0f, 3.0f, 0.0f);
+                                b.drag = 2.0f; b.life = 0.8f; b.size = 0.08f; b.collide = false;
+                                particles.burst(b, 16, glm::vec3(0.4f, 0.4f, 0.4f), glm::vec3(0.8f, 0.5f, 0.8f));
+                            }
+                        }
+                        feetWasWet = feetWet;
+                        if (wetAt(player.position + glm::vec3(0.0f, 1.62f, 0.0f))) {
+                            const int bubble = particleSprite("bubble");
+                            for (bubbleOwed += deltaTime * 2.5f; bubbleOwed >= 1.0f && bubble >= 0; bubbleOwed -= 1.0f) {
+                                ParticleSpec b;
+                                b.frames = { bubble };
+                                const float yawR = glm::radians(player.yaw);
+                                b.pos = player.position + glm::vec3(std::cos(yawR) * 0.3f, 1.5f, std::sin(yawR) * 0.3f);
+                                b.vel = glm::vec3(particles.randomRange(-0.2f, 0.2f), 0.6f, particles.randomRange(-0.2f, 0.2f));
+                                b.acc = glm::vec3(0.0f, 1.5f, 0.0f);
+                                b.drag = 1.5f; b.life = particles.randomRange(0.8f, 1.6f); b.size = 0.07f; b.collide = false;
+                                particles.spawn(b);
+                            }
+                        } else {
+                            bubbleOwed = 0.0f;
                         }
                     }
                     // Online: tell the server exactly what we just did, so it can do the same
@@ -6902,12 +7251,7 @@ int main(int argc, char** argv) {
 
                 auto& reg = BlockRegistry::getInstance();
                 auto spawnBreakParticles = [&](const glm::ivec3& pos, uint8_t id) {
-                    const auto& prop = reg.getBlock(id);
-                    int particleLayer = -1;   // the block's side texture (or any face it has)
-                    for (int f : { 4, 0, 2, 1, 5, 3 }) {
-                        if (prop.faces[f].baseLayer >= 0) { particleLayer = prop.faces[f].baseLayer; break; }
-                    }
-                    particles.spawnBreakParticles(glm::vec3(pos), id, static_cast<float>(particleLayer));
+                    particles.spawnBreakParticles(glm::vec3(pos), id, static_cast<float>(blockParticleLayer(id)));
                 };
                 const uint8_t heldId = g_Hotbar->getActiveBlockId();
                 const BlockProperty* held = heldId != 0 ? &reg.getBlock(heldId) : nullptr;
@@ -7013,8 +7357,14 @@ int main(int argc, char** argv) {
                                     g_Dig.particleTimer -= deltaTime;
                                     if (g_Dig.particleTimer <= 0.0f && g_Dig.progress < 1.0f) {
                                         g_Dig.particleTimer = 0.25f;
-                                        spawnBreakParticles(hitPos, targetBlockId);
                                         playBlockSound(targetBlockId, "dig", glm::vec3(hitPos) + glm::vec3(0.5f), 0.5f);
+                                    }
+                                    // Minecraft: chips off the face being hit, every tick of digging
+                                    static float chipOwed = 0.0f;
+                                    chipOwed += deltaTime * 20.0f;
+                                    for (; chipOwed >= 1.0f; chipOwed -= 1.0f) {
+                                        particles.spawnDigParticles(glm::vec3(hitPos), glm::vec3(rayResult.faceNormal), targetBlockId,
+                                                                    static_cast<float>(blockParticleLayer(targetBlockId)));
                                     }
                                     if (g_Dig.progress >= 1.0f) {
                                         survivalDig(hitPos, targetBlockId);
@@ -7187,7 +7537,8 @@ int main(int argc, char** argv) {
             glm::mat4 proj = glm::perspective(glm::radians(g_FieldOfView), aspectRatio, 0.1f, 500.0f);
             glm::mat4 view = player.getViewMatrix();
 
-            // Third-person camera (F5): behind the player, pulled in so it never goes through blocks
+            // Third-person camera (F5): behind the player (or in front, looking back at them), pulled
+            // in so it never goes through blocks
             if (g_ThirdPerson && g_CurrentGameState == GameState::PLAYING) {
                 const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
                 const glm::vec3 front = glm::normalize(glm::vec3(
@@ -7195,9 +7546,12 @@ int main(int argc, char** argv) {
                     sin(glm::radians(player.pitch)),
                     sin(glm::radians(player.yaw)) * cos(glm::radians(player.pitch))));
 
+                // eye -> camera. In front the pitch is mirrored: looking down lifts the camera
+                // above the player (instead of into the ground under them)
+                const glm::vec3 away = g_ThirdPersonFront ? glm::vec3(front.x, -front.y, front.z) : -front;
                 float dist = 4.0f;
                 for (float d = 0.25f; d <= 4.0f; d += 0.25f) {
-                    const glm::vec3 p = eye - front * d;
+                    const glm::vec3 p = eye + away * d;
                     const uint8_t id = world.getBlockAt(glm::ivec3(static_cast<int>(std::floor(p.x)),
                                                                    static_cast<int>(std::floor(p.y)),
                                                                    static_cast<int>(std::floor(p.z))));
@@ -7206,7 +7560,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                view = glm::lookAt(eye - front * dist, eye, glm::vec3(0.0f, 1.0f, 0.0f));
+                view = glm::lookAt(eye + away * dist, eye, glm::vec3(0.0f, 1.0f, 0.0f));
             }
 
             glm::vec3 sunDir = g_LightingSystem->getSunDirection();
@@ -7444,11 +7798,14 @@ int main(int argc, char** argv) {
                                 vx.lightSky = lv[0]; vx.lightR = lv[1]; vx.lightG = lv[2]; vx.lightB = lv[3];
                                 return vx;
                             };
-                            const Vertex a = mk(-0.5f, 0.0f, 0, 1, 1.0f), b = mk(0.5f, 0.0f, 1, 1, 1.0f),
+                            Vertex a = mk(-0.5f, 0.0f, 0, 1, 1.0f), b = mk(0.5f, 0.0f, 1, 1, 1.0f),
                                          cc = mk(0.5f, 1.0f, 1, 0, 1.0f), d = mk(-0.5f, 1.0f, 0, 0, 1.0f);
-                            verts = { a, b, cc, a, cc, d };
                             Vertex a2 = a, b2 = b, c2 = cc, d2 = d;
-                            for (Vertex* vv : { &a2, &b2, &c2, &d2 }) vv->faceShading = 0.8f;
+                            // the two sides a hair apart: on the same plane they fought over which
+                            // one shows, and spinning items flickered
+                            for (Vertex* vv : { &a, &b, &cc, &d }) vv->posZ = 0.01f;
+                            for (Vertex* vv : { &a2, &b2, &c2, &d2 }) { vv->faceShading = 0.8f; vv->posZ = -0.01f; }
+                            verts = { a, b, cc, a, cc, d };
                             verts.insert(verts.end(), { b2, a2, d2, b2, d2, c2 });
                             const float bob = std::sin(now * 2.5f + static_cast<float>(v.id)) * 0.05f;
                             model = glm::translate(glm::mat4(1.0f), v.pos + glm::vec3(0.0f, 0.08f + bob, 0.0f));
@@ -7499,8 +7856,11 @@ int main(int argc, char** argv) {
                 if (!otherPlayers.empty()) playerAvatars.render(otherPlayers, shaderProgram, view, proj);
 
                 // Block-break particles (same shader as the world, so they get fog and lighting)
-                if (!g_Paused) particles.update(deltaTime);
-                particles.render(view, proj, shaderProgram, g_TextureArrayID);
+                if (!g_Paused) {
+                    runAmbientEffects(world, player.position, deltaTime);   // torches smoking, lava popping...
+                    particles.update(deltaTime, &world, player.position);
+                }
+                particles.render(view, proj, shaderProgram, g_TextureArrayID, &world);
 
                 g_Clouds->update(deltaTime);
                 if (!skyHidden) {
@@ -7519,7 +7879,8 @@ int main(int argc, char** argv) {
                 glUniform1f(glGetUniformLocation(modelShaderProgram, "u_WeatherLight"), g_Weather.worldLight());
 
                 glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), player.position);
-                modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw + 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                // Models face -Z; turn that to where the player looks (yaw 0 = +X), so F5 shows its back
+                modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 
                 // Player model: only in third person (in first person the camera is inside its head)
                 {
@@ -7527,15 +7888,28 @@ int main(int argc, char** argv) {
                     glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LocalLight"), lit.r, lit.g, lit.b);
                 }
                 if (g_ThirdPerson) {
+                    // Why there's no body to see is said once (in the console), not left a mystery
+                    static std::string s_PlayerModelWarned;
+                    std::string problem;
                     try {
                         sol::object modelObj = lua["g_PlayerModel"];
                         if (modelObj.is<std::shared_ptr<AnimatedModel>>()) {
                             auto model = modelObj.as<std::shared_ptr<AnimatedModel>>();
-                            if (model) {
-                                model->draw(modelShaderProgram, modelMatrix);
-                            }
+                            if (!model) problem = "g_PlayerModel is empty";
+                            else if (!model->loaded) problem = "g_PlayerModel did not load (see the [Model] lines above)";
+                            else model->draw(modelShaderProgram, modelMatrix);
+                        } else {
+                            problem = (modelObj.get_type() == sol::type::lua_nil)
+                                ? "g_PlayerModel is nil - no mod loaded a player model (the player mod's models/player_model.json missing?)"
+                                : "g_PlayerModel is not a model from engine.load_model";
                         }
-                    } catch (...) {}
+                    } catch (const std::exception& e) {
+                        problem = std::string("drawing it failed: ") + e.what();
+                    }
+                    if (!problem.empty() && problem != s_PlayerModelWarned) {
+                        std::cout << "[Player] Third person: no player model to draw: " << problem << std::endl;
+                        s_PlayerModelWarned = problem;
+                    }
                 }
 
                 // Models placed from Lua with engine.add_model (mobs etc.)
@@ -7561,8 +7935,37 @@ int main(int argc, char** argv) {
                     for (const EntityView& v : entityViews) {
                         present.insert(v.id);
                         EntityLook& look = g_EntityLooks[v.id];
-                        if (look.seen && v.hurtCount != look.hurtCount) look.hurtUntil = now + 0.35;
+                        if (look.seen && v.hurtCount != look.hurtCount) {
+                            look.hurtUntil = now + 0.35;
+                            // Minecraft's hit sparks: a burst of crit stars around its middle
+                            const int crit = particleSprite("crit");
+                            if (crit >= 0) {
+                                ParticleSpec c;
+                                c.frames = { crit };
+                                c.pos = v.pos + glm::vec3(0.0f, v.height * 0.6f, 0.0f);
+                                c.acc = glm::vec3(0.0f, -6.0f, 0.0f);
+                                c.drag = 3.0f; c.life = 0.75f; c.size = 0.2f; c.sizeEnd = 0.06f;
+                                c.color = glm::vec3(0.9f, 0.9f, 0.95f);
+                                c.glow = true;
+                                // each one starts just outside its body and flies outwards, so they burst
+                                // all round it (inside the body they'd be hidden by the model)
+                                const glm::vec3 centre = c.pos;
+                                for (int k = 0; k < 18; ++k) {
+                                    const float ang = particles.random01() * 6.2831853f;
+                                    const float up = particles.randomRange(-0.6f, 0.9f);
+                                    const glm::vec3 dir = glm::normalize(glm::vec3(std::cos(ang), up, std::sin(ang)));
+                                    ParticleSpec q = c;
+                                    q.pos = centre + glm::vec3(dir.x * (v.width * 0.55f + 0.1f), dir.y * v.height * 0.45f,
+                                                               dir.z * (v.width * 0.55f + 0.1f));
+                                    q.vel = dir * particles.randomRange(1.5f, 3.5f) + glm::vec3(0.0f, 0.6f, 0.0f);
+                                    q.life *= particles.randomRange(0.7f, 1.2f);
+                                    particles.spawn(q);
+                                }
+                            }
+                        }
                         look.hurtCount = v.hurtCount;
+                        look.pos = v.pos; look.width = v.width; look.height = v.height;
+                        look.item = v.type == EntityManager::kItemType;
                         if (!look.seen || v.anim != look.anim) { look.anim = v.anim; look.animStart = now; }
                         look.seen = true;
                         auto vis = g_EntityVisuals.find(v.type);
@@ -7570,12 +7973,11 @@ int main(int argc, char** argv) {
                         AnimatedModel& model = *vis->second.model;
                         model.resetPose();
                         if (!v.anim.empty() && vis->second.anims) {
-                            for (const auto& a : vis->second.anims->animations) {
-                                if (!a || a->name != v.anim) continue;
+                            // the full name ("animation.cow.walk") or the short one ("walk"), like everywhere else
+                            if (const auto a = vis->second.anims->get(v.anim)) {
                                 float t = static_cast<float>((now - look.animStart) * v.animSpeed);
                                 if (a->length > 0.0f) t = v.animLoop ? std::fmod(std::max(t, 0.0f), a->length) : std::min(t, a->length);
                                 a->apply(model, t);
-                                break;
                             }
                         }
                         // light where it stands (sunlight in caves is dark; torches light it)
@@ -7591,7 +7993,28 @@ int main(int argc, char** argv) {
                     glUniform3f(localLight, 1.0f, 1.0f, 1.0f);
                     glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
                     for (auto it = g_EntityLooks.begin(); it != g_EntityLooks.end();) {
-                        if (present.count(it->first)) ++it; else it = g_EntityLooks.erase(it);
+                        if (present.count(it->first)) { ++it; continue; }
+                        // A mob gone from near you died (or a mod took it away): Minecraft's white "poof".
+                        // (Its last hit is never seen - it's removed the moment it dies; mobs that
+                        // despawn or leave your range do it far away, where nothing shows.)
+                        const EntityLook& gone = it->second;
+                        if (!gone.item && gone.seen && glm::distance(gone.pos, player.position) < 24.0f) {
+                            std::vector<int> smoke;
+                            for (int f = 0; f < 8; ++f) { const int l = particleSprite(("smoke_" + std::to_string(f)).c_str()); if (l >= 0) smoke.push_back(l); }
+                            if (!smoke.empty()) {
+                                ParticleSpec pf;
+                                pf.frames = smoke;
+                                pf.pos = gone.pos + glm::vec3(0.0f, gone.height * 0.5f, 0.0f);
+                                pf.vel = glm::vec3(0.0f, 0.4f, 0.0f);
+                                pf.acc = glm::vec3(0.0f, 0.3f, 0.0f);
+                                pf.drag = 3.0f; pf.life = 0.9f; pf.size = 0.32f; pf.sizeEnd = 0.2f;
+                                pf.color = glm::vec3(0.95f);
+                                pf.collide = false;
+                                particles.burst(pf, 20, glm::vec3(gone.width * 0.5f, gone.height * 0.45f, gone.width * 0.5f),
+                                                glm::vec3(1.2f, 0.8f, 1.2f));
+                            }
+                        }
+                        it = g_EntityLooks.erase(it);
                     }
                 }
 
@@ -7786,13 +8209,20 @@ int main(int argc, char** argv) {
                     if (!g_ThirdPerson) {
                         g_FirstPerson.render(shaderProgram, modelShaderProgram, g_TextureArrayID, width, height,
                                              handLight, fpModel, settingInt("main_hand", 0) == 1);
+                    } else if (fpModel) {
+                        // F5: what's held, in the player model's hand (placed as the model is drawn)
+                        glm::mat4 modelWorld = glm::translate(glm::mat4(1.0f), player.position);
+                        modelWorld = glm::rotate(modelWorld, glm::radians(-player.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                        g_FirstPerson.renderThirdPerson(shaderProgram, g_TextureArrayID, view, proj, handLight,
+                                                        fpModel, modelWorld, settingInt("main_hand", 0) == 1);
                     }
                 }
 
                 // ---------------- HUD ----------------
                 glDisable(GL_DEPTH_TEST);
                 glUseProgram(uiProgram);
-                if (isCursorDisabled && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
+                // (no crosshair when the camera faces the player: it would point at nothing)
+                if (isCursorDisabled && !g_ThirdPersonFront && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
                     glBindVertexArray(crosshairVAO);
                     glLineWidth(2.0f);
                     glDrawArrays(GL_LINES, 0, 4);

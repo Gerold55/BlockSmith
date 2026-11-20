@@ -154,8 +154,7 @@ engine.register_block("water", 0.2, 0.4, 0.9, {
     walkable = false,
     selectable = false,
     behavior = "liquid",
-    tint = false,
-    in_creative = true
+    tint = false
 })
 
 -- Flowing Water Stream Block (Uses flowing textures)
@@ -304,4 +303,5 @@ engine.register_block("flower_tulip_pink", 1.0, 1.0, 1.0, "textures/cw_flower_tu
 dofile(g_CurrentModPath .. "/ui.lua")
 dofile(g_CurrentModPath .. "/pause_menu.lua")
 dofile(g_CurrentModPath .. "/leafdecay.lua")
-dofile(g_CurrentModPath .. "/abm.lua")
+-- Particles: torches smoking, lava popping, leaves falling, and the pictures the engine uses
+dofile(g_CurrentModPath .. "/particles.lua")
