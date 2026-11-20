@@ -81,6 +81,7 @@ void WorldRenderer::clear(bool forceRebuild) {
     m_needsUpload.clear();
     m_firstUpload.clear();
     m_forceRebuild = forceRebuild;
+    m_visible.clear();
 }
 
 void WorldRenderer::update(World& world, const glm::vec3& playerPos) {
@@ -158,47 +159,85 @@ float WorldRenderer::chunkFade(const ChunkCoord& c) const {
     return std::clamp(elapsedMs(it->second) / (kChunkFadeSeconds * 1000.0f), 0.0f, 1.0f);
 }
 
-// Opaque pass nearest-first (early depth rejection). Transparent pass farthest-first.
-void WorldRenderer::drawList(GLuint shaderProgram, std::vector<Visible>& list) const {
+namespace {
+void setChunkUniforms(GLint modelLoc, GLint fadeLoc, const glm::vec3& origin, float fade) {
+    const glm::mat4 model = glm::translate(glm::mat4(1.0f), origin);
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+    glUniform1f(fadeLoc, fade);
+}
+} // namespace
+
+// Opaque pass nearest-first (early depth rejection)
+void WorldRenderer::drawOpaque(GLuint shaderProgram, std::vector<Visible>& list) const {
     std::sort(list.begin(), list.end(),
               [](const Visible& a, const Visible& b) { return a.dist2 < b.dist2; });
-
     const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
     const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
-
-    auto setChunkUniforms = [modelLoc, fadeLoc](const Visible& v) {
-        const glm::mat4 model = glm::translate(glm::mat4(1.0f), v.origin);
-        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
-        glUniform1f(fadeLoc, v.fade);
-    };
-
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
     for (const Visible& v : list) {
         if (v.mesh->opaqueVertexCount > 0 && v.mesh->opaqueVAO != 0) {
-            setChunkUniforms(v);
+            setChunkUniforms(modelLoc, fadeLoc, v.origin, v.fade);
             v.mesh->drawOpaque();
         }
     }
+}
 
+// Transparent pass farthest-first, blended, not writing depth (list sorted nearest-first)
+void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visible>& list) const {
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     for (auto it = list.rbegin(); it != list.rend(); ++it) {
         if (it->mesh->transparentVertexCount > 0 && it->mesh->transparentVAO != 0) {
-            setChunkUniforms(*it);
+            setChunkUniforms(modelLoc, fadeLoc, it->origin, it->fade);
             it->mesh->drawTransparent();
         }
     }
     glDepthMask(GL_TRUE);
 }
 
-void WorldRenderer::render(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye) {
-    const Frustum frustum = makeFrustum(viewProj);
-    std::vector<Visible> list;
-    list.reserve(m_meshes.size());
+// Tinting glass (BlockProperty::tintView): after everything behind it is drawn, its faces again
+// with multiply blending - the shader's u_TintPass gives each pixel the glass's colour as a
+// filter (white where it's clear) - so the world, water, mobs and sky seen through it take its
+// colour, at any time of day. Several panes in a row multiply, like real glass.
+void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& list) const {
+    bool any = false;
+    for (const auto& v : list) if (v.mesh->tintVertexCount > 0) { any = true; break; }
+    if (!any) return;
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    const GLint tintLoc  = glGetUniformLocation(shaderProgram, "u_TintPass");
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_DST_COLOR, GL_ZERO);              // result = what's there x the glass colour
+    if (tintLoc >= 0) glUniform1i(tintLoc, 1);
+    for (const auto& v : list) {
+        if (v.mesh->tintVertexCount > 0 && v.mesh->tintVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, v.origin, v.fade);
+            v.mesh->drawTint();
+        }
+    }
+    if (tintLoc >= 0) glUniform1i(tintLoc, 0);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_TRUE);
+}
 
+void WorldRenderer::drawList(GLuint shaderProgram, std::vector<Visible>& list) const {
+    drawOpaque(shaderProgram, list);
+    drawTransparent(shaderProgram, list);
+    drawTint(shaderProgram, list);
+}
+
+void WorldRenderer::collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list) {
+    const Frustum frustum = makeFrustum(viewProj);
+    list.clear();
+    list.reserve(m_meshes.size());
     for (const auto& entry : m_meshes) {
         ChunkMesh* mesh = entry.second.get();
         if (mesh->opaqueVertexCount == 0 && mesh->transparentVertexCount == 0) continue;
@@ -212,7 +251,23 @@ void WorldRenderer::render(GLuint shaderProgram, const glm::mat4& viewProj, cons
         const glm::vec3 d = (boxMin + boxMax) * 0.5f - eye;
         list.push_back(Visible{mesh, boxMin, glm::dot(d, d), chunkFade(entry.first)});
     }
+}
+
+void WorldRenderer::render(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye) {
+    std::vector<Visible> list;
+    collectVisible(viewProj, eye, list);
     drawList(shaderProgram, list);
+}
+
+void WorldRenderer::renderOpaque(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye) {
+    collectVisible(viewProj, eye, m_visible);
+    drawOpaque(shaderProgram, m_visible);
+}
+
+void WorldRenderer::renderTransparent(GLuint shaderProgram) {
+    drawTransparent(shaderProgram, m_visible);
+    drawTint(shaderProgram, m_visible);
+    m_visible.clear();     // (meshes may be thrown away before the next frame)
 }
 
 float WorldRenderer::areaReadyProgress(const World& world, const glm::vec3& pos, int radius) const {

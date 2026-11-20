@@ -30,6 +30,20 @@
 
 print("[UI] server_manager.lua loaded")
 
+local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
+    local ok, m = pcall(require, "textedit")
+    if ok then return m end
+    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
+    local function view(_, t, w, sc)
+        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
+        return t, ui.text_width(t, sc)
+    end
+    return { reset = function() end, focus = function() end, view = view,
+             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
+             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
+             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
+end)()
+
 local Theme = {
     colors = {
         background   = { 0.10, 0.10, 0.10, 1.00 },
@@ -175,14 +189,20 @@ local function bottom_buttons(W, H, S, rows)
     return out, top
 end
 
-local function draw_field(f, value, focused, S, fs)
+local function draw_field(f, value, focused, S, fs, id)
     rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
     rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
-    local shown = value
-    local room = f.w - 8 * S - text_width("_", fs)
-    while #shown > 0 and text_width(shown, fs) > room do shown = shown:sub(2) end
-    local blink = focused and (ui.get_time() % 1.0) < 0.5
-    text(shown .. (blink and "_" or ""), f.x + 4 * S, f.y + (f.h - text_height(fs)) / 2, fs, C.name, false, S)
+    local ty = f.y + (f.h - text_height(fs)) / 2
+    if focused and id then
+        -- scrolled so the caret stays in view; the caret where it is (lualib/textedit.lua)
+        local shown, caret_x = te.view(id, value, f.w - 8 * S, fs)
+        text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
+        te.draw_caret(id, f.x + 4 * S + caret_x, ty - S, text_height(fs) + 2 * S, C.name[1], C.name[2], C.name[3], 1)
+        return
+    end
+    local shown = value                                    -- not being typed in: its start
+    while #shown > 1 and text_width(shown, fs) > f.w - 8 * S do shown = shown:sub(1, -2) end
+    text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
 end
 
 -- ===========================================================================
@@ -334,7 +354,7 @@ local function list_layout(W, H)
         },
         {
             { label = "Create Server", action = function()
-                SM.mode = "create"; SM.create_name = ""; SM.message = nil end },
+                SM.mode = "create"; SM.create_name = ""; SM.message = nil; te.reset("sm:create") end },
             { label = "Delete", enabled = sel ~= nil, action = function() SM.mode = "delete"; SM.message = nil end },
             { label = "Back", action = function() SM.open = false end },
         },
@@ -449,7 +469,7 @@ local function render_create(W, H)
     rect(0, 0, W, H, C.background)
     text_centered("Create Server", W / 2, 12 * S, fs, C.title, S)
     text("Server name", L.field.x, L.field.y - text_height(fs) - 6 * S, fs, C.detail, false, S)
-    draw_field(L.field, SM.create_name, true, S, fs)
+    draw_field(L.field, SM.create_name, true, S, fs, "sm:create")
     local hint = SM.message or "You can change the game, mods and everything else next"
     text_centered(hint, W / 2, L.field.y + L.field.h + 8 * S, fs * 0.85, SM.message and C.warning or C.detail, S)
     for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
@@ -585,7 +605,7 @@ local function render_edit(W, H)
                 text(item.label, rx + 4 * S, ty, fs, C.name, true, S)
                 local w = setting_widgets(L, item, rx, ry, rw, rh)
                 if w.field then
-                    draw_field(w.field, setting_value(item.key), SM.focus == item.key, S, fs)
+                    draw_field(w.field, setting_value(item.key), SM.focus == item.key, S, fs, "sm:" .. item.key)
                 elseif w.button then
                     local label = (item.kind == "game") and ("< " .. game_title(SM.cfg.game) .. " >")
                                or (item.kind == "mode") and (((SM.cfg.gamemode == "creative") and "Creative" or "Survival"))
@@ -654,7 +674,9 @@ local function click_edit(mx, my, W, H)
         else
             local w = setting_widgets(L, item, rx, ry, rw, rh)
             if w.field and inside(mx, my, w.field.x, w.field.y, w.field.w, w.field.h) then
-                SM.focus = item.key
+                if SM.focus ~= item.key then te.reset("sm:" .. item.key) end
+                SM.focus = item.key        -- (the caret goes where you click)
+                te.focus("sm:" .. item.key, SM.cfg[item.key] or "", mx - (w.field.x + 4 * L.S), L.fs)
                 return
             elseif w.button and inside(mx, my, w.button.x, w.button.y, w.button.w, w.button.h) then
                 if item.kind == "game" then
@@ -720,19 +742,20 @@ function handle_server_manager_key(key, action, mods)
 
     if SM.mode == "create" then
         if key == ui.keys.ESCAPE then SM.mode = "list"; SM.message = nil
-        elseif key == ui.keys.BACKSPACE then SM.create_name = SM.create_name:sub(1, -2)
         elseif enter then
             local folder, err = engine.create_server_profile(SM.create_name)
             if not folder then SM.message = err else refresh(); open_editor(folder) end
+        else
+            SM.create_name = te.key("sm:create", SM.create_name, key, action, mods)   -- caret keys
         end
         return true
     end
     if SM.mode == "edit" then
         if SM.focus then
-            if key == ui.keys.BACKSPACE then
-                SM.cfg[SM.focus] = (SM.cfg[SM.focus] or ""):sub(1, -2)
-            elseif enter or key == ui.keys.ESCAPE or key == 258 then   -- 258 = Tab
+            if enter or key == ui.keys.ESCAPE or key == 258 then   -- 258 = Tab
                 SM.focus = nil
+            else                                                -- caret keys, Backspace, Delete
+                SM.cfg[SM.focus] = te.key("sm:" .. SM.focus, SM.cfg[SM.focus] or "", key, action, mods)
             end
         elseif key == ui.keys.ESCAPE then
             SM.mode = "list"; SM.message = nil
@@ -754,15 +777,15 @@ end
 function handle_server_manager_char(codepoint, ch)
     if not ch or ch == "" or codepoint < 32 or codepoint >= 127 then return true end
     if SM.mode == "create" then
-        if #SM.create_name < 32 and ch:match("^[%w _%-]$") then SM.create_name = SM.create_name .. ch end
+        if ch:match("^[%w _%-]$") then SM.create_name = te.insert("sm:create", SM.create_name, ch, 32) end
         return true
     end
     if SM.mode == "edit" and SM.focus then
         local item
         for _, it in ipairs(SETTINGS) do if it.key == SM.focus then item = it end end
         local cur = SM.cfg[SM.focus] or ""
-        if item and #cur < (item.max or 64) and ch:match(item.allowed or "^[ -~]$") then
-            SM.cfg[SM.focus] = cur .. ch
+        if item and ch:match(item.allowed or "^[ -~]$") then
+            SM.cfg[SM.focus] = te.insert("sm:" .. SM.focus, cur, ch, item.max or 64)
         end
     end
     return true

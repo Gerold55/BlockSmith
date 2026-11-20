@@ -29,6 +29,10 @@ void applySoundProperties(BlockProperty& block, const sol::table& props);
 // "#rrggbb", light_absorb = extra light lost passing through, light_filter = { r, g, b } colour
 // let through (stained glass). See Light.h.
 void applyLightProperties(BlockProperty& block, const sol::table& props);
+// pattern = "tank": tank = { fluid = "water", box = { x0, y0, z0, x1, y1, z1 } (pixels, 0..16),
+// inset = 1 (pixels), stream = false, floor = inset (pixels: where the liquid starts),
+// shell = true (draw the box), fluid2 = nil (a second liquid layered on top) }
+void applyTankProperties(BlockProperty& block, const sol::table& props);
 // The tool type a block wants when it didn't say ("pickaxe" for stone, "axe" for wood...)
 std::string blockTool(const BlockProperty& block);
 bool blockNeedsTool(const BlockProperty& block);

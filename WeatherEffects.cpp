@@ -33,6 +33,12 @@ void main() {
     vec4 c = u_Color;
     if (u_HasTexture == 1) {
         c *= texture(u_Texture, vUV);
+    } else if (u_Streaks == 2) {
+        // a lightning bolt: a white-hot core with a soft blue glow, full strength day or night
+        float side = 1.0 - abs(vUV.x * 2.0 - 1.0);
+        c.a *= side * side;
+        FragColor = vec4(mix(c.rgb, vec3(1.0), side * side * side), c.a);
+        return;
     } else if (u_Streaks == 1) {
         // a thin line, soft at the sides and ends
         float side = 1.0 - abs(vUV.x * 2.0 - 1.0);
@@ -170,6 +176,9 @@ void WeatherEffects::respawn(Particle& p, const glm::vec3& camera, bool anywhere
 void WeatherEffects::update(float dt, const glm::vec3& camera, const World& world) {
     m_time += dt;
     if (m_flash > 0.0f) m_flash = std::max(0.0f, m_flash - m_flashDecay * dt);
+    for (auto& b : m_bolts) b.age += dt;
+    m_bolts.erase(std::remove_if(m_bolts.begin(), m_bolts.end(), [](const Bolt& b) { return b.age >= b.life; }),
+                  m_bolts.end());
 
     // Columns' surfaces are re-read twice a second (blocks change, the camera moves)
     m_surfaceAge += dt;
@@ -268,6 +277,95 @@ void WeatherEffects::drawSkyTint() {
     glBindVertexArray(0);
     glDepthMask(GL_TRUE);
     glEnable(GL_DEPTH_TEST);
+}
+
+void WeatherEffects::strike(const glm::vec3& top, const glm::vec3& ground, float seconds) {
+    if (top.y <= ground.y + 1.0f) return;
+    Bolt b;
+    b.life = glm::clamp(seconds, 0.1f, 2.0f);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    // The main channel: zig-zags down, drifting sideways a little at each kink
+    const int steps = glm::clamp(static_cast<int>((top.y - ground.y) / 4.0f), 8, 60);
+    glm::vec3 p = top;
+    b.points.push_back(p);
+    std::vector<int> mainIdx{0};
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / steps;
+        glm::vec3 next = glm::mix(top, ground, t);
+        if (i < steps) next += glm::vec3(u(m_rng) * 2.2f, u(m_rng) * 0.6f, u(m_rng) * 2.2f);
+        b.points.push_back(next);
+        const int idx = static_cast<int>(b.points.size()) - 1;
+        b.segments.push_back({mainIdx.back(), idx});
+        b.width.push_back(0.45f);
+        mainIdx.push_back(idx);
+        p = next;
+    }
+    // Branches from the upper two thirds, thinner, fading out sideways and down
+    const int branches = 2 + static_cast<int>((u(m_rng) + 1.0f) * 1.5f);
+    for (int k = 0; k < branches; ++k) {
+        const int from = mainIdx[1 + static_cast<size_t>((u(m_rng) + 1.0f) * 0.5f * (steps * 2 / 3))];
+        glm::vec3 q = b.points[static_cast<size_t>(from)];
+        const glm::vec3 dir = glm::normalize(glm::vec3(u(m_rng), -1.2f, u(m_rng)));
+        int last = from;
+        const int len = 3 + static_cast<int>((u(m_rng) + 1.0f) * 2.0f);
+        for (int i = 0; i < len; ++i) {
+            q += dir * 3.5f + glm::vec3(u(m_rng) * 1.5f, 0.0f, u(m_rng) * 1.5f);
+            if (q.y <= ground.y) break;
+            b.points.push_back(q);
+            const int idx = static_cast<int>(b.points.size()) - 1;
+            b.segments.push_back({last, idx});
+            b.width.push_back(0.22f * (1.0f - static_cast<float>(i) / len) + 0.06f);
+            last = idx;
+        }
+    }
+    m_bolts.push_back(std::move(b));
+    if (m_bolts.size() > 8) m_bolts.erase(m_bolts.begin());
+}
+
+void WeatherEffects::drawBolts(const glm::mat4& view, const glm::mat4& proj, const glm::vec3& camera) {
+    if (m_bolts.empty() || m_particleProgram == 0) return;
+    m_verts.clear();
+    auto vtx = [this](const glm::vec3& p, float u, float v) { m_verts.insert(m_verts.end(), { p.x, p.y, p.z, u, v }); };
+    float brightest = 0.0f;
+    for (const auto& b : m_bolts) {
+        // Flickers: bright, dimmer, bright again, then fades out
+        const float t = b.age / b.life;
+        const float flicker = (t < 0.15f) ? 1.0f : (t < 0.3f) ? 0.45f : (t < 0.5f) ? 0.9f : (1.0f - t) * 1.6f;
+        brightest = std::max(brightest, flicker);
+        for (size_t i = 0; i < b.segments.size(); ++i) {
+            const glm::vec3 a = b.points[static_cast<size_t>(b.segments[i].first)];
+            const glm::vec3 c = b.points[static_cast<size_t>(b.segments[i].second)];
+            const glm::vec3 along = c - a;
+            glm::vec3 side = glm::cross(along, camera - (a + c) * 0.5f);
+            const float len = glm::length(side);
+            if (len < 1e-4f) continue;
+            // a glow several times wider than the white core (the shader shapes it)
+            side = side / len * (b.width[i] * 3.0f * glm::clamp(flicker, 0.3f, 1.0f));
+            vtx(a - side, 0, 0); vtx(a + side, 1, 0); vtx(c + side, 1, 1);
+            vtx(a - side, 0, 0); vtx(c + side, 1, 1); vtx(c - side, 0, 1);
+        }
+    }
+    if (m_verts.empty()) return;
+    glUseProgram(m_particleProgram);
+    const glm::mat4 vp = proj * view;
+    glUniformMatrix4fv(glGetUniformLocation(m_particleProgram, "u_ViewProj"), 1, GL_FALSE, glm::value_ptr(vp));
+    const glm::vec4 color(0.62f, 0.72f, 1.0f, glm::clamp(brightest, 0.0f, 1.0f));
+    glUniform4fv(glGetUniformLocation(m_particleProgram, "u_Color"), 1, glm::value_ptr(color));
+    glUniform1i(glGetUniformLocation(m_particleProgram, "u_HasTexture"), 0);
+    glUniform1i(glGetUniformLocation(m_particleProgram, "u_Streaks"), 2);
+    glUniform1f(glGetUniformLocation(m_particleProgram, "u_Daylight"), 1.0f);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);         // light adds up
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_verts.size() * sizeof(float)), m_verts.data(), GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_verts.size() / 5));
+    glBindVertexArray(0);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_TRUE);
 }
 
 void WeatherEffects::drawFlash() {

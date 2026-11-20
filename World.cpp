@@ -340,7 +340,7 @@ void World::loadQueuedChunks(sol::state& lua) {
             switch (loadChunkFromDisk(c.first, c.second, *chunk, &why)) {
             case DiskLoad::Loaded:
                 computeBiomeTint(*chunk, c.first, c.second, &lua);   // saved before biome colours
-                addLoadedChunk(c.first, c.second, std::move(chunk));
+                addLoadedChunk(c.first, c.second, std::move(chunk), true);
                 break;
             case DiskLoad::Missing:                     // deleted since the check: as never saved
             case DiskLoad::Damaged:                     // regenerate (it's replaced when saved)
@@ -419,7 +419,8 @@ void World::noteSeedFailure(const std::string& error) {
               << "), trying again in " << (500 << shift) / 1000.0 << " s: " << error << std::endl;
 }
 
-void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk) {
+void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk, bool fromDisk) {
+    if (!m_remote) m_justLoaded.push_back({ChunkCoord{cx, cz}, fromDisk});
     m_notOnDisk.erase(ChunkCoord{cx, cz});   // loaded now: it may be saved, so probe again next time
     m_diskRetry.erase(ChunkCoord{cx, cz});
     chunk->chunkX = cx;
@@ -523,7 +524,7 @@ bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
     } else {
         computeBiomeTint(*chunk, chunkX, chunkZ, &lua);   // saved before biome colours
     }
-    addLoadedChunk(chunkX, chunkZ, std::move(chunk));
+    addLoadedChunk(chunkX, chunkZ, std::move(chunk), fromDisk);
     return true;
 }
 
@@ -608,6 +609,7 @@ void World::reset() {
     m_loadQueue.clear();
     m_dirty.clear();
     m_unloaded.clear();
+    m_justLoaded.clear();
     m_generating.clear();   // results still on their way carry the old reset count: ignored
     if (m_generator) m_generator->clearQueue();
     ++m_resetCount;
@@ -624,6 +626,7 @@ void World::reset() {
     m_fatalError.clear();
     m_fallChecks.clear();   // blocks falling in the old world
     m_falling.clear();
+    m_fallingStarts.clear();
     m_queueDirty = true;
     m_luaSeeded = false;
     m_playerChunk = ChunkCoord{0, 0};
@@ -939,9 +942,10 @@ void World::noteFluidChange(const glm::ivec3& loc) {
 
 // ---------------------------------------------------------------------------
 // Falling blocks (register_block's gravity = true), like Minecraft's sand and gravel: with
-// nothing solid underneath, the block drops, speeding up, and lands on the first solid block.
-// It moves a whole block at a time through setBlockAt, so it lights, saves and reaches other
-// players like any change; a stack falls one block after another.
+// nothing solid underneath, the block leaves the world and drops smoothly, speeding up, then
+// is placed on the first solid block. Only two block changes (where it was, where it lands),
+// so chunks aren't rebuilt and players aren't sent a change for every block it passes; a stack
+// falls one block after another.
 // ---------------------------------------------------------------------------
 
 // Air, a fluid, or something you walk through (grass, flowers, torches - they're crushed)
@@ -953,11 +957,70 @@ bool World::canFallInto(const glm::ivec3& p) const {
     return !BlockRegistry::getInstance().getBlock(id).isWalkable;
 }
 
-void World::updateFalling(float dt) {
-    if (m_remote) { m_fallChecks.clear(); m_falling.clear(); return; }
-    auto& reg = BlockRegistry::getInstance();
+std::vector<World::FallingInfo> World::fallingBlocks() const {
+    std::vector<FallingInfo> out;
+    out.reserve(m_falling.size());
+    for (const auto& f : m_falling) {
+        out.push_back(FallingInfo{ f.id, f.meta, glm::vec3(static_cast<float>(f.x), f.y, static_cast<float>(f.z)) });
+    }
+    return out;
+}
 
-    // Blocks that should start falling
+void World::addFallingVisual(const glm::ivec3& cell, uint8_t id, uint8_t meta) {
+    if (m_falling.size() >= 4096 || id == 0) return;
+    m_falling.push_back(FallingBlock{ cell.x, cell.z, static_cast<float>(cell.y), 0.0f, id, meta, true, 0.0f });
+}
+
+// Minecraft's 0.04 blocks/tick^2 = 16 blocks/s^2, up to about 40 blocks/s
+bool World::stepFalling(FallingBlock& f, float dt) {
+    f.speed = std::min(f.speed + 16.0f * dt, 40.0f);
+    float newY = f.y - f.speed * dt;
+    int cell = static_cast<int>(std::floor(f.y + 1e-4f));   // the cell its bottom is in
+    while (newY < static_cast<float>(cell)) {
+        const glm::ivec3 below(f.x, cell - 1, f.z);
+        if (below.y >= 0 && below.y < CHUNK_HEIGHT && !isLoaded(below)) {
+            f.y = static_cast<float>(cell);                     // not loaded yet: wait above it
+            f.speed = 0.0f;
+            return false;
+        }
+        if (!canFallInto(below)) {                              // landed on it
+            f.y = static_cast<float>(cell);
+            return true;
+        }
+        --cell;
+    }
+    f.y = newY;
+    return false;
+}
+
+void World::landFalling(const FallingBlock& f, int cellY) {
+    // Normally the cell it fell into; if someone built there meanwhile, the first free one above
+    glm::ivec3 at(f.x, cellY, f.z);
+    while (at.y < CHUNK_HEIGHT && !canFallInto(at)) ++at.y;
+    if (at.y >= CHUNK_HEIGHT) return;
+    setBlockWithMetaAt(at, f.id, f.meta);
+}
+
+void World::updateFalling(float dt) {
+    auto& reg = BlockRegistry::getInstance();
+    dt = std::min(dt, 0.25f);   // (a long frame shouldn't send blocks through the floor in one step)
+
+    // A remote world (joined to a server): the server decides; we only animate what it said
+    // started falling. Its landing arrives as an ordinary block change.
+    if (m_remote) {
+        m_fallChecks.clear();
+        for (size_t i = 0; i < m_falling.size();) {
+            FallingBlock& f = m_falling[i];
+            // Landed here first: it rests in place until the server's "it landed" arrives
+            // (applyNetworkBlock removes it then) - at most 1.5 s, in case that never comes
+            if (f.landedFor > 0.0f || stepFalling(f, dt)) f.landedFor += dt;
+            if (f.landedFor > 1.5f) { m_falling[i] = m_falling.back(); m_falling.pop_back(); }
+            else ++i;
+        }
+        return;
+    }
+
+    // Blocks that should start falling: they leave the world, and fall as FallingBlocks
     if (!m_fallChecks.empty()) {
         std::vector<glm::ivec3> checks;
         checks.swap(m_fallChecks);
@@ -966,37 +1029,39 @@ void World::updateFalling(float dt) {
             const uint8_t id = getBlockAt(p);
             if (id == 0 || !reg.getBlock(id).hasGravity) continue;
             if (!canFallInto(p + glm::ivec3(0, -1, 0))) continue;
-            bool already = false;
-            for (const auto& f : m_falling) if (f.pos == p) { already = true; break; }
-            if (!already) m_falling.push_back(FallingBlock{ p, 0.0f, 0.0f });
+            if (m_falling.size() >= 4096) break;
+            const uint8_t meta = getMetadataAt(p);
+            setBlockAt(p, 0);              // (queues the block above: a stack follows)
+            m_falling.push_back(FallingBlock{ p.x, p.z, static_cast<float>(p.y), 0.0f, id, meta, false, 0.0f });
+            m_fallingStarts.push_back(FallingStart{ p, id, meta });
         }
     }
 
-    // Move them: Minecraft's 0.04 blocks/tick^2 = 16 blocks/s^2, up to about 40 blocks/s
     for (size_t i = 0; i < m_falling.size();) {
         FallingBlock& f = m_falling[i];
-        const uint8_t id = getBlockAt(f.pos);
-        bool done = (id == 0 || !reg.getBlock(id).hasGravity);   // dug or replaced meanwhile
-        if (!done) {
-            f.speed = std::min(f.speed + 16.0f * dt, 40.0f);
-            f.progress += f.speed * dt;
-            while (f.progress >= 1.0f) {
-                const glm::ivec3 below = f.pos + glm::ivec3(0, -1, 0);
-                if (!canFallInto(below)) { done = true; break; }  // landed
-                const uint8_t meta = getMetadataAt(f.pos);
-                setBlockAt(f.pos, 0);                        // (queues the block above: stacks follow)
-                setBlockWithMetaAt(below, id, meta);
-                f.pos = below;
-                f.progress -= 1.0f;
-            }
-        }
-        if (done) {
+        if (stepFalling(f, dt)) {
+            if (!f.visualOnly) landFalling(f, static_cast<int>(std::lround(f.y)));
             m_falling[i] = m_falling.back();
             m_falling.pop_back();
         } else {
             ++i;
         }
     }
+}
+
+void World::finishFalling() {
+    for (auto& f : m_falling) {
+        if (f.visualOnly) continue;
+        // straight down to where it would land (or as far as the loaded world goes)
+        int cell = static_cast<int>(std::floor(f.y + 1e-4f));
+        while (cell > 0) {
+            const glm::ivec3 below(f.x, cell - 1, f.z);
+            if (!isLoaded(below) || !canFallInto(below)) break;
+            --cell;
+        }
+        landFalling(f, cell);
+    }
+    m_falling.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1181,18 @@ void World::removeChunk(int cx, int cz) {
 
 void World::applyNetworkBlock(const glm::ivec3& loc, uint8_t id, uint8_t meta) {
     if (loc.y < 0 || loc.y >= CHUNK_HEIGHT) return;
+    // A falling block of ours (shown since the server said it started falling) has landed here:
+    // the real block takes over from the moving copy
+    if (id != 0) {
+        for (size_t i = 0; i < m_falling.size(); ++i) {
+            const FallingBlock& f = m_falling[i];
+            if (f.visualOnly && f.id == id && f.x == loc.x && f.z == loc.z && f.y >= static_cast<float>(loc.y) - 0.5f) {
+                m_falling[i] = m_falling.back();
+                m_falling.pop_back();
+                break;
+            }
+        }
+    }
     ChunkData* chunk = chunkAt(loc);
     if (!chunk) return;
     const int lx = positiveMod(loc.x, CHUNK_WIDTH);

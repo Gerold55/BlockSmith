@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include "ChatSystem.h"
 #include "FontRenderer.h"
+#include "WebLink.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -100,6 +101,7 @@ std::string trimLeft(const std::string& s) {
 
 // "/name usage" with no trailing space when usage is empty.
 std::string commandLabel(const std::string& name, const std::string& usage) {
+    if (!usage.empty() && usage[0] == '/') return usage;      // mods give the whole thing: "/give <item>"
     return "/" + name + (usage.empty() ? std::string() : " " + usage);
 }
 
@@ -133,28 +135,77 @@ void ChatSystem::registerCommand(const std::string& name, const std::string& usa
     m_commands.push_back(CommandInfo{key, usage, description});
 }
 
-std::vector<const ChatSystem::CommandInfo*> ChatSystem::matchingCommands() const {
-    std::vector<const CommandInfo*> out;
-    if (!isOpen || currentInput.empty() || currentInput[0] != '/') return out;
-
-    const std::string typed = toLower(currentInput.substr(1));
-    if (typed.find(' ') != std::string::npos) return out;   // already past the command name
-
-    for (const auto& c : m_commands) {
-        if (c.name.compare(0, typed.size(), typed) == 0) out.push_back(&c);
+void ChatSystem::refreshSuggestions() {
+    m_sugg.clear();
+    if (!isOpen) return;
+    const std::string head = currentInput.substr(0, m_cursor);
+    const bool command = !head.empty() && head[0] == '/';
+    const size_t space = head.find_last_of(' ');
+    m_wordStart = (space == std::string::npos) ? (command ? 1 : 0) : space + 1;
+    const std::string word = head.substr(m_wordStart);
+    std::vector<std::string> before;
+    {
+        const size_t from = command ? 1 : 0;
+        std::string cur;
+        for (size_t i = from; i < m_wordStart; ++i) {
+            if (head[i] == ' ') { if (!cur.empty()) before.push_back(cur); cur.clear(); }
+            else cur += head[i];
+        }
+        if (!cur.empty()) before.push_back(cur);
     }
-    return out;
+    if (!command && !m_plainShown) return;            // plain chat: only after Tab
+    if (!command && word.empty()) return;
+
+    const std::string lw = toLower(word);
+    auto fits = [&](const std::string& s) { return toLower(s).compare(0, lw.size(), lw) == 0 && toLower(s) != lw; };
+    auto find = [&](const std::string& s) -> Suggestion* {
+        for (auto& x : m_sugg) if (toLower(x.insert) == toLower(s)) return &x;
+        return nullptr;
+    };
+    if (command && before.empty()) {                  // the command's name: the ones we know first
+        for (const auto& c : m_commands) {
+            if (fits(c.name)) m_sugg.push_back({c.name, commandLabel(c.name, c.usage) + (c.description.empty() ? "" : "  -  " + c.description)});
+        }
+    }
+    if (m_completer) {
+        for (auto& sg : m_completer(head, before, word, command)) {
+            if (sg.insert.empty() || !fits(sg.insert)) continue;
+            if (Suggestion* same = find(sg.insert)) {
+                // The same command here and on the server: the server's usage is the one that counts
+                // (not /help and /clear: this chat's own, which run here even online)
+                const std::string n = toLower(sg.insert);
+                if (!sg.label.empty() && command && before.empty() && n != "help" && n != "clear") same->label = sg.label;
+                continue;
+            }
+            if (sg.label.empty()) sg.label = (command && before.empty()) ? "/" + sg.insert : sg.insert;
+            m_sugg.push_back(std::move(sg));
+            if (m_sugg.size() >= 100) break;
+        }
+    }
+    if (command && before.empty()) {                  // command names in order
+        std::sort(m_sugg.begin(), m_sugg.end(), [](const Suggestion& a, const Suggestion& b) { return a.insert < b.insert; });
+    }
+    m_suggestSel = m_sugg.empty() ? 0 : std::clamp(m_suggestSel, 0, static_cast<int>(m_sugg.size()) - 1);
+    m_suggestTop = std::clamp(m_suggestTop, std::max(0, m_suggestSel - static_cast<int>(kMaxSuggestions) + 1), m_suggestSel);
 }
 
 void ChatSystem::acceptSuggestion() {
-    const auto matches = matchingCommands();
-    if (matches.empty()) return;
-
-    const int n = static_cast<int>(matches.size());
-    const int idx = std::clamp(m_suggestSel, 0, n - 1);
-    currentInput = "/" + matches[static_cast<size_t>(idx)]->name + " ";
-    m_cursor = currentInput.size();
+    if (m_sugg.empty() || m_wordStart > m_cursor) return;
+    const int idx = std::clamp(m_suggestSel, 0, static_cast<int>(m_sugg.size()) - 1);
+    const std::string ins = m_sugg[static_cast<size_t>(idx)].insert;
+    size_t wordEnd = m_cursor;                        // the whole word, if the caret is inside it
+    while (wordEnd < currentInput.size() && currentInput[wordEnd] != ' ') ++wordEnd;
+    currentInput.replace(m_wordStart, wordEnd - m_wordStart, ins);
+    m_cursor = m_wordStart + ins.size();
+    if (m_cursor >= currentInput.size() || currentInput[m_cursor] != ' ') {
+        currentInput.insert(m_cursor, " ");
+    }
+    ++m_cursor;
+    if (currentInput.size() > kMaxInputLength) { currentInput.resize(kMaxInputLength); m_cursor = std::min(m_cursor, currentInput.size()); }
     m_suggestSel = 0;
+    m_suggestTop = 0;
+    m_plainShown = false;
+    refreshSuggestions();
 }
 
 void ChatSystem::openChat(GLFWwindow* window, int triggerKey) {
@@ -164,6 +215,9 @@ void ChatSystem::openChat(GLFWwindow* window, int triggerKey) {
     m_cursor = 0;
     m_historyIndex = -1;
     m_suggestSel = 0;
+    m_suggestTop = 0;
+    m_scroll = 0.0;
+    m_plainShown = false;
     suppressNextChar = (triggerKey == GLFW_KEY_T);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 }
@@ -175,6 +229,10 @@ void ChatSystem::closeChat(GLFWwindow* window) {
     m_cursor = 0;
     m_historyIndex = -1;
     m_suggestSel = 0;
+    m_suggestTop = 0;
+    m_scroll = 0.0;
+    m_sugg.clear();
+    m_pendingLink.clear();
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 }
 
@@ -198,9 +256,47 @@ void ChatSystem::pushLine(const std::string& text, const glm::vec3& color) {
     if (text.empty()) return;
     m_lines.push_back(ChatLine{text, color, glfwGetTime()});
     while (m_lines.size() > maxHistorySize) m_lines.pop_front();
+    if (m_scroll > 0.0) scrollLog(1.0);               // scrolled back: what you're reading stays put
+}
+
+bool ChatSystem::handleMouseClick(double x, double y, GLFWwindow* window) {
+    if (!isOpen) return false;
+    const float fx = static_cast<float>(x), fy = static_cast<float>(y);
+    auto inside = [&](const LinkHit& r) { return fx >= r.x0 && fx < r.x1 && fy >= r.y0 && fy < r.y1; };
+    if (!m_pendingLink.empty()) {                     // the "Open this link?" box takes every click
+        if (inside(m_linkButtons[0])) openPendingLink();
+        else if (inside(m_linkButtons[1])) {
+            if (window) glfwSetClipboardString(window, m_pendingLink.c_str());
+            m_linkNote = "Copied - paste it into your browser";
+        } else if (inside(m_linkButtons[2])) {
+            m_pendingLink.clear();
+        }
+        return true;
+    }
+    for (const auto& hit : m_linkHits) {
+        if (inside(hit) && !hit.url.empty()) {
+            m_pendingLink = hit.url;
+            m_linkNote.clear();
+            return true;
+        }
+    }
+    return false;
+}
+
+void ChatSystem::openPendingLink() {
+    const std::string url = m_pendingLink;
+    m_pendingLink.clear();
+    const bool ok = m_linkOpener ? m_linkOpener(url) : weblink::open(url);
+    if (!ok) addMessage("Couldn't open " + url + " - copy it into your browser instead", kErrorColor);
+}
+
+void ChatSystem::scrollLog(double lines) {
+    const double most = m_lines.size() > kLinesOpen ? static_cast<double>(m_lines.size() - kLinesOpen) : 0.0;
+    m_scroll = std::clamp(m_scroll + lines, 0.0, most);
 }
 
 void ChatSystem::handleCharInput(unsigned int codepoint) {
+    if (!m_pendingLink.empty()) return;
     if (!isOpen) return;
 
     if (suppressNextChar) {
@@ -220,6 +316,9 @@ void ChatSystem::insertText(const std::string& text) {
         ++m_cursor;
     }
     m_suggestSel = 0;
+    m_suggestTop = 0;
+    m_plainShown = false;
+    refreshSuggestions();
 }
 
 void ChatSystem::deleteBack() {
@@ -227,12 +326,16 @@ void ChatSystem::deleteBack() {
     currentInput.erase(m_cursor - 1, 1);
     --m_cursor;
     m_suggestSel = 0;
+    m_suggestTop = 0;
+    m_plainShown = false;
+    refreshSuggestions();
 }
 
 void ChatSystem::deleteForward() {
     if (m_cursor >= currentInput.size()) return;
     currentInput.erase(m_cursor, 1);
     m_suggestSel = 0;
+    refreshSuggestions();
 }
 
 void ChatSystem::handleKeyInput(int key, int scancode, int action, int mods, GLFWwindow* window) {
@@ -241,6 +344,16 @@ void ChatSystem::handleKeyInput(int key, int scancode, int action, int mods, GLF
 
     suppressNextChar = false;
     const bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    if (!m_pendingLink.empty()) {                     // "Open this link?": Enter opens, Esc cancels
+        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) openPendingLink();
+        else if (key == GLFW_KEY_ESCAPE) m_pendingLink.clear();
+        else if (key == GLFW_KEY_C && ctrl && window) {
+            glfwSetClipboardString(window, m_pendingLink.c_str());
+            m_linkNote = "Copied - paste it into your browser";
+        }
+        return;
+    }
 
     switch (key) {
     case GLFW_KEY_ENTER:
@@ -252,24 +365,43 @@ void ChatSystem::handleKeyInput(int key, int scancode, int action, int mods, GLF
         closeChat(window);
         break;
 
-    case GLFW_KEY_TAB:
+    case GLFW_KEY_TAB: {
+        // Commands: the highlighted suggestion. Plain chat: the first Tab shows the player
+        // names that fit (or completes the only one), the next takes the highlighted one.
+        const bool command = !currentInput.empty() && currentInput[0] == '/';
+        if (!command && !m_plainShown) {
+            m_plainShown = true;
+            refreshSuggestions();
+            if (m_sugg.size() != 1) break;
+        }
         acceptSuggestion();
         break;
+    }
 
     case GLFW_KEY_UP:
     case GLFW_KEY_DOWN: {
         // While suggestions are showing, Up/Down move the highlight. Otherwise they browse history.
-        const auto matches = matchingCommands();
-        if (!matches.empty()) {
-            const int n = static_cast<int>(matches.size());
+        if (!m_sugg.empty()) {
+            // every suggestion, not just the ones showing: the list scrolls to keep it in view
+            const int n = static_cast<int>(m_sugg.size());
             const int step = (key == GLFW_KEY_UP) ? -1 : 1;
             const int cur = std::clamp(m_suggestSel, 0, n - 1);
             m_suggestSel = (cur + step + n) % n;
+            const int rows = static_cast<int>(kMaxSuggestions);
+            if (m_suggestSel < m_suggestTop) m_suggestTop = m_suggestSel;
+            if (m_suggestSel >= m_suggestTop + rows) m_suggestTop = m_suggestSel - rows + 1;
         } else {
             recallHistory(key == GLFW_KEY_UP ? +1 : -1);
         }
         break;
     }
+
+    case GLFW_KEY_PAGE_UP:
+        scrollLog(static_cast<double>(kLinesOpen - 1));
+        break;
+    case GLFW_KEY_PAGE_DOWN:
+        scrollLog(-static_cast<double>(kLinesOpen - 1));
+        break;
 
     case GLFW_KEY_BACKSPACE:
         deleteBack();
@@ -281,18 +413,22 @@ void ChatSystem::handleKeyInput(int key, int scancode, int action, int mods, GLF
 
     case GLFW_KEY_LEFT:
         if (m_cursor > 0) --m_cursor;
+        refreshSuggestions();
         break;
 
     case GLFW_KEY_RIGHT:
         if (m_cursor < currentInput.size()) ++m_cursor;
+        refreshSuggestions();
         break;
 
     case GLFW_KEY_HOME:
         m_cursor = 0;
+        refreshSuggestions();
         break;
 
     case GLFW_KEY_END:
         m_cursor = currentInput.size();
+        refreshSuggestions();
         break;
 
     case GLFW_KEY_V:
@@ -325,10 +461,12 @@ void ChatSystem::recallHistory(int direction) {
     }
     m_cursor = currentInput.size();
     m_suggestSel = 0;
+    refreshSuggestions();
 }
 
 void ChatSystem::sendCurrentInput(GLFWwindow* window) {
-    const std::string text = currentInput;
+    std::string text = currentInput;
+    text.erase(text.find_last_not_of(' ') + 1);      // (Tab leaves a space after the last word)
 
     if (!text.empty()) {
         if (m_sentHistory.empty() || m_sentHistory.back() != text) {
@@ -499,32 +637,66 @@ void ChatSystem::renderChatOverlay(FontRenderer* fontRenderer, GLuint fontShader
     }
 
     // Suggestion list, stacked directly above the input bar.
-    const auto matches = matchingCommands();
-    const int shown = static_cast<int>(std::min(matches.size(), kMaxSuggestions));
-    if (shown > 0) {
-        m_suggestSel = std::clamp(m_suggestSel, 0, shown - 1);
+    const int total = isOpen ? static_cast<int>(m_sugg.size()) : 0;
+    if (total > 0) {
+        m_suggestSel = std::clamp(m_suggestSel, 0, total - 1);
+        m_suggestTop = std::clamp(m_suggestTop, 0, std::max(0, total - static_cast<int>(kMaxSuggestions)));
+        m_suggestTop = std::clamp(m_suggestTop, std::max(0, m_suggestSel - static_cast<int>(kMaxSuggestions) + 1), m_suggestSel);
     }
+    const int shown = std::min(total, static_cast<int>(kMaxSuggestions));
     const float suggestTop = inputTopY - static_cast<float>(shown) * kLinePixelH;
 
     for (int i = 0; i < shown; ++i) {
-        const CommandInfo* c = matches[static_cast<size_t>(i)];
-        const bool selected = (i == m_suggestSel);
+        const int index = m_suggestTop + i;
+        const Suggestion& sg = m_sugg[static_cast<size_t>(index)];
+        const bool selected = (index == m_suggestSel);
         const float y = suggestTop + static_cast<float>(i) * kLinePixelH;
 
         addRectTask(boxLeft, y, boxWidth, kLinePixelH,
                     selected ? glm::vec4(0.25f, 0.25f, 0.35f, 0.9f) : glm::vec4(0.0f, 0.0f, 0.0f, 0.6f));
 
-        const std::string label = commandLabel(c->name, c->usage) + "  -  " + c->description;
+        std::string label = sg.label;
+        const int above = m_suggestTop, below = total - (m_suggestTop + shown);
+        if (i == 0 && above > 0) label += "   (" + std::to_string(above) + " above)";
+        if (i == shown - 1 && below > 0) label += "   (+" + std::to_string(below) + " more: Down or keep typing)";
         textTasks.push_back({label, boxLeft + kTextInsetX, y + kLineTextDropY,
                              selected ? glm::vec4(1.0f, 1.0f, 0.6f, 1.0f) : glm::vec4(0.8f, 0.8f, 0.8f, 1.0f)});
     }
+
+    // Where the mouse is, in the same units as everything here (for hovering over links)
+    const float textScaleX = (W > 0.0f) ? static_cast<float>(fbWidth) / W : 1.0f;
+    float mouseX = -1.0f, mouseY = -1.0f;
+    if (currentWindow && isOpen) {
+        double cx = 0.0, cy = 0.0;
+        int ww = 0, wh = 0;
+        glfwGetCursorPos(currentWindow, &cx, &cy);
+        glfwGetWindowSize(currentWindow, &ww, &wh);
+        if (ww > 0 && wh > 0) {
+            mouseX = static_cast<float>(cx * W / ww);
+            mouseY = static_cast<float>(cy * H / wh);
+        }
+    }
+    m_linkHits.clear();
 
     // Log lines stack upward from the suggestions when open, or from the hotbar line when closed.
     const float baseY = isOpen ? suggestTop : chatBottom;
     const size_t maxLines = isOpen ? kLinesOpen : kLinesClosed;
     size_t row = 0;
+    // Scrolled back (wheel / Page Up): start that many lines up from the newest
+    const size_t skip = isOpen ? std::min(static_cast<size_t>(m_scroll + 0.5), m_lines.size()) : 0;
+    if (isOpen && m_lines.size() > maxLines) {
+        // a scrollbar at the right edge of the log: where you are in it
+        const float trackH = static_cast<float>(maxLines) * kLinePixelH;
+        const float trackTop = baseY - trackH;
+        const float frac = static_cast<float>(maxLines) / static_cast<float>(m_lines.size());
+        const float thumbH = std::max(kLinePixelH * 0.5f, trackH * frac);
+        const float back = static_cast<float>(skip) / static_cast<float>(m_lines.size() - maxLines);
+        const float thumbTop = trackTop + (trackH - thumbH) * (1.0f - back);
+        addRectTask(boxLeft + boxWidth - 4.0f, trackTop, 4.0f, trackH, glm::vec4(0.0f, 0.0f, 0.0f, 0.35f));
+        addRectTask(boxLeft + boxWidth - 4.0f, thumbTop, 4.0f, thumbH, glm::vec4(0.8f, 0.8f, 0.85f, 0.8f));
+    }
 
-    for (auto it = m_lines.rbegin(); it != m_lines.rend() && row < maxLines; ++it, ++row) {
+    for (auto it = m_lines.rbegin() + static_cast<std::ptrdiff_t>(skip); it != m_lines.rend() && row < maxLines; ++it, ++row) {
         const double age = now - it->timeAdded;
 
         float alpha = 1.0f;
@@ -539,8 +711,38 @@ void ChatSystem::renderChatOverlay(FontRenderer* fontRenderer, GLuint fontShader
         const float bgAlpha = (isOpen ? 0.5f : 0.35f) * alpha;
 
         addRectTask(boxLeft, lineTop, boxWidth, kLinePixelH, glm::vec4(0.0f, 0.0f, 0.0f, bgAlpha));
-        textTasks.push_back({it->text, boxLeft + kTextInsetX, lineTop + kLineTextDropY,
-                             glm::vec4(it->color, alpha)});
+        const auto links = weblink::find(it->text);
+        if (links.empty()) {
+            textTasks.push_back({it->text, boxLeft + kTextInsetX, lineTop + kLineTextDropY,
+                                 glm::vec4(it->color, alpha)});
+            continue;
+        }
+        // A line with web addresses: drawn in pieces, the links blue and underlined (and
+        // clickable while the chat is open)
+        float x = boxLeft + kTextInsetX;
+        size_t from = 0;
+        auto piece = [&](const std::string& text, const glm::vec4& color) {
+            if (text.empty()) return 0.0f;
+            textTasks.push_back({text, x, lineTop + kLineTextDropY, color});
+            const float w = fontRenderer->textWidth(text, 1.0f, screen) / textScaleX;
+            x += w;
+            return w;
+        };
+        for (const auto& [start, length] : links) {
+            piece(it->text.substr(from, start - from), glm::vec4(it->color, alpha));
+            const std::string shownLink = it->text.substr(start, length);
+            const std::string url = weblink::normalize(shownLink);
+            const float x0 = x;
+            const float w = fontRenderer->textWidth(shownLink, 1.0f, screen) / textScaleX;
+            const bool hover = isOpen && m_pendingLink.empty() && mouseX >= x0 && mouseX < x0 + w &&
+                               mouseY >= lineTop && mouseY < lineTop + kLinePixelH;
+            piece(shownLink, hover ? glm::vec4(0.65f, 0.85f, 1.0f, alpha) : glm::vec4(0.35f, 0.65f, 1.0f, alpha));
+            addRectTask(x0, lineTop + kLineTextDropY + 2.0f, w, hover ? 2.0f : 1.0f,
+                        hover ? glm::vec4(0.65f, 0.85f, 1.0f, alpha) : glm::vec4(0.35f, 0.65f, 1.0f, alpha));
+            if (isOpen) m_linkHits.push_back({x0, lineTop, x0 + w, lineTop + kLinePixelH, url});
+            from = start + length;
+        }
+        piece(it->text.substr(from), glm::vec4(it->color, alpha));
     }
 
     // Save state we change so the rest of the frame is unaffected.
@@ -552,35 +754,76 @@ void ChatSystem::renderChatOverlay(FontRenderer* fontRenderer, GLuint fontShader
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Phase 1: background rectangles.
-    glUseProgram(m_rectProgram);
-    glBindVertexArray(m_rectVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, m_rectVBO);
-
-    for (const auto& rect : rectTasks) {
-        const float v[36] = {
-            rect.x0, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-            rect.x1, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-            rect.x1, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-            rect.x0, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-            rect.x1, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-            rect.x0, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
-        };
-        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-    }
-    glBindVertexArray(0);
-
-    // Phase 2: text. FontRenderer takes pixel coordinates, top-left origin.
-    glUseProgram(fontShader);
-
     const float scaleX = (W > 0.0f) ? static_cast<float>(fbWidth) / W : 1.0f;
     const float scaleY = (H > 0.0f) ? static_cast<float>(fbHeight) / H : 1.0f;
 
-    for (const auto& task : textTasks) {
-        fontRenderer->renderText(fontShader, task.text,
-                                 task.x * scaleX, task.y * scaleY,
-                                 1.0f, 1.0f, task.color, screen);
+    // Background rectangles, then the text on them. FontRenderer takes pixel coordinates, top-left origin.
+    auto drawPass = [&](const std::vector<RectTask>& rects, const std::vector<TextTask>& texts) {
+        glDisable(GL_DEPTH_TEST);                     // (drawing text turns it back on)
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(m_rectProgram);
+        glBindVertexArray(m_rectVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_rectVBO);
+        for (const auto& rect : rects) {
+            const float v[36] = {
+                rect.x0, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+                rect.x1, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+                rect.x1, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+                rect.x0, rect.y0, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+                rect.x1, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+                rect.x0, rect.y1, rect.color.r, rect.color.g, rect.color.b, rect.color.a,
+            };
+            glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(v), v);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+        glBindVertexArray(0);
+        glUseProgram(fontShader);
+        for (const auto& task : texts) {
+            fontRenderer->renderText(fontShader, task.text, task.x * scaleX, task.y * scaleY,
+                                     1.0f, 1.0f, task.color, screen);
+        }
+    };
+    drawPass(rectTasks, textTasks);
+
+    // "Open this link?" on top of everything
+    if (isOpen && !m_pendingLink.empty()) {
+        rectTasks.clear();
+        textTasks.clear();
+        auto width = [&](const std::string& t) { return fontRenderer->textWidth(t, 1.0f, screen) / textScaleX; };
+        // long addresses: the middle left out, so the start (the site) and the end both show
+        const float boxW = std::min(W - 40.0f, 760.0f);
+        std::string shownUrl = m_pendingLink;
+        if (width(shownUrl) > boxW - 40.0f) {
+            const std::string tail = m_pendingLink.substr(m_pendingLink.size() - std::min<size_t>(24, m_pendingLink.size() / 2));
+            std::string head = m_pendingLink.substr(0, m_pendingLink.size() - tail.size());
+            while (head.size() > 10 && width(head + "..." + tail) > boxW - 40.0f) head.pop_back();
+            shownUrl = head + "..." + tail;
+        }
+        const float boxH = 200.0f;
+        const float bx = (W - boxW) * 0.5f, by = (H - boxH) * 0.5f;
+        addRectTask(0.0f, 0.0f, W, H, glm::vec4(0.0f, 0.0f, 0.0f, 0.55f));
+        addRectTask(bx, by, boxW, boxH, glm::vec4(0.08f, 0.08f, 0.1f, 0.95f));
+        addRectTask(bx, by, boxW, 2.0f, glm::vec4(0.35f, 0.65f, 1.0f, 1.0f));
+        auto centred = [&](const std::string& t, float y, const glm::vec4& c) {
+            textTasks.push_back({t, bx + (boxW - width(t)) * 0.5f, y, c});
+        };
+        centred("Open this link in your browser?", by + 34.0f, glm::vec4(1.0f));
+        centred("Website: " + weblink::host(m_pendingLink), by + 66.0f, glm::vec4(1.0f, 0.9f, 0.5f, 1.0f));
+        centred(shownUrl, by + 94.0f, glm::vec4(0.35f, 0.65f, 1.0f, 1.0f));
+        centred(m_linkNote.empty() ? "Only open links from people and servers you trust." : m_linkNote,
+                by + 124.0f, glm::vec4(0.7f, 0.7f, 0.7f, 1.0f));
+        const char* labels[3] = { "Open (Enter)", "Copy", "Cancel (Esc)" };
+        const float bw = (boxW - 4.0f * 16.0f) / 3.0f, bh = 32.0f, btnY = by + boxH - bh - 16.0f;
+        for (int i = 0; i < 3; ++i) {
+            const float x0 = bx + 16.0f + static_cast<float>(i) * (bw + 16.0f);
+            m_linkButtons[i] = {x0, btnY, x0 + bw, btnY + bh, ""};
+            const bool hover = mouseX >= x0 && mouseX < x0 + bw && mouseY >= btnY && mouseY < btnY + bh;
+            addRectTask(x0, btnY, bw, bh, hover ? glm::vec4(0.3f, 0.32f, 0.42f, 1.0f) : glm::vec4(0.2f, 0.2f, 0.25f, 1.0f));
+            textTasks.push_back({labels[i], x0 + (bw - width(labels[i])) * 0.5f, btnY + 22.0f, glm::vec4(1.0f)});
+        }
+        drawPass(rectTasks, textTasks);
     }
 
     if (cullWasOn) glEnable(GL_CULL_FACE);

@@ -1,4 +1,5 @@
 #include "Lighting.h"
+#include <cmath>
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <filesystem>
@@ -17,19 +18,21 @@ LightingSystem::LightingSystem() {
 LightingSystem::~LightingSystem() = default;
 
 void LightingSystem::update(float deltaTime) {
-    // Optional per-frame updates for dynamic lighting transitions or weather effects
+    clock.advance(deltaTime);
 }
 
 float LightingSystem::getTimeOfDay() const {
-    if (customTimeOfDay >= 0.0f) {
-        return customTimeOfDay;
-    }
-    return static_cast<float>(glfwGetTime()) * 0.03f;
+    if (customTimeOfDay >= 0.0f) return customTimeOfDay - std::floor(customTimeOfDay);
+    return static_cast<float>(clock.time());
 }
 
 glm::vec3 LightingSystem::getSunDirection() const {
-    float time = getTimeOfDay();
-    return glm::normalize(glm::vec3(cos(time), sin(time), 0.3f));
+    if (customTimeOfDay >= 0.0f) {
+        DayClock fixed;
+        fixed.total = customTimeOfDay;
+        return fixed.sunDirection();
+    }
+    return clock.sunDirection();
 }
 
 glm::vec3 LightingSystem::getMoonDirection() const {
@@ -40,8 +43,7 @@ int LightingSystem::getMoonPhase() const {
     if (forcedMoonPhase >= 0) {
         return forcedMoonPhase;
     }
-    int dayCount = static_cast<int>(static_cast<float>(glfwGetTime()) / 60.0f);
-    return dayCount % 8;
+    return clock.moonPhase();      // a new phase every day, the same for everyone on a server
 }
 
 void LightingSystem::setSunTexture(const std::string& path) {
@@ -87,7 +89,7 @@ void LightingSystem::resetToDefaults() {
     customFogColor = glm::vec3(-1.0f);
     sunIntensity = 1.0f;
     ambientIntensity = 1.0f;
-    customTimeOfDay = -1.0f;
+    customTimeOfDay = -1.0f;      // (the clock itself belongs to the world: set when one opens)
     forcedMoonPhase = -1;
     m_PointLights.clear();
 }

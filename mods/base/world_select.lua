@@ -29,6 +29,20 @@ print("[UI] world_select.lua loaded")
 -- THEME
 -- ===========================================================================
 
+local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
+    local ok, m = pcall(require, "textedit")
+    if ok then return m end
+    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
+    local function view(_, t, w, sc)
+        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
+        return t, ui.text_width(t, sc)
+    end
+    return { reset = function() end, focus = function() end, view = view,
+             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
+             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
+             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
+end)()
+
 local Theme = {
     colors = {
         background     = { 0.10, 0.10, 0.10, 1.00 },
@@ -173,6 +187,8 @@ local function open_create()
     state.name = "New World"
     state.seed = ""
     state.focus = "name"
+    te.reset("world:name")      -- carets at the end of the new text
+    te.reset("world:seed")
     state.message = nil
     state.game_mode = (has_game_modes() and survival.settings and survival.settings.default_mode) or "survival"
 end
@@ -242,7 +258,7 @@ local function draw_button(b, mx, my, S, fs)
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs, tc, S)
 end
 
-local function draw_field(f, value, focused, placeholder, S, fs)
+local function draw_field(f, value, focused, placeholder, S, fs, id)
     rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
     rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
 
@@ -251,12 +267,18 @@ local function draw_field(f, value, focused, placeholder, S, fs)
         text(placeholder, f.x + 4 * S, ty, fs, C.detail, false, S)
         return
     end
-
-    local max_chars = math.max(1, math.floor((f.w - 8 * S) / (Theme.font.char_w * fs)) - 1)
-    local shown = value
-    if #shown > max_chars then shown = shown:sub(#shown - max_chars + 1) end
-    local blink = focused and (ui.get_time() % 1.0) < 0.5
-    text(shown .. (blink and "_" or ""), f.x + 4 * S, ty, fs, C.name, false, S)
+    if focused and id then
+        -- scrolled so the caret stays in view; the caret where it is (lualib/textedit.lua)
+        local shown, caret_x = te.view(id, value, f.w - 8 * S, fs)
+        text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
+        te.draw_caret(id, f.x + 4 * S + caret_x, ty - S, text_height(fs) + 2 * S, C.name[1], C.name[2], C.name[3], 1)
+        return
+    end
+    local shown = value                                    -- not being typed in: its start
+    while #shown > 1 and (ui.text_width and ui.text_width(shown, fs) or #shown * 8 * fs) > f.w - 8 * S do
+        shown = shown:sub(1, -2)
+    end
+    text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
 end
 
 local function click_buttons(buttons, mx, my)
@@ -434,10 +456,10 @@ local function render_create(W, H)
     text_centered("Create New World", W / 2, L.titleY, fs, C.title, S)
 
     text("World Name", L.fx, L.nameLabelY, fs, C.detail, false, S)
-    draw_field(L.nameField, state.name, state.focus == "name", nil, S, fs)
+    draw_field(L.nameField, state.name, state.focus == "name", nil, S, fs, "world:name")
 
     text("Seed for the World Generator", L.fx, L.seedLabelY, fs, C.detail, false, S)
-    draw_field(L.seedField, state.seed, state.focus == "seed", "Random", S, fs)
+    draw_field(L.seedField, state.seed, state.focus == "seed", "Random", S, fs, "world:seed")
     text("Leave blank for a random seed", L.fx, L.hintY, fs * 0.85, C.detail, false, S)
     if L.modeButton then
         text(MODE_INFO[state.game_mode].text, L.fx, L.modeTextY, fs * 0.85, C.detail, false, S)
@@ -450,10 +472,19 @@ local function click_create(mx, my, W, H)
     local L = create_layout(W, H)
     if click_buttons(L.buttons, mx, my) then return end
 
+    -- A click in a box: typing goes there, with the caret where you clicked
     local f = L.nameField
-    if inside(mx, my, f.x, f.y, f.w, f.h) then state.focus = "name" return end
+    if inside(mx, my, f.x, f.y, f.w, f.h) then
+        state.focus = "name"
+        te.focus("world:name", state.name, mx - (f.x + 4 * L.S), L.fs)
+        return
+    end
     f = L.seedField
-    if inside(mx, my, f.x, f.y, f.w, f.h) then state.focus = "seed" return end
+    if inside(mx, my, f.x, f.y, f.w, f.h) then
+        state.focus = "seed"
+        te.focus("world:seed", state.seed, mx - (f.x + 4 * L.S), L.fs)
+        return
+    end
 end
 
 -- ===========================================================================
@@ -549,8 +580,9 @@ function handle_world_select_key(key, action, mods)
             state.focus = (state.focus == "name") and "seed" or "name"
         elseif key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
             create_and_play()
-        elseif key == ui.keys.BACKSPACE then
-            state[state.focus] = state[state.focus]:sub(1, -2)
+        else
+            -- Left / Right / Home / End / Backspace / Delete (Ctrl: by word)
+            state[state.focus] = te.key("world:" .. state.focus, state[state.focus], key, action, mods)
         end
         return true
     end
@@ -579,8 +611,8 @@ function handle_world_select_char(codepoint, ch)
     if state.mode ~= "create" or not ch or ch == "" then return false end
     local field = state.focus
     local limit = (field == "name") and Theme.max_name or Theme.max_seed
-    if codepoint >= 32 and codepoint < 127 and #state[field] < limit then
-        state[field] = state[field] .. ch
+    if codepoint >= 32 and codepoint < 127 then
+        state[field] = te.insert("world:" .. field, state[field], ch, limit)
     end
     return true
 end

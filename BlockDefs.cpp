@@ -79,7 +79,33 @@ void applyLightProperties(BlockProperty& block, const sol::table& props) {
     sol::object filterObj = props["light_filter"];
     if (readColor(filterObj, f)) {
         for (int i = 0; i < 3; ++i) block.lightFilter[i] = f[i];
+        block.tintView = true;              // stained glass tints the view too, unless told not to
     }
+    sol::optional<bool> tintView = props["tint_view"];
+    if (tintView) block.tintView = *tintView;
+}
+
+void applyTankProperties(BlockProperty& block, const sol::table& props) {
+    sol::optional<sol::table> tank = props["tank"];
+    if (!tank) return;
+    block.tankFluid = tank->get_or("fluid", std::string());
+    if (sol::optional<sol::table> box = (*tank)["box"]) {
+        float v[6];
+        bool ok = true;
+        for (int i = 0; i < 6; ++i) {
+            sol::optional<float> n = (*box)[i + 1];
+            if (!n || !std::isfinite(*n)) { ok = false; break; }
+            v[i] = std::max(0.0f, std::min(16.0f, *n)) / 16.0f;
+        }
+        if (ok && v[0] < v[3] && v[1] < v[4] && v[2] < v[5]) for (int i = 0; i < 6; ++i) block.tankBox[i] = v[i];
+    }
+    sol::optional<float> inset = (*tank)["inset"];
+    if (inset && std::isfinite(*inset)) block.tankInset = std::max(0.0f, std::min(7.0f, *inset)) / 16.0f;
+    block.tankStream = tank->get_or("stream", false);
+    sol::optional<float> floorPx = (*tank)["floor"];
+    if (floorPx && std::isfinite(*floorPx)) block.tankFloor = std::max(0.0f, std::min(15.0f, *floorPx)) / 16.0f;
+    block.tankShell = tank->get_or("shell", true);
+    block.tankFluid2 = tank->get_or("fluid2", std::string());
 }
 
 void applySoundProperties(BlockProperty& block, const sol::table& props) {
@@ -182,6 +208,9 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         applyDigProperties(block, props);
         applySoundProperties(block, props);
         applyLightProperties(block, props);
+        applyTankProperties(block, props);
+        // Tanks: see-through (the liquid shows through the glass), drawn by their own shape
+        if (block.pattern == "tank") block.isTransparent = true;
         // Doors (DoorShape.h): a thin panel, so light and the blocks beside them show through,
         // and see-through pixels in the picture (windows) are cut out
         if (block.pattern == "door") {

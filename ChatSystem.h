@@ -53,12 +53,34 @@ public:
     // (the server echoes it back to everyone), false to show it locally instead.
     void setMessageSender(std::function<bool(const std::string&)> sender) { m_messageSender = std::move(sender); }
 
+    // ---- Completion (Tab) ----
+    // The word being typed gets suggestions: command names (registered ones, and whatever the
+    // completer adds - a server's), then their arguments, and in plain chat (after Tab) player
+    // names. The completer is asked with the text before the cursor, the words before the one
+    // being typed (without the "/"), that word, and whether it's a command; it returns what
+    // fits (unfiltered is fine). Answers that come later (from a server): call
+    // refreshSuggestions() when they arrive.
+    struct Suggestion { std::string insert; std::string label; };
+    using Completer = std::function<std::vector<Suggestion>(const std::string& head, const std::vector<std::string>& before,
+                                                            const std::string& word, bool command)>;
+    void setCompleter(Completer c) { m_completer = std::move(c); }
+    void refreshSuggestions();
+    // Scrolls the log while the chat is open: + = back to older lines (the mouse wheel's up)
+    void scrollLog(double lines);
+
+    // Web addresses in chat lines are links. A click on one (chat open) asks "Open this link?"
+    // first; x, y in the same pixels the chat is drawn in. True = the click was the chat's.
+    bool handleMouseClick(double x, double y, GLFWwindow* window);
+    bool linkPromptOpen() const { return !m_pendingLink.empty(); }
+    // What opens a link the player agreed to (default: weblink::open, the system browser)
+    void setLinkOpener(std::function<bool(const std::string&)> opener) { m_linkOpener = std::move(opener); }
+
     void renderChatOverlay(FontRenderer* fontRenderer, GLuint fontShader, int screenWidth, int screenHeight);
 
     bool isOpen = false;
     bool suppressNextChar = false;   // skip the 'T' that opened the chat
     std::string currentInput;
-    size_t maxHistorySize = 100;     // lines kept in the log
+    size_t maxHistorySize = 200;     // lines kept in the log (scroll back with the wheel / Page Up)
 
 private:
     struct ChatLine {
@@ -72,7 +94,6 @@ private:
         std::string description;
     };
 
-    std::vector<const CommandInfo*> matchingCommands() const;
     void acceptSuggestion();
     void pushLine(const std::string& text, const glm::vec3& color);
     void insertText(const std::string& text);
@@ -95,7 +116,21 @@ private:
 
     size_t m_cursor = 0;
     int m_historyIndex = -1;
-    int m_suggestSel = 0;
+    int m_suggestSel = 0;               // index into m_sugg
+    int m_suggestTop = 0;               // the first suggestion shown (the list scrolls with Up/Down)
+    double m_scroll = 0.0;              // lines scrolled back from the newest
+
+    struct LinkHit { float x0, y0, x1, y1; std::string url; };
+    std::vector<LinkHit> m_linkHits;    // links drawn this frame (where to click)
+    LinkHit m_linkButtons[3] = {};      // Open, Copy, Cancel in the "Open this link?" box
+    std::string m_pendingLink;          // asking about this one
+    std::string m_linkNote;             // "Copied..."
+    std::function<bool(const std::string&)> m_linkOpener;
+    void openPendingLink();
+    std::vector<Suggestion> m_sugg;     // for the word being typed (refreshSuggestions)
+    size_t m_wordStart = 0;             // where that word starts in currentInput
+    bool m_plainShown = false;          // plain chat: names show after Tab
+    Completer m_completer;
 
     bool m_gpuReady = false;
     GLuint m_rectProgram = 0;

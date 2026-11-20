@@ -11,6 +11,7 @@
 // dedicated (windowless) server.
 
 #include <glm/glm.hpp>
+#include "DayTime.h"
 #include <cstdint>
 #include <deque>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <vector>
 #include "World.h"
 #include "PlayerMovement.h"
+#include "Entities.h"
 
 typedef struct _ENetHost ENetHost;
 typedef struct _ENetPeer ENetPeer;
@@ -151,6 +153,14 @@ public:
     bool teleportPlayer(const std::string& name, const glm::vec3& pos);
     std::vector<std::pair<std::string, glm::vec3>> playerPositions() const;   // for saving
     bool kickPlayer(const std::string& name, const std::string& reason);
+    // A joined player's IP address ("" if they aren't here) - for ban-ip
+    std::string playerAddress(const std::string& name) const;
+    // Asks a player's game to do something it decides itself: "give" (item, count), "clear",
+    // "kill" (reason). Their game runs it (GameClient::takeActions; mods: on_server_action).
+    bool sendAction(const std::string& name, const std::string& action,
+                    const std::string& a = "", const std::string& b = "");
+    // Asked first when someone joins, with their IP address: "" lets them in, else why not (ban-ip)
+    std::function<std::string(const std::string& ip)> canJoinFrom;
     // Where a returning player should appear (return true + set pos), and a hook for
     // when a player leaves (to save their position). Optional.
     std::function<bool(const std::string& name, glm::vec3& pos)> spawnFor;
@@ -169,10 +179,29 @@ public:
     const std::string& serverId() const { return m_serverId; }
     // A "/command" a player typed (without the slash). Reply with messagePlayer. Optional.
     std::function<void(const std::string& name, const std::string& command)> onCommand;
+    // Tab in a player's chat: the text before their cursor ("/give Al" or "hello Bo") -> what
+    // fits the word they're typing (the server's commands they may use, players, items...)
+    std::function<std::vector<std::string>(const std::string& name, const std::string& text)> onComplete;
     // Called once someone has joined (e.g. to send them a welcome message). Optional.
     std::function<void(const std::string& name)> onJoin;
-    // A player changed a block (and the server accepted it): for break/place sounds
-    std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onPlayerEdit;
+    // A player changed a block (and the server accepted it): for break/place sounds and mods
+    std::function<void(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onPlayerEdit;
+    // Before a player's block change is applied: "" = allowed, anything else = refused (the
+    // player's game is sent the real block back). The text is shown to the player, except
+    // kSilentRefusal. Optional. (Mods: can_edit_block)
+    // Asked for every real change: a different block, or the same block with different metadata
+    // (a door opening, a tank filling), with what's stored now and what's asked for.
+    std::function<std::string(const std::string& name, const glm::ivec3& pos, uint8_t oldId, uint8_t oldMeta,
+                              uint8_t newId, uint8_t newMeta)> canEdit;
+    static constexpr const char* kSilentRefusal = "\x01";
+    // A player's chat line, before everyone sees it: return false to drop it; `text` may be
+    // changed. Optional. (Mods: on_player_chat)
+    std::function<bool(const std::string& name, std::string& text)> onChat;
+    // Chat and /commands from one player: a burst of kChatBurst, then one every
+    // kChatRefillSeconds. More is dropped; kSpamKickStrikes drops in a row gets them kicked.
+    static constexpr double kChatBurst = 6.0;
+    static constexpr double kChatRefillSeconds = 0.75;
+    static constexpr int kSpamKickStrikes = 25;
     // A chat line to one player only. False if they're not online.
     // ---- Game modes and operators: the server decides. Each player's game follows what it's
     //      told and won't let the player change it themselves (only the server/admins can). ----
@@ -202,10 +231,48 @@ public:
     void setShared(const std::string& key, const std::string& value);
     const std::unordered_map<std::string, std::string>& shared() const { return m_shared; }
 
+    // Entities (mobs, dropped items): the owner's EntityManager. Players get what's near them:
+    // what each one is and looks like (when it appears or changes) and where it is, 20 times a
+    // second. Their games only draw them; nothing else of the entity is sent.
+    void setEntities(EntityManager* entities) { m_entityManager = entities; }
+    // A player hit (kind 0) or right-clicked (kind 1) an entity, holding `item`. Already checked:
+    // it exists and is within their reach, and they aren't clicking faster than 10 times a second.
+    std::function<void(const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& playerPos)> onEntityAct;
+    // A player's game dropped items (a block they dug, or thrown out): checked to be next to them
+    // How it was dropped: `returned` = it didn't fit in their inventory (picked up again a little
+    // later); hasVelocity = thrown (Q, a death scatter) with `velocity`; pickupDelay < 0 = usual.
+    struct DropInfo { bool returned = false; bool hasVelocity = false; glm::vec3 velocity{0.0f}; float pickupDelay = -1.0f; };
+    std::function<void(const std::string& name, const std::string& item, int count, const glm::vec3& pos, const DropInfo& how)> onDropItem;
+    // A player used the tool in their hand on a block (the scythe on a crop). Already checked:
+    // the block is loaded and within their reach, at most 10 a second (with entity hits). The
+    // server works out what happens from its own world (Lua: on_player_harvest).
+    std::function<void(const std::string& name, const std::string& item, const glm::ivec3& pos)> onHarvest;
+    // Changes a block for a joined player with the same checks as their own edits: loaded,
+    // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
+    // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
+    // False = refused, not online, or nothing to change (the block and metadata are already
+    // exactly that); `why` = what to tell them ("" = nothing).
+    // `meta` is the metadata to set (checked like the block: a metadata-only change is a change).
+    bool playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
+                        std::string* why = nullptr, float slack = 0.0f, uint8_t meta = 0);
+
+    // The time of day (DayTime.h). The owner (the dedicated server, or the game when hosting)
+    // calls this every tick with its clock; players get it when they join, every few seconds,
+    // and at once when it jumps (a "time set") or its speed changes.
+    void setDayTime(const DayClock& clock);
+
 private:
+    void sendDayTime(ENetPeer* peer);
+    DayClock m_dayClock;          // the owner's clock, as of the last setDayTime
+    DayClock m_daySent;           // ...as last sent to everyone, and when
+    double m_daySentAt = 0.0;
+    bool m_hasDayClock = false;
+    float m_dayTimer = 0.0f;
     void sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values);
     struct Client {
         ENetPeer* peer = nullptr;
+        double completeWindow = 0.0;   // (completion requests: at most 20 a second)
+        int completeCount = 0;
         uint16_t id = 0;
         bool joined = false;
         // Between C_HELLO and C_AUTH: the challenge we sent and what they asked for
@@ -232,10 +299,23 @@ private:
         // For F3 / netstats
         int inputsThisSecond = 0, inputsPerSecond = 0;
         int droppedInputs = 0;        // refused because they sent more movement than time allowed
+        // Chat flood limit (kChatBurst...): tokens left, when they were last topped up, strikes
+        double chatTokens = kChatBurst;
+        double chatRefillAt = 0.0;
+        int spamStrikes = 0;
+        double lastSpamWarning = -100.0;
         float movedThisSecond = 0.0f, speed = 0.0f;   // horizontal blocks/second on the server
         double statsWindow = 0.0;
         std::unordered_set<World::ChunkCoord, PairHash> sentChunks;
+        // Entities this player's game knows about: what we last told it
+        struct KnownEntity { uint32_t version = 0; glm::vec3 pos{0.0f}; float yaw = 0.0f; };
+        std::unordered_map<uint32_t, KnownEntity> knownEntities;
+        double entityActWindow = 0.0;     // (hits / right-clicks / drops: at most 10 / 30 a second)
+        int entityActs = 0, drops = 0;
     };
+    void sendEntities();
+    EntityManager* m_entityManager = nullptr;
+    float m_entityTimer = 0.0f;
 
     void handlePacket(Client& c, const uint8_t* data, size_t size);
     void sendStatus(ENetPeer* peer);
@@ -243,13 +323,18 @@ private:
     void handleAuth(Client& c, const uint8_t* data, size_t size);
     void finishJoin(Client& c, const std::string& name, int view);
     void handleBlocks(Client& c, const uint8_t* data, size_t size);
+    std::string editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, uint8_t meta, float slack);
     void handleInputs(Client& c, const uint8_t* data, size_t size);
     void kick(Client& c, const std::string& reason);
+    void sendMessageTo(Client& c, const std::string& text, const glm::vec3& color);
+    static std::string cleanChatText(const std::string& in);
+    bool allowChat(Client& c);
     void dropClient(uint16_t id);
     void sendMode(Client& c);
 
     void streamChunks(Client& c);
     void sendBlockChanges(const std::vector<World::BlockChange>& changes);
+    void sendFallingStarts(const std::vector<World::FallingStart>& starts);
     void sendPositions();
     void broadcastChat(const std::string& text, const glm::vec3& color);
 
@@ -349,6 +434,15 @@ public:
     void sendChat(const std::string& text);
     // A "/command" (without the slash) for the server to run; it answers in chat.
     void sendCommand(const std::string& command);
+    // Asks the server what fits the word being typed in chat (Tab). The answer comes later:
+    // completionFor(text, out) has it once it's here; takeCompletionArrived() is true once then.
+    void requestCompletion(const std::string& text);
+    bool completionFor(const std::string& text, std::vector<std::string>& out) const {
+        if (text != m_completeText || !m_completeHave) return false;
+        out = m_completeList;
+        return true;
+    }
+    bool takeCompletionArrived() { const bool a = m_completeArrived; m_completeArrived = false; return a; }
     std::vector<net::ChatLine> takeChat();
 
     // Shared values from the server (see GameServer::setShared)
@@ -358,11 +452,29 @@ public:
     }
     // Keys that changed since the last call (in order)
     std::vector<std::string> takeSharedChanges() { std::vector<std::string> out; out.swap(m_sharedChanges); return out; }
+    // What the server asked our game to do (GameServer::sendAction), oldest first
+    struct Action { std::string action, a, b; };
+    std::vector<Action> takeActions() { std::vector<Action> out; out.swap(m_actions); return out; }
     // Game mode the server gave us ("" = not told yet / not online) and whether we're an operator
     const std::string& gameMode() const { return m_mode; }
     bool isOperator() const { return m_isOp; }
     // True once each time the server changes our mode or operator status
     bool takeModeChange() { const bool c = m_modeChanged; m_modeChanged = false; return c; }
+    // The server's time of day, once each time it arrives (older servers never send one: then
+    // the game keeps its own clock)
+    bool takeDayTime(DayClock& out) { if (!m_dayTimeNew) return false; out = m_dayTime; m_dayTimeNew = false; return true; }
+    // Entities near us (mobs, dropped items), where they are this frame (drawn a little in the
+    // past, smoothly, like other players)
+    const std::unordered_map<uint32_t, EntityView>& entities() const { return m_entityViews; }
+    // Hit (kind 0) or right-click (kind 1) an entity, holding `item`; the server decides what happens
+    void sendEntityAct(uint32_t id, int kind, const std::string& item);
+    // Drop items into the world next to us (what we dug, or threw out); the server makes them
+    // returned = it was given to us but didn't fit; velocity (thrown) and pickupDelay (< 0 = usual)
+    void sendDropItem(const std::string& item, int count, const glm::vec3& pos, bool returned = false,
+                      const glm::vec3* velocity = nullptr, float pickupDelay = -1.0f);
+    // Used `item` on the block at pos (the scythe): the server decides what it does and yields
+    void sendHarvest(const std::string& item, const glm::ivec3& pos);
+
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
 
@@ -372,6 +484,12 @@ private:
     void sendEdits();
 
     std::vector<std::string> m_sharedChanges;
+    std::vector<Action> m_actions;
+    std::string m_completeText, m_completeAsked;   // what the last answer / question was for
+    std::vector<std::string> m_completeList;
+    bool m_completeHave = false, m_completeArrived = false;
+    DayClock m_dayTime;
+    bool m_dayTimeNew = false;
     std::string m_mode;
     bool m_isOp = false;
     bool m_modeChanged = false;
@@ -399,6 +517,12 @@ private:
     std::vector<net::ChatLine> m_chat;
     std::unordered_map<std::string, std::string> m_shared;
     float m_posTimer = 0.0f;
+
+    struct EntitySnap { double time; glm::vec3 pos; float yaw; };
+    std::unordered_map<uint32_t, EntityView> m_entityViews;
+    std::unordered_map<uint32_t, std::deque<EntitySnap>> m_entitySnaps;
+    void interpolateEntities(double renderTime);
+    void syncClock(float serverTime);
 
     // Prediction & reconciliation
     struct PendingInput { uint32_t seq; MoveInput input; float dt; };

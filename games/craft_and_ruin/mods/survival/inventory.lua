@@ -258,6 +258,17 @@ function inv.set(i, name, count)
     save()
 end
 function inv.clear() slots = {}; equipment = {}; grid = {}; held = nil; update_armor(); save() end
+-- Everything in the inventory (storage, armour, the crafting grid, the cursor) as a list of
+-- { name, count } - e.g. to drop it all when you die
+function inv.all_stacks()
+    local out = {}
+    local function add(s) if s and s.name and s.name ~= "" and (s.count or 0) > 0 then out[#out + 1] = { name = s.name, count = s.count } end end
+    for _, s in pairs(slots) do add(s) end
+    for _, s in pairs(equipment) do add(s) end
+    for _, s in pairs(grid) do add(s) end
+    add(held)
+    return out
+end
 function inv.is_open() return open end
 
 -- Into storage: onto matching stacks first, then empty slots. Returns what didn't fit.
@@ -726,6 +737,15 @@ function handle_inventory_click(mx, my, W, H, button, shift)
             hotbar.set_creative_open(true)
             return true
         end
+    end
+    -- Outside the window while holding a stack: drop it into the world (left: all, right: one)
+    if held and not (mx >= L.x and mx < L.x + L.w and my >= L.y and my < L.y + L.h) then
+        local n = button == "right" and 1 or held.count
+        if engine.drop_item then engine.drop_item(held.name, n) end
+        held.count = held.count - n
+        if held.count <= 0 then held = nil end
+        save()
+        return true
     end
     for _, r in ipairs(L.rects) do
         if mx >= r.x and mx < r.x + r.size and my >= r.y and my < r.y + r.size then

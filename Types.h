@@ -86,6 +86,21 @@ struct BlockProperty {
     uint8_t lightEmit[3] = {0, 0, 0};   // light it gives off, per colour (0..15 each)
     int lightAbsorb = -1;               // light lost per block passing through (at least 1; sunlight straight down loses only this; -1 = guess: water 1, leaves 1)
     float lightFilter[3] = {1.0f, 1.0f, 1.0f};   // colour let through (stained glass), 0..1 each
+    // Looking through it tints what's behind (stained glass): a see-through block drawn a second
+    // time as a colour filter. register_block's tint_view; on by default with a light_filter.
+    bool tintView = false;
+    // --- A tank (pattern "tank"): a see-through box with liquid inside, as full as its metadata
+    //     says (0 = empty .. 16 = full). register_block's tank = { fluid, box, inset, stream } ---
+    std::string tankFluid;                       // the block whose pictures fill it ("water", "lava"); "" = none
+    float tankBox[6] = {0, 0, 0, 1, 1, 1};       // the outer box, in blocks (x0 y0 z0 x1 y1 z1)
+    float tankInset = 1.0f / 16.0f;              // wall thickness: the liquid sits this far inside
+    bool tankStream = false;                     // also a thin stream pouring out of its bottom (a spout)
+    float tankFloor = -1.0f;                     // where the liquid starts (blocks, from the box bottom; < 0 = the inset)
+    bool tankShell = true;                       // draw the box itself (false: only the liquid - a smeltery's insides)
+    // Two liquids in layers (a smeltery): tankFluid at the bottom, this one on top. The metadata
+    // then holds both heights, in 16ths of the block: low 4 bits = where the lower one ends (1..15),
+    // high 4 bits = where the upper one ends, minus 1 (so 0..15 = 1..16).
+    std::string tankFluid2;
     // --- If this is a tool ---
     std::string toolType;         // "pickaxe", "axe", "shovel", "sword"... ("" = not a tool)
     float toolSpeed = 1.0f;       // how many times faster it digs blocks of its type

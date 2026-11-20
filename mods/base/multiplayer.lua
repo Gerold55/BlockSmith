@@ -43,6 +43,20 @@ print("[UI] multiplayer.lua loaded")
 -- THEME
 -- ===========================================================================
 
+local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
+    local ok, m = pcall(require, "textedit")
+    if ok then return m end
+    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
+    local function view(_, t, w, sc)
+        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
+        return t, ui.text_width(t, sc)
+    end
+    return { reset = function() end, focus = function() end, view = view,
+             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
+             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
+             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
+end)()
+
 local Theme = {
     colors = {
         background     = { 0.10, 0.10, 0.10, 1.00 },
@@ -214,6 +228,8 @@ local function open_edit(index)
     state.edit_address = s and s.address or ""
     state.focus = s and "name" or "address"
     state.message = nil
+    te.reset("mp:name")         -- carets at the end of the text
+    te.reset("mp:address")
 end
 
 local function save_edit()
@@ -268,30 +284,42 @@ local function draw_button(b, mx, my, S, fs)
     elseif b.danger then fill = hovered and C.danger_hover or C.danger
     else fill = hovered and C.button_hover or C.button end
 
-    rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
-    rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-    if b.enabled then
-        rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-        rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-        rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+    -- The game's button picture (like the title screen); plain boxes if the engine has none
+    local state = ((not b.enabled) and "disabled") or (hovered and "hover") or "normal"
+    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
+        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
+        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
+        if b.enabled then
+            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
+            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
+            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
+        end
     end
     local tc = (not b.enabled) and C.text_off or (hovered and C.text_hover or C.text)
     text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs, tc, S)
 end
 
-local function draw_field(f, value, focused, placeholder, S, fs)
+local function draw_field(f, value, focused, placeholder, S, fs, id)
     rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
     rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
+
     local ty = f.y + (f.h - text_height(fs)) / 2
     if value == "" and not focused and placeholder then
         text(placeholder, f.x + 4 * S, ty, fs, C.detail, false, S)
         return
     end
-    local max_chars = math.max(1, math.floor((f.w - 8 * S) / (Theme.font.char_w * fs)) - 1)
-    local shown = value
-    if #shown > max_chars then shown = shown:sub(#shown - max_chars + 1) end
-    local blink = focused and (ui.get_time() % 1.0) < 0.5
-    text(shown .. (blink and "_" or ""), f.x + 4 * S, ty, fs, C.name, false, S)
+    if focused and id then
+        -- scrolled so the caret stays in view; the caret where it is (lualib/textedit.lua)
+        local shown, caret_x = te.view(id, value, f.w - 8 * S, fs)
+        text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
+        te.draw_caret(id, f.x + 4 * S + caret_x, ty - S, text_height(fs) + 2 * S, C.name[1], C.name[2], C.name[3], 1)
+        return
+    end
+    local shown = value                                    -- not being typed in: its start
+    while #shown > 1 and (ui.text_width and ui.text_width(shown, fs) or #shown * 8 * fs) > f.w - 8 * S do
+        shown = shown:sub(1, -2)
+    end
+    text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
 end
 
 local function click_buttons(buttons, mx, my)
@@ -738,10 +766,10 @@ local function render_edit(W, H)
 
     if L.nameField then
         text("Server Name", L.fx, L.nameLabelY, fs, C.detail, false, S)
-        draw_field(L.nameField, state.edit_name, state.focus == "name", nil, S, fs)
+        draw_field(L.nameField, state.edit_name, state.focus == "name", nil, S, fs, "mp:name")
     end
     text("Server Address", L.fx, L.addrLabelY, fs, C.detail, false, S)
-    draw_field(L.addrField, state.edit_address, state.focus == "address", "e.g. 192.168.1.20", S, fs)
+    draw_field(L.addrField, state.edit_address, state.focus == "address", "e.g. 192.168.1.20", S, fs, "mp:address")
     text("Add :port if it isn't 30000", L.fx, L.hintY, fs * 0.85, C.detail, false, S)
     if state.message then text_centered(state.message, W / 2, L.messageY, fs * 0.85, C.warning, S) end
 
@@ -751,10 +779,19 @@ end
 local function click_edit(mx, my, W, H)
     local L = edit_layout(W, H)
     if click_buttons(L.buttons, mx, my) then return end
+    -- A click in a box: typing goes there, with the caret where you clicked
     local f = L.nameField
-    if f and inside(mx, my, f.x, f.y, f.w, f.h) then state.focus = "name" return end
+    if f and inside(mx, my, f.x, f.y, f.w, f.h) then
+        state.focus = "name"
+        te.focus("mp:name", state.edit_name, mx - (f.x + 4 * L.S), L.fs)
+        return
+    end
     f = L.addrField
-    if inside(mx, my, f.x, f.y, f.w, f.h) then state.focus = "address" return end
+    if inside(mx, my, f.x, f.y, f.w, f.h) then
+        state.focus = "address"
+        te.focus("mp:address", state.edit_address, mx - (f.x + 4 * L.S), L.fs)
+        return
+    end
 end
 
 -- ===========================================================================
@@ -890,9 +927,10 @@ function handle_multiplayer_key(key, action, mods)
             state.focus = (state.focus == "name") and "address" or "name"
         elseif enter then
             if state.mode == "direct" then connect_direct() else save_edit() end
-        elseif key == ui.keys.BACKSPACE then
+        else
+            -- Left / Right / Home / End / Backspace / Delete (Ctrl: by word)
             local field = state.focus == "name" and "edit_name" or "edit_address"
-            state[field] = state[field]:sub(1, -2)
+            state[field] = te.key("mp:" .. (state.focus == "name" and "name" or "address"), state[field], key, action, mods)
         end
         return true
     end
@@ -920,10 +958,10 @@ function handle_multiplayer_char(codepoint, ch)
     if not ch or ch == "" or codepoint < 32 or codepoint >= 127 then return false end
     if state.mode == "edit" or state.mode == "direct" then
         if state.focus == "name" and state.mode == "edit" then
-            if #state.edit_name < Theme.max_server_name then state.edit_name = state.edit_name .. ch end
+            state.edit_name = te.insert("mp:name", state.edit_name, ch, Theme.max_server_name)
         else
-            if #state.edit_address < Theme.max_address and ch ~= " " then
-                state.edit_address = state.edit_address .. ch
+            if ch ~= " " then
+                state.edit_address = te.insert("mp:address", state.edit_address, ch, Theme.max_address)
             end
         end
         return true

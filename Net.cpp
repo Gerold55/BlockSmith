@@ -45,6 +45,12 @@ enum Msg : uint8_t {
     C_BLOCKS  = 3,    // u16 count, { i32 x y z, str block, u8 meta }
     C_CHAT    = 4,    // str text
     C_COMMAND = 5,    // str command (no slash) - run by the server, answered with S_CHAT
+    C_COMPLETE = 7,   // str text before the cursor ("/give Al") - answered with S_COMPLETE
+    C_ENTITY_ACT = 8, // u32 id, u8 kind (0 hit, 1 right-click), str item in hand
+    C_DROP    = 9,    // str item, u16 count, f32 x y z, u8 returned [, f32 vx vy vz, f32 pickupDelay]
+                      // items dropped next to the player (thrown: with a velocity)
+    C_HARVEST = 10,   // str item in hand, i32 x y z   a tool used on a block (the scythe): the
+                      // server works out what happens there and gives what it yields
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -62,10 +68,23 @@ enum Msg : uint8_t {
     S_SHARED  = 76,   // u16 count, { str key, str value }   shared values (weather...)
     S_MODE    = 77,   // str gameMode, u8 isOperator   (the server decides; the game follows)
     S_CHALLENGE = 78, // str serverId, str nonce, u8 accountExists   (after C_HELLO; see Auth.h)
+    S_FALLING = 80,   // u16 count, { i32 x y z, str block, u8 meta }   blocks that started falling
+                      // (the game animates them; their landing is an ordinary S_BLOCKS change)
+    S_ACTION  = 81,   // str action, str a, str b   the server asks the game to do something:
+                      // "give" (item, count), "clear", "kill" (reason)
+    S_COMPLETE = 82,  // str text, u16 count, { str }   what fits the word being typed (Tab)
+    S_ENTITY_INFO = 83, // f32 serverTime, u16 count, { u32 id, str type, f32 x y z, f32 yaw, str anim,
+                        //   f32 animSpeed, u8 loop, str nametag, str item, u16 itemCount, u8 hurtCount,
+                        //   f32 width height, f32 health maxHealth }   (new to you, or changed)
+    S_ENTITIES = 84,  // f32 serverTime, u16 count, { u32 id, f32 x y z, f32 yaw }   where they are now
+    S_ENTITY_GONE = 85, // u16 count, { u32 id }   removed, or out of your range
+    S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
+                      // (older games ignore it and keep their own sky; no protocol change needed)
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
 constexpr int   kChunksPerUpdate     = 4;            // per client per frame
+constexpr float kDayTimeInterval     = 5.0f;         // the time of day goes to everyone this often
 constexpr size_t kMaxChunkBytesInFlight = 512 * 1024; // don't queue more than this per client
 constexpr float kPositionInterval    = 1.0f / 30.0f; // 30 position updates a second
 constexpr float kMaxReach            = 10.0f;        // blocks a player may edit from
@@ -154,7 +173,8 @@ std::string blockName(uint8_t id) {
 
 // "" = air. Returns false for a block this game doesn't have.
 bool blockIdFromName(const std::string& name, uint8_t& id) {
-    if (name.empty()) { id = 0; return true; }
+    // "" and "air" are air (id 0 - which getBlockId also returns for unknown names)
+    if (name.empty() || name == "air") { id = 0; return true; }
     id = BlockRegistry::getInstance().getBlockId(name);
     return id != 0;
 }
@@ -458,7 +478,10 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
     }
     m_world->setExtraLoadCenters(centers);
 
-    // 3. Block changes (player edits, water, mods) -> everyone who has that chunk
+    // 3. Blocks that started falling (sand, gravel), then block changes (player edits, water,
+    //    mods) -> everyone who has that chunk. Falling first: the block leaves its cell in the
+    //    same update, and players should see it start falling, not a hole.
+    sendFallingStarts(m_world->takeFallingStarts());
     sendBlockChanges(m_world->takeBlockChanges());
 
     // 4. Chunks
@@ -466,11 +489,28 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         if (c.joined && c.hasPosition) streamChunks(c);
     }
 
+    // The time of day, every few seconds
+    if (m_hasDayClock) {
+        m_dayTimer += dt;
+        if (m_dayTimer >= kDayTimeInterval) {
+            m_dayTimer = 0.0f;
+            for (auto& [id, c] : m_clients) if (c.joined) sendDayTime(c.peer);
+            m_daySent = m_dayClock;
+            m_daySentAt = net::clockSeconds();
+        }
+    }
+
     // 5. Positions, 20 times a second
     m_posTimer += dt;
     if (m_posTimer >= kPositionInterval) {
         m_posTimer = std::fmod(m_posTimer, kPositionInterval);
         sendPositions();
+    }
+    // Entities, 20 times a second
+    m_entityTimer += dt;
+    if (m_entityTimer >= 0.05f) {
+        m_entityTimer = std::fmod(m_entityTimer, 0.05f);
+        sendEntities();
     }
 
     // Let LAN players see this game, every 1.5 seconds
@@ -594,16 +634,110 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
     case C_CHAT: {
         Reader r(data, size);
         std::string text = r.str();
-        if (!r.ok || text.empty()) return;
+        if (!r.ok) return;
         if (text.size() > 256) text.resize(256);
+        text = cleanChatText(text);
+        if (text.empty() || !allowChat(c)) return;
+        if (onChat) {
+            const std::string name = c.name;              // (a mod may kick this player)
+            const uint16_t cid = c.id;
+            if (!onChat(name, text) || text.empty()) return;
+            if (text.size() > 256) text.resize(256);
+            text = cleanChatText(text);
+            if (m_clients.find(cid) == m_clients.end()) return;
+        }
         broadcastChat("<" + c.name + "> " + text, kChatColor);
+        break;
+    }
+    case C_COMPLETE: {
+        Reader r(data, size);
+        std::string text = r.str();
+        if (!c.joined || !r.ok || text.size() > 256) return;
+        const double now = net::clockSeconds();
+        if (now - c.completeWindow > 1.0) { c.completeWindow = now; c.completeCount = 0; }
+        if (++c.completeCount > 20) return;           // (a flood: just no answer)
+        std::vector<std::string> list;
+        if (onComplete) {
+            std::string clean = cleanChatText(text);
+            if (!clean.empty() && (text.back() == ' ' || text.back() == '\t')) clean += ' ';   // "/give " = its 1st argument
+            list = onComplete(c.name, clean);
+        }
+        if (list.size() > 200) list.resize(200);
+        Writer w(S_COMPLETE);
+        w.str(text);
+        w.u16(static_cast<uint16_t>(list.size()));
+        for (const auto& x : list) w.str(x);
+        sendTo(c.peer, w);
+        break;
+    }
+    case C_ENTITY_ACT: {
+        Reader r(data, size);
+        const uint32_t id = r.u32();
+        const uint8_t kind = r.u8();
+        const std::string item = r.str();
+        if (!r.ok || !c.joined || kind > 1 || item.size() > 64 || !m_entityManager || !onEntityAct) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.entityActs > 10) return;
+        const Entity* e = m_entityManager->get(id);
+        if (!e) return;
+        const EntityType* t = m_entityManager->type(e->type);
+        const float reach = 6.0f + (t ? std::max(t->width, t->height) : 1.0f);
+        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+        const glm::vec3 centre = e->pos + glm::vec3(0.0f, t ? t->height * 0.5f : 0.5f, 0.0f);
+        if (glm::distance(eye, centre) > reach) return;           // too far (or cheating)
+        const std::string name = c.name;
+        const glm::vec3 where = c.position;
+        onEntityAct(name, id, kind, item, where);
+        break;
+    }
+    case C_DROP: {
+        Reader r(data, size);
+        const std::string item = r.str();
+        const int count = r.u16();
+        const glm::vec3 p = r.vec3f();
+        GameServer::DropInfo how;
+        how.returned = r.u8() != 0;
+        if (r.ok && r.n - r.p >= 16) {                 // thrown (newer games)
+            const glm::vec3 v = r.vec3f();
+            const float delay = r.f32();
+            if (r.ok) {
+                how.hasVelocity = true;
+                how.velocity = glm::clamp(v, glm::vec3(-12.0f), glm::vec3(12.0f));
+                how.pickupDelay = std::clamp(delay, -1.0f, 10.0f);
+            }
+        }
+        if (!r.ok || !c.joined || item.empty() || item.size() > 64 || count <= 0 || !onDropItem) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.drops > 30) return;
+        if (glm::distance(p, c.position + glm::vec3(0.0f, 1.0f, 0.0f)) > 8.0f) return;
+        const std::string name = c.name;
+        onDropItem(name, item, std::min(count, 64 * 64), p, how);
+        break;
+    }
+    case C_HARVEST: {
+        Reader r(data, size);
+        const std::string item = r.str();
+        const glm::ivec3 pos = r.ivec3();
+        if (!r.ok || !c.joined || item.empty() || item.size() > 64 || !onHarvest) return;
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.entityActs > 10) return;
+        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+        if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach) return;
+        if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return;
+        const std::string name = c.name;
+        onHarvest(name, item, pos);
         break;
     }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
-        if (!r.ok || command.empty()) return;
+        if (!r.ok) return;
         if (command.size() > 256) command.resize(256);
+        command = cleanChatText(command);
+        if (command.empty() || !allowChat(c)) return;
         if (onCommand) {
             const std::string name = c.name;   // the command may kick this player (c gone after)
             onCommand(name, command);
@@ -666,6 +800,13 @@ void GameServer::handleAuth(Client& c, const uint8_t* data, size_t size) {
     if (!r.ok || proof.response.size() > 128 || proof.registerKey.size() > 128) { kick(c, "Bad login packet"); return; }
     const std::string name = c.helloName;
 
+    if (canJoinFrom && c.peer) {               // banned IP address (ban-ip)
+        char ip[64] = {0};
+        if (enet_address_get_host_ip(&c.peer->address, ip, sizeof(ip)) == 0) {
+            const std::string reason = canJoinFrom(ip);
+            if (!reason.empty()) { kick(c, reason); return; }
+        }
+    }
     if (canJoin) {
         const std::string reason = canJoin(name, proof);   // banned, not whitelisted, wrong password...
         if (!reason.empty()) { kick(c, reason); return; }
@@ -734,6 +875,9 @@ void GameServer::finishJoin(Client& c, const std::string& name, int view) {
         sendShared(c.peer, std::vector<std::pair<std::string, std::string>>(m_shared.begin(), m_shared.end()));
     }
 
+    // The time of day, so their sky matches everyone's from the start
+    if (m_hasDayClock) sendDayTime(c.peer);
+
     // Their game mode and whether they're an operator
     c.mode = modeFor ? modeFor(name) : std::string();
     if (c.mode.empty()) c.mode = m_defaultMode;
@@ -790,6 +934,34 @@ bool GameServer::teleportPlayer(const std::string& name, const glm::vec3& pos) {
     return false;
 }
 
+void GameServer::sendDayTime(ENetPeer* peer) {
+    Writer w(S_TIME);
+    const double whole = std::floor(m_dayClock.total);
+    w.u32(static_cast<uint32_t>(std::min(whole, 4.0e9)));
+    w.f32(static_cast<float>(m_dayClock.total - whole));
+    w.f32(static_cast<float>(m_dayClock.secondsPerDay));
+    w.f32(static_cast<float>(m_dayClock.speed));
+    sendTo(peer, w);
+}
+
+void GameServer::setDayTime(const DayClock& clock) {
+    // Where players' games think the time is now: what they were last sent, run on since
+    const double now = net::clockSeconds();
+    bool sendNow = !m_hasDayClock || clock.speed != m_daySent.speed || clock.secondsPerDay != m_daySent.secondsPerDay;
+    if (!sendNow) {
+        const double predicted = m_daySent.total + (now - m_daySentAt) * m_daySent.rate();
+        sendNow = std::abs(clock.total - predicted) * clock.secondsPerDay > 2.0;   // a jump (time set / add)
+    }
+    m_dayClock = clock;
+    m_hasDayClock = true;
+    if (sendNow) {
+        m_dayTimer = 0.0f;
+        for (auto& [id, c] : m_clients) if (c.joined) sendDayTime(c.peer);
+        m_daySent = clock;
+        m_daySentAt = now;
+    }
+}
+
 void GameServer::sendShared(ENetPeer* peer, const std::vector<std::pair<std::string, std::string>>& values) {
     Writer w(S_SHARED);
     w.u16(static_cast<uint16_t>(values.size()));
@@ -807,6 +979,49 @@ void GameServer::setShared(const std::string& key, const std::string& value) {
     }
 }
 
+void GameServer::sendMessageTo(Client& c, const std::string& text, const glm::vec3& color) {
+    Writer w(S_CHAT);
+    w.str(text);
+    w.f32(color.r); w.f32(color.g); w.f32(color.b);
+    sendTo(c.peer, w);
+}
+
+// Chat from players: no control characters (they could fake new lines or confuse the chat
+// box); UTF-8 letters are kept. Leading/trailing spaces go.
+std::string GameServer::cleanChatText(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char ch : in) {
+        if (ch < 32 || ch == 127) { if (ch == '\t') out += ' '; continue; }
+        out += static_cast<char>(ch);
+    }
+    const size_t a = out.find_first_not_of(' ');
+    if (a == std::string::npos) return "";
+    return out.substr(a, out.find_last_not_of(' ') - a + 1);
+}
+
+// Flood limit for chat and /commands (kChatBurst...). False = drop this one.
+bool GameServer::allowChat(Client& c) {
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (c.chatRefillAt <= 0.0) c.chatRefillAt = now;
+    c.chatTokens = std::min(kChatBurst, c.chatTokens + (now - c.chatRefillAt) / kChatRefillSeconds);
+    c.chatRefillAt = now;
+    if (c.chatTokens >= 1.0) {
+        c.chatTokens -= 1.0;
+        if (c.chatTokens >= kChatBurst - 1.0) c.spamStrikes = 0;   // calmed down
+        return true;
+    }
+    if (++c.spamStrikes >= kSpamKickStrikes) {
+        kick(c, "Kicked for spamming chat");
+        return false;   // (c is gone)
+    }
+    if (now - c.lastSpamWarning > 2.0) {
+        c.lastSpamWarning = now;
+        sendMessageTo(c, "You're sending messages too fast - slow down.", glm::vec3(1.0f, 0.55f, 0.55f));
+    }
+    return false;
+}
+
 bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
     for (auto& [id, c] : m_clients) {
         if (!c.joined || c.name != name) continue;
@@ -819,10 +1034,31 @@ bool GameServer::messagePlayer(const std::string& name, const std::string& text,
     return false;
 }
 
+// Why a player may not make this change ("" = they may): too far away (more than kMaxReach +
+// slack from their eyes) or not loaded, an undiggable block outside creative (silently), then
+// spawn protection and mods (canEdit: their reason, shown to them). `id` and `meta` are what the
+// player asks for; canEdit runs when either differs from what's stored.
+std::string GameServer::editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, uint8_t meta, float slack) {
+    const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+    if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach + slack) return kSilentRefusal;
+    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return kSilentRefusal;
+    const uint8_t was = m_world->getBlockAt(pos);
+    const uint8_t wasMeta = m_world->getMetadataAt(pos);
+    // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever the
+    // player's game says
+    if (c.mode != "creative" && id == 0 && was != 0 &&
+        blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) return kSilentRefusal;
+    // Mods may refuse it (spawn protection, claims...): checked last, for real changes only - a
+    // different block, or new metadata on the same one (opening a door, filling a tank...)
+    if (canEdit && (was != id || wasMeta != meta)) return canEdit(c.name, pos, was, wasMeta, id, meta);
+    return "";
+}
+
 void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
     Reader r(data, size);
     const uint16_t count = r.u16();
     std::vector<World::BlockChange> rejected;
+    bool refusalSent = false;
 
     for (uint16_t i = 0; i < count && r.ok; ++i) {
         const glm::ivec3 pos = r.ivec3();
@@ -831,27 +1067,21 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         if (!r.ok) break;
 
         uint8_t id = 0;
-        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
-        const bool inReach = glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) <= kMaxReach;
         const bool loaded = m_world->chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
-
-        // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever
-        // the player's game says
-        bool allowed = true;
-        if (loaded && c.mode != "creative" && blockIdFromName(name, id) && id == 0) {
-            const uint8_t was = m_world->getBlockAt(pos);
-            if (was != 0 && blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) allowed = false;
-        }
-
-        if (allowed && blockIdFromName(name, id) && inReach && loaded) {
+        const std::string why = blockIdFromName(name, id) ? editRefusal(c, pos, id, meta, 0.0f) : std::string(kSilentRefusal);
+        if (why.empty()) {
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->setBlockWithMetaAt(pos, id, meta);
-            if (onPlayerEdit && oldId != id) onPlayerEdit(pos, oldId, id);
-        } else if (loaded) {
-            // Undo the player's prediction: send them what's really there
-            rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
+            if (onPlayerEdit && oldId != id) onPlayerEdit(c.name, pos, oldId, id);
+            continue;
         }
+        if (why != kSilentRefusal && !refusalSent) {
+            sendMessageTo(c, why, glm::vec3(1.0f, 0.55f, 0.55f));
+            refusalSent = true;   // one message for a whole batch of edits
+        }
+        // Undo the player's prediction: send them what's really there
+        if (loaded) rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
     }
 
     if (!rejected.empty()) {
@@ -864,6 +1094,30 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         }
         sendTo(c.peer, w);
     }
+}
+
+bool GameServer::playerSetBlock(const std::string& name, const glm::ivec3& pos, const std::string& block,
+                                std::string* why, float slack, uint8_t meta) {
+    if (why) why->clear();
+    uint8_t id = 0;
+    if (!blockIdFromName(block, id)) return false;
+    for (auto& [cid, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        const std::string refusal = editRefusal(c, pos, id, meta, std::clamp(slack, 0.0f, 4.0f));
+        if (!refusal.empty()) {
+            if (why && refusal != kSilentRefusal) *why = refusal;
+            return false;
+        }
+        // (unloaded or out of reach was refused above.) Already exactly this block and metadata:
+        // nothing changes, so it's no change to report - false, with no reason to show
+        const uint8_t oldId = m_world->getBlockAt(pos);
+        const uint8_t oldMeta = m_world->getMetadataAt(pos);
+        if (oldId == id && oldMeta == meta) return false;
+        m_world->setBlockWithMetaAt(pos, id, meta);
+        if (onPlayerEdit && oldId != id) onPlayerEdit(name, pos, oldId, id);
+        return true;
+    }
+    return false;   // not online
 }
 
 void GameServer::kick(Client& c, const std::string& reason) {
@@ -960,6 +1214,28 @@ void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes
     }
 }
 
+void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& starts) {
+    if (starts.empty()) return;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined) continue;
+        std::vector<const World::FallingStart*> mine;
+        for (const auto& f : starts) {
+            if (c.sentChunks.count(chunkOf(glm::vec3(f.cell)))) mine.push_back(&f);
+        }
+        for (size_t start = 0; start < mine.size(); start += 4096) {
+            const size_t end = std::min(mine.size(), start + 4096);
+            Writer w(S_FALLING);
+            w.u16(static_cast<uint16_t>(end - start));
+            for (size_t i = start; i < end; ++i) {
+                w.i32(mine[i]->cell.x); w.i32(mine[i]->cell.y); w.i32(mine[i]->cell.z);
+                w.str(blockName(mine[i]->id));
+                w.u8(mine[i]->meta);
+            }
+            sendTo(c.peer, w);
+        }
+    }
+}
+
 void GameServer::sendPositions() {
     struct Entry { uint16_t id; float time; glm::vec3 p; float yaw, pitch; };
     const float serverTime = net::clockSeconds();
@@ -1003,6 +1279,81 @@ void GameServer::sendPositions() {
         w.d[countAt] = n & 0xFF;
         w.d[countAt + 1] = n >> 8;
         sendTo(c.peer, w, false);
+    }
+}
+
+// Each player's game gets the entities within its range: what they are when they come into
+// range (or change: animation, name tag, a hit...), where they are when they move, and that
+// they've gone when they're removed or out of range.
+void GameServer::sendEntities() {
+    if (!m_entityManager) return;
+    const auto& all = m_entityManager->all();
+    const float serverTime = net::clockSeconds();
+    for (auto& [cid, c] : m_clients) {
+        if (!c.joined || !c.hasPosition) continue;
+        const float range = std::min(96.0f, (c.viewDistance + 1) * static_cast<float>(CHUNK_WIDTH));
+        Writer info(S_ENTITY_INFO), pos(S_ENTITIES), gone(S_ENTITY_GONE);
+        info.f32(serverTime);
+        info.u16(0);
+        pos.f32(serverTime);
+        pos.u16(0);
+        gone.u16(0);
+        uint16_t nInfo = 0, nPos = 0, nGone = 0;
+        auto flush = [&](Writer& w, uint16_t n, size_t countAt, bool reliable) {
+            if (n == 0) return;
+            w.d[countAt] = n & 0xFF;
+            w.d[countAt + 1] = n >> 8;
+            sendTo(c.peer, w, reliable);
+        };
+        for (const auto& [id, e] : all) {
+            if (e.removed) continue;
+            const glm::vec2 d(e.pos.x - c.position.x, e.pos.z - c.position.z);
+            if (glm::length(d) > range) continue;
+            auto known = c.knownEntities.find(id);
+            if (known == c.knownEntities.end() || known->second.version != e.version) {
+                if (info.d.size() > 60000) continue;      // the rest next time
+                const EntityView v = m_entityManager->view(e);
+                info.u32(id);
+                info.str(v.type);
+                info.f32(v.pos.x); info.f32(v.pos.y); info.f32(v.pos.z);
+                info.f32(v.yaw);
+                info.str(v.anim);
+                info.f32(v.animSpeed);
+                info.u8(v.animLoop ? 1 : 0);
+                info.str(v.nametag);
+                info.str(v.item);
+                info.u16(static_cast<uint16_t>(std::clamp(v.itemCount, 0, 65535)));
+                info.u8(v.hurtCount);
+                info.f32(v.width); info.f32(v.height);
+                info.f32(v.health); info.f32(v.maxHealth);
+                ++nInfo;
+                c.knownEntities[id] = {e.version, e.pos, e.yaw};
+            } else if (glm::distance(known->second.pos, e.pos) > 0.002f || std::fabs(known->second.yaw - e.yaw) > 0.1f) {
+                if (nPos >= 3000) continue;
+                pos.u32(id);
+                pos.f32(e.pos.x); pos.f32(e.pos.y); pos.f32(e.pos.z);
+                pos.f32(e.yaw);
+                ++nPos;
+                known->second.pos = e.pos;
+                known->second.yaw = e.yaw;
+            }
+        }
+        // Gone: removed, or now out of range
+        for (auto it = c.knownEntities.begin(); it != c.knownEntities.end();) {
+            auto e = all.find(it->first);
+            bool keep = e != all.end() && !e->second.removed;
+            if (keep) {
+                const glm::vec2 d(e->second.pos.x - c.position.x, e->second.pos.z - c.position.z);
+                keep = glm::length(d) <= range + 8.0f;     // (a little slack: no flicker at the edge)
+            }
+            if (keep || nGone >= 3000) { ++it; continue; }
+            gone.u32(it->first);
+            ++nGone;
+            it = c.knownEntities.erase(it);
+        }
+        flush(gone, nGone, 1, true);
+        flush(info, nInfo, 5, true);
+        flush(pos, nPos, 5, false);
     }
 }
 
@@ -1088,6 +1439,27 @@ std::vector<std::string> GameServer::playerNames() const {
     for (const auto& [id, c] : m_clients) if (c.joined) out.push_back(c.name);
     std::sort(out.begin(), out.end());
     return out;
+}
+
+std::string GameServer::playerAddress(const std::string& name) const {
+    for (const auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name || !c.peer) continue;
+        char ip[64] = {0};
+        if (enet_address_get_host_ip(&c.peer->address, ip, sizeof(ip)) != 0) return "";
+        return ip;
+    }
+    return "";
+}
+
+bool GameServer::sendAction(const std::string& name, const std::string& action, const std::string& a, const std::string& b) {
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        Writer w(S_ACTION);
+        w.str(action); w.str(a); w.str(b);
+        sendTo(c.peer, w);
+        return true;
+    }
+    return false;
 }
 
 std::vector<std::pair<std::string, glm::vec3>> GameServer::playerPositions() const {
@@ -1193,11 +1565,15 @@ void GameClient::disconnect() {
     m_peer = nullptr;
     m_state = State::Idle;
     m_views.clear();
+    m_entityViews.clear();
+    m_entitySnaps.clear();
     m_mode.clear(); m_isOp = false; m_modeChanged = true;   // our own game decides again
     std::cout << "[Client] Disconnected" << std::endl;
 }
 
 void GameClient::finish(const std::string& reason) {
+    m_completeAsked.clear(); m_completeText.clear(); m_completeList.clear();
+    m_completeHave = m_completeArrived = false;
     const bool wasJoined = m_state == State::Joined;
     if (m_host) {
         enet_host_destroy(m_host);
@@ -1206,6 +1582,8 @@ void GameClient::finish(const std::string& reason) {
     }
     m_state = State::Idle;
     m_views.clear();
+    m_entityViews.clear();
+    m_entitySnaps.clear();
     if (!m_mode.empty() || m_isOp) { m_mode.clear(); m_isOp = false; m_modeChanged = true; }
     m_ended = true;
     if (!m_kickReason.empty()) m_endReason = m_kickReason;
@@ -1284,6 +1662,7 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             m_interpDelay += std::clamp(target - m_interpDelay, -step * 0.10, step * 0.25);
         }
         if (m_clockSynced) interpolatePlayers(m_views, net::clockSeconds() + m_clockOffset - m_interpDelay);
+        if (m_clockSynced) interpolateEntities(net::clockSeconds() + m_clockOffset - m_interpDelay);
     }
     if (m_host) enet_host_flush(m_host);
 }
@@ -1397,6 +1776,49 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_modeChanged = true;
         break;
     }
+    case S_FALLING: {
+        if (m_state != State::Joined) return;
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const glm::ivec3 pos = r.ivec3();
+            const std::string name = r.str();
+            const uint8_t meta = r.u8();
+            if (!r.ok) break;
+            uint8_t id = 0;
+            if (blockIdFromName(name, id) && id != 0) m_world->addFallingVisual(pos, id, meta);
+        }
+        break;
+    }
+    case S_COMPLETE: {
+        const std::string text = r.str();
+        const uint16_t count = r.u16();
+        std::vector<std::string> list;
+        for (uint16_t i = 0; i < count && r.ok; ++i) list.push_back(r.str());
+        if (!r.ok) break;
+        m_completeText = text;
+        m_completeList = std::move(list);
+        m_completeHave = m_completeArrived = true;
+        break;
+    }
+    case S_ACTION: {
+        if (m_state != State::Joined) return;
+        Action a;
+        a.action = r.str(); a.a = r.str(); a.b = r.str();
+        if (r.ok && !a.action.empty() && m_actions.size() < 256) m_actions.push_back(std::move(a));
+        break;
+    }
+    case S_TIME: {
+        const uint32_t whole = r.u32();
+        const float frac = r.f32();
+        const float secondsPerDay = r.f32();
+        const float speed = r.f32();
+        if (!r.ok) break;
+        m_dayTime.total = static_cast<double>(whole) + std::clamp(static_cast<double>(frac), 0.0, 0.999999);
+        m_dayTime.secondsPerDay = std::clamp(static_cast<double>(secondsPerDay), 0.0, 1.0e7);
+        m_dayTime.speed = std::clamp(static_cast<double>(speed), 0.0, 1000.0);
+        m_dayTimeNew = true;
+        break;
+    }
     case S_SHARED: {
         const uint16_t count = r.u16();
         for (uint16_t i = 0; i < count && r.ok; ++i) {
@@ -1442,12 +1864,7 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         const float serverTime = r.f32();
         const uint16_t count = r.u16();
         if (!r.ok) return;
-        // Estimate the server's clock. A packet can't arrive before it was sent, so the
-        // largest (server time - our time) seen is the best estimate; drift down slowly.
-        const double sample = serverTime - net::clockSeconds();
-        if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
-        else m_clockOffset += (sample - m_clockOffset) * 0.01;
-        m_clockSynced = true;
+        syncClock(serverTime);
 
         for (uint16_t i = 0; i < count && r.ok; ++i) {
             const uint16_t id = r.u16();
@@ -1458,6 +1875,73 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
             if (!r.ok) break;
             auto it = m_views.find(id);
             if (it != m_views.end()) pushSnapshot(it->second, time, p, yaw, pitch);
+        }
+        break;
+    }
+    case S_ENTITY_INFO: {
+        const float serverTime = r.f32();
+        if (r.ok) syncClock(serverTime);
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            EntityView v;
+            v.id = r.u32();
+            v.type = r.str();
+            v.pos = r.vec3f();
+            v.yaw = r.f32();
+            v.anim = r.str();
+            v.animSpeed = r.f32();
+            v.animLoop = r.u8() != 0;
+            v.nametag = r.str();
+            v.item = r.str();
+            v.itemCount = r.u16();
+            v.hurtCount = r.u8();
+            v.width = r.f32();
+            v.height = r.f32();
+            v.health = r.f32();
+            v.maxHealth = r.f32();
+            if (!r.ok) break;
+            auto& snaps = m_entitySnaps[v.id];
+            auto it = m_entityViews.find(v.id);
+            if (it == m_entityViews.end()) {
+                snaps.clear();
+                m_entityViews[v.id] = v;
+            } else {
+                // keep the smoothed position; everything else is new
+                const glm::vec3 shownPos = it->second.pos;
+                const float shownYaw = it->second.yaw;
+                it->second = v;
+                it->second.pos = shownPos;
+                it->second.yaw = shownYaw;
+            }
+            if (snaps.empty() || serverTime > snaps.back().time) snaps.push_back({serverTime, v.pos, v.yaw});
+            while (snaps.size() > 64) snaps.pop_front();
+        }
+        break;
+    }
+    case S_ENTITIES: {
+        const float serverTime = r.f32();
+        if (r.ok) syncClock(serverTime);
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const uint32_t id = r.u32();
+            const glm::vec3 p = r.vec3f();
+            const float yaw = r.f32();
+            if (!r.ok) break;
+            if (!m_entityViews.count(id)) continue;          // its info hasn't arrived yet
+            auto& snaps = m_entitySnaps[id];
+            if (!snaps.empty() && serverTime <= snaps.back().time) continue;
+            snaps.push_back({serverTime, p, yaw});
+            while (snaps.size() > 64) snaps.pop_front();
+        }
+        break;
+    }
+    case S_ENTITY_GONE: {
+        const uint16_t count = r.u16();
+        for (uint16_t i = 0; i < count && r.ok; ++i) {
+            const uint32_t id = r.u32();
+            if (!r.ok) break;
+            m_entityViews.erase(id);
+            m_entitySnaps.erase(id);
         }
         break;
     }
@@ -1566,6 +2050,82 @@ void GameClient::sendCommand(const std::string& command) {
     Writer w(C_COMMAND);
     w.str(command);
     sendTo(m_peer, w);
+}
+
+void GameClient::requestCompletion(const std::string& text) {
+    if (m_state != State::Joined || text == m_completeAsked) return;
+    m_completeAsked = text;
+    Writer w(C_COMPLETE);
+    w.str(text);
+    sendTo(m_peer, w);
+}
+
+// Estimate the server's clock. A packet can't arrive before it was sent, so the largest
+// (server time - our time) seen is the best estimate; drift down slowly.
+void GameClient::syncClock(float serverTime) {
+    const double sample = serverTime - net::clockSeconds();
+    if (!m_clockSynced || sample > m_clockOffset) m_clockOffset = sample;
+    else m_clockOffset += (sample - m_clockOffset) * 0.01;
+    m_clockSynced = true;
+}
+
+void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
+    if (m_state != State::Joined) return;
+    Writer w(C_ENTITY_ACT);
+    w.u32(id);
+    w.u8(static_cast<uint8_t>(kind));
+    w.str(item);
+    sendTo(m_peer, w);
+}
+
+void GameClient::sendHarvest(const std::string& item, const glm::ivec3& pos) {
+    if (m_state != State::Joined || item.empty() || item.size() > 64) return;
+    Writer w(C_HARVEST);
+    w.str(item);
+    w.i32(pos.x); w.i32(pos.y); w.i32(pos.z);
+    sendTo(m_peer, w);
+}
+
+void GameClient::sendDropItem(const std::string& item, int count, const glm::vec3& pos, bool returned,
+                              const glm::vec3* velocity, float pickupDelay) {
+    if (m_state != State::Joined || item.empty() || count <= 0) return;
+    Writer w(C_DROP);
+    w.str(item);
+    w.u16(static_cast<uint16_t>(std::min(count, 65535)));
+    w.f32(pos.x); w.f32(pos.y); w.f32(pos.z);
+    w.u8(returned ? 1 : 0);
+    if (velocity) {
+        w.f32(velocity->x); w.f32(velocity->y); w.f32(velocity->z);
+        w.f32(pickupDelay);
+    }
+    sendTo(m_peer, w);
+}
+
+// Like the other players: each entity where it was at renderTime, between the two updates
+// around it (a jump of more than 8 blocks is a teleport: no sliding across the map)
+void GameClient::interpolateEntities(double renderTime) {
+    for (auto& [id, v] : m_entityViews) {
+        auto it = m_entitySnaps.find(id);
+        if (it == m_entitySnaps.end() || it->second.empty()) continue;
+        auto& snaps = it->second;
+        while (snaps.size() > 2 && snaps[1].time < renderTime - 0.5) snaps.pop_front();
+        if (renderTime <= snaps.front().time || snaps.size() == 1) {
+            const auto& sn = renderTime <= snaps.front().time ? snaps.front() : snaps.back();
+            v.pos = sn.pos; v.yaw = sn.yaw;
+            continue;
+        }
+        if (renderTime >= snaps.back().time) {
+            v.pos = snaps.back().pos; v.yaw = snaps.back().yaw;
+            continue;
+        }
+        size_t i = 1;
+        while (i < snaps.size() && snaps[i].time < renderTime) ++i;
+        const auto& a = snaps[i - 1];
+        const auto& b = snaps[i];
+        const float t = static_cast<float>((renderTime - a.time) / std::max(b.time - a.time, 1e-6));
+        v.pos = glm::distance(a.pos, b.pos) > 8.0f ? (t < 0.5f ? a.pos : b.pos) : glm::mix(a.pos, b.pos, t);
+        v.yaw = lerpAngle(a.yaw, b.yaw, t);
+    }
 }
 
 void GameClient::sendChat(const std::string& text) {

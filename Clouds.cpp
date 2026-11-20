@@ -26,15 +26,24 @@ float blockNoise(int x, int z, int cellsPerGroup, int salt) {
     return hash01(x / cellsPerGroup, z / cellsPerGroup, salt);
 }
 
-bool isFilled(int x, int z, float threshold) {
+// How "cloudy" a cell is (0..1); it's filled when this is above the threshold, so as the
+// threshold moves, cells appear or vanish one by one in a fixed random order (clouds forming
+// and dissolving). `clump` weights the big blobs: 1 = clouds bunch into large masses.
+float cellValue(int x, int z, float clump) {
     x = wrapCell(x);
     z = wrapCell(z);
-    
-    // Classic Minecraft anisotropic scaling: stretch the noise horizontally along X 
+    // Classic Minecraft anisotropic scaling: stretch the noise horizontally along X
     // using block noise for sharp, crisp voxel edges instead of smooth interpolation.
-    const float large = blockNoise(x * 2, z, 24, 1); 
-    const float small = blockNoise(x, z, 8, 2);  
-    return (0.45f * large + 0.55f * small) > threshold;
+    const float large = blockNoise(x * 2, z, 24, 1);
+    const float medium = blockNoise(x, z, 16, 3);
+    const float small = blockNoise(x, z, 8, 2);
+    const float scattered = 0.45f * large + 0.55f * small;
+    const float bunched = 0.6f * large + 0.3f * medium + 0.1f * small;
+    return scattered + (bunched - scattered) * clump;
+}
+
+bool isFilled(int x, int z, float threshold, float clump) {
+    return cellValue(x, z, clump) > threshold;
 }
 
 void addQuad(std::vector<float>& out,
@@ -50,7 +59,7 @@ void addQuad(std::vector<float>& out,
 }
 
 // Builds one tile. Geometry depends on height, thickness, cell size, and threshold.
-std::vector<float> buildTileVertices(float cellBlocks, float baseY, float thickness, float threshold) {
+std::vector<float> buildTileVertices(float cellBlocks, float baseY, float thickness, float threshold, float clump) {
     std::vector<float> out;
     const float T  = cellBlocks;
     const float y0 = baseY;
@@ -58,7 +67,7 @@ std::vector<float> buildTileVertices(float cellBlocks, float baseY, float thickn
 
     for (int i = 0; i < kTile; ++i) {
         for (int k = 0; k < kTile; ++k) {
-            if (!isFilled(i, k, threshold)) continue;
+            if (!isFilled(i, k, threshold, clump)) continue;
 
             const float x0 = i * T,  x1 = (i + 1) * T;
             const float z0 = k * T,  z1 = (k + 1) * T;
@@ -66,10 +75,10 @@ std::vector<float> buildTileVertices(float cellBlocks, float baseY, float thickn
             addQuad(out, {x0, y1, z0}, {x1, y1, z0}, {x1, y1, z1}, {x0, y1, z1}, 1.00f);
             addQuad(out, {x0, y0, z0}, {x0, y0, z1}, {x1, y0, z1}, {x1, y0, z0}, 0.65f);
 
-            if (!isFilled(i + 1, k, threshold)) addQuad(out, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, {x1, y0, z1}, 0.85f);
-            if (!isFilled(i - 1, k, threshold)) addQuad(out, {x0, y0, z1}, {x0, y1, z1}, {x0, y1, z0}, {x0, y0, z0}, 0.85f);
-            if (!isFilled(i, k + 1, threshold)) addQuad(out, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}, 0.75f);
-            if (!isFilled(i, k - 1, threshold)) addQuad(out, {x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0}, 0.75f);
+            if (!isFilled(i + 1, k, threshold, clump)) addQuad(out, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, {x1, y0, z1}, 0.85f);
+            if (!isFilled(i - 1, k, threshold, clump)) addQuad(out, {x0, y0, z1}, {x0, y1, z1}, {x0, y1, z0}, {x0, y0, z0}, 0.85f);
+            if (!isFilled(i, k + 1, threshold, clump)) addQuad(out, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}, 0.75f);
+            if (!isFilled(i, k - 1, threshold, clump)) addQuad(out, {x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0}, 0.75f);
         }
     }
     return out;
@@ -85,17 +94,12 @@ CloudSettings lerpSettings(const CloudSettings& a, const CloudSettings& b, float
     r.darken     = glm::mix(a.darken, b.darken, t);
     r.fadeStart  = glm::mix(a.fadeStart, b.fadeStart, t);
     r.fadeEnd    = glm::mix(a.fadeEnd, b.fadeEnd, t);
-    if (t >= 0.5f) {
-        r.height    = b.height;
-        r.thickness = b.thickness;
-        r.cellSize  = b.cellSize;
-        r.threshold = b.threshold;
-    } else {
-        r.height    = a.height;
-        r.thickness = a.thickness;
-        r.cellSize  = a.cellSize;
-        r.threshold = a.threshold;
-    }
+    // The shape changes smoothly too (the mesh is rebuilt as it goes; see Clouds::update)
+    r.height    = glm::mix(a.height, b.height, t);
+    r.thickness = glm::mix(a.thickness, b.thickness, t);
+    r.threshold = glm::mix(a.threshold, b.threshold, t);
+    r.clump     = glm::mix(a.clump, b.clump, t);
+    r.cellSize  = t >= 0.5f ? b.cellSize : a.cellSize;   // (a different grid can't blend)
     return r;
 }
 
@@ -237,7 +241,7 @@ bool Clouds::loadTexture(const std::string& path) {
 
 void Clouds::rebuildMesh() {
     const auto verts = buildTileVertices(m_settings.cellSize, m_settings.height,
-                                         m_settings.thickness, m_settings.threshold);
+                                         m_settings.thickness, m_settings.threshold, m_settings.clump);
     m_vertexCount = static_cast<GLsizei>(verts.size() / 4);
 
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
@@ -249,7 +253,8 @@ void Clouds::rebuildMesh() {
 void Clouds::setSettings(const CloudSettings& s) {
     const bool geometryChanged =
         s.height != m_settings.height || s.thickness != m_settings.thickness ||
-        s.cellSize != m_settings.cellSize || s.threshold != m_settings.threshold;
+        s.cellSize != m_settings.cellSize || s.threshold != m_settings.threshold ||
+        s.clump != m_settings.clump;
     const bool textureChanged = s.texturePath != m_settings.texturePath;
 
     m_settings = s;
@@ -257,31 +262,50 @@ void Clouds::setSettings(const CloudSettings& s) {
     if (textureChanged) loadTexture(s.texturePath);
 }
 
-void Clouds::setWeather(const std::string& name, float transitionSeconds) {
+bool Clouds::setWeather(const std::string& name, float transitionSeconds) {
     CloudSettings target = m_settings;
+    // (threshold: higher = fewer clouds, above 1 = none; clump: bunched together)
     if (name == "clear") {
-        target.threshold = 0.68f; target.opacity = 1.0f; target.darken = 0.0f;
-        target.color = glm::vec3(1.0f); 
-        target.nightColor = glm::vec3(0.15f, 0.18f, 0.28f); // Deep midnight blue-grey tint for clear nights
+        target.threshold = 1.05f; target.clump = 0.0f; target.darken = 0.0f;
+        target.thickness = 2.0f; target.height = 150.0f;
+        target.color = glm::vec3(1.0f);
+        target.nightColor = glm::vec3(0.15f, 0.18f, 0.28f);
         target.scrollSpeed = 1.0f;
     } else if (name == "cloudy") {
-        target.threshold = 0.55f; target.darken = 0.1f;
-        target.color = glm::vec3(0.92f); 
-        target.nightColor = glm::vec3(0.12f, 0.14f, 0.22f); // Darker, heavier overcast night clouds
+        target.threshold = 0.5f; target.clump = 0.3f; target.darken = 0.1f;
+        target.thickness = 3.0f; target.height = 150.0f;
+        target.color = glm::vec3(0.92f);
+        target.nightColor = glm::vec3(0.12f, 0.14f, 0.22f);
         target.scrollSpeed = 2.0f;
     } else if (name == "rain") {
-        target.threshold = 0.46f; target.darken = 0.35f;
-        target.color = glm::vec3(0.7f); 
-        target.nightColor = glm::vec3(0.08f, 0.09f, 0.15f); // Stormy dark blue/grey night tint
+        target.threshold = 0.36f; target.clump = 0.6f; target.darken = 0.35f;
+        target.thickness = 4.0f; target.height = 145.0f;
+        target.color = glm::vec3(0.62f);
+        target.nightColor = glm::vec3(0.08f, 0.09f, 0.15f);
         target.scrollSpeed = 3.0f;
-    } else if (name == "storm") {
-        target.threshold = 0.38f; target.darken = 0.6f;
-        target.color = glm::vec3(0.45f); 
-        target.nightColor = glm::vec3(0.05f, 0.05f, 0.10f); // Near-black thunderstorm night tint
+    } else if (name == "thunder" || name == "storm") {
+        // One huge, dark, low, thick storm cloud over everything
+        target.threshold = -0.01f; target.clump = 1.0f; target.darken = 0.7f;   // (below 0: every cell, one solid mass)
+        target.thickness = 9.0f; target.height = 128.0f;
+        target.color = glm::vec3(0.3f, 0.31f, 0.34f);
+        target.nightColor = glm::vec3(0.04f, 0.04f, 0.07f);
         target.scrollSpeed = 5.0f;
+    } else if (name == "snow") {
+        // Snow clouds bunch together into big soft-grey masses
+        target.threshold = 0.4f; target.clump = 1.0f; target.darken = 0.15f;
+        target.thickness = 5.0f; target.height = 140.0f;
+        target.color = glm::vec3(0.86f, 0.87f, 0.9f);
+        target.nightColor = glm::vec3(0.14f, 0.15f, 0.2f);
+        target.scrollSpeed = 1.5f;
+    } else if (name == "blizzard") {
+        target.threshold = 0.2f; target.clump = 1.0f; target.darken = 0.3f;
+        target.thickness = 7.0f; target.height = 135.0f;
+        target.color = glm::vec3(0.75f, 0.77f, 0.8f);
+        target.nightColor = glm::vec3(0.1f, 0.11f, 0.15f);
+        target.scrollSpeed = 6.0f;
     } else {
         std::cerr << "[Clouds] Unknown weather: " << name << std::endl;
-        return;
+        return false;
     }
 
     m_from = m_settings;
@@ -289,6 +313,7 @@ void Clouds::setWeather(const std::string& name, float transitionSeconds) {
     m_transitionTime = 0.0f;
     m_transitionDuration = transitionSeconds > 0.0f ? transitionSeconds : 0.0001f;
     m_transition = 0.0f;
+    return true;
 }
 
 void Clouds::update(float dt) {
@@ -296,7 +321,19 @@ void Clouds::update(float dt) {
     m_transitionTime += dt;
     m_transition = glm::clamp(m_transitionTime / m_transitionDuration, 0.0f, 1.0f);
 
-    const CloudSettings blended = lerpSettings(m_from, m_to, m_transition);
+    CloudSettings blended = lerpSettings(m_from, m_to, m_transition);
+    // The shape: rebuilt only when it has changed enough to show (a few times a second during
+    // a change, not every frame); exactly the target at the end
+    if (m_transition < 1.0f &&
+        std::fabs(blended.threshold - m_settings.threshold) < 0.006f &&
+        std::fabs(blended.clump - m_settings.clump) < 0.03f &&
+        std::fabs(blended.thickness - m_settings.thickness) < 0.25f &&
+        std::fabs(blended.height - m_settings.height) < 0.5f) {
+        blended.threshold = m_settings.threshold;
+        blended.clump = m_settings.clump;
+        blended.thickness = m_settings.thickness;
+        blended.height = m_settings.height;
+    }
     setSettings(blended);
 }
 
