@@ -225,8 +225,10 @@ else()
 endif()
 
 if (NOT WIN32)
-    find_package(Backtrace REQUIRED)
-    target_link_libraries(BlockSmith PRIVATE ${Backtrace_LIBRARIES})
+    find_library(EXECINFO_LIBRARY execinfo)
+    if (EXECINFO_LIBRARY)
+        target_link_libraries(BlockSmith PRIVATE ${EXECINFO_LIBRARY})
+    endif()
 endif()
 
 endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
@@ -342,8 +344,10 @@ if (NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
 
-    find_package(Backtrace REQUIRED)
-    target_link_libraries(BlockSmithServer PRIVATE ${Backtrace_LIBRARIES})
+    find_library(EXECINFO_LIBRARY execinfo)
+    if (EXECINFO_LIBRARY)
+        target_link_libraries(BlockSmithServer PRIVATE ${EXECINFO_LIBRARY})
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
