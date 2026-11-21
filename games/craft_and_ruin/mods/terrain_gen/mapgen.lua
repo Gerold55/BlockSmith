@@ -756,6 +756,8 @@ end
 local function hook_weather()
     if type(weather) ~= "table" then return false end
     weather.is_cold = function(x, z)
+        -- (no position - e.g. asked on the dedicated server, which has no player of its own)
+        if type(x) ~= "number" or type(z) ~= "number" or x ~= x or z ~= z then return false end
         local col = column(floor(x), floor(z))
         return col.t_eff < 0.27 or (col.mountain > 0.55 and col.y >= 128 - (0.5 - col.temp) * 40)
     end
