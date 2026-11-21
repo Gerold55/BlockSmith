@@ -1,0 +1,7 @@
+# Mods from the mods/ folder that worlds of 'craft_and_ruin' run, unless a world
+# chooses otherwise (saves/<world>/world_mods.txt). Set on the Mods screen.
+base = true
+game_showcase = true
+mobs = true
+smeltery = false
+ui_showcase = false

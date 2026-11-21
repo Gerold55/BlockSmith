@@ -9,12 +9,14 @@ engine.register_block("air", 0.0, 0.0, 0.0, nil, nil, {
 
 -- Standard Opaque Blocks
 engine.register_block("stone", 1.0, 1.0, 1.0, "textures/cw_stone.png", nil, {
+    description = "Stone",
     transparent = false,
     walkable = true,
     behavior = "solid"
 })
 
 engine.register_block("dirt", 1.0, 1.0, 1.0, "textures/cw_dirt.png", nil, {
+    description = "Dirt",
     transparent = false,
     walkable = true,
     behavior = "solid"
@@ -28,6 +30,7 @@ engine.register_block("grass", 120, 200, 85, {
 }, {
     sides  = "textures/cw_grass_side_overlay.png"
 }, {
+    description = "Grass Block",
     transparent = false,
     walkable = true,
     behavior = "solid",
@@ -48,6 +51,7 @@ engine.register_block("log_oak", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_oak_log_top.png",
     sides  = "textures/cw_oak_log.png"
 }, nil, {
+    description = "Oak Log",
     transparent = false,
     walkable = true,
     behavior = "solid"
@@ -55,6 +59,7 @@ engine.register_block("log_oak", 1.0, 1.0, 1.0, {
 
 -- Oak Leaves
 engine.register_block("leaves_oak", 75, 180, 30, "textures/cw_oak_leaves.png", nil, {
+    description = "Oak Leaves",
     transparent = true,
     cutout      = true,
     walkable    = true,
@@ -68,6 +73,7 @@ engine.register_block("log_birch", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_birch_log_top.png",
     sides  = "textures/cw_birch_log.png"
 }, nil, {
+    description = "Birch Log",
     transparent = false,
     walkable = true,
     behavior = "solid"
@@ -75,6 +81,7 @@ engine.register_block("log_birch", 1.0, 1.0, 1.0, {
 
 -- Birch Leaves (Golden Autumn Tint)
 engine.register_block("leaves_birch", 1.0, 0.85, 0.1, "textures/cw_birch_leaves.png", nil, {
+    description = "Birch Leaves",
     transparent = true,
     cutout      = true,
     walkable    = true,
@@ -85,24 +92,28 @@ engine.register_block("leaves_birch", 1.0, 0.85, 0.1, "textures/cw_birch_leaves.
 -- --- Planks (crafted from logs: 1 log = 4 planks in the survival inventory) ---
 -- Wood sounds, axe digging and hardness 2 come automatically from the name ("planks").
 engine.register_block("planks_oak", 1.0, 1.0, 1.0, "textures/planks_oak.png", nil, {
+    description = "Oak Planks",
     transparent = false,
     walkable = true,
     behavior = "solid"
 })
 
 engine.register_block("planks_birch", 1.0, 1.0, 1.0, "textures/planks_birch.png", nil, {
+    description = "Birch Planks",
     transparent = false,
     walkable = true,
     behavior = "solid"
 })
 
 engine.register_block("planks_spruce", 1.0, 1.0, 1.0, "textures/cw_spruce_planks.png", nil, {
+    description = "Spruce Planks",
     transparent = false,
     walkable = true,
     behavior = "solid"
 })
 
 engine.register_block("planks_jungle", 1.0, 1.0, 1.0, "textures/planks_jungle.png", nil, {
+    description = "Jungle Planks",
     transparent = false,
     walkable = true,
     behavior = "solid"
@@ -111,6 +122,7 @@ engine.register_block("planks_jungle", 1.0, 1.0, 1.0, "textures/planks_jungle.pn
 -- --- Stick (an item: shown as a picture, never placed) ---
 -- Crafted from 2 planks; leaves sometimes drop them (leafdecay mod).
 engine.register_block("stick", 1.0, 1.0, 1.0, "textures/stick.png", nil, {
+    description = "Stick",
     transparent = true,
     walkable = false,
     inventory_image = "stick.png",
@@ -118,9 +130,11 @@ engine.register_block("stick", 1.0, 1.0, 1.0, "textures/stick.png", nil, {
 
 -- --- Saplings (leaves sometimes drop them; plant them like flowers) ---
 engine.register_block("sapling_oak", 1.0, 1.0, 1.0, "textures/sapling_oak.png", nil, {
+    description = "Oak Sapling",
     transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
 })
 engine.register_block("sapling_birch", 1.0, 1.0, 1.0, "textures/sapling_birch.png", nil, {
+    description = "Birch Sapling",
     transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
 })
 
@@ -131,6 +145,7 @@ engine.register_block("workbench", 1.0, 1.0, 1.0, {
     bottom = "textures/planks_oak.png",
     sides  = "textures/workbench_side.png"
 }, nil, {
+    description = "Workbench",
     transparent = false,
     walkable = true,
     behavior = "solid",
@@ -150,6 +165,7 @@ engine.register_block("water", 0.2, 0.4, 0.9, {
     bottom = "textures/ws_water_source_animated.png",
     sides = "textures/ws_water_source_animated.png"
 }, nil, {
+    description = "Water",
     transparent = true,
     walkable = false,
     selectable = false,
@@ -163,6 +179,7 @@ engine.register_block("flowing_water", 0.2, 0.4, 0.9, {
     bottom = "textures/ws_water_flowing_animated.png",
     sides = "textures/ws_water_flowing_animated.png"
 }, nil, {
+    description = "Flowing Water",
     transparent = true,
     walkable = false,
     selectable = false,
@@ -173,6 +190,7 @@ engine.register_block("flowing_water", 0.2, 0.4, 0.9, {
 
 -- Register Cattail Stem (Bottom/Middle part in water)
 engine.register_block("cattail", 0.2, 0.6, 0.2, "cw_cattail_bottom.png", nil, {
+    description = "Cattail",
     transparent = true,
     walkable = false,
     pattern = "plantlike",
@@ -181,6 +199,7 @@ engine.register_block("cattail", 0.2, 0.6, 0.2, "cw_cattail_bottom.png", nil, {
 
 -- Register Cattail Top (Brown fluffy head)
 engine.register_block("cattail_top", 0.4, 0.2, 0.1, "cw_cattail_top.png", nil, {
+    description = "Cattail",
     transparent = true,
     walkable = false,
     pattern = "plantlike"
@@ -188,12 +207,14 @@ engine.register_block("cattail_top", 0.4, 0.2, 0.1, "cw_cattail_top.png", nil, {
 
 -- Register Bedrock (Unbreakable bottom layer)
 engine.register_block("bedrock", 0.2, 0.2, 0.2, "cw_bedrock.png", nil, {
+    description = "Bedrock",
     walkable = true,
     selectable = false
 })
 
 -- Register Sand (Desert / Beach surface layer)
 engine.register_block("sand", 0.85, 0.82, 0.65, "cw_sand.png", nil, {
+    description = "Sand",
     walkable = true,
     tint = false,
     gravity = true
@@ -201,6 +222,7 @@ engine.register_block("sand", 0.85, 0.82, 0.65, "cw_sand.png", nil, {
 
 -- Register Gravel (Rough underground / cave patch blocks)
 engine.register_block("gravel", 0.5, 0.5, 0.5, "cw_gravel.png", nil, {
+    description = "Gravel",
     walkable = true,
     tint = false,
     gravity = true
@@ -210,6 +232,7 @@ engine.register_block("gravel", 0.5, 0.5, 0.5, "cw_gravel.png", nil, {
 
 -- Short Grass (Cross-plane plantlike pattern with biome tinting)
 engine.register_block("short_grass", 120, 200, 85, "textures/cw_grass.png", nil, {
+    description = "Short Grass",
     transparent = true,
     walkable = false,
     selectable = true,
@@ -223,6 +246,7 @@ engine.register_block("reed", 0.8, 0.9, 0.8, {
     bottom = "textures/cw_reeds.png",
     sides  = "textures/cw_reeds.png"
 }, nil, {
+    description = "Reeds",
     transparent = true,
     walkable = false,
     selectable = true,
@@ -236,6 +260,7 @@ engine.register_block("reed_top", 0.8, 0.9, 0.8, {
     bottom = "textures/cw_reeds.png",
     sides  = "textures/cw_reeds_top.png"
 }, nil, {
+    description = "Reeds",
     transparent = true,
     walkable = false,
     selectable = true,
@@ -250,6 +275,7 @@ engine.register_block("cactus", 0.3, 0.7, 0.3, {
     bottom = "textures/cw_cactus_bottom.png",
     sides  = "textures/cw_cactus_side.png"
 }, nil, {
+    description = "Cactus",
     transparent = false,
     walkable = true,
     selectable = true,
@@ -259,6 +285,7 @@ engine.register_block("cactus", 0.3, 0.7, 0.3, {
 
 -- Red Flower (Cross-plane plantlike pattern without biome tinting)
 engine.register_block("poppy", 1.0, 1.0, 1.0, "textures/cw_flower_poppy.png", nil, {
+    description = "Poppy",
     transparent = true,
     walkable = false,
     selectable = true,
@@ -267,6 +294,7 @@ engine.register_block("poppy", 1.0, 1.0, 1.0, "textures/cw_flower_poppy.png", ni
 })
 
 engine.register_block("flower_daisy", 1.0, 1.0, 1.0, "textures/cw_flower_daisy.png", nil, {
+    description = "Daisy",
     transparent = true, 
     walkable = false, 
     selectable = true, 
@@ -276,26 +304,32 @@ engine.register_block("flower_daisy", 1.0, 1.0, 1.0, "textures/cw_flower_daisy.p
 })
 
 engine.register_block("flower_bluebell", 1.0, 1.0, 1.0, "textures/cw_flower_bluebell.png", nil, {
+    description = "Bluebell",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
 engine.register_block("flower_azure_bluet", 1.0, 1.0, 1.0, "textures/cw_flower_azure_bluet.png", nil, {
+    description = "Azure Bluet",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
 engine.register_block("flower_allium", 1.0, 1.0, 1.0, "textures/cw_flower_allium.png", nil, {
+    description = "Allium",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
 engine.register_block("flower_tulip_white", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_white.png", nil, {
+    description = "White Tulip",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
 engine.register_block("flower_tulip_red", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_red.png", nil, {
+    description = "Red Tulip",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
 engine.register_block("flower_tulip_pink", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_pink.png", nil, {
+    description = "Pink Tulip",
     transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
 })
 
@@ -305,3 +339,5 @@ dofile(g_CurrentModPath .. "/pause_menu.lua")
 dofile(g_CurrentModPath .. "/leafdecay.lua")
 -- Particles: torches smoking, lava popping, leaves falling, and the pictures the engine uses
 dofile(g_CurrentModPath .. "/particles.lua")
+-- Biome blocks: spruce, jungle and acacia trees, snow and ice, terracotta and red sand
+dofile(g_CurrentModPath .. "/biome_blocks.lua")

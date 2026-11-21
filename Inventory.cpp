@@ -580,6 +580,8 @@ std::vector<std::string> InventorySystem::getCurrentItems() {
 }
 
 std::string blockModOf(const std::string& name);   // main.cpp
+std::string blockDisplayName(const BlockProperty& b);   // main.cpp
+std::string blockFullName(const BlockProperty& b);      // main.cpp
 
 void InventorySystem::registerLuaBindings(sol::state& lua) {
     s_lua = &lua;
@@ -758,7 +760,8 @@ void InventorySystem::registerLuaBindings(sol::state& lua) {
     });
 
     // ui.get_block_info(name) -> { id, name, pattern, has_texture, in_creative, inventory_image,
-    //                              item, tool_type, tool, light, walkable, transparent } or nil
+    //                              item, tool_type, tool, light, walkable, transparent, mod,
+    //                              description, full_name } or nil
     //   item = has an inventory picture (never placed); tool_type = what it is as a tool;
     //   tool = what digs it; light = brightest colour it gives off (0..15, if set)
     ui.set_function("get_block_info", [](const std::string& name, sol::this_state ts) -> sol::object {
@@ -783,6 +786,8 @@ void InventorySystem::registerLuaBindings(sol::state& lua) {
         t["walkable"]    = b.isWalkable;
         t["transparent"] = b.isTransparent;
         t["mod"]         = blockModOf(b.name);    // the mod that registered it ("" = the engine)
+        t["description"] = blockDisplayName(b);   // the name players see ("Oak Log")
+        t["full_name"]   = blockFullName(b);      // "core_blocks:log_oak" (what /give takes too)
         return t;
     });
 

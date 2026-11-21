@@ -48,6 +48,8 @@ struct BlockLight {
 // The light table for every block id (rebuilt from the block registry when blocks change)
 const BlockLight& blockLight(uint8_t id);
 void refreshBlockLights();
+// The blocks changed completely (the mods were loaded again): worked out afresh when next needed
+void invalidateBlockLights();
 
 } // namespace light
 

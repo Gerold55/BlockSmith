@@ -41,6 +41,8 @@ const BlockLight& blockLight(uint8_t id) {
     return g_table[id];
 }
 
+void invalidateBlockLights() { g_built = false; }
+
 void refreshBlockLights() {
     auto& registry = BlockRegistry::getInstance();
     for (int i = 0; i < 256; ++i) g_table[i] = BlockLight{};

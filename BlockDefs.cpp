@@ -11,6 +11,11 @@ namespace {
 uint8_t g_NextBlockId = 1;   // 0 is air
 }
 
+void resetBlockDefinitions() {
+    g_NextBlockId = 1;
+    BlockRegistry::getInstance().reset();
+}
+
 void applyDigProperties(BlockProperty& block, const sol::table& props) {
     sol::optional<float> hardness = props["hardness"];
     if (hardness) block.hardness = *hardness < 0.0f ? -1.0f : *hardness;
@@ -205,6 +210,8 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         shouldTint          = props.get_or("tint", shouldTint);
         // in_creative = false hides the block from the creative inventory (it still exists in the world)
         block.in_creative   = props.get_or("in_creative", true);
+        // description = "Oak Log": the name players see (pointing at it, in the inventory)
+        block.description   = props.get_or("description", std::string());
         applyDigProperties(block, props);
         applySoundProperties(block, props);
         applyLightProperties(block, props);

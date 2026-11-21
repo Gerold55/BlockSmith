@@ -541,6 +541,16 @@ Player* g_PlayerInstance = nullptr;
 // engine.get_online_players... - the same as on the dedicated server
 ServerLuaApi g_ServerApi;
 bool g_PendingWorldOpen = false;          // open g_ActiveWorldName at the start of LOADING
+// Playing a world that needs other mods (or another game) than the ones loaded: the session ends,
+// everything mods made is thrown away and loaded again for that world, and it opens - all behind
+// the loading screen, in the same window (see main)
+struct ReloadRequest {
+    bool pending = false;
+    std::string world;   // open this world once the mods are loaded ("" = back to the title screen)
+    std::string game;
+};
+ReloadRequest g_Reload;
+int g_SessionGeneration = 0;              // goes up with every reload (caches of the old mods check it)
 double g_LastAutosave = 0.0;
 constexpr double kAutosaveSeconds = 120.0;
 
@@ -699,8 +709,14 @@ void saveCurrentWorld() {
 // Older saves without a "game=" line belong to whichever game opens them first.
 bool worldBelongsToLoadedGame(const WorldMeta& meta, std::string* why = nullptr) {
     if (meta.game.empty() || meta.game == g_LoadedGameFolder) return true;
-    if (why) *why = "This world was made with '" + meta.game + "'. Restart the game with that game selected to play it.";
+    if (why) *why = "This world was made with '" + meta.game + "', but '" + g_LoadedGameFolder + "' is loaded.";
     return false;
+}
+
+std::string worldGame(const std::string& world) {
+    WorldMeta meta;
+    if (!world.empty() && readWorldMeta(savesRoot() / world / "world.dat", meta) && !meta.game.empty()) return meta.game;
+    return g_ActiveGameFolder;
 }
 
 bool canPickUpItem(const std::string& item, int count) {
@@ -731,6 +747,123 @@ glm::vec3 modelLightAt(const glm::vec3& pos) {
 
 // Opens g_ActiveWorldName: creates it if new, otherwise restores seed, player and hotbar.
 // Returns false (and opens nothing) if the world belongs to a different game.
+// ---------------------------------------------------------------------------
+// World thumbnails: saves/<world>/thumbnail.png, a picture of the world for the world list.
+// Taken from the game view (before the hand and HUD are drawn) when the game is paused, and
+// a few seconds after a world first opens if it has none yet.
+// ---------------------------------------------------------------------------
+bool g_ThumbnailWanted = false;       // take one this frame
+bool g_ThumbnailChecked = false;      // (the "has none yet" check, once per opened world)
+double g_WorldOpenedAt = 0.0;
+double g_LastThumbnailAt = 0.0;      // (while playing, the picture is refreshed every few minutes)
+
+// A plain PNG (8-bit RGB, deflate "stored" blocks: no compression library needed)
+bool writePngRGB(const fs::path& file, const std::vector<uint8_t>& rgb, int w, int h) {
+    auto crc32 = [](const uint8_t* d, size_t n, uint32_t c = 0xFFFFFFFFu) {
+        for (size_t i = 0; i < n; ++i) {
+            c ^= d[i];
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+        }
+        return c;
+    };
+    auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(uint8_t(x >> 24)); v.push_back(uint8_t(x >> 16)); v.push_back(uint8_t(x >> 8)); v.push_back(uint8_t(x));
+    };
+    std::vector<uint8_t> raw;                       // each row: filter byte 0, then the pixels
+    raw.reserve(static_cast<size_t>(h) * (w * 3 + 1));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgb.begin() + static_cast<size_t>(y) * w * 3, rgb.begin() + static_cast<size_t>(y + 1) * w * 3);
+    }
+    std::vector<uint8_t> z = { 0x78, 0x01 };        // zlib header, then stored blocks of up to 65535
+    for (size_t pos = 0; pos < raw.size() || pos == 0;) {
+        const size_t len = std::min<size_t>(65535, raw.size() - pos);
+        const bool last = pos + len >= raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back(uint8_t(len)); z.push_back(uint8_t(len >> 8));
+        z.push_back(uint8_t(~len)); z.push_back(uint8_t(~len >> 8));
+        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + len);
+        pos += len;
+        if (last) break;
+    }
+    uint32_t a = 1, b = 0;                          // adler32
+    for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    be32(z, (b << 16) | a);
+
+    std::vector<uint8_t> png = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+    auto chunk = [&](const char* type, const std::vector<uint8_t>& data) {
+        be32(png, static_cast<uint32_t>(data.size()));
+        std::vector<uint8_t> td(type, type + 4);
+        td.insert(td.end(), data.begin(), data.end());
+        png.insert(png.end(), td.begin(), td.end());
+        be32(png, crc32(td.data(), td.size()) ^ 0xFFFFFFFFu);
+    };
+    std::vector<uint8_t> ihdr;
+    be32(ihdr, static_cast<uint32_t>(w)); be32(ihdr, static_cast<uint32_t>(h));
+    ihdr.insert(ihdr.end(), { 8, 2, 0, 0, 0 });    // 8 bits, RGB
+    chunk("IHDR", ihdr);
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        if (!out) return false;
+    }
+    std::error_code ec;
+    return replaceFile(tmp, file, ec);
+}
+
+// Reads the frame being drawn (width x height pixels) and saves a 320x180 thumbnail of its
+// middle (16:9) for the world being played
+void saveWorldThumbnail(int width, int height) {
+    if (g_ActiveWorldName.empty() || width < 16 || height < 16) return;
+    const fs::path dir = savesRoot() / g_ActiveWorldName;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return;
+    std::vector<uint8_t> frame(static_cast<size_t>(width) * height * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, frame.data());
+    // The biggest 16:9 area in the middle, shrunk to 320x180 by averaging
+    const int TW = 320, TH = 180;
+    int cw = width, ch = width * 9 / 16;
+    if (ch > height) { ch = height; cw = height * 16 / 9; }
+    const int ox = (width - cw) / 2, oy = (height - ch) / 2;
+    std::vector<uint8_t> out(static_cast<size_t>(TW) * TH * 3);
+    for (int ty = 0; ty < TH; ++ty) {
+        const int y0 = oy + ty * ch / TH, y1 = std::max(y0 + 1, oy + (ty + 1) * ch / TH);
+        for (int tx = 0; tx < TW; ++tx) {
+            const int x0 = ox + tx * cw / TW, x1 = std::max(x0 + 1, ox + (tx + 1) * cw / TW);
+            uint32_t sum[3] = { 0, 0, 0 }, n = 0;
+            for (int y = y0; y < y1; y += std::max(1, (y1 - y0) / 3)) {
+                for (int x = x0; x < x1; x += std::max(1, (x1 - x0) / 3)) {
+                    const uint8_t* p = &frame[(static_cast<size_t>(y) * width + x) * 3];
+                    sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2]; ++n;
+                }
+            }
+            uint8_t* o = &out[(static_cast<size_t>(TH - 1 - ty) * TW + tx) * 3];   // (GL reads bottom-up)
+            for (int c = 0; c < 3; ++c) o[c] = static_cast<uint8_t>(sum[c] / std::max(1u, n));
+        }
+    }
+    if (writePngRGB(dir / "thumbnail.png", out, TW, TH)) {
+        std::cout << "[World] Thumbnail saved for '" << g_ActiveWorldName << "'" << std::endl;
+    }
+}
+
+// "Just now", "5 minutes ago", "Yesterday", "3 days ago"...
+std::string playedAgo(fs::file_time_type when) {
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(fs::file_time_type::clock::now() - when).count();
+    if (secs < 90) return "Just now";
+    const long long mins = secs / 60, hours = mins / 60, days = hours / 24;
+    if (mins < 60) return std::to_string(mins) + " minutes ago";
+    if (hours < 24) return hours == 1 ? "An hour ago" : std::to_string(hours) + " hours ago";
+    if (days < 2) return "Yesterday";
+    if (days < 31) return std::to_string(days) + " days ago";
+    if (days < 62) return "Last month";
+    return std::to_string(days / 30) + " months ago";
+}
+
 bool openActiveWorld(World& world, Player& player) {
     const fs::path dir = savesRoot() / g_ActiveWorldName;
 
@@ -747,6 +880,9 @@ bool openActiveWorld(World& world, Player& player) {
     fs::create_directories(dir / "chunks", ec);
 
     world.reset();
+    g_ThumbnailChecked = false;          // (a new world gets its first thumbnail after a few seconds)
+    g_WorldOpenedAt = glfwGetTime();
+    g_LastThumbnailAt = g_WorldOpenedAt;
     g_SharedValues.clear();   // shared values (weather...) belong to a world
     g_SharedChanged.clear();
     g_ModStorage.clear();     // so does mod storage
@@ -815,7 +951,17 @@ bool openActiveWorld(World& world, Player& player) {
 }
 
 // Switches to the loading screen; the world itself is opened from the main loop.
+std::string worldGame(const std::string& world);
+std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world);
+extern std::set<std::string> g_LoadedGlobalMods;
+
 void beginLoadingWorld(GLFWwindow* win) {
+    // This world runs other mods (or is another game's): load those first, then open it
+    const std::string game = worldGame(g_ActiveWorldName);
+    if (!g_Reload.pending && (game != g_LoadedGameFolder || resolveGlobalMods(game, g_ActiveWorldName) != g_LoadedGlobalMods)) {
+        std::cout << "[Mods] '" << g_ActiveWorldName << "' needs other mods than the ones loaded: reloading for it" << std::endl;
+        g_Reload = ReloadRequest{ true, g_ActiveWorldName, game };
+    }
     g_CurrentGameState = GameState::LOADING;
     g_PendingWorldOpen = true;
     g_SpawnPlaced = false;
@@ -888,19 +1034,21 @@ std::string createWorld(const std::string& rawName, const std::string& seedText,
 
     std::error_code ec;
     fs::create_directories(savesRoot() / name / "chunks", ec);
-    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_LoadedGameFolder,
+    // (for the game selected on the title screen: playing it loads that game's mods)
+    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_ActiveGameFolder,
                    false);   // a new world starts with an empty hotbar
     if (!options.empty()) {
         std::ofstream f(savesRoot() / name / "mod_storage.txt");
         for (const auto& [k, v] : options) f << escapeStorage("world:" + k) << '\t' << escapeStorage(v) << '\n';
     }
-    std::cout << "[World] Created save folder '" << name << "' for game '" << g_LoadedGameFolder << "'" << std::endl;
+    std::cout << "[World] Created save folder '" << name << "' for game '" << g_ActiveGameFolder << "'" << std::endl;
     return name;
 }
 
-// Can the world list be used right now? Only if the selected game is the one whose mods are loaded.
+// Can the world list be used right now? Always: playing a world of another game (or with other
+// mods) reloads the mods for it first.
 bool selectedGameIsLoaded() {
-    return g_ActiveGameFolder == g_LoadedGameFolder;
+    return true;
 }
 
 // Permanently deletes saves/<name>. Refuses anything that isn't a world folder directly
@@ -1090,9 +1238,20 @@ void applyLoadStatus(ModInfo& m, const std::vector<fs::path>& files) {
     m.status = !m.error.empty() ? "error" : (ran ? "loaded" : "not_loaded");
 }
 
+std::map<std::string, bool> loadGameModDefaults(const std::string& game);
+bool writeOnOffFile(const fs::path& file, const std::map<std::string, bool>& values, const std::string& header);
+fs::path gameModsFile(const std::string& game);
+bool validFolderName(const std::string& name);
+bool globalModOn(const std::string& game, const std::string& world, const std::string& id,
+                 const std::map<std::string, bool>* gameDefaults = nullptr,
+                 const std::map<std::string, bool>* worldChoices = nullptr);
+
 // Every mod folder and loose .lua file in the mods/ folder (game mods are not listed).
 std::vector<ModInfo> listInstalledMods() {
     std::vector<ModInfo> mods;
+    // "enabled" = on by default for the selected game's worlds (the Mods screen sets that)
+    const auto gameDefaults = loadGameModDefaults(g_ActiveGameFolder);
+    const std::map<std::string, bool> noWorld;
     for (const auto& root : modRoots()) {
         if (root.source != "Global") continue;   // only the mods/ folder
 
@@ -1131,13 +1290,13 @@ std::vector<ModInfo> listInstalledMods() {
             if (m.title.empty()) m.title = m.id;
             m.luaFiles = static_cast<int>(files.size());
             m.required = modIsRequired(entry.path(), m.id);
-            m.enabled = modIsEnabled(root.path, m.id);
+            m.enabled = globalModOn(g_ActiveGameFolder, "", m.id, &gameDefaults, &noWorld);
 
             applyLoadStatus(m, files);
             const auto started = g_ModEnabledAtStartup.find(m.id);
             const bool wasOn = started == g_ModEnabledAtStartup.end() || started->second;
             if (!wasOn) m.status = "disabled";
-            m.restartNeeded = (wasOn != m.enabled);
+            m.restartNeeded = false;   // applied when a world is opened (no restart)
 
             mods.push_back(m);
         }
@@ -1148,7 +1307,7 @@ std::vector<ModInfo> listInstalledMods() {
     return mods;
 }
 
-// Switches a mod in mods/ on or off (applies on restart). Returns false + reason on failure.
+// Switches a mod in mods/ on or off for the selected game's worlds (they pick it up when opened).
 bool setModEnabled(const std::string& id, bool on, std::string& error) {
     if (id.empty() || id.find('/') != std::string::npos || id.find('\\') != std::string::npos ||
         id.find("..") != std::string::npos) {
@@ -1166,15 +1325,149 @@ bool setModEnabled(const std::string& id, bool on, std::string& error) {
         return false;
     }
 
-    auto settings = loadModSettings();
-    settings[id] = on;
-    if (!saveModSettings(settings)) {
-        error = "Could not save " + modSettingsFile().string();
+    // The selected game's default (worlds that haven't chosen for themselves follow it)
+    auto defaults = loadGameModDefaults(g_ActiveGameFolder);
+    defaults[id] = on;
+    if (!validFolderName(g_ActiveGameFolder) ||
+        !writeOnOffFile(gameModsFile(g_ActiveGameFolder), defaults,
+                        "# Mods from the mods/ folder that worlds of '" + g_ActiveGameFolder + "' run, unless a world\n"
+                        "# chooses otherwise (saves/<world>/world_mods.txt). Set on the Mods screen.\n")) {
+        error = "Could not save " + gameModsFile(g_ActiveGameFolder).string();
         return false;
     }
-    std::cout << "[Mods] " << id << " will be " << (on ? "enabled" : "disabled") << " after a restart" << std::endl;
+    std::cout << "[Mods] " << id << " is now " << (on ? "on" : "off") << " for worlds of " << g_ActiveGameFolder << std::endl;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Which mods a world runs (like Luanti's world.mt, with Minecraft-style game-wide defaults)
+//   - A game's own mods (games/<game>/mods) always run with it.
+//   - Mods in the mods/ folder run only where they're switched on:
+//       mods/game_mods_<game>.txt      the game's defaults: "my_mod = true" (Mods screen)
+//       saves/<world>/world_mods.txt   one world's own choice, which wins (world list > Mods)
+//     A mod neither file mentions is off, so a newly installed mod changes no world until it's
+//     switched on. "base" and mods with "required = true" always run.
+//   - The first time a game's defaults are needed they start from the old mods/mod_settings.txt
+//     (every mod on unless switched off there), so existing worlds keep the mods they had.
+// Opening a world whose mods (or game) differ from the ones loaded reloads everything in place.
+// ---------------------------------------------------------------------------
+
+std::string g_SessionWorld;                 // the world whose mods this session loaded ("" = the game's defaults)
+std::set<std::string> g_LoadedGlobalMods;   // mods/ folder mods running this session
+
+bool validModId(const std::string& id) {
+    return !id.empty() && id.size() <= 128 && id.find('/') == std::string::npos &&
+           id.find('\\') == std::string::npos && id.find("..") == std::string::npos && id.find('=') == std::string::npos;
+}
+bool validFolderName(const std::string& name) {
+    return validModId(name) && name != "." && name.find(':') == std::string::npos;
+}
+
+// The mods in the mods/ folder that are real mods (a folder with .lua files, or a loose .lua)
+std::vector<std::string> installedGlobalModIds() {
+    std::vector<std::string> ids;
+    const fs::path root = globalModsFolder();
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(root, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (entry.is_directory(ec)) {
+            if (name == "clientmods") continue;
+            bool hasLua = false;
+            for (const auto& f : fs::recursive_directory_iterator(entry.path(), ec)) {
+                if (f.is_regular_file() && f.path().extension() == ".lua") { hasLua = true; break; }
+            }
+            if (hasLua) ids.push_back(name);
+        } else if (entry.is_regular_file(ec) && entry.path().extension() == ".lua") {
+            ids.push_back(name);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::map<std::string, bool> readOnOffFile(const fs::path& file) {
+    std::map<std::string, bool> out;
+    for (const auto& [key, val] : readConfFile(file)) {
+        out[key] = !(val == "false" || val == "0" || val == "off" || val == "no");
+    }
+    return out;
+}
+
+bool writeOnOffFile(const fs::path& file, const std::map<std::string, bool>& values, const std::string& header) {
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) return false;
+        out << header;
+        for (const auto& [id, on] : values) out << id << " = " << (on ? "true" : "false") << "\n";
+        if (!out) return false;
+    }
+    if (!replaceFile(tmp, file, ec)) {
+        std::cerr << "[Mods] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
+    }
+    return true;
+}
+
+fs::path gameModsFile(const std::string& game) {
+    return globalModsFolder() / ("game_mods_" + game + ".txt");
+}
+
+std::map<std::string, bool> loadGameModDefaults(const std::string& game) {
+    const fs::path file = gameModsFile(game);
+    std::error_code ec;
+    if (fs::exists(file, ec)) return readOnOffFile(file);
+    // First time: what the old global on/off list said (on unless switched off), written down
+    // so that mods installed from now on start off
+    std::map<std::string, bool> seeded;
+    const auto legacy = loadModSettings();
+    for (const auto& id : installedGlobalModIds()) {
+        const auto it = legacy.find(id);
+        seeded[id] = it == legacy.end() || it->second;
+    }
+    if (validFolderName(game)) {
+        writeOnOffFile(file, seeded, "# Mods from the mods/ folder that worlds of '" + game + "' run, unless a world\n"
+                                     "# chooses otherwise (saves/<world>/world_mods.txt). Set on the Mods screen.\n");
+    }
+    return seeded;
+}
+
+fs::path worldModsFile(const std::string& world) {
+    return savesRoot() / world / "world_mods.txt";
+}
+
+std::map<std::string, bool> loadWorldModChoices(const std::string& world) {
+    if (world.empty() || !validFolderName(world)) return {};
+    return readOnOffFile(worldModsFile(world));
+}
+
+// Is a mods/ folder mod on for this game and world? (world = "" -> the game's default)
+bool globalModOn(const std::string& game, const std::string& world, const std::string& id,
+                 const std::map<std::string, bool>* gameDefaults,
+                 const std::map<std::string, bool>* worldChoices) {
+    if (modIsRequired(globalModsFolder() / id, id)) return true;
+    std::map<std::string, bool> w, g;
+    if (!worldChoices) { w = loadWorldModChoices(world); worldChoices = &w; }
+    if (auto it = worldChoices->find(id); it != worldChoices->end()) return it->second;
+    if (!gameDefaults) { g = loadGameModDefaults(game); gameDefaults = &g; }
+    if (auto it = gameDefaults->find(id); it != gameDefaults->end()) return it->second;
+    return false;
+}
+
+std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world) {
+    const auto g = loadGameModDefaults(game);
+    const auto w = loadWorldModChoices(world);
+    std::set<std::string> on;
+    for (const auto& id : installedGlobalModIds()) {
+        if (globalModOn(game, world, id, &g, &w)) on.insert(id);
+    }
+    return on;
+}
+
+// The game a saved world belongs to ("" if it has no world.dat yet: the selected game)
+std::string worldGame(const std::string& world);
 
 // Opens the main mods folder in Explorer / Finder / the desktop file manager.
 void openModsFolder() {
@@ -1405,6 +1698,8 @@ int loadTextureToLayer(const std::string& path) {
     }
     // The same picture file used by several blocks (or particles) shares one layer
     static std::unordered_map<std::string, int> layerOfFile;
+    static int layerGen = -1;                       // (a mod reload starts the layers again)
+    if (layerGen != g_SessionGeneration) { layerOfFile.clear(); layerGen = g_SessionGeneration; }
     const std::string fileKey = found ? fs::path(finalPath).lexically_normal().generic_string() : ("?" + path);
     if (auto it = layerOfFile.find(fileKey); it != layerOfFile.end() && it->second < g_NextTextureLayer) return it->second;
     if (g_NextTextureLayer >= MAX_TEXTURE_LAYERS) {
@@ -1667,7 +1962,13 @@ struct ModelInstance {
 std::map<int, ModelInstance> g_ModelInstances;   // models placed with engine.add_model
 int g_NextModelInstance = 1;
 bool g_ThirdPerson = false;                      // F5 camera (the player model is only drawn in third person)
-bool g_ThirdPersonFront = false;                 // ...in front of the player, looking back at them (F5 twice)
+bool g_ThirdPersonFront = false;
+bool g_HudHidden = false;                        // F1: no HUD, crosshair or hand (screenshots)
+// The name of what's held (above the hotbar, for a moment after switching)
+bool g_ShowBlockNames = true;                    // engine.set_block_name_display(false) hides it
+uint8_t g_HeldNameFor = 0;                       // the held item whose name is showing
+int g_HeldNameSlot = -1;
+double g_HeldNameSince = -100.0;                 // when it changed (the name fades after 2 s)                 // ...in front of the player, looking back at them (F5 twice)
 
 // ===========================================================================
 // Settings (settings.txt next to the mods folder) and key bindings
@@ -1704,6 +2005,7 @@ const std::vector<KeyAction>& keyActions() {
         { "chat",      "Open Chat",      GLFW_KEY_T },
         { "command",   "Open Command",   GLFW_KEY_SLASH },
         { "third_person", "Toggle Camera View", GLFW_KEY_F5 },
+        { "hide_hud",    "Hide HUD",       GLFW_KEY_F1 },
         { "debug_info",  "Show FPS / Network Info", GLFW_KEY_F3 },
         { "player_list", "List Players",  GLFW_KEY_TAB },
         { "hotbar1",   "Hotbar Slot 1",  GLFW_KEY_1 },
@@ -2434,9 +2736,9 @@ void openFolderInExplorer(const fs::path& folder) {
     std::system(cmd.c_str());
 }
 
-struct SavedServer { std::string name, address; };
+struct SavedServer { std::string name, address; bool pinned = false; };
 
-// servers.txt: one server per line, "name|address"
+// servers.txt: one server per line, "name|address", or "name|address|pinned" for one pinned to the top
 std::vector<SavedServer> loadServers() {
     std::vector<SavedServer> out;
     std::ifstream in(serversFile());
@@ -2445,7 +2747,14 @@ std::vector<SavedServer> loadServers() {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const size_t bar = line.find('|');
         if (line.empty() || line[0] == '#' || bar == std::string::npos) continue;
-        out.push_back({line.substr(0, bar), line.substr(bar + 1)});
+        std::string rest = line.substr(bar + 1);
+        bool pinned = false;
+        const size_t bar2 = rest.find('|');
+        if (bar2 != std::string::npos) {
+            pinned = rest.substr(bar2 + 1) == "pinned";
+            rest = rest.substr(0, bar2);
+        }
+        out.push_back({line.substr(0, bar), rest, pinned});
     }
     return out;
 }
@@ -2456,7 +2765,7 @@ void saveServers(const std::vector<SavedServer>& servers) {
         std::cerr << "[Multiplayer] Could not write " << serversFile().string() << std::endl;
         return;
     }
-    out << "# Saved servers (name|address). Edited from the Multiplayer screen.\n";
+    out << "# Saved servers (name|address, then |pinned if pinned to the top). Edited from the Multiplayer screen.\n";
     for (const auto& s : servers) {
         std::string name = s.name, address = s.address;
         for (auto* str : {&name, &address}) {
@@ -2464,7 +2773,7 @@ void saveServers(const std::vector<SavedServer>& servers) {
                                       [](char ch) { return ch == '|' || ch == '\n' || ch == '\r'; }),
                        str->end());
         }
-        out << name << "|" << address << "\n";
+        out << name << "|" << address << (s.pinned ? "|pinned" : "") << "\n";
     }
 }
 
@@ -2685,6 +2994,8 @@ void addClientModWorldApi(ClientMods& cm) {
     // tinted like the block (for maps). Worked out once per block.
     client["get_block_color"] = [](const std::string& name) {
         static std::map<std::string, glm::vec3> cache;
+        static int cacheGen = -1;                   // (other mods, other blocks)
+        if (cacheGen != g_SessionGeneration) { cache.clear(); cacheGen = g_SessionGeneration; }
         const auto it = cache.find(name);
         if (it != cache.end()) return std::make_tuple(it->second.r, it->second.g, it->second.b);
         glm::vec3 c(0.5f);
@@ -2773,6 +3084,25 @@ static std::unordered_map<std::string, std::string> g_BlockMod;
 std::string blockModOf(const std::string& name) {
     auto it = g_BlockMod.find(name);
     return it == g_BlockMod.end() ? std::string() : it->second;
+}
+
+// The name players see: the block's description ("Oak Log"), or one made from its name
+// (log_oak -> "Log Oak") when it has none
+std::string blockDisplayName(const BlockProperty& b) {
+    if (!b.description.empty()) return b.description;
+    std::string out;
+    bool up = true;
+    for (char ch : b.name) {
+        if (ch == '_' || ch == ':') { out += ' '; up = true; continue; }
+        out += up ? static_cast<char>(std::toupper(static_cast<unsigned char>(ch))) : ch;
+        up = false;
+    }
+    return out;
+}
+// "mod:name", like Luanti's item names: the mod that registered it, then its name
+std::string blockFullName(const BlockProperty& b) {
+    const std::string mod = blockModOf(b.name);
+    return mod.empty() ? b.name : mod + ":" + b.name;
 }
 
 void registerBlockFromLua(const std::string& name, float r, float g, float b, sol::object texObj, sol::object overlayObj, sol::optional<sol::table> propsTable) {
@@ -2929,6 +3259,8 @@ void HeldLight::update(const World& w) {
 // picture. Loaded the first time it's asked for (from any mod's folder) and kept.
 int particleTexture(const std::string& name) {
     static std::unordered_map<std::string, int> cache;
+    static int cacheGen = -1;                       // (a mod reload starts the layers again)
+    if (cacheGen != g_SessionGeneration) { cache.clear(); cacheGen = g_SessionGeneration; }
     if (name.empty() || name.size() > 128) return -1;
     auto it = cache.find(name);
     if (it != cache.end()) return it->second;
@@ -3626,6 +3958,70 @@ void drawLoadingScreen(GLuint uiProgram, GLuint fontProgram, float progress, int
     }
 }
 
+// Between two sessions (see main): everything the old mods set up is forgotten, so the next
+// session starts as if the game had just been started - with the next world's mods.
+void resetForReload() {
+    std::cout << "[Mods] Reloading for '" << g_Reload.world << "' (game " << g_Reload.game << ")" << std::endl;
+    ++g_SessionGeneration;
+
+    // Blocks, fluids and what's worked out from them
+    resetBlockDefinitions();   // the registry, and ids start from 1 again
+    FluidRegistry::get().reset();
+    light::invalidateBlockLights();
+    CaveGenerator::reset();
+
+    // Textures: the block texture array and every picture loaded by name
+    if (g_TextureArrayID) { glDeleteTextures(1, &g_TextureArrayID); g_TextureArrayID = 0; }
+    g_NextTextureLayer = 0;
+    g_LayerSources.clear();
+    for (const auto& [tex, src] : g_StandardTextureSources) { GLuint t = tex; glDeleteTextures(1, &t); }
+    g_StandardTextureSources.clear();
+    g_TextureIndex.clear();
+    g_TextureIndexRoots.clear();
+    if (g_CrackTexture) { glDeleteTextures(1, &g_CrackTexture); g_CrackTexture = 0; }
+    g_CrackStages = 10;
+
+    // Which mods ran, and what they set
+    g_ModFolders.clear();
+    g_ModFileStatus.clear();
+    g_ModEnabledAtStartup.clear();
+    g_CurrentModPath.clear();
+    g_BlockMod.clear();
+    g_ItemUseHandlers.clear();
+    g_SharedValues.clear();
+    g_SharedChanged.clear();
+    g_ModStorage.clear();
+    g_ModStorageDirty = false;
+    g_ModelInstances.clear();
+    g_NextModelInstance = 1;
+    g_EntityVisuals.clear();
+
+    // Settings mods change, back to the engine's own
+    g_FootstepDistance = 1.3f;
+    g_FlyAllowed = true;
+    g_PlaceRepeatSeconds = 0.2f;
+    g_LuaInventoryOpen = false;
+    g_FirstPerson = FirstPersonView{};
+    g_LightSettings = LightSettings{};
+    g_HeldLight = HeldLight{};
+    g_Fog = FogSettings{};
+    g_Underwater = UnderwaterSettings{};
+    g_UnderwaterBlend = 0.0f;
+    g_Inventory = InventorySystem{};
+    g_ThirdPerson = false;
+    g_ThirdPersonFront = false;
+    g_HudHidden = false;
+    g_ShowBlockNames = true;
+    g_Paused = false;
+    g_SettingsInGame = false;
+
+    // The next session: this game, with this world's mods, opening it (main does that)
+    g_ActiveGameFolder = g_Reload.game;
+    g_SessionWorld = g_Reload.world;
+    g_CurrentGameState = GameState::LOADING;
+    g_LoadingProgress = 0.0f;
+}
+
 int main(int argc, char** argv) {
     // Remember where the game's .exe is: BlockSmithServer is built next to it (My Servers screen)
     if (argc > 0 && argv[0]) {
@@ -3673,11 +4069,38 @@ int main(int argc, char** argv) {
             return -1;
         }
 
-        // Closes the window LAST. Everything that owns OpenGL objects (the hotbar, fonts, sky,
-        // and locals declared below such as the world renderer and particles) deletes them in
-        // its destructor, which needs the context to still exist. Locals are destroyed in reverse
-        // order, so this one - made before all of them - goes after them. (Closing the window
-        // first made quitting the game crash in ~Hotbar.)
+        // The window and its OpenGL context last the whole run - through every mod reload below
+        struct WindowShutdown {
+            GLFWwindow* window;
+            ~WindowShutdown() {
+                glfwDestroyWindow(window);
+                glfwTerminate();
+            }
+        } windowShutdown{ window };
+
+        // ===================================================================================
+        // SESSIONS. Everything mods make - the Lua state, blocks, textures, entities, sounds,
+        // the menus' objects - belongs to one session. Playing a world that runs other mods
+        // (or another game) ends the session behind the loading screen, forgets all of it and
+        // starts a new one with that world's mods, which then opens the world: like Luanti, but
+        // in the same window without a restart. (The body below keeps its old indentation.)
+        // ===================================================================================
+        for (;;) {
+        {
+        if (g_SessionGeneration > 0) {
+            // The window's title names the game now loaded
+            std::string title = "BlockSmith";
+            for (const auto& g : getAvailableGames()) {
+                if (g.folderName == g_ActiveGameFolder) title = g.title + " - BlockSmith";
+            }
+            glfwSetWindowTitle(window, title.c_str());
+            windowTitle = title;
+        }
+        // Frees this session's OpenGL objects LAST. Everything that owns OpenGL objects (the
+        // hotbar, fonts, sky, and locals declared below such as the world renderer and
+        // particles) deletes them in its destructor, which needs the context to still exist.
+        // Locals are destroyed in reverse order, so this one - made before all of them - goes
+        // after them. (The window itself goes after every session: WindowShutdown.)
         struct GlShutdown {
             GLFWwindow* window;
             ~GlShutdown() {
@@ -3690,8 +4113,7 @@ int main(int argc, char** argv) {
                 delete g_Skybox;         g_Skybox = nullptr;
                 delete g_Clouds;         g_Clouds = nullptr;
                 delete g_MainMenu;       g_MainMenu = nullptr;
-                glfwDestroyWindow(window);
-                glfwTerminate();
+                glfwSetWindowUserPointer(window, nullptr);   // the session's EngineContext is gone
             }
         } glShutdown{ window };
 
@@ -3717,7 +4139,7 @@ int main(int argc, char** argv) {
         g_Skybox->init();
         g_Clouds = new Clouds();
         g_Clouds->init();
-        if (!g_Weather.init()) std::cerr << "[Weather] Couldn't set up weather effects" << std::endl;
+        if (g_SessionGeneration == 0 && !g_Weather.init()) std::cerr << "[Weather] Couldn't set up weather effects" << std::endl;
         g_Audio.init();   // no sound card: the game runs silently
         for (const char* group : { "master", "music", "effects", "ambient" }) {
             const std::string id = std::string("volume_") + group;
@@ -3888,6 +4310,11 @@ int main(int argc, char** argv) {
                     return;
                 }
 
+                if (key == keyForAction("hide_hud")) {
+                    g_HudHidden = !g_HudHidden;
+                    return;
+                }
+
                 if (key == keyForAction("third_person")) {
                     // Like Minecraft: first person -> behind the player -> in front of them -> first person
                     if (!g_ThirdPerson) { g_ThirdPerson = true; g_ThirdPersonFront = false; }
@@ -3951,6 +4378,7 @@ int main(int argc, char** argv) {
                         return;
                     }
                     g_Paused = true;
+                    g_ThumbnailWanted = true;   // a picture of the world for the world list (thumbnail.png)
                     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                 }
             }
@@ -4092,6 +4520,26 @@ int main(int argc, char** argv) {
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glBindVertexArray(0);
             glUniform4f(tintLoc, 1.0f, 1.0f, 1.0f, 1.0f);   // (the program is shared: back to no tint)
+        };
+        // ui.world_thumbnail(world) -> a path for ui.draw_image (the world's thumbnail.png), or nil
+        //   if it has none. A newer picture (the world was played since) is loaded fresh.
+        uiTable["world_thumbnail"] = [](const std::string& worldName, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            if (worldName.empty() || worldName.find('/') != std::string::npos || worldName.find('\\') != std::string::npos ||
+                worldName.find("..") != std::string::npos) return sol::make_object(lv, sol::lua_nil);
+            const fs::path file = savesRoot() / worldName / "thumbnail.png";
+            std::error_code ec;
+            if (!fs::exists(file, ec)) return sol::make_object(lv, sol::lua_nil);
+            static std::unordered_map<std::string, fs::file_time_type> seen;
+            const std::string path = file.string();
+            const auto when = fs::last_write_time(file, ec);
+            auto it = seen.find(path);
+            if (it != seen.end() && it->second != when) {          // changed: forget the old picture
+                auto img = s_uiImages.find(path);
+                if (img != s_uiImages.end()) { if (img->second) glDeleteTextures(1, &img->second); s_uiImages.erase(img); }
+            }
+            seen[path] = when;
+            return sol::make_object(lv, path);
         };
         // ui.get_image_size(path) -> width, height in pixels (nil if it can't be loaded)
         uiTable["get_image_size"] = [uiImage](const std::string& path) -> std::tuple<sol::optional<int>, sol::optional<int>> {
@@ -5040,6 +5488,30 @@ int main(int argc, char** argv) {
             try { return std::stoi(it->second); } catch (...) { return 3; }
         };
         engineTable["is_third_person"] = []() { return g_ThirdPerson; };
+        // engine.set_hud_visible(on) / engine.is_hud_visible(): the HUD, crosshair and hand (F1)
+        engineTable["set_hud_visible"] = [](bool on) { g_HudHidden = !on; };
+        // engine.set_block_name_display(on): the name of the block pointed at, and of the held
+        //   item after switching (on by default). engine.get_block_description(name) -> "Oak Log"
+        engineTable["set_block_name_display"] = [](bool on) { g_ShowBlockNames = on; };
+        engineTable["get_block_description"] = [](const std::string& name) -> std::string {
+            auto& reg = BlockRegistry::getInstance();
+            const uint8_t id = reg.getBlockId(name);
+            return id == 0 ? std::string() : blockDisplayName(reg.getBlock(id));
+        };
+        engineTable["is_hud_visible"] = []() { return !g_HudHidden; };
+        // engine.set_player_look(yaw, pitch): where the player looks, in degrees (yaw -90 = north,
+        //   -Z; 0 = east, +X; pitch 90 = straight up). engine.get_player_look() -> yaw, pitch
+        engineTable["set_player_look"] = [](float yaw, float pitch) {
+            if (!g_PlayerInstance || !std::isfinite(yaw) || !std::isfinite(pitch)) return false;
+            g_PlayerInstance->yaw = yaw;
+            // (closer to straight up or down than this, the view maths runs out of precision and nothing draws)
+            g_PlayerInstance->pitch = std::clamp(pitch, -89.9f, 89.9f);
+            return true;
+        };
+        engineTable["get_player_look"] = []() -> std::tuple<float, float> {
+            if (!g_PlayerInstance) return { -90.0f, 0.0f };
+            return { g_PlayerInstance->yaw, g_PlayerInstance->pitch };
+        };
         // engine.get_camera_mode() -> "first", "back" or "front"; engine.set_camera_mode(mode) (F5 cycles them)
         engineTable["get_camera_mode"] = []() -> std::string {
             return !g_ThirdPerson ? "first" : (g_ThirdPersonFront ? "front" : "back");
@@ -5458,6 +5930,8 @@ int main(int argc, char** argv) {
             t["item"] = !b.inventoryImage.empty();
             t["has_sounds"] = !b.soundFootstep.name.empty() || !b.soundDig.name.empty() ||
                               !b.soundDug.name.empty() || !b.soundPlace.name.empty();
+            t["description"] = blockDisplayName(b);
+            t["full_name"] = blockFullName(b);
             return t;
         };
 
@@ -5617,6 +6091,9 @@ int main(int argc, char** argv) {
                 e["name"] = w.name;
                 e["seed"] = w.seed;
                 if (!w.gameMode.empty()) e["game_mode"] = w.gameMode;
+                e["played"] = playedAgo(w.lastPlayed);   // "2 hours ago"
+                std::error_code tec;
+                e["has_thumbnail"] = fs::exists(savesRoot() / w.name / "thumbnail.png", tec);
                 t[idx++] = e;
             }
             return t;
@@ -5688,6 +6165,7 @@ int main(int argc, char** argv) {
                 sol::table e = lua.create_table();
                 e["name"] = s.name;
                 e["address"] = s.address;
+                e["pinned"] = s.pinned;
                 t[i++] = e;
             }
             return t;
@@ -5699,7 +6177,8 @@ int main(int argc, char** argv) {
                 sol::optional<sol::table> e = list[i];
                 if (!e) continue;
                 servers.push_back({e->get_or<std::string>("name", "Server"),
-                                   e->get_or<std::string>("address", "")});
+                                   e->get_or<std::string>("address", ""),
+                                   e->get_or("pinned", false)});
             }
             saveServers(servers);
         };
@@ -6222,7 +6701,78 @@ int main(int argc, char** argv) {
         };
         engineTable["get_texture_pack"] = []() { return g_ActiveTexturePack; };
         engineTable["open_texture_packs_folder"] = []() { openTexturePacksFolder(); };
-        // engine.set_mod_enabled(id, on) -> true, or false + reason. Applies on the next start.
+        // ---- Which mods a world runs (world list > Mods) ----
+        // engine.get_world_mods(world) -> { game = "...", mods = { { id, title, description,
+        //     source = "Game"|"Global", required, enabled, default, choice }, ... } }
+        //   Game mods are always on. For mods/ folder mods: `default` = on for the game (Mods
+        //   screen), `choice` = the world's own (true / false, nil = follows the game),
+        //   `enabled` = what the world runs. `loaded` = running right now.
+        engineTable["get_world_mods"] = [&lua](const std::string& worldName) -> sol::object {
+            if (!validFolderName(worldName)) return sol::make_object(lua, sol::lua_nil);
+            const std::string game = worldGame(worldName);
+            const auto defaults = loadGameModDefaults(game);
+            const auto choices = loadWorldModChoices(worldName);
+            sol::table t = lua.create_table();
+            sol::table list = lua.create_table();
+            int i = 1;
+            // the ones a world can switch first, then the game's own
+            for (const auto& id : installedGlobalModIds()) {
+                sol::table e = lua.create_table();
+                std::string title = id, description;
+                const fs::path folder = globalModsFolder() / id;
+                std::error_code ec;
+                if (fs::is_directory(folder, ec)) {
+                    auto conf = readConfFile(folder / "mod.conf");
+                    if (!conf["title"].empty()) title = conf["title"];
+                    else if (!conf["name"].empty()) title = conf["name"];
+                    description = conf["description"];
+                }
+                const bool required = modIsRequired(folder, id);
+                const auto d = defaults.find(id);
+                const auto c = choices.find(id);
+                e["id"] = id; e["title"] = title; e["description"] = description;
+                e["source"] = "Global"; e["required"] = required;
+                e["default"] = required || (d != defaults.end() && d->second);
+                if (c != choices.end() && !required) e["choice"] = c->second;
+                e["enabled"] = globalModOn(game, worldName, id, &defaults, &choices);
+                e["loaded"] = g_LoadedGlobalMods.count(id) > 0 && game == g_LoadedGameFolder;
+                list[i++] = e;
+            }
+            for (const auto& m : listModsForGame(game)) {
+                if (m.source != "Game") continue;
+                sol::table e = lua.create_table();
+                e["id"] = m.id; e["title"] = m.title; e["description"] = m.description;
+                e["source"] = "Game"; e["required"] = true; e["enabled"] = true; e["default"] = true;
+                e["loaded"] = (game == g_LoadedGameFolder);
+                list[i++] = e;
+            }
+            t["game"] = game;
+            t["mods"] = list;
+            return t;
+        };
+        // engine.set_world_mod(world, id, on) -> true, or false + reason. on = true / false, or
+        //   nil to follow the game's default again. Used the next time the world is opened.
+        engineTable["set_world_mod"] = [](const std::string& worldName, const std::string& id, sol::optional<bool> on) {
+            if (!validFolderName(worldName)) return std::make_tuple(false, std::string("Invalid world name."));
+            std::error_code ec;
+            if (!fs::is_directory(savesRoot() / worldName, ec)) return std::make_tuple(false, std::string("No such world."));
+            if (!validModId(id)) return std::make_tuple(false, std::string("Invalid mod name."));
+            if (!fs::exists(globalModsFolder() / id, ec)) return std::make_tuple(false, std::string("Mod not found."));
+            if (modIsRequired(globalModsFolder() / id, id)) {
+                return std::make_tuple(false, std::string("This mod is required and always runs."));
+            }
+            auto choices = loadWorldModChoices(worldName);
+            if (on) choices[id] = *on; else choices.erase(id);
+            if (!writeOnOffFile(worldModsFile(worldName), choices,
+                                "# Mods from the mods/ folder this world runs (true) or doesn't (false). Mods not\n"
+                                "# listed follow the game's choice (the Mods screen). The game's own mods always run.\n")) {
+                return std::make_tuple(false, std::string("Could not save the world's mod list."));
+            }
+            return std::make_tuple(true, std::string());
+        };
+
+        // engine.set_mod_enabled(id, on) -> true, or false + reason: on by default for the selected
+        //   game's worlds (a world's own choice wins). Applies when a world is opened.
         engineTable["set_mod_enabled"] = [](const std::string& id, bool on) {
             std::string error;
             if (id.rfind("client:", 0) == 0) {   // a client mod (clientmods/mods.conf)
@@ -6267,6 +6817,9 @@ int main(int argc, char** argv) {
         buildTextureIndex();   // pictures anywhere in the game / mods can be used by name
         std::vector<fs::path> modFiles;
         std::set<std::string> initFolders;
+        // The mods/ folder mods this session runs: the game's defaults, or the world's own choice
+        const std::set<std::string> sessionGlobalMods = resolveGlobalMods(g_ActiveGameFolder, g_SessionWorld);
+        g_LoadedGlobalMods = sessionGlobalMods;
 
         std::set<std::string> seenModRoots;   // the same folder reached by two paths is only loaded once
         for (const auto& searchPath : modSearchPaths) {
@@ -6296,11 +6849,13 @@ int main(int argc, char** argv) {
                     const std::string modId = (relEc || rel.empty()) ? "" : rel.begin()->string();
                     if (modId == "clientmods") continue;   // mods/clientmods/: the player's client mods, not game mods
                     if (!modId.empty()) {
-                        const bool on = modIsEnabled(resolvedPath, modId);
+                        // On for this game and the world being opened (Luanti-style world mods)
+                        const bool on = sessionGlobalMods.count(modId) > 0;
                         g_ModEnabledAtStartup[modId] = on;
                         if (!on) {
                             if (reportedDisabled.insert(modId).second) {
-                                std::cout << "[Mod] Skipping disabled mod: " << modId << std::endl;
+                                std::cout << "[Mod] Not loading " << modId << " (off for "
+                                          << (g_SessionWorld.empty() ? "this game" : "world '" + g_SessionWorld + "'") << ")" << std::endl;
                             }
                             continue;
                         }
@@ -6681,7 +7236,20 @@ int main(int argc, char** argv) {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);   // (read again each frame)
         };
 
+        // A new session made for a world: open it now that its mods are loaded
+        if (g_Reload.pending) {
+            const std::string target = g_Reload.world;
+            g_Reload = ReloadRequest{};
+            if (!target.empty()) {
+                g_ActiveWorldName = target;
+                beginLoadingWorld(window);
+            }
+        }
+
+        // A reload asked for during the session: one more frame (the loading screen), then go
+        int reloadFrames = 0;
         while (!glfwWindowShouldClose(window)) {
+            if (g_Reload.pending && reloadFrames++ >= 1) break;
             float currentFrameTime = static_cast<float>(glfwGetTime());
             float deltaTime = currentFrameTime - lastFrameTime;
             lastFrameTime = currentFrameTime;
@@ -6914,7 +7482,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (g_CurrentGameState == GameState::LOADING) {
+            if (g_CurrentGameState == GameState::LOADING && !g_Reload.pending) {
                 if (g_PendingWorldOpen) {
                     g_PendingWorldOpen = false;
                     if (!openActiveWorld(world, player)) {
@@ -8188,6 +8756,19 @@ int main(int argc, char** argv) {
                 if (blend < 0.5f) g_Weather.drawBolts(view, proj, eyePos);
                 g_Weather.drawFlash();
 
+                // The world's thumbnail: this frame's picture, before the hand and HUD go on it
+                if (!g_ThumbnailChecked && glfwGetTime() - g_WorldOpenedAt > 6.0 && !g_ActiveWorldName.empty()) {
+                    g_ThumbnailChecked = true;
+                    std::error_code tec;
+                    if (!fs::exists(savesRoot() / g_ActiveWorldName / "thumbnail.png", tec)) g_ThumbnailWanted = true;
+                }
+                if (!g_Paused && glfwGetTime() - g_LastThumbnailAt > 300.0) g_ThumbnailWanted = true;
+                if (g_ThumbnailWanted) {
+                    g_ThumbnailWanted = false;
+                    g_LastThumbnailAt = glfwGetTime();
+                    if (g_Client.state() != GameClient::State::Joined) saveWorldThumbnail(width, height);
+                }
+
                 // ---------------- First-person hand (FirstPerson.h) ----------------
                 {
                     // Walking speed for the bob; "on the ground" by vertical speed, as the grounded
@@ -8206,7 +8787,7 @@ int main(int argc, char** argv) {
                     const uint16_t here = world.getLightAt(glm::ivec3(glm::floor(eyePos)));
                     const glm::vec4 handLight(light::sky(here) / 15.0f, light::red(here) / 15.0f,
                                               light::green(here) / 15.0f, light::blue(here) / 15.0f);
-                    if (!g_ThirdPerson) {
+                    if (!g_ThirdPerson && !g_HudHidden) {
                         g_FirstPerson.render(shaderProgram, modelShaderProgram, g_TextureArrayID, width, height,
                                              handLight, fpModel, settingInt("main_hand", 0) == 1);
                     } else if (fpModel) {
@@ -8220,6 +8801,8 @@ int main(int argc, char** argv) {
 
                 // ---------------- HUD ----------------
                 glDisable(GL_DEPTH_TEST);
+                // F1 hides all of this (the crosshair, hotbar and HUDs), like Minecraft
+                if (!g_HudHidden) {
                 glUseProgram(uiProgram);
                 // (no crosshair when the camera faces the player: it would point at nothing)
                 if (isCursorDisabled && !g_ThirdPersonFront && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
@@ -8289,6 +8872,36 @@ int main(int argc, char** argv) {
                                                 static_cast<float>(height), uiProgram, texturedUIProgram);
                     glDisable(GL_DEPTH_TEST);
                 }
+
+                // The held item's name above the hotbar for a moment after switching, like Minecraft
+                if (g_ShowBlockNames && g_FontRenderer && !g_Paused && !g_Inventory.isCreativeOpen() && !g_LuaInventoryOpen) {
+                    const Dimensions2D screen{width, height};
+                    const glm::vec2 sc = uiTextScale(1.0f, screen);
+                    auto& names = BlockRegistry::getInstance();
+                    auto shadowed = [&](const std::string& t, float x, float y, glm::vec2 s, glm::vec4 c) {
+                        g_FontRenderer->renderText(fontProgram, t, x + 2.0f, y + 2.0f, s.x, s.y, glm::vec4(0.1f, 0.1f, 0.1f, c.a * 0.85f), screen);
+                        g_FontRenderer->renderText(fontProgram, t, x, y, s.x, s.y, c, screen);
+                    };
+                    glUseProgram(fontProgram);
+                    if (g_Hotbar) {
+                        const uint8_t held = g_Hotbar->getActiveBlockId();
+                        if (held != g_HeldNameFor || g_Hotbar->activeSlot != g_HeldNameSlot) {
+                            g_HeldNameFor = held;
+                            g_HeldNameSlot = g_Hotbar->activeSlot;
+                            g_HeldNameSince = glfwGetTime();
+                        }
+                        const double age = glfwGetTime() - g_HeldNameSince;
+                        if (held != 0 && age < 2.0) {
+                            const float alpha = static_cast<float>(std::min(1.0, (2.0 - age) / 0.5));
+                            float hx = 0, hy = 0, hw = 0, hh = 0;
+                            hotbarScreenRect(*g_Hotbar, static_cast<float>(width), static_cast<float>(height), hx, hy, hw, hh);
+                            const std::string t = blockDisplayName(names.getBlock(held));
+                            const float tw = g_FontRenderer->textWidth(t, sc.x, screen);
+                            shadowed(t, std::round((width - tw) * 0.5f), std::round(hy - 14.0f), sc, glm::vec4(1.0f, 1.0f, 1.0f, alpha));
+                        }
+                    }
+                }
+                }   // !g_HudHidden
 
                 // 2. Creative inventory (drawn by inventory.lua)
                 g_Inventory.renderCreativeInventory(window, lua, static_cast<float>(width), static_cast<float>(height), uiProgram, texturedUIProgram);
@@ -8483,11 +9096,13 @@ int main(int argc, char** argv) {
                 drawLoadingScreen(uiProgram, fontProgram, g_LoadingProgress, width, height);
             } else if (g_CurrentGameState == GameState::WORLD_SELECT) {
                 resetUIRenderState();
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_world_select",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
             } else if (g_CurrentGameState == GameState::MULTIPLAYER) {
                 resetUIRenderState();
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_multiplayer",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
@@ -8503,6 +9118,8 @@ int main(int argc, char** argv) {
                                             uiProgram, texturedUIProgram);
             } else if (g_CurrentGameState == GameState::SETTINGS) {
                 resetUIRenderState();
+                // From the title screen: over the game's panorama, turning behind it
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_settings",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
@@ -8571,8 +9188,23 @@ int main(int argc, char** argv) {
         for (auto& [addr, t] : g_ServerIcons) if (t.tex) glDeleteTextures(1, &t.tex);
         g_ServerIcons.clear();
 
+        // Everything still holding the session's Lua functions lets go while the Lua state exists
+        g_BlockMods = BlockModifiers{};
+        g_EntityLua = EntityLua{};
+        g_Entities = EntityManager{};
+        g_ServerApi = ServerLuaApi{};
+        g_AmbientEffects.clear();
+        g_AmbientByBlock.clear();
+        g_AmbientResolvedFor = 0;
+        g_Lua = nullptr;
+
         g_Audio.shutdown();
-        // (the window and the objects drawing with OpenGL go at the end of this block: GlShutdown)
+        // (the objects drawing with OpenGL go at the end of this block: GlShutdown)
+        }   // end of the session: its Lua state, world and renderers are gone now
+
+        if (!g_Reload.pending || glfwWindowShouldClose(window)) break;
+        resetForReload();
+        }   // for (;;): the next session, with the mods of the world being opened
     } catch (const std::exception& e) {
         std::cerr << "\n[CRITICAL EXCEPTION]: " << e.what() << std::endl;
         system("pause");

@@ -19,6 +19,9 @@ public:
 
     const std::vector<BlockProperty>& getAllBlocks() const { return blocks; }
 
+    // Forgets every registered block (only air is left): the mods are being loaded again
+    void reset();
+
 private:
     BlockRegistry();
     ~BlockRegistry() = default;
