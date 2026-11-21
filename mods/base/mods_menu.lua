@@ -173,7 +173,8 @@ local function refresh_mods()
     if not state.selected and #state.mods > 0 then state.selected = 1 end
 end
 
--- Switches a mod on/off (saved to mods/mod_settings.txt, applied on restart)
+-- Switches a mod on/off for the selected game's worlds (mods/game_mods_<game>.txt). A world's
+-- own choice (Singleplayer > Mods) wins; it applies when a world is opened, no restart.
 local function toggle_mod(m)
     if not m or m.required then return end
     local ok, err = engine.set_mod_enabled(m.id, not m.enabled)
@@ -357,8 +358,11 @@ local function draw_info(L, mx, my)
         row("Enabled", "Always (required)", C.check_locked)
     elseif m.restart_needed then
         row("Enabled", (m.enabled and "On" or "Off") .. " - restart to apply", C.warning)
-    else
+    elseif m.client then
         row("Enabled", m.enabled and "On" or "Off", m.enabled and C.loaded or C.disabled)
+    else
+        row("In worlds", m.enabled and "On (a world can turn it off)" or "Off (a world can turn it on)",
+            m.enabled and C.loaded or C.disabled)
     end
     row("Author", m.author)
     row("Source", m.source)
@@ -405,12 +409,17 @@ function render_mods(W, H)
     local mx, my = ui.get_mouse()
 
     rect(0, 0, W, H, C.background)
-    text_centered("Mods (" .. #state.mods .. ")", W / 2, L.titleY, fs, C.title, S)
+    local gi = engine.get_game_info and engine.get_game_info()
+    local for_game = (gi and gi.title and gi.title ~= "") and (" for " .. gi.title) or ""
+    text_centered("Mods" .. for_game .. " (" .. #state.mods .. ")", W / 2, L.titleY, fs, C.title, S)
 
     if state.message then
         text_centered(state.message, W / 2, L.noteY, fs * 0.8, C.error, S)
     elseif any_restart_needed() then
         text_centered("Restart the game to apply your changes.", W / 2, L.noteY, fs * 0.8, C.warning, S)
+    elseif state.selected and state.mods[state.selected] and not state.mods[state.selected].client then
+        text_centered(fit("Ticked mods run in this game's worlds, unless a world chooses otherwise (Singleplayer > Mods).",
+                          W - 20 * S, fs * 0.8), W / 2, L.noteY, fs * 0.8, C.detail, S)
     else
         -- Where client mods come from, so a missing one is easy to track down
         local cm = engine.get_client_mods_folder and engine.get_client_mods_folder()
@@ -420,7 +429,7 @@ function render_mods(W, H)
             text_centered(fit("Client mods (" .. n .. "): " .. cm, W - 20 * S, fs * 0.8),
                           W / 2, L.noteY, fs * 0.8, C.detail, S)
         else
-            text_centered("Mods load when the game starts - restart after adding or removing mods.",
+            text_centered("Ticked mods run in this game's worlds; each world can change it (Singleplayer > Mods).",
                           W / 2, L.noteY, fs * 0.8, C.detail, S)
         end
     end

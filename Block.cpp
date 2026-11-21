@@ -21,6 +21,10 @@ BlockRegistry::BlockRegistry() {
     registerBlock(airBlock);
 }
 
+void BlockRegistry::reset() {
+    *this = BlockRegistry();
+}
+
 void BlockRegistry::registerBlock(const BlockProperty& block) {
     if (block.id >= blocks.size()) {
         blocks.resize(block.id + 1);

@@ -43,6 +43,13 @@ struct Bone {
     glm::vec3 pivot{0.0f};       // point the bone rotates around (json)
     glm::vec3 scale{1.0f};
     glm::quat restRotation{1.0f, 0.0f, 0.0f, 0.0f};
+    // From a Bedrock / Blockbench file: `rotation` is in Bedrock's terms (what Blockbench shows,
+    // e.g. a leg at -60 on X swings forward) and is turned into the engine's when drawn
+    bool bedrock = false;
+    // The box around the bone's own cubes, in the model file's coordinates (blocks), if it has any
+    // (where the hand is, for holding things in third person)
+    bool hasBounds = false;
+    glm::vec3 boundsMin{0.0f}, boundsMax{0.0f};
 
     std::shared_ptr<Mesh> mesh;                    // first mesh (kept for older code)
     std::vector<std::shared_ptr<Mesh>> meshes;     // all meshes attached to this bone
@@ -74,6 +81,9 @@ public:
     // Draws one bone and everything attached to it (e.g. an arm for the first-person view),
     // in the model file's pose, with the bone's pivot at `world`'s origin. False if no such bone.
     bool drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world);
+    // Where a bone is now (its current pose), as draw() would put it with `world`: the matrix
+    // that takes the model file's coordinates (blocks) to the world. False if no such bone.
+    bool boneMatrix(const std::string& name, const glm::mat4& world, glm::mat4& out) const;
 
     // True if no bone is its own ancestor: following children from any bone - including bones
     // no root reaches - never comes back to a bone already on the path. False sets `cycleBone`

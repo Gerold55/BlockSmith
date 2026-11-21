@@ -17,6 +17,9 @@ struct BlockProperty;
 
 // Survival digging fields from a Lua table (hardness, tool, needs_tool, drops, tool_type,
 // tool_speed). Used by register_block's properties and engine.override_block.
+// Forgets every block (the mods are being loaded again): ids start from 1 again
+void resetBlockDefinitions();
+
 void applyDigProperties(BlockProperty& block, const sol::table& props);
 
 // Seconds to dig a block by hand: its hardness, or a sensible guess from its name for

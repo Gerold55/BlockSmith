@@ -122,6 +122,17 @@ void ChunkGenerator::workerLoop(int index) {
                               "the world generator couldn't be restarted after set_world_seed failed: " + lastSeedError});
             continue;
         }
+        if (lua && seeded && luaSeed != job.seed && m_factory) {
+            // Another world: start from a fresh Lua state, so nothing a world generator worked
+            // out for the old seed (caches of where things are, and so on) carries over into
+            // this world's chunks - every chunk comes from the same, cleanly seeded generator
+            try {
+                auto fresh = m_factory();
+                if (fresh) { lua = std::move(fresh); seeded = false; }
+            } catch (const std::exception& e) {
+                std::cerr << "[Generator " << index << "] couldn't start fresh for the new world: " << e.what() << std::endl;
+            }
+        }
         if (lua && (!seeded || luaSeed != job.seed)) {
             bool ok = true;
             {   // (everything referring to this Lua state ends here - it may be replaced below)

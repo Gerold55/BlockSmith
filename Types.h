@@ -52,6 +52,7 @@ struct DoorProperty {
 struct BlockProperty {
     uint8_t id = 0;
     std::string name;
+    std::string description;   // the name players see ("Oak Log"); "" = made from `name`
     glm::vec3 defaultTint = glm::vec3(1.0f);
     FaceDefinition faces[6]; // 0: +X, 1: -X, 2: +Y (Top), 3: -Y (Bottom), 4: +Z, 5: -Z
     bool isTransparent = false;

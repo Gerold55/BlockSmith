@@ -115,6 +115,7 @@ target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
 add_executable(BlockSmith
     main.cpp
+    Diagnostics.cpp
     Player.cpp
     World.cpp
     ChunkMesh.cpp
@@ -230,8 +231,67 @@ endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
 # just the world, the mods and the networking.
 # Build it with:  cmake --build build --config Release --target BlockSmithServer
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Build info: the git commit, stamped into generated/BuildInfo.h on every build (Version.h reads
+# it; the server prints it). Override with -DBLOCKSMITH_COMMIT=<hash> or the environment variable.
+# ---------------------------------------------------------------------------
+set(BLOCKSMITH_COMMIT "" CACHE STRING "Commit hash to stamp into the build (empty: ask git)")
+set(BLOCKSMITH_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The stamping script is written into the build folder from here, so nothing outside this file is
+# needed. It runs on every build (so the hash is never stale) and only rewrites BuildInfo.h when
+# the commit changed (so nothing recompiles needlessly). No git, or not a git checkout: "unknown".
+#   cmake -DSRC=<source dir> -DOUT=<header> [-DCOMMIT=<hash>] -P BuildInfo.cmake
+set(BLOCKSMITH_BUILDINFO_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/BuildInfo.cmake")
+file(WRITE "${BLOCKSMITH_BUILDINFO_SCRIPT}" [==[
+set(commit "${COMMIT}")
+if (commit STREQUAL "" AND DEFINED ENV{BLOCKSMITH_COMMIT})
+    set(commit "$ENV{BLOCKSMITH_COMMIT}")
+endif()
+set(dirty "")
+if (commit STREQUAL "")
+    find_package(Git QUIET)
+    if (GIT_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short=10 HEAD
+                        WORKING_DIRECTORY "${SRC}" OUTPUT_VARIABLE commit
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE rc)
+        if (NOT rc EQUAL 0)
+            set(commit "")
+        else()
+            # uncommitted changes in tracked files: "-dirty"
+            execute_process(COMMAND "${GIT_EXECUTABLE}" diff --quiet HEAD --
+                            WORKING_DIRECTORY "${SRC}" RESULT_VARIABLE drc ERROR_QUIET)
+            if (drc EQUAL 1)
+                set(dirty "-dirty")
+            endif()
+        endif()
+    endif()
+endif()
+if (commit STREQUAL "")
+    set(commit "unknown")
+endif()
+# Only letters, digits, '-' and '.' go into the header
+string(REGEX REPLACE "[^A-Za-z0-9.-]" "" commit "${commit}")
+
+set(text "// Generated on each build (CMakeLists.txt: blocksmith_buildinfo) - don't edit.\n#pragma once\n#define BLOCKSMITH_COMMIT \"${commit}${dirty}\"\n")
+set(old "")
+if (EXISTS "${OUT}")
+    file(READ "${OUT}" old)
+endif()
+if (NOT old STREQUAL text)
+    file(WRITE "${OUT}" "${text}")
+endif()
+]==])
+add_custom_target(blocksmith_buildinfo ALL
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+            -DOUT=${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h -DCOMMIT=${BLOCKSMITH_COMMIT}
+            -P ${BLOCKSMITH_BUILDINFO_SCRIPT}
+    BYPRODUCTS ${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h
+    COMMENT "Stamping the git commit into BuildInfo.h"
+    VERBATIM)
+
 add_executable(BlockSmithServer
     ServerMain.cpp
+    Diagnostics.cpp
     ChunkGenerator.cpp
     Fluids.cpp
     World.cpp
@@ -254,7 +314,9 @@ if (WIN32)
     target_sources(BlockSmithServer PRIVATE BlockSmith.rc)   # same icon for the server .exe
 endif()
 
+add_dependencies(BlockSmithServer blocksmith_buildinfo)
 target_include_directories(BlockSmithServer PRIVATE
+    ${BLOCKSMITH_GENERATED_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
@@ -281,6 +343,41 @@ endif()
 # from GitHub and approved sites. Windows: WinHTTP (built in). Elsewhere: libcurl if installed;
 # without it the game still builds and remote.* says downloads aren't available.
 # ---------------------------------------------------------------------------
+# Debug info in release builds too, so traces and crash reports can be turned into file:line
+# (addr2line -e <program> <offset>, or a debugger). GCC / Clang: line tables only (-g1, small);
+# MSVC: a .pdb next to the .exe, which the Windows traces read by themselves. No effect on speed.
+option(BLOCKSMITH_DEBUG_INFO "Keep debug info (file and line numbers) in release builds" ON)
+if (BLOCKSMITH_DEBUG_INFO)
+    foreach(target BlockSmith BlockSmithServer)
+        if (TARGET ${target})
+            if (MSVC)
+                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Zi>)
+                target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+            else()
+                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-g1>)
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# Diagnostics.cpp: warning traces and crash reports name the functions on the stack. Linux /
+# macOS: export the program's symbols (and dladdr's library); Windows: DbgHelp.
+foreach(target BlockSmith BlockSmithServer)
+    if (TARGET ${target})
+        if (WIN32)
+            target_link_libraries(${target} PRIVATE dbghelp)
+        else()
+            set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+        endif()
+    endif()
+endforeach()
+
+if (TARGET BlockSmith)
+    add_dependencies(BlockSmith blocksmith_buildinfo)
+    target_include_directories(BlockSmith PRIVATE ${BLOCKSMITH_GENERATED_DIR})
+endif()
+
 if (WIN32)
     if (TARGET BlockSmith)
         target_link_libraries(BlockSmith PRIVATE winhttp)

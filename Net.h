@@ -34,6 +34,10 @@ namespace net {
 constexpr uint16_t kDefaultPort      = 30000;
 constexpr uint32_t kProtocolVersion  = 8;   // 7: the server decides each player's game mode
                                             // 8: passwords by per-server challenge-response (Auth.h)
+// The oldest server protocol this game can still play on. A newer game may join an older server
+// (it speaks the older protocol), never the other way round. Raise it when support for an old
+// protocol is dropped.
+constexpr uint32_t kMinProtocolVersion = 8;
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -216,6 +220,8 @@ public:
     std::string playerMode(const std::string& name) const;   // "" if not online
     bool setPlayerOperator(const std::string& name, bool op);
 
+    // The BlockSmith version a player joined with ("" = an older game that doesn't say)
+    std::string playerEngineVersion(const std::string& name) const;
     bool messagePlayer(const std::string& name, const std::string& text,
                        const glm::vec3& color = glm::vec3(1.0f, 1.0f, 0.4f));
     // The furthest any player may see, in chunks (they can choose less).
@@ -280,6 +286,7 @@ private:
         std::string nonce;
         std::string helloName;
         int helloView = 8;
+        std::string engineVersion;    // their BlockSmith ("5.17.0-dev"), "" from older games
         std::string mode;             // game mode the server gave them
         bool op = false;
         std::string name;
@@ -549,7 +556,9 @@ private:
 struct ServerStatus {
     enum class State { Pinging, Online, Offline } state = State::Pinging;
     std::string motd;
-    std::string version;         // the server's kVersionName
+    std::string version;         // the server's kVersionName (the protocol)
+    std::string engineVersion;   // the server's BlockSmith ("5.17.0-dev"), "" from older servers
+    std::string engineCommit;    // ...and its commit
     std::string game;            // game folder the server is playing
     std::string gameTitle;       // that game's title (from its game.conf), "" from older servers
     int players = 0, maxPlayers = 0;

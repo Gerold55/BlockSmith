@@ -71,6 +71,8 @@ public:
     void refresh();
     // refresh() if it has never run (so lookups work before the first update)
     void ensureFresh() { if (!m_refreshed) refresh(); }
+    // Back to plain water only: the mods are being loaded again
+    void reset();
 
     // The fluid a block belongs to (source or flowing block), or nullptr. Valid after refresh().
     const FluidDef* forBlock(uint8_t blockId) const {

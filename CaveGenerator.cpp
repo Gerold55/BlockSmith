@@ -454,6 +454,17 @@ void CaveGenerator::setSeed(uint32_t seed) { g_seed = seed; }
 void CaveGenerator::setEnabled(bool enabled) { g_enabled = enabled; }
 bool CaveGenerator::isEnabled() { return g_enabled; }
 void CaveGenerator::prepare() { classifyBlocks(); }
+void CaveGenerator::reset() {
+    {
+        std::lock_guard<std::mutex> lock(g_blocksMutex);
+        g_blocks = BlockClasses{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        g_settings = CaveSettings{};
+    }
+    g_enabled = true;
+}
 
 void CaveGenerator::setSettings(const CaveSettings& s) {
     std::lock_guard<std::mutex> lock(g_settingsMutex);

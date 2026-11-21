@@ -342,8 +342,16 @@ local function all_items()
     return all_cache
 end
 
+-- The name players see: the block's description ("Oak Log"), else one made from its name
+local pretty_cache = {}
 local function pretty(name)
-    return (name:gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
+    local cached = pretty_cache[name]
+    if cached then return cached end
+    local info = ui.get_block_info and ui.get_block_info(name)
+    local out = (info and info.description and info.description ~= "") and info.description
+                or (name:gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
+    pretty_cache[name] = out
+    return out
 end
 
 -- What's shown: the chosen category, or search results across everything
@@ -997,14 +1005,8 @@ function handle_creative_click(mx, my, W, H, button, shift)
         end
     end
 
-    -- Outside the window while carrying something: drop it into the world, like Minecraft (left
-    -- click: the whole stack, right click: one). An older engine without drop_item: thrown away.
-    if state.held and not inside(mx, my, L.x, L.y, L.w, L.h) then
-        local n = button == "right" and 1 or state.held.count
-        if engine.drop_item then engine.drop_item(state.held.name, n) end
-        state.held.count = state.held.count - n
-        if state.held.count <= 0 then state.held = nil end
-    end
+    -- Outside the window while carrying something: throw it away
+    if state.held and not inside(mx, my, L.x, L.y, L.w, L.h) then state.held = nil end
 end
 
 -- Mouse wheel: up = previous page, down = next (the last page is clamped while drawing)
