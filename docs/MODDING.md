@@ -1630,7 +1630,7 @@ mods/                           global mods: loaded with any game, can be switch
 texturepacks/
   MyPack/pack.conf              any image with the same file name replaces a game texture
 saves/<world>/                  worlds
-servers/<profile>/              dedicated server setups (made with My Servers)
+servers/<profile>/              dedicated server setups (engine.create_server_profile)
 ```
 
 **How a mod's files run:**
@@ -3269,91 +3269,108 @@ Define any of these as globals. Only the ones you need. If another mod may alrea
 
 ## 17. Multiplayer and servers
 
-**Shared values** let a mod decide something and have every player see it, the way the weather mod does:
-- <a id="fn-engine-set_shared"></a>`engine.set_shared(key, text)` sets a value. Only whoever runs the world can: singleplayer, the host, or the dedicated server.
-- <a id="fn-engine-get_shared"></a>`engine.get_shared(key)` reads one.
-- `on_shared_changed(key, value)` runs on every player's game when a value changes, and when they join.
-- <a id="fn-engine-is_authority"></a>`engine.is_authority()` tells your mod whether it's the one deciding.
+This chapter has two halves:
 
-On the dedicated server, `on_update(dt)` runs every tick. `/commands` the server doesn't know go to `on_chat_command(text, player, is_operator, reply)`, and `reply(text)` answers only that player. Commands added with `chat.register_command` show up in the server's `help`. When you host a LAN game, your guests' `/commands` reach `on_chat_command` too, with `is_operator` false.
+- **Running a server** ([17a](#17a-running-a-server) to [17f](#17f-logs-diagnostics-and-updates)): for whoever owns a server. Setting it up, the settings, everyday moderation, reports, and keeping it healthy. No Lua needed.
+- **Mods on a server** ([17g](#17g-mods-on-a-server)): for mod authors. What runs where, server events and functions, and the limits mods run under.
 
-### Server events
+A world can be played three ways, and mods run the same in all of them: **singleplayer**; **a LAN game** (open a world, press Esc, click Host Game; people on your network see it under Multiplayer > Local Network); and **the dedicated server**, `BlockSmithServer`, a program of its own with no window, for a server that stays up.
 
-These run wherever the world is: on the dedicated server, and in the game for singleplayer and when you host a LAN game. Chain them like any hook (`local previous = on_player_join`).
+### 17a. Running a server
 
-| event | when | return |
+**Quick start.**
+
+1. Put `BlockSmithServer` (`BlockSmithServer.exe` on Windows) next to the game's `games/` and `mods/` folders. It's built with the game, or on its own with `cmake --build build --config Release --target BlockSmithServer`.
+2. Run `BlockSmithServer --setup` and answer the questions (name, game, world, port, max players...). Or just start it: it writes a `server.conf` with the defaults, which you can edit.
+3. Start it: `BlockSmithServer`. It says `'My Server' is listening on port 30000`, and anything you type in its window is a [server command](#17c-server-commands) (no `/` needed).
+4. Join from the game: Multiplayer > + Add Server, with the address (`localhost` on the same PC; otherwise its IP, plus `:port` if it isn't 30000). Players outside your network need port 30000 (UDP) forwarded on the router.
+5. Make yourself the boss: type `op <your name>` in the server window. From then on you can use every command in chat too, with `/` in front.
+
+Command-line options: `--setup`, `--config <file>` (another settings file), `--game <folder>`, `--world <name>`, `--port <number>` (these three override `server.conf` for one run), `--list-games`, `--version`.
+
+**The server's files**, all next to `server.conf` unless it says otherwise. They're plain text: you can read and edit them with any editor (edit the lists while the server is stopped, or type `reload` after).
+
+| file | what's in it | changed by |
 |---|---|---|
-| <a id="fn-hooks-on_player_join"></a>`on_player_join(name, info)` | someone joined. `info.operator`, `info.mode` (`"survival"`/`"creative"`), `info.new_account` (they just protected their name with a password) | |
-| <a id="fn-hooks-on_player_leave"></a>`on_player_leave(name, x, y, z)` | someone left (or was kicked), and where they were | |
-| <a id="fn-hooks-on_player_chat"></a>`on_player_chat(name, text)` | a chat line, **before** anyone sees it | `false` drops it; a string replaces it; nothing lets it through |
-| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` | a player is about to change a block: break or place one, or change only its metadata (opening a door, filling a tank). It is also asked for changes a mod makes for them with `engine.player_set_block`. `old_meta` is what is stored now and `new_meta` what they ask for (0..255). | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
-| `on_player_harvest(name, item, x, y, z)` | a joined player asked to use `item` on that block ([`engine.request_harvest`](#fn-engine-request_harvest); the scythe) | |
-| <a id="fn-hooks-on_server_start"></a>`on_server_start()` | the dedicated server is ready for players (in the game: you started hosting) | |
-| <a id="fn-hooks-on_server_stop"></a>`on_server_stop()` | the server is stopping, before the world is saved (in the game: you stopped hosting) | |
+| `server.conf` | all the settings (below) | you; `motd`, `name`, `setworldspawn` |
+| `ops.txt` | operators, `Name \| level` | `op`, `deop` |
+| `whitelist.txt` | who may join while `whitelist = true` | `whitelist add/remove` |
+| `banned.txt`, `banned-ips.txt` | banned names and addresses, with the reason | `ban`, `unban`, `ban-ip`, `pardon-ip` |
+| `accounts.txt` | names protected by a player's password (only a hash) | players joining with a password; `password reset` |
+| `gamemodes.txt` | players given another game mode | `gamemode` |
+| `reports.txt` | player reports ([17d](#17d-player-reports)) | `/report`, `reports close/reopen/delete` |
+| `server_icon.png` | the icon in the server list (64×64 PNG, up to 64 KB) | you |
+| `logs/latest.log` | everything the server printed, with times; older logs and `crash-*.txt` beside it | the server |
+| `saves/<world>/` | the world: chunks, `players/`, `gamerules.txt`, `spawnpoints.txt`, `mod_storage.txt` | the server |
 
-`on_block_broken` and `on_block_placed` also get the player's name, as their last argument.
+**Settings** (`server.conf`, `key = value`, `#` starts a comment). Change them while it runs by editing the file and typing `reload`; `game`, `world`, `seed` and `port` need a restart.
 
-`can_edit_block` checks players on a server and LAN guests. Your own edits in singleplayer, or as the host, aren't checked. Nothing the player's game does can skip it: the server asks it before changing anything.
+| setting | default | |
+|---|---|---|
+| **In the server list** | | |
+| `name` | BlockSmith Server | the server's name |
+| `motd` | (a gold title) | the description under it: `{gold}`, `{red}`, `{#ff8800}`... colours, `{b}bold{/b}`, `{n}` second line. Also the `motd <text>` command |
+| `icon` | server_icon.png | the icon file |
+| **What runs** | | |
+| `game` | craft_and_ruin | the game (a folder in `games/`; `games` lists them). Players need it too |
+| `world` | world | the world folder in `saves/` (made if it doesn't exist) |
+| `seed` | (random) | the seed for a new world |
+| `port` | 30000 | the UDP port |
+| `disabled_mods` | | mods not to load (comma separated); players need the same mods as the server |
+| **Players** | | |
+| `max_players` | 20 | |
+| `view_distance` | 8 | how far players may see, in chunks (2 to 10); lower is less work |
+| `spawn` | 8 8 | where new players appear (x z) |
+| `welcome` | (a gold welcome) | said to each player who joins; `{player}` is their name |
+| `gamemode` | survival | survival or creative, for everyone not given another |
+| `whitelist` | false | only `whitelist.txt` may join |
+| `require_password` | false | players must set a password (Settings > Player) to join. Recommended for public servers |
+| `spawn_protection` | 16 | blocks around spawn only operators may change (0 = off; off while there are no operators) |
+| `op_level` | 4 | the level `op <name>` gives when no level is said ([levels](#17c-server-commands)) |
+| **Players' client mods** | | |
+| `client_mods` | true | may players run their own client mods here ([§20](#20-client-mods)) |
+| `client_mods_chat` | false | may those send chat and commands for the player |
+| `client_mods_players` | true | may they see other players' names and positions |
+| `client_mods_block_range` | 64 | how far from the player they may read blocks (0 = any distance) |
+| **Performance and time** | | |
+| `tick_rate` | 30 | updates a second (20 to 60) |
+| `generator_threads` | 0 | threads making new terrain (0 = CPU cores - 1) |
+| `autosave_seconds` | 60 | |
+| `day_length` | 20 | minutes in a whole day |
+| `lua_time_limit` | 5 | seconds one mod event may run before it's stopped (0 = no limit) |
+| **Online content and updates** | | |
+| `remote_content` | true | may mods download data (never code) ([§21](#21-online-content)) |
+| `remote_domains` | | sites approved besides GitHub |
+| `update_check` | true | look for a newer BlockSmith ([17f](#17f-logs-diagnostics-and-updates)) |
+| `update_url` | (the BlockSmith repo) | where its version file is |
 
-```lua
--- Spawn protection: only operators may build within 24 blocks of 0, 0
-local previous = can_edit_block
-function can_edit_block(player, x, y, z, old, new)
-    if previous and previous(player, x, y, z, old, new) == false then return false end
-    if math.abs(x) < 24 and math.abs(z) < 24 and not engine.is_player_operator(player) then
-        return false, "Spawn is protected"
-    end
-end
+### 17b. Everyday moderation
 
--- Welcome message and a simple word filter
-local previous_join = on_player_join
-function on_player_join(name, info)
-    if previous_join then previous_join(name, info) end
-    engine.message_player(name, "Welcome, " .. name .. "!", 1, 0.85, 0.3)
-end
+What you'll do most, and the command for it. Type them in the server window, or in chat with `/` in front as an operator.
 
-local previous_chat = on_player_chat
-function on_player_chat(name, text)
-    if previous_chat then
-        local r = previous_chat(name, text)
-        if r == false then return false end
-        if type(r) == "string" then text = r end
-    end
-    return (text:gsub("[Bb]adword", "****"))
-end
-```
-
-### Server functions
-
-| function | |
+| to... | type |
 |---|---|
-| <a id="fn-engine-get_online_players"></a>`engine.get_online_players()` | `{ { name, x, y, z, mode, operator }, ... }`: everyone in the world. In singleplayer that's you; as a LAN host, you and your guests. |
-| <a id="fn-engine-get_player_info"></a>`engine.get_player_info(name)` | that table for one player, or `nil` if they're not online |
-| <a id="fn-engine-message_player"></a>`engine.message_player(name, text [, r, g, b])` | a chat line only they see (colour 0..1 or 0..255). True if they're online. |
-| <a id="fn-engine-kick_player"></a>`engine.kick_player(name [, reason])` | disconnects them (right after the current event, never in the middle of it). True if they're online. |
-| <a id="fn-engine-teleport_player"></a>`engine.teleport_player(name, x, y, z)` | moves them |
-| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block [, meta])` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). It also returns false, with no reason, when the block and metadata are already exactly what was asked for: nothing changed. Use it for anything a player earns from a change, and give the reward only on true. |
-| <a id="fn-engine-set_player_mode"></a><a id="fn-engine-get_player_mode"></a>`engine.set_player_mode(name, "survival"\|"creative")`, `engine.get_player_mode(name)` | their game mode. On the dedicated server, a change is remembered in `gamemodes.txt`. |
-| <a id="fn-engine-is_player_operator"></a>`engine.is_player_operator(name)` | is that player an operator? (LAN guests never are; you are, in your own world) |
-| <a id="fn-engine-get_server_info"></a>`engine.get_server_info()` | `{ dedicated, running, online, game, max_players, name, world, ... }` |
-| `engine.get_storage(key)`, `engine.set_storage(key, value)` | on the dedicated server too: saved in the world's `mod_storage.txt`, with the world |
+| make someone an operator (or limit what they may do) | `op Alex`, `op Alex 3` (levels below); `deop Alex` |
+| see who's online | `list` |
+| warn someone privately | `msg Alex please stop` |
+| send someone away / keep them away | `kick Alex spamming`; `ban Alex griefing`, `unban Alex`; `ban-ip Alex` |
+| only let friends in | `whitelist on`, `whitelist add Alex`, `whitelist list` |
+| read and handle player reports | `reports`, `reports show 3`, `reports close 3 warned them` ([17d](#17d-player-reports)) |
+| change someone's game mode | `gamemode creative Alex` |
+| bring someone to you, or go to them | `tp Alex @s`, `tp Alex` |
+| fix someone's inventory or rescue them | `give Alex torch 16`, `clear Alex`, `kill Alex` |
+| set the time or the rules | `time set day`, `gamerule keepInventory true` |
+| move the spawn | `setworldspawn` (where you stand) |
+| change the description in the list | `motd {gold}Season 2 is live!` |
+| someone forgot their password | `password reset Alex` |
+| save, reload the lists, stop | `save`, `reload`, `stop` |
+| is everything all right? | `tps`, `diag` |
 
-### Server safety
+**Protecting the spawn.** `spawn_protection = 16` (the default): blocks within 16 of the spawn can only be changed by operators (level 1 or more). It only works once there's an operator, as in Minecraft.
 
-- **Mods can't freeze the server.** If one call into a mod (`on_update`, an event, a command) runs longer than `lua_time_limit` seconds (default 5, set in `server.conf`; 0 = no limit), it's stopped with an error and the server carries on. In the game the limit is 5 seconds for the events above.
-- **Errors aren't spammed.** A mod error that repeats every tick is printed once, until the message changes.
-- **Chat and command flooding is limited.** Each player gets a burst of 6 messages, then one every 0.75 s. More are dropped with a "slow down" warning, and 25 dropped in a row gets them kicked.
-- **Clean chat.** Control characters are removed from chat and commands, so nobody can fake extra lines.
-- **What mods can read** is limited to the mods, games and `lualib/` folders, and they can't load native code. See [Lua modules: require](#lua-modules-require).
+**Protecting names.** A player who joins with a password (Settings > Player) owns that name on your server: nobody can use it without the password. `require_password = true` makes everyone do it. Passwords never leave the player's PC: the server keeps a per-server proof, not the password.
 
-Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated `BlockSmithServer`. Blocks are sent to players by **name**, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.
-
-- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there.
-- **Server setup:** run `BlockSmithServer --setup` once, or use My Servers in the game.
-- **Settings:** in `server.conf` (name, description and colours, icon, game, world, port, max players, whitelist, passwords, disabled mods, tick rate, world generation threads, `lua_time_limit`, `day_length`, `spawn_protection`, `op_level`).
-- **Operator commands:** `/op`, `/gamemode`, `/tp`, `/give`, `/time`, `/gamerule`, `/kick`, `/ban`, `/whitelist`, `/save`, `/stop` and more: see [Server commands](#server-commands). `day_length` in `server.conf` sets how many minutes a day lasts (20 by default). Type `help` in the server console. The console completes with **Tab**: commands, then their arguments (online players and known names for `kick`, `ban`, `op` and `msg`, banned names for `unban`, `on/off/add/remove` for `whitelist`, `survival/creative` for `gamemode`, mod ids for `mods enable/disable`, and mods' own commands). Press Tab twice to list the choices. **Up/Down** bring back earlier commands, and what the server prints appears above the line you're typing.
-
-### Server commands
+### 17c. Server commands
 
 Commands work like Minecraft's: typed in the server console (no slash), or in chat by players with `/` in front.
 
@@ -3407,11 +3424,9 @@ The survival mod follows them. Your mods can too: a rule's value is the shared v
 
 <a id="fn-hooks-on_server_action"></a>**`give`, `clear` and `kill` happen in the player's game**, where inventories and health live: the server asks, and the game does it. A mod can do these its own way with `on_server_action(action, a, b)`, returning `true` when it has. `action` is `"give"` (`a` = item, `b` = count), `"clear"` or `"kill"` (`a` = the reason shown on the death screen). The survival mod uses it to kill with its death screen and to clear its inventory too. Chain it like other hooks.
 
-**Spawn protection.** `spawn_protection = 16` in `server.conf`: blocks within that many blocks of the world's spawn can only be changed by operators (0 = off). As in Minecraft, it's off while there are no operators.
+### 17d. Player reports
 
-**The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
-
-**Player reports.** Anyone can type `/report <player> <reason>` in chat (or `report` in the console). The report is saved in `reports.txt` next to `server.conf`, so the owner can read it later, whether or not they were online when it happened. Each report keeps:
+Anyone can type `/report <player> <reason>` in chat (or `report` in the console). The report is saved in `reports.txt` next to `server.conf`, so the owner can read it later, whether or not they were online when it happened. Each report keeps:
 
 - who reported whom, when, and why;
 - where both players were (or that the reported player was offline);
@@ -3432,9 +3447,25 @@ reports delete 2              (level 4 / the console)
 
 New reports show in the console straight away and go to the operators online (level 3+). Operators who join later are told how many are open, and the console says so when the server starts. Mods get `on_player_report(id, reporter, reported, reason)`.
 
-**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 5.17.0) is older than this server (BlockSmith 5.18.0). An update is available..."). Builds of the same release play together (`5.18.0-dev` counts as 5.18.0). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (5.17.0): you can still join").
+### 17e. Game modes and permissions
 
-**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 5.17.0-dev (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+
+On a server, **the server decides each player's game mode**, and only its admins can change it. A player who joins a survival server can't put themselves in creative.
+
+- **Dedicated server:** `gamemode = survival` (or `creative`) in `server.conf` is the mode everyone starts in. Operators change a player's mode with `/gamemode survival|creative [name]`, and it's remembered in `gamemodes.txt`. Anyone can type `/gamemode` on its own to see their mode.
+- **LAN game:** players who join get the host world's mode. Only the host can change it, with `/gamemode survival|creative <player>`.
+- **Locked in the engine:** while you're on a server, `engine.set_creative` refuses anything but the mode the server gave you (it returns `false`), so no mod can switch you either.
+- **Checked by the server:** outside creative, the server won't let a player break blocks that can't be dug (bedrock, `hardness = -1`), even with a modified game.
+
+For mods:
+- <a id="fn-engine-get_server_game_mode"></a>`engine.get_server_game_mode()` returns `"survival"` or `"creative"` (the mode the server gave you), or `nil` when you're not on a server.
+- <a id="fn-engine-is_operator"></a>`engine.is_operator()` is true in singleplayer and when hosting. On a server, it says whether you're one of its operators, for example to show admin buttons.
+- <a id="fn-hooks-on_game_mode"></a>`on_game_mode(mode, is_operator)` runs when the server sets your mode: when you join, and when an operator changes it. `mode` is `nil` after you leave the server. The survival mod uses this to follow the server.
+- `on_chat_command`'s `is_operator` is your real operator status on a server, so mods can keep their own commands for admins.
+
+### 17f. Logs, diagnostics and updates
+
+**The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
 
 **Diagnostics (the game and the server).** Both write everything they print to `logs/latest.log` (next to `server.conf`, or next to the game's `settings.txt`), with the time on each line; the previous log is kept as `logs/<date>-<n>.log`. To find what went wrong:
 
@@ -3452,6 +3483,10 @@ New reports show in the console straight away and go to the operators online (le
 ```
 
 Stack frames name the function where the platform can; every frame also gives its module and offset. `addr2line -f -C -i -e BlockSmithServer 0x8118f` (Linux / macOS) turns an offset into the function, file and line; on Windows the `.pdb` next to the `.exe` is read by the traces themselves. Release builds keep line tables for this (`-DBLOCKSMITH_DEBUG_INFO=OFF` leaves them out).
+
+**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 5.17.0-dev (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+
+**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 5.17.0) is older than this server (BlockSmith 5.18.0). An update is available..."). Builds of the same release play together (`5.18.0-dev` counts as 5.18.0). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (5.17.0): you can still join").
 
 **New versions.** The game and the server check now and then (at start, then every 6 hours) whether a newer BlockSmith is out. They read one small JSON file, `version.json`, as data, like any remote content (HTTPS, whitelisted hosts, checked to really be JSON); nothing is ever downloaded or installed for you.
 
@@ -3490,22 +3525,91 @@ Older games and servers that don't send their version still work together as bef
 
 Settings: `update_check = false` turns it off, `update_url = <address>` reads another file (it must be allowed like any remote content: GitHub or a domain in `remote_domains`). Both go in `settings.txt` for the game and `server.conf` for a server. The default is `https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json`: publish a new version by changing that file. Mods can read the answer with `engine.get_update_info()` -> `{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }`.
 
-### Game modes and permissions
+### 17g. Mods on a server
 
-On a server, **the server decides each player's game mode**, and only its admins can change it. A player who joins a survival server can't put themselves in creative.
+Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated `BlockSmithServer`. Blocks are sent to players by **name**, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.
 
-- **Dedicated server:** `gamemode = survival` (or `creative`) in `server.conf`, or Game mode on the My Servers settings page, is the mode everyone starts in. Operators change a player's mode with `/gamemode survival|creative [name]`, and it's remembered in `gamemodes.txt`. Anyone can type `/gamemode` on its own to see their mode.
-- **LAN game:** players who join get the host world's mode. Only the host can change it, with `/gamemode survival|creative <player>`.
-- **Locked in the engine:** while you're on a server, `engine.set_creative` refuses anything but the mode the server gave you (it returns `false`), so no mod can switch you either.
-- **Checked by the server:** outside creative, the server won't let a player break blocks that can't be dug (bedrock, `hardness = -1`), even with a modified game.
+- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there.
 
-For mods:
-- <a id="fn-engine-get_server_game_mode"></a>`engine.get_server_game_mode()` returns `"survival"` or `"creative"` (the mode the server gave you), or `nil` when you're not on a server.
-- <a id="fn-engine-is_operator"></a>`engine.is_operator()` is true in singleplayer and when hosting. On a server, it says whether you're one of its operators, for example to show admin buttons.
-- <a id="fn-hooks-on_game_mode"></a>`on_game_mode(mode, is_operator)` runs when the server sets your mode: when you join, and when an operator changes it. `mode` is `nil` after you leave the server. The survival mod uses this to follow the server.
-- `on_chat_command`'s `is_operator` is your real operator status on a server, so mods can keep their own commands for admins.
+**Shared values** let a mod decide something and have every player see it, the way the weather mod does:
+- <a id="fn-engine-set_shared"></a>`engine.set_shared(key, text)` sets a value. Only whoever runs the world can: singleplayer, the host, or the dedicated server.
+- <a id="fn-engine-get_shared"></a>`engine.get_shared(key)` reads one.
+- `on_shared_changed(key, value)` runs on every player's game when a value changes, and when they join.
+- <a id="fn-engine-is_authority"></a>`engine.is_authority()` tells your mod whether it's the one deciding.
 
-Lua functions for multiplayer menus:
+On the dedicated server, `on_update(dt)` runs every tick. `/commands` the server doesn't know go to `on_chat_command(text, player, is_operator, reply)`, and `reply(text)` answers only that player. Commands added with `chat.register_command` show up in the server's `help`. When you host a LAN game, your guests' `/commands` reach `on_chat_command` too, with `is_operator` false.
+
+#### Server events
+
+These run wherever the world is: on the dedicated server, and in the game for singleplayer and when you host a LAN game. Chain them like any hook (`local previous = on_player_join`).
+
+| event | when | return |
+|---|---|---|
+| <a id="fn-hooks-on_player_join"></a>`on_player_join(name, info)` | someone joined. `info.operator`, `info.mode` (`"survival"`/`"creative"`), `info.new_account` (they just protected their name with a password) | |
+| <a id="fn-hooks-on_player_leave"></a>`on_player_leave(name, x, y, z)` | someone left (or was kicked), and where they were | |
+| <a id="fn-hooks-on_player_chat"></a>`on_player_chat(name, text)` | a chat line, **before** anyone sees it | `false` drops it; a string replaces it; nothing lets it through |
+| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` | a player is about to change a block: break or place one, or change only its metadata (opening a door, filling a tank). It is also asked for changes a mod makes for them with `engine.player_set_block`. `old_meta` is what is stored now and `new_meta` what they ask for (0..255). | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
+| `on_player_harvest(name, item, x, y, z)` | a joined player asked to use `item` on that block ([`engine.request_harvest`](#fn-engine-request_harvest); the scythe) | |
+| <a id="fn-hooks-on_server_start"></a>`on_server_start()` | the dedicated server is ready for players (in the game: you started hosting) | |
+| <a id="fn-hooks-on_server_stop"></a>`on_server_stop()` | the server is stopping, before the world is saved (in the game: you stopped hosting) | |
+
+`on_block_broken` and `on_block_placed` also get the player's name, as their last argument.
+
+`can_edit_block` checks players on a server and LAN guests. Your own edits in singleplayer, or as the host, aren't checked. Nothing the player's game does can skip it: the server asks it before changing anything.
+
+```lua
+-- Spawn protection: only operators may build within 24 blocks of 0, 0
+local previous = can_edit_block
+function can_edit_block(player, x, y, z, old, new)
+    if previous and previous(player, x, y, z, old, new) == false then return false end
+    if math.abs(x) < 24 and math.abs(z) < 24 and not engine.is_player_operator(player) then
+        return false, "Spawn is protected"
+    end
+end
+
+-- Welcome message and a simple word filter
+local previous_join = on_player_join
+function on_player_join(name, info)
+    if previous_join then previous_join(name, info) end
+    engine.message_player(name, "Welcome, " .. name .. "!", 1, 0.85, 0.3)
+end
+
+local previous_chat = on_player_chat
+function on_player_chat(name, text)
+    if previous_chat then
+        local r = previous_chat(name, text)
+        if r == false then return false end
+        if type(r) == "string" then text = r end
+    end
+    return (text:gsub("[Bb]adword", "****"))
+end
+```
+
+#### Server functions
+
+| function | |
+|---|---|
+| <a id="fn-engine-get_online_players"></a>`engine.get_online_players()` | `{ { name, x, y, z, mode, operator }, ... }`: everyone in the world. In singleplayer that's you; as a LAN host, you and your guests. |
+| <a id="fn-engine-get_player_info"></a>`engine.get_player_info(name)` | that table for one player, or `nil` if they're not online |
+| <a id="fn-engine-message_player"></a>`engine.message_player(name, text [, r, g, b])` | a chat line only they see (colour 0..1 or 0..255). True if they're online. |
+| <a id="fn-engine-kick_player"></a>`engine.kick_player(name [, reason])` | disconnects them (right after the current event, never in the middle of it). True if they're online. |
+| <a id="fn-engine-teleport_player"></a>`engine.teleport_player(name, x, y, z)` | moves them |
+| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block [, meta])` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). It also returns false, with no reason, when the block and metadata are already exactly what was asked for: nothing changed. Use it for anything a player earns from a change, and give the reward only on true. |
+| <a id="fn-engine-set_player_mode"></a><a id="fn-engine-get_player_mode"></a>`engine.set_player_mode(name, "survival"\|"creative")`, `engine.get_player_mode(name)` | their game mode. On the dedicated server, a change is remembered in `gamemodes.txt`. |
+| <a id="fn-engine-is_player_operator"></a>`engine.is_player_operator(name)` | is that player an operator? (LAN guests never are; you are, in your own world) |
+| <a id="fn-engine-get_server_info"></a>`engine.get_server_info()` | `{ dedicated, running, online, game, max_players, name, world, ... }` |
+| `engine.get_storage(key)`, `engine.set_storage(key, value)` | on the dedicated server too: saved in the world's `mod_storage.txt`, with the world |
+
+#### Server safety
+
+- **Mods can't freeze the server.** If one call into a mod (`on_update`, an event, a command) runs longer than `lua_time_limit` seconds (default 5, set in `server.conf`; 0 = no limit), it's stopped with an error and the server carries on. In the game the limit is 5 seconds for the events above.
+- **Errors aren't spammed.** A mod error that repeats every tick is printed once, until the message changes.
+- **Chat and command flooding is limited.** Each player gets a burst of 6 messages, then one every 0.75 s. More are dropped with a "slow down" warning, and 25 dropped in a row gets them kicked.
+- **Clean chat.** Control characters are removed from chat and commands, so nobody can fake extra lines.
+- **What mods can read** is limited to the mods, games and `lualib/` folders, and they can't load native code. See [Lua modules: require](#lua-modules-require).
+
+#### Functions for multiplayer menus
+
 - <a id="fn-engine-host_game"></a><a id="fn-engine-join_server"></a><a id="fn-engine-stop_hosting"></a>`engine.join_server`, `host_game`, `stop_hosting`
 - <a id="fn-engine-get_connection_status"></a><a id="fn-engine-get_network_info"></a><a id="fn-engine-get_player_list"></a>`engine.get_connection_status`, `get_network_info`, `get_player_list`
 - <a id="fn-engine-get_lan_games"></a><a id="fn-engine-get_server_status"></a><a id="fn-engine-ping_server"></a>`engine.ping_server`, `get_server_status`, `get_lan_games`
@@ -3568,7 +3672,7 @@ A game styles the title screen with files in its `menu/` folder (`games/<game>/m
 
 **No picture?** The engine looks for the game's `menu/button.png`, then `mods/base/menu/button.png` (shared by every game), and otherwise draws its own built-in button. So buttons always look like buttons, even with no texture files at all.
 
-**Every menu uses it:** the pause menu, Settings, Singleplayer, Multiplayer, My Servers, Mods and Texture Packs draw their buttons with the same picture, so they all match the title screen. Disabled buttons are darker, Delete buttons are tinted red, and the open tab uses the hover look.
+**Every menu uses it:** the pause menu, Settings, Singleplayer, Multiplayer, Mods and Texture Packs draw their buttons with the same picture, so they all match the title screen. Disabled buttons are darker, Delete buttons are tinted red, and the open tab uses the hover look.
 
 <a id="fn-ui-draw_button"></a><a id="fn-ui-get_button_text_color"></a>Your own screens can do the same:
 ```lua

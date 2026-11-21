@@ -237,10 +237,54 @@ endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
 # ---------------------------------------------------------------------------
 set(BLOCKSMITH_COMMIT "" CACHE STRING "Commit hash to stamp into the build (empty: ask git)")
 set(BLOCKSMITH_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The stamping script is written into the build folder from here, so nothing outside this file is
+# needed. It runs on every build (so the hash is never stale) and only rewrites BuildInfo.h when
+# the commit changed (so nothing recompiles needlessly). No git, or not a git checkout: "unknown".
+#   cmake -DSRC=<source dir> -DOUT=<header> [-DCOMMIT=<hash>] -P BuildInfo.cmake
+set(BLOCKSMITH_BUILDINFO_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/BuildInfo.cmake")
+file(WRITE "${BLOCKSMITH_BUILDINFO_SCRIPT}" [==[
+set(commit "${COMMIT}")
+if (commit STREQUAL "" AND DEFINED ENV{BLOCKSMITH_COMMIT})
+    set(commit "$ENV{BLOCKSMITH_COMMIT}")
+endif()
+set(dirty "")
+if (commit STREQUAL "")
+    find_package(Git QUIET)
+    if (GIT_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short=10 HEAD
+                        WORKING_DIRECTORY "${SRC}" OUTPUT_VARIABLE commit
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE rc)
+        if (NOT rc EQUAL 0)
+            set(commit "")
+        else()
+            # uncommitted changes in tracked files: "-dirty"
+            execute_process(COMMAND "${GIT_EXECUTABLE}" diff --quiet HEAD --
+                            WORKING_DIRECTORY "${SRC}" RESULT_VARIABLE drc ERROR_QUIET)
+            if (drc EQUAL 1)
+                set(dirty "-dirty")
+            endif()
+        endif()
+    endif()
+endif()
+if (commit STREQUAL "")
+    set(commit "unknown")
+endif()
+# Only letters, digits, '-' and '.' go into the header
+string(REGEX REPLACE "[^A-Za-z0-9.-]" "" commit "${commit}")
+
+set(text "// Generated on each build (CMakeLists.txt: blocksmith_buildinfo) - don't edit.\n#pragma once\n#define BLOCKSMITH_COMMIT \"${commit}${dirty}\"\n")
+set(old "")
+if (EXISTS "${OUT}")
+    file(READ "${OUT}" old)
+endif()
+if (NOT old STREQUAL text)
+    file(WRITE "${OUT}" "${text}")
+endif()
+]==])
 add_custom_target(blocksmith_buildinfo ALL
     COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
             -DOUT=${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h -DCOMMIT=${BLOCKSMITH_COMMIT}
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildInfo.cmake
+            -P ${BLOCKSMITH_BUILDINFO_SCRIPT}
     BYPRODUCTS ${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h
     COMMENT "Stamping the git commit into BuildInfo.h"
     VERBATIM)
