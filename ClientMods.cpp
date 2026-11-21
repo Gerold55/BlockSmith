@@ -1,5 +1,6 @@
 // Client mods: see ClientMods.h
 #include "ClientMods.h"
+#include "Diagnostics.h"
 #include "ModOrder.h"
 #include "SafeReplace.h"
 
@@ -255,6 +256,7 @@ void ClientMods::init(sol::state& gameLua, const std::string& folder) {
     sol::state& L = *m_lua;
     L.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table, sol::lib::math,
                      sol::lib::utf8, sol::lib::os);
+    diag::installLuaTraceback(L.lua_state());   // client mods' errors: with their Lua stack
 
     L["print"] = [](sol::variadic_args va, sol::this_state ts) {
         sol::state_view lv(ts);

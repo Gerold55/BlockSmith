@@ -16,6 +16,9 @@
 //   BlockSmithServer --list-games
 
 #include "World.h"
+#include "Version.h"
+#include "UpdateCheck.h"
+#include "Diagnostics.h"
 #include "ChunkData.h"
 #include "CaveGenerator.h"
 #include "CaveLua.h"
@@ -225,6 +228,8 @@ struct ServerConfig {
     double luaTimeLimit = 5.0;   // seconds one mod event may run before it's stopped (0 = no limit)
     bool remoteContent = true;   // mods may download data (JSON, text, pictures, sounds) - never code
     std::vector<std::string> remoteDomains;   // approved besides GitHub
+    bool updateCheck = true;                  // look for a newer BlockSmith now and then (data only)
+    std::string updateUrl = update::kDefaultUrl;
     ClientModRules clientMods;   // what players' own client mods may do here
 };
 
@@ -312,7 +317,13 @@ void writeDefaultConfig(const fs::path& file, const ServerConfig& c) {
         << "# (raw files, GitHub Pages) - never code. Each mod lists its sources in its mod.conf.\n"
         << "remote_content = " << (c.remoteContent ? "true" : "false") << "\n"
         << "# Other sites mods may download from (comma separated, e.g. example.com, *.mysite.org)\n"
-        << "remote_domains = \n";
+        << "remote_domains = \n"
+        << "\n"
+        << "# --- Updates ---\n"
+        << "# Check now and then whether a newer BlockSmith is out (only a small version file is read;\n"
+        << "# nothing is downloaded or installed - the console says where to get it)\n"
+        << "update_check = " << (c.updateCheck ? "true" : "false") << "\n"
+        << "update_url = " << c.updateUrl << "\n";
 }
 
 ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
@@ -369,6 +380,8 @@ ServerConfig parseConfig(const std::map<std::string, std::string>& kvIn) {
     };
     if (double v = 0.0; finiteNumber("day_length", v)) c.dayLengthMinutes = std::clamp(v, 0.5, 100000.0);
     if (kv.count("remote_content")) c.remoteContent = toBool(kv["remote_content"], c.remoteContent);
+    if (kv.count("update_check")) c.updateCheck = toBool(kv["update_check"], c.updateCheck);
+    if (kv.count("update_url") && !kv["update_url"].empty()) c.updateUrl = kv["update_url"];
     {
         std::istringstream doms(kv["remote_domains"]);
         std::string d;
@@ -763,7 +776,7 @@ CompletionData g_Completion;
 
 // The console's commands, in the order 'help' shows them (respawn is the game's own)
 const std::vector<std::string> kConsoleCommands = {
-    "stop", "save", "save-all", "save-on", "save-off", "reload", "tps", "seed", "games", "mods", "motd", "name",
+    "stop", "save", "save-all", "save-on", "save-off", "reload", "tps", "seed", "version", "diag", "report", "reports", "games", "mods", "motd", "name",
     "list", "say", "me", "msg", "tell", "kick", "ban", "unban", "pardon", "ban-ip", "pardon-ip", "banlist",
     "whitelist", "op", "deop", "ops", "password", "gamemode", "gm", "time", "gamerule", "tp", "teleport",
     "give", "clear", "kill", "setworldspawn", "spawnpoint", "help"};
@@ -793,74 +806,8 @@ const GameRuleDef* findGameRule(const std::string& name) {
 }
 
 // logs/latest.log next to server.conf: everything the console shows, each line with the time.
-// The previous log is kept as logs/<date>-<n>.log.
-class LogTee : public std::streambuf {
-public:
-    LogTee(std::streambuf* console, std::ofstream* file) : m_console(console), m_file(file) {}
-protected:
-    int overflow(int ch) override {
-        if (ch == traits_type::eof()) return traits_type::not_eof(ch);
-        const char c = static_cast<char>(ch);
-        xsputn(&c, 1);
-        return ch;
-    }
-    std::streamsize xsputn(const char* s, std::streamsize n) override {
-        m_console->sputn(s, n);
-        std::lock_guard<std::mutex> lock(mutex());
-        for (std::streamsize i = 0; i < n; ++i) {
-            if (m_atLineStart) { (*m_file) << stamp(); m_atLineStart = false; }
-            m_file->put(s[i]);
-            if (s[i] == '\n') { m_atLineStart = true; m_file->flush(); }
-        }
-        return n;
-    }
-    int sync() override { m_console->pubsync(); return 0; }
-private:
-    static std::mutex& mutex() { static std::mutex m; return m; }
-    static std::string stamp() {
-        const std::time_t t = std::time(nullptr);
-        std::tm tmv{};
-#ifdef _WIN32
-        localtime_s(&tmv, &t);
-#else
-        localtime_r(&t, &tmv);
-#endif
-        char buf[16];
-        std::strftime(buf, sizeof(buf), "[%H:%M:%S] ", &tmv);
-        return buf;
-    }
-    std::streambuf* m_console;
-    std::ofstream* m_file;
-    bool m_atLineStart = true;
-};
-
-void startLogFile(const fs::path& dir) {
-    std::error_code ec;
-    const fs::path logs = dir / "logs";
-    fs::create_directories(logs, ec);
-    const fs::path latest = logs / "latest.log";
-    if (fs::exists(latest, ec)) {                      // keep the last one: logs/2026-11-19-1.log ...
-        const std::time_t t = std::time(nullptr);
-        std::tm tmv{};
-#ifdef _WIN32
-        localtime_s(&tmv, &t);
-#else
-        localtime_r(&t, &tmv);
-#endif
-        char day[16];
-        std::strftime(day, sizeof(day), "%Y-%m-%d", &tmv);
-        for (int n = 1; n < 1000; ++n) {
-            const fs::path old = logs / (std::string(day) + "-" + std::to_string(n) + ".log");
-            if (!fs::exists(old, ec)) { fs::rename(latest, old, ec); break; }
-        }
-    }
-    static std::ofstream file(latest, std::ios::trunc);
-    if (!file) { std::cerr << "[Server] Could not write " << latest.string() << std::endl; return; }
-    static LogTee outTee(std::cout.rdbuf(), &file);
-    static LogTee errTee(std::cerr.rdbuf(), &file);
-    std::cout.rdbuf(&outTee);
-    std::cerr.rdbuf(&errTee);
-}
+// The previous log is kept as logs/<date>-<n>.log. (Diagnostics.h: shared with the game.)
+void startLogFile(const fs::path& dir) { diag::startLogFile(dir); }
 
 // What Tab offers: `before` are the words before the one being typed
 std::vector<std::string> completeConsole(const std::vector<std::string>& before, const std::string&) {
@@ -894,7 +841,8 @@ std::vector<std::string> completeConsole(const std::vector<std::string>& before,
         if (cmd == "ban-ip") return d.players;
         if (cmd == "pardon-ip") return d.bannedIps;
         if (cmd == "banlist") return {"players", "ips"};
-        if (cmd == "kick" || cmd == "msg" || cmd == "tell") return d.players;
+        if (cmd == "kick" || cmd == "msg" || cmd == "tell" || cmd == "report") return d.players;
+        if (cmd == "reports") return {"all", "show", "close", "reopen", "delete"};
         if (cmd == "ban") return join(d.players, d.accounts);
         if (cmd == "op") return join(join(d.players, d.accounts), d.whitelisted);
         if (cmd == "deop") return d.ops;
@@ -1020,6 +968,113 @@ bool saveStorage(const fs::path& file, const std::map<std::string, std::string>&
     return replaceFile(tmp, file, ec);
 }
 
+// ---------------------------------------------------------------------------
+// Player reports (/report <player> <reason>): kept in reports.txt next to server.conf, so the
+// owner can read them whenever - in the console ('reports'), in the game as an operator, or in
+// the file itself - whether or not they were online when it happened. Each report keeps who
+// reported whom and why, when, where both players were, and the chat around it.
+// reports.txt: one report per line, tab-separated, \\ \\n \\t escaped:
+//   id, status (open/closed), unix time, reporter, reported, reported's position,
+//   reporter's position, reason, closed by, note, chat (lines joined with newlines)
+// ---------------------------------------------------------------------------
+struct Report {
+    int id = 0;
+    std::string status = "open";
+    long long time = 0;
+    std::string reporter, target, targetPos, reporterPos, reason, handledBy, note;
+    std::vector<std::string> chat;
+};
+
+struct ReportBook {
+    fs::path file;
+    std::vector<Report> list;
+    int nextId = 1;
+
+    void load() {
+        list.clear();
+        nextId = 1;
+        std::ifstream in(file);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> f;
+            size_t start = 0;
+            for (size_t i = 0; i <= line.size(); ++i) {
+                if (i == line.size() || line[i] == '\t') { f.push_back(unescapeStorage(line.substr(start, i - start))); start = i + 1; }
+            }
+            if (f.size() < 8) continue;
+            Report r;
+            try { r.id = std::stoi(f[0]); r.time = std::stoll(f[2]); } catch (...) { continue; }
+            r.status = f[1] == "closed" ? "closed" : "open";
+            r.reporter = f[3]; r.target = f[4]; r.targetPos = f[5]; r.reporterPos = f[6]; r.reason = f[7];
+            if (f.size() > 8) r.handledBy = f[8];
+            if (f.size() > 9) r.note = f[9];
+            if (f.size() > 10 && !f[10].empty()) {
+                std::istringstream c(f[10]);
+                std::string l;
+                while (std::getline(c, l)) r.chat.push_back(l);
+            }
+            nextId = std::max(nextId, r.id + 1);
+            list.push_back(r);
+        }
+    }
+    bool save() const {
+        const fs::path tmp = file.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            out << "# Player reports (/report). Read them with 'reports' in the server console.\n";
+            for (const auto& r : list) {
+                std::string chat;
+                for (size_t i = 0; i < r.chat.size(); ++i) chat += (i ? "\n" : "") + r.chat[i];
+                const std::string fields[] = { std::to_string(r.id), r.status, std::to_string(r.time), r.reporter, r.target,
+                                               r.targetPos, r.reporterPos, r.reason, r.handledBy, r.note, chat };
+                for (size_t i = 0; i < 11; ++i) out << (i ? "\t" : "") << escapeStorage(fields[i]);
+                out << "\n";
+            }
+            if (!out) return false;
+        }
+        std::error_code ec;
+        return replaceFile(tmp, file, ec);
+    }
+    Report* find(int id) {
+        for (auto& r : list) if (r.id == id) return &r;
+        return nullptr;
+    }
+    int openCount() const {
+        int n = 0;
+        for (const auto& r : list) if (r.status == "open") ++n;
+        return n;
+    }
+    int openBy(const std::string& reporter, const std::string& target) const {
+        int n = 0;
+        for (const auto& r : list) {
+            if (r.status == "open" && lower(r.reporter) == lower(reporter) && lower(r.target) == lower(target)) ++n;
+        }
+        return n;
+    }
+};
+
+// "3 min ago", "2 h ago", "5 days ago"
+std::string agoText(long long when) {
+    const long long s = std::max<long long>(0, static_cast<long long>(std::time(nullptr)) - when);
+    if (s < 60) return std::to_string(s) + " s ago";
+    if (s < 3600) return std::to_string(s / 60) + " min ago";
+    if (s < 86400) return std::to_string(s / 3600) + " h ago";
+    return std::to_string(s / 86400) + " days ago";
+}
+std::string dateText(long long when) {
+    const std::time_t t = static_cast<std::time_t>(when);
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
+    return buf;
+}
+
 // The folders a mod's Lua may read (LuaSandbox): the game's folder, the global mods folder(s)
 // and the shared module folders (lualib/ next to mods/, and games/<game>/lualib/)
 std::vector<fs::path> serverModRoots(const std::string& game) {
@@ -1047,6 +1102,7 @@ void installSandbox(sol::state& lua, const std::string& game) {
 void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                        sol::lib::coroutine, sol::lib::utf8);
+    diag::installLuaTraceback(lua.lua_state());   // every Lua error the server catches: with its Lua stack
     installSandbox(lua, ctx.config->game);        // require / dofile only inside mods and lualib
     luasandbox::installTimeLimitHook(lua);
     if (worker) lua["print"] = [](sol::variadic_args) {};
@@ -1243,6 +1299,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
 
 void printUsage() {
     std::cout << "Usage: BlockSmithServer [options]\n"
+              << "  --version         show the version and commit, and exit\n"
               << "  --setup           answer a few questions to set up (or change) the server\n"
               << "  --config <file>   settings file (default server.conf, created if missing)\n"
               << "  --game <folder>   game to run (overrides 'game' in the settings)\n"
@@ -1334,7 +1391,9 @@ void runSetup(const fs::path& configFile) {
 // main
 // ===========================================================================
 int main(int argc, char** argv) {
-    std::cout << "BlockSmith dedicated server (" << net::kVersionName << ")" << std::endl;
+    diag::init("server");   // crash reports, and (below) warning traces (Diagnostics.h)
+    std::cout << "BlockSmith dedicated server " << BLOCKSMITH_VERSION << " (commit " << BLOCKSMITH_COMMIT
+              << ", protocol " << net::kVersionName << ")" << std::endl;
 
     // ---- Command line ----
     fs::path configFile = "server.conf";
@@ -1344,6 +1403,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto next = [&]() { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(); };
         if (a == "--help" || a == "-h") { printUsage(); return 0; }
+        else if (a == "--version" || a == "-v") return 0;   // (the first line printed says it)
         else if (a == "--list-games") { printGames(); return 0; }
         else if (a == "--setup") setup = true;
         else if (a == "--config") configFile = next();
@@ -1364,6 +1424,13 @@ int main(int argc, char** argv) {
     }
     const fs::path confDir = configFile.has_parent_path() ? configFile.parent_path() : fs::path(".");
     startLogFile(confDir);   // logs/latest.log: everything from here on, with the time
+    // (first in the log: which build wrote it)
+    std::cout << "[Server] " << BLOCKSMITH_VERSION_FULL << ", protocol " << net::kVersionName << std::endl;
+    // the system report (build, OS, CPU, memory...), then every warning with its trace
+    diag::addReportLine(std::string("Protocol: ") + net::kVersionName);
+    diag::addReportLine("Config: " + fs::absolute(configFile).string());
+    diag::printSystemReport();
+    diag::enableWarningTraces();
     auto readSettings = [&]() {
         auto kv = readConfFile(configFile);
         for (const auto& [k, v] : overrides) kv[k] = v;
@@ -1518,6 +1585,10 @@ int main(int argc, char** argv) {
     remotePolicy.extraDomains = config.remoteDomains;
     RemoteLua remoteContent(lua, confDir / "cache" / "remote", remotePolicy, serverModRoots(config.game),
                             config.luaTimeLimit);
+    // Is there a newer BlockSmith? (a version file, read as data: UpdateCheck.h)
+    update::Checker updates(confDir / "cache" / "update", config.updateUrl, remotePolicy, config.updateCheck);
+    const auto serverStart = Clock::now();
+    std::string lastUpdateLine;
     int failed = 0;
     for (const auto& file : findModFiles(config.game, config.disabledMods)) {
         lua["g_CurrentModPath"] = file.parent_path().string();
@@ -1579,6 +1650,17 @@ int main(int argc, char** argv) {
     NameList ops{confDir / "ops.txt", {}};
     NameList playerModes{confDir / "gamemodes.txt", {}};   // "Name | creative": modes given by /gamemode
     Accounts accounts{confDir / "accounts.txt", {}};
+    // Player reports (reports.txt) and the chat they quote: the last 200 lines, with who and when
+    ReportBook reports{confDir / "reports.txt", {}};
+    reports.load();
+    struct ChatLine { long long time; std::string name, text; };
+    std::deque<ChatLine> recentChat;
+    std::map<std::string, std::chrono::steady_clock::time_point> lastReport;   // (one report a minute each)
+    // An operator's level (ops.txt "Name | level"; no level: op_level from server.conf); 0 = not one
+    auto opLevelOf = [&](const std::string& name) {
+        if (!ops.has(name)) return 0;
+        try { return std::clamp(std::stoi(ops.reason(name)), 1, 4); } catch (...) { return config.opLevel; }
+    };
     whitelist.load();
     banned.load();
     ops.load();
@@ -1630,7 +1712,14 @@ int main(int argc, char** argv) {
         }
         return ctx.api.canEdit(name, pos, oldId, oldMeta, newId, newMeta);
     };
-    server.onChat = [&ctx](const std::string& name, std::string& text) { return ctx.api.chat(name, text); };
+    server.onChat = [&](const std::string& name, std::string& text) {
+        const bool keep = ctx.api.chat(name, text);
+        if (keep) {   // (for reports: what was said, by whom, when)
+            recentChat.push_back({ static_cast<long long>(std::time(nullptr)), name, text.substr(0, 300) });
+            while (recentChat.size() > 200) recentChat.pop_front();
+        }
+        return keep;
+    };
     std::set<std::string> newAccounts;   // registered while joining (told about it once they're in)
     server.hasAccount = [&](const std::string& name) { return accounts.has(name); };
     // ban-ip: banned-ips.txt ("1.2.3.4 | reason")
@@ -1683,6 +1772,43 @@ int main(int argc, char** argv) {
         }
         if (ops.has(name)) server.messagePlayer(name, "You are an operator here: type /help for server commands.",
                                                 glm::vec3(0.6f, 0.9f, 1.0f));
+        // Which BlockSmith they have, and whether there's an update for them: this server's
+        // version is newer, or the newest release (the server's update check) is
+        {
+            const std::string theirs = server.playerEngineVersion(name);
+            update::Version pv, sv, lv;
+            const bool known = update::parseVersion(theirs, pv);
+            update::parseVersion(BLOCKSMITH_VERSION, sv);
+            const update::Info& u = updates.info();
+            const bool latestKnown = u.checked && update::parseVersion(u.latest, lv);
+            const std::string where = u.download.empty() ? "" : " Download: " + u.download;
+            const glm::vec3 gold(1.0f, 0.78f, 0.28f);
+            std::cout << "[Server] " << name << " plays BlockSmith " << (known ? theirs : std::string("(an older game that doesn't say)"))
+                      << std::endl;
+            if (!known) {
+                server.messagePlayer(name, std::string("An update is available: this server runs BlockSmith ") +
+                                     BLOCKSMITH_VERSION + ", and your game is older." + where, gold);
+            } else if (update::compare(pv, sv) < 0) {
+                server.messagePlayer(name, std::string("An update is available: this server runs BlockSmith ") +
+                                     BLOCKSMITH_VERSION + ", you have " + theirs + "." + where, gold);
+            } else if (latestKnown && update::compare(pv, lv) < 0) {
+                server.messagePlayer(name, "A new BlockSmith is out: " + u.latest + " (you have " + theirs + ")." + where, gold);
+            }
+            if (known && update::compare(pv, sv) > 0) {
+                std::cout << "[Server] " << name << "'s game (BlockSmith " << theirs << ") is newer than this server ("
+                          << BLOCKSMITH_VERSION << "): the server may need an update" << std::endl;
+            }
+        }
+        // operators who handle reports hear about the open ones
+        if (opLevelOf(name) >= 3 && reports.openCount() > 0) {
+            server.messagePlayer(name, "There " + std::string(reports.openCount() == 1 ? "is 1 open report" : "are " +
+                                 std::to_string(reports.openCount()) + " open reports") + ": type /reports to see them.",
+                                 glm::vec3(1.0f, 0.55f, 0.45f));
+        }
+        // operators hear about a new version (they're the ones who can install it)
+        if (ops.has(name) && (updates.info().available || updates.info().required)) {
+            server.messagePlayer(name, "Server: " + updates.summary(), glm::vec3(1.0f, 0.78f, 0.28f));
+        }
         ctx.api.playerJoined(name, newAccount);
     };
 
@@ -1706,9 +1832,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     applyLiveSettings();   // again: starting the server clears shared values
-    std::cout << "[Server] '" << config.name << "' is listening on port " << config.port << " (max "
+    std::cout << "[Server] '" << config.name << "' (" << BLOCKSMITH_VERSION << ", commit " << BLOCKSMITH_COMMIT
+              << ") is listening on port " << config.port << " (max "
               << config.maxPlayers << " players" << (config.whitelist ? ", whitelist on" : "")
               << (config.requirePassword ? ", passwords required" : "") << "). Type 'help' for commands (Tab completes them)." << std::endl;
+    if (reports.openCount() > 0) {
+        std::cout << "[Server] " << reports.openCount() << " open player report(s): type 'reports' to see them" << std::endl;
+    }
     if (ops.entries.empty()) {
         std::cout << "[Server] No operators yet: join, then type 'op <your name>' here to manage the server "
                   << "from inside the game" << std::endl;
@@ -1753,7 +1883,7 @@ int main(int argc, char** argv) {
         try { return std::clamp(std::stoi(ops.reason(name)), 1, 4); } catch (...) { return config.opLevel; }
     };
     static const std::map<std::string, int> kCommandLevel = {
-        {"help", 0}, {"list", 0}, {"msg", 0}, {"tell", 0}, {"me", 0},
+        {"help", 0}, {"list", 0}, {"msg", 0}, {"tell", 0}, {"me", 0}, {"version", 0}, {"diag", 4}, {"report", 0}, {"reports", 3},
         {"seed", 2}, {"say", 2}, {"tps", 2}, {"gamemode", 2}, {"gm", 2}, {"time", 2}, {"gamerule", 2},
         {"tp", 2}, {"teleport", 2}, {"give", 2}, {"clear", 2}, {"kill", 2}, {"setworldspawn", 2}, {"spawnpoint", 2},
         {"kick", 3}, {"ban", 3}, {"unban", 3}, {"pardon", 3}, {"ban-ip", 3}, {"pardon-ip", 3}, {"banlist", 3},
@@ -1766,7 +1896,9 @@ int main(int argc, char** argv) {
     static const std::map<std::string, std::pair<std::string, std::string>> kCommandUsage = {
         {"list", {"", "Who's online"}}, {"me", {"<action>", "Say what you're doing"}},
         {"msg", {"<player> <text>", "A private message"}}, {"tell", {"<player> <text>", "A private message"}},
-        {"seed", {"", "The world's seed"}}, {"say", {"<text>", "A message from the server"}},
+        {"seed", {"", "The world's seed"}}, {"version", {"", "Which BlockSmith the server runs"}}, {"diag", {"", "Diagnostics: system, build, warnings"}},
+        {"report", {"<player> <reason>", "Report a player to the server's staff"}},
+        {"reports", {"[all|show|close|reopen|delete] [id] [note]", "Read and handle player reports"}}, {"say", {"<text>", "A message from the server"}},
         {"tps", {"", "How fast the server is running"}},
         {"gamemode", {"survival|creative [player]", "Change a game mode"}}, {"gm", {"survival|creative [player]", "Change a game mode"}},
         {"time", {"set|add|speed|query [value]", "The time of day"}}, {"gamerule", {"[rule] [true|false]", "Show or change the game rules"}},
@@ -1807,7 +1939,7 @@ int main(int argc, char** argv) {
         };
         // Commands from mods (chat.register_command + on_chat_command(text, player, is_operator,
         // reply)): Lua decides who may use them
-        static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed",
+        static const std::set<std::string> builtIn = {"help", "list", "msg", "stop", "save", "reload", "tps", "seed", "version", "diag", "report", "reports",
             "games", "mods", "motd", "name", "say", "kick", "ban", "unban", "banlist", "whitelist", "op", "deop",
             "ops", "password", "respawn", "gamemode", "gm", "time", "gamerule", "tp", "teleport", "give", "clear",
             "kill", "me", "setworldspawn", "spawnpoint", "save-all", "save-on", "save-off", "ban-ip", "pardon-ip"};
@@ -1919,7 +2051,7 @@ int main(int argc, char** argv) {
         };
 
         if (cmd == "help") {
-            reply("Everyone: list, msg <name> <text>, me <action>, help");
+            reply("Everyone: list, msg <name> <text>, me <action>, report <player> <reason>, version, help");
             if (level >= 2) {
                 reply("Game:     gamemode survival|creative [player], tp <player|x y z> [x y z|player], give <player> <item> [count],");
                 reply("          clear [player], kill [player], time set|add|speed, gamerule [rule] [value], seed, say, tps");
@@ -1928,9 +2060,10 @@ int main(int argc, char** argv) {
             if (level >= 3) {
                 reply("Players:  kick, ban, unban, ban-ip, pardon-ip, banlist [players|ips], whitelist on|off|add|remove|list");
                 reply("Admins:   op <name> [level 1-4], deop <name>, ops");
+                reply("Reports:  reports [all], reports show|close|reopen <id> [note], reports delete <id>");
             }
             if (level >= 4) {
-                reply("Server:   stop, save (save-all), save-off, save-on, reload, games, mods [enable|disable <id>],");
+                reply("Server:   stop, save (save-all), save-off, save-on, reload, games, mods [enable|disable <id>], diag,");
                 reply("          motd [text], name [text], password reset <name>");
             }
             if (level == 0) reply("Operators have more: ask one, or see the server's help.");
@@ -1956,6 +2089,137 @@ int main(int argc, char** argv) {
                           generator.threadCount(), generator.chunksPerSecond(), world.generatingCount(),
                           world.loadedChunkCount());
             reply(buf);
+        } else if (cmd == "version") {
+            reply(std::string(BLOCKSMITH_VERSION_FULL) + ", protocol " + net::kVersionName);
+            if (!updates.enabled()) reply("Update check: off (update_check in server.conf)");
+            else if (updates.summary().empty()) reply("Update check: still asking...");
+            else {
+                reply(updates.summary());
+                if (updates.warning()) for (const auto& t : updates.trace()) reply("  " + t);
+            }
+        } else if (cmd == "report") {
+            // /report <player> <reason>: saved for the server's staff, with the chat around it
+            std::string reason;
+            const std::string target = firstWord(rest, reason);
+            const std::string reporter = console ? std::string("(console)") : from;
+            if (target.empty() || reason.empty()) { reply("Usage: report <player> <reason>"); return; }
+            if (!console && lower(target) == lower(from)) { reply("You can't report yourself."); return; }
+            // someone who is here, or has been (their save, or their account)
+            std::string targetName;
+            glm::vec3 tpos(0.0f);
+            bool online = false;
+            for (const auto& [n, p] : server.playerPositions()) if (lower(n) == lower(target)) { targetName = n; tpos = p; online = true; }
+            if (targetName.empty()) {
+                // someone who has played here: their save (players/<Name>.txt, any capitals), or account
+                std::error_code fec;
+                for (const auto& e : fs::directory_iterator(worldDir / "players", fec)) {
+                    if (e.path().extension() == ".txt" && lower(e.path().stem().string()) == lower(target)) targetName = e.path().stem().string();
+                }
+                if (targetName.empty() && accounts.has(target)) targetName = target;
+            }
+            if (targetName.empty() || !net::validPlayerName(targetName)) { reply("There's no player called '" + target + "' on this server."); return; }
+            if (!console) {
+                const auto now = std::chrono::steady_clock::now();
+                auto it = lastReport.find(lower(from));
+                if (it != lastReport.end() && now - it->second < std::chrono::seconds(60)) {
+                    reply("Please wait a minute before sending another report.");
+                    return;
+                }
+                if (reports.openBy(from, targetName) >= 3) { reply("You already have 3 open reports about " + targetName + "."); return; }
+                lastReport[lower(from)] = now;
+            }
+            Report r;
+            r.id = reports.nextId++;
+            r.time = static_cast<long long>(std::time(nullptr));
+            r.reporter = reporter;
+            r.target = targetName;
+            r.reason = update::plainText(reason, 300);
+            r.targetPos = online ? fmt(tpos) : "(offline)";
+            r.reporterPos = "(console)";
+            if (!console) for (const auto& [n, p] : server.playerPositions()) if (n == from) r.reporterPos = fmt(p);
+            // the chat around it: what either of them said in the last 15 minutes (up to 30 lines)
+            for (const auto& c : recentChat) {
+                if (r.time - c.time > 15 * 60) continue;
+                if (lower(c.name) != lower(targetName) && lower(c.name) != lower(from)) continue;
+                r.chat.push_back("[" + dateText(c.time).substr(11) + "] <" + c.name + "> " + update::plainText(c.text, 300));
+            }
+            if (r.chat.size() > 30) r.chat.erase(r.chat.begin(), r.chat.end() - 30);
+            reports.list.push_back(r);
+            if (!reports.save()) std::cerr << "[Server] Could not write " << reports.file.string() << std::endl;
+            reply("Thanks - your report (#" + std::to_string(r.id) + ") about " + targetName + " was sent to the server's staff.");
+            std::cout << "[Report] #" << r.id << " " << reporter << " reported " << targetName << ": " << r.reason
+                      << " (" << targetName << " at " << r.targetPos << ")" << std::endl;
+            for (const auto& [n, p] : server.playerPositions()) {
+                if (n != from && opLevelOf(n) >= 3) {
+                    server.messagePlayer(n, "[Report #" + std::to_string(r.id) + "] " + reporter + " reported " + targetName + ": " +
+                                         r.reason + "  (/reports show " + std::to_string(r.id) + ")", glm::vec3(1.0f, 0.55f, 0.45f));
+                }
+            }
+            ctx.api.call("on_player_report", [](sol::protected_function_result&) {}, r.id, reporter, targetName, r.reason);
+        } else if (cmd == "reports") {
+            // reports [all] | show <id> | close <id> [note] | reopen <id> | delete <id>
+            std::string args;
+            const std::string sub = lower(firstWord(rest, args));
+            std::string note;
+            const std::string idText = firstWord(args, note);
+            int id = 0;
+            try { id = idText.empty() ? 0 : std::stoi(idText); } catch (...) { id = 0; }
+            const std::string who = console ? std::string("(console)") : from;
+            if (sub.empty() || sub == "all" || sub == "list") {
+                const bool all = sub == "all";
+                int shown = 0;
+                for (auto it = reports.list.rbegin(); it != reports.list.rend(); ++it) {
+                    if (!all && it->status != "open") continue;
+                    if (++shown > 20) { reply("...and more (oldest not shown)"); break; }
+                    reply("#" + std::to_string(it->id) + " " + (it->status == "open" ? "OPEN  " : "closed") + " " + agoText(it->time) +
+                          ": " + it->reporter + " -> " + it->target + ": " + update::plainText(it->reason, 80));
+                }
+                if (shown == 0) reply(all ? "No reports yet." : "No open reports. ('reports all' shows the closed ones too)");
+                else reply("'reports show <id>' for the details, 'reports close <id> [note]' when it's dealt with.");
+            } else if (Report* r = reports.find(id); !r) {
+                reply(idText.empty() ? "Usage: reports show|close|reopen|delete <id>" : "There's no report #" + idText + ".");
+            } else if (sub == "show") {
+                reply("Report #" + std::to_string(r->id) + " (" + r->status + "), " + dateText(r->time) + " (" + agoText(r->time) + ")");
+                reply("  From: " + r->reporter + " at " + r->reporterPos);
+                reply("  About: " + r->target + " at " + r->targetPos);
+                reply("  Reason: " + r->reason);
+                if (!r->handledBy.empty()) reply("  Closed by " + r->handledBy + (r->note.empty() ? "" : ": " + r->note));
+                reply(r->chat.empty() ? "  Chat: (nothing either of them said)" : "  Chat (theirs, the 15 minutes before):");
+                for (const auto& l : r->chat) reply("    " + l);
+            } else if (sub == "close") {
+                r->status = "closed";
+                r->handledBy = who;
+                r->note = update::plainText(note, 200);
+                reports.save();
+                reply("Report #" + std::to_string(r->id) + " closed.");
+                std::cout << "[Report] #" << r->id << " closed by " << who << (note.empty() ? "" : ": " + note) << std::endl;
+            } else if (sub == "reopen") {
+                r->status = "open";
+                reports.save();
+                reply("Report #" + std::to_string(r->id) + " is open again.");
+            } else if (sub == "delete") {
+                if (level < 4) { reply("Only level 4 operators (and the console) can delete reports."); return; }
+                const int gone = r->id;
+                reports.list.erase(std::remove_if(reports.list.begin(), reports.list.end(),
+                                                  [gone](const Report& x) { return x.id == gone; }), reports.list.end());
+                reports.save();
+                reply("Report #" + std::to_string(gone) + " deleted.");
+            } else {
+                reply("Usage: reports [all] | reports show|close|reopen|delete <id> [note]");
+            }
+        } else if (cmd == "diag") {
+            // Everything that helps find a problem: the build and system, how it's running, the
+            // update check and the warnings so far (most frequent first; full traces are in the log)
+            for (const auto& l : diag::systemReport()) reply(l);
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "Running: %.1f ticks/s (target %d), slowest tick %.0f ms, %zu chunks loaded, %zu players",
+                          tps, config.tickRate, slowestTickMs, world.loadedChunkCount(), server.playerPositions().size());
+            reply(buf);
+            reply("Updates: " + (updates.enabled() ? (updates.summary().empty() ? std::string("still asking") : updates.summary())
+                                                   : std::string("check off")));
+            const auto warnings = diag::warningSummary(15);
+            reply(warnings.empty() ? "Warnings: none" : "Warnings (count x first message):");
+            for (const auto& w : warnings) reply("  " + w);
         } else if (cmd == "seed") {
             reply("Seed: " + std::to_string(meta.seed));
         } else if (cmd == "reload") {
@@ -2457,6 +2721,19 @@ int main(int argc, char** argv) {
             blockMods.update(tickDt, world, nearPlayers);
         }
         remoteContent.update();   // finished downloads -> mods' callbacks
+        updates.update(std::chrono::duration<double>(Clock::now() - serverStart).count());
+        if (updates.takeNews()) {
+            // said when it changes (not again every few hours when nothing's new)
+            const std::string line = updates.summary();
+            if (!line.empty() && line != lastUpdateLine) {
+                std::cout << "[Server] " << line << std::endl;
+                // a warning (new version, must update, or the check failed): the details too
+                if (updates.warning()) {
+                    for (const auto& t : updates.trace()) std::cout << "[Server]   " << t << std::endl;
+                }
+                lastUpdateLine = line;
+            }
+        }
 
         // The time of day runs on the server, and goes to every player (every few seconds, and
         // at once when it jumps)

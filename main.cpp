@@ -83,6 +83,9 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "EntityLua.h"
 #include "BlockModifiers.h"
 #include "RemoteLua.h"
+#include "UpdateCheck.h"
+#include "Diagnostics.h"
+#include "WebLink.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
 
@@ -415,6 +418,9 @@ bool g_ShowDebugInfo = false;   // F3: FPS, ping and multiplayer info in the top
 std::string g_GpuName;          // graphics card in use (shown on F3)
 float g_Fps = 0.0f;       // frames per second, updated twice a second (shown by /netstats)   // why the last connection failed/ended (shown on the Multiplayer screen)
 MainMenu* g_MainMenu = nullptr;
+// Is there a newer BlockSmith? (UpdateCheck.h - one small version file, read as data). Made once,
+// on the first session, and kept for the life of the game.
+std::unique_ptr<update::Checker> g_Updates;
 InventorySystem g_Inventory; // Dedicated C++ inventory system instance
 float g_FieldOfView = 70.0f;
 FogSettings g_Fog;
@@ -512,6 +518,18 @@ std::vector<GameInfo> getAvailableGames() {
         games.push_back({"craft_and_ruin", "Craft & Ruin", "Brandon", "Default Voxel Survival Game"});
     }
     return games;
+}
+
+// Is this game installed: a folder of that name in games/ (the same rule the title screen uses
+// to list the games you can pick)
+bool gameInstalled(const std::string& folder) {
+    if (folder.empty() || folder == "." || folder == ".." || folder.find('/') != std::string::npos ||
+        folder.find('\\') != std::string::npos || folder.find(':') != std::string::npos) return false;
+    std::error_code ec;
+    for (const char* root : { "games", "../../games" }) {
+        if (fs::is_directory(fs::path(root) / folder, ec)) return true;
+    }
+    return false;
 }
 
 std::vector<std::string> getAvailableWorlds() {
@@ -2447,6 +2465,7 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     auto lua = std::make_unique<sol::state>();
     lua->open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                         sol::lib::coroutine, sol::lib::utf8);
+    diag::installLuaTraceback(lua->lua_state());
     installModSandbox(*lua);
     (*lua)["print"] = [](sol::variadic_args) {};
     lua->new_usertype<ChunkData>("Chunk",
@@ -4029,6 +4048,13 @@ int main(int argc, char** argv) {
         const fs::path exe = fs::absolute(fs::path(argv[0]), exeEc);
         if (!exeEc) g_ExeDir = exe.parent_path();
     }
+    // Diagnostics (Diagnostics.h): crash reports, logs/latest.log next to settings.txt, a trace
+    // under every warning, and (once the graphics card is known) the system report
+    diag::init("client");
+    diag::startLogFile(settingsFile().parent_path());
+    diag::enableWarningTraces();
+    std::cout << "BlockSmith " << BLOCKSMITH_VERSION << " (commit " << BLOCKSMITH_COMMIT << ", protocol "
+              << net::kVersionName << ")" << std::endl;
     try {
         if (!glfwInit()) return -1;
 
@@ -4125,6 +4151,15 @@ int main(int argc, char** argv) {
             g_GpuName = renderer ? renderer : "unknown";
             std::cout << "[Graphics] GPU: " << g_GpuName << " (" << (vendor ? vendor : "?") << ", OpenGL "
                       << (version ? version : "?") << ")" << std::endl;
+            static bool reported = false;   // (once, not again for every session)
+            if (!reported) {
+                reported = true;
+                diag::addReportLine(std::string("Protocol: ") + net::kVersionName);
+                diag::addReportLine("Graphics: " + g_GpuName + " (" + (vendor ? vendor : "?") + ", OpenGL " +
+                                    (version ? version : "?") + ")");
+                diag::addReportLine("Settings: " + fs::absolute(settingsFile()).string());
+                diag::printSystemReport();
+            }
         }
 
         glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -4393,6 +4428,7 @@ int main(int argc, char** argv) {
         sol::state lua;
         lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                            sol::lib::coroutine, sol::lib::utf8);
+        diag::installLuaTraceback(lua.lua_state());   // every Lua error the game catches: with its Lua stack
         // The player's client mods: their own Lua state, made after (so gone before) the game's
         ClientMods clientMods;
         struct ClientModsPointer {
@@ -6120,13 +6156,23 @@ int main(int argc, char** argv) {
         };
         // engine.play_world(name) -> true, or false + error message
         engineTable["play_world"] = [window](const std::string& name) {
-            if (!selectedGameIsLoaded()) {
-                return std::make_tuple(false, std::string("Restart the game to play worlds for this game."));
+            // The target: a world folder directly in saves/ ...
+            if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos ||
+                name.find('\\') != std::string::npos || name.find(':') != std::string::npos) {
+                return std::make_tuple(false, std::string("Invalid world name."));
+            }
+            // ... of the game selected on the title screen, which must be installed. It doesn't
+            // have to be the game that's loaded now: beginLoadingWorld reloads the mods for it
+            // (the world's game and its mods) first. openActiveWorld checks the loaded game again
+            // before the save is restored.
+            if (!gameInstalled(g_ActiveGameFolder)) {
+                return std::make_tuple(false, "The selected game ('" + g_ActiveGameFolder + "') isn't installed.");
             }
             WorldMeta meta;
-            std::string why;
-            if (readWorldMeta(savesRoot() / name / "world.dat", meta) && !worldBelongsToLoadedGame(meta, &why)) {
-                return std::make_tuple(false, why);
+            if (readWorldMeta(savesRoot() / name / "world.dat", meta) && !meta.game.empty() &&
+                meta.game != g_ActiveGameFolder) {
+                return std::make_tuple(false, "This world was made with '" + meta.game + "', but '" +
+                                              g_ActiveGameFolder + "' is selected.");
             }
             g_ActiveWorldName = name;
             beginLoadingWorld(window);
@@ -6150,6 +6196,34 @@ int main(int argc, char** argv) {
             t["title"] = title;
             t["can_play"] = selectedGameIsLoaded();
             return t;
+        };
+        // engine.get_update_info() -> { enabled, checked, available, required, current, commit, latest,
+        //   min_supported, download, notes, error }: is there a newer BlockSmith (UpdateCheck.h)
+        engineTable["get_update_info"] = [&lua]() {
+            sol::table t = lua.create_table();
+            t["enabled"] = g_Updates && g_Updates->enabled();
+            t["current"] = std::string(BLOCKSMITH_VERSION);
+            t["commit"] = std::string(BLOCKSMITH_COMMIT);
+            if (g_Updates) {
+                const update::Info& u = g_Updates->info();
+                t["checked"] = u.checked;
+                t["available"] = u.available;
+                t["required"] = u.required;
+                t["latest"] = u.latest;
+                t["min_supported"] = u.minSupported;
+                t["download"] = u.download;
+                t["notes"] = u.notes;
+                t["error"] = u.error;
+            }
+            return t;
+        };
+        // engine.open_update_page() -> true if the browser was asked to open the new version's
+        //   download page (only on the title-screen pages, and only the checked https link from
+        //   the version file: UpdateCheck.h)
+        engineTable["open_update_page"] = []() {
+            if (g_CurrentGameState == GameState::PLAYING || g_CurrentGameState == GameState::LOADING) return false;
+            if (!g_Updates || g_Updates->info().download.empty()) return false;
+            return weblink::open(g_Updates->info().download);
         };
         engineTable["save_world"] = []() {
             if (g_CurrentGameState == GameState::PLAYING) saveCurrentWorld();
@@ -6409,6 +6483,20 @@ int main(int argc, char** argv) {
             t["game_installed"] = installed;
             t["same_game"] = st->game.empty() || st->game == g_LoadedGameFolder;
             t["compatible"] = st->compatible;
+            // Which BlockSmith the server runs, and how it compares with this game: "newer" (an
+            // update is available for you), "older" (the server is behind), "same", or "" (an older
+            // server that doesn't say)
+            t["engine_version"] = st->engineVersion;
+            t["engine_commit"] = st->engineCommit;
+            {
+                update::Version sv, mine;
+                std::string cmp;
+                if (update::parseVersion(st->engineVersion, sv) && update::parseVersion(BLOCKSMITH_VERSION, mine)) {
+                    const int c = update::compare(sv, mine);
+                    cmp = c > 0 ? "newer" : (c < 0 ? "older" : "same");
+                }
+                t["engine_compare"] = cmp;
+            }
             t["error"] = st->error;
             sol::table names = lua.create_table();
             for (size_t i = 0; i < st->names.size(); ++i) names[i + 1] = st->names[i];
@@ -6796,6 +6884,18 @@ int main(int argc, char** argv) {
         // Player settings (key bindings, FOV, ...) from settings.txt
         loadSettings();
 
+        // update_check = false in settings.txt turns the new-version check off; update_url points
+        // it at another version file (it must be allowed like any remote content)
+        if (!g_Updates) {
+            const auto on = g_Settings.find("update_check");
+            const bool enabled = on == g_Settings.end() || (on->second != "false" && on->second != "0");
+            const auto url = g_Settings.find("update_url");
+            g_Updates = std::make_unique<update::Checker>(
+                settingsFile().parent_path() / "cache" / "update",
+                (url != g_Settings.end() && !url->second.empty()) ? url->second : std::string(update::kDefaultUrl),
+                remotePolicyFromSettings(), enabled);
+        }
+
         // Every player always has a name (used in chat and multiplayer)
         g_ChatSystem->setPlayerName(ensurePlayerName());
         g_ChatSystem->registerCommand("name", "[new name]", "Show or change your player name.");
@@ -7163,6 +7263,14 @@ int main(int argc, char** argv) {
                         // Singleplayer -> world selection screen (world_select.lua)
                         g_CurrentGameState = GameState::WORLD_SELECT;
                         callLuaUI(ctx->lua, "on_world_select_opened");
+                    } else if (actionResult == "update") {
+                        // The new version's download page, in the player's own browser (they clicked
+                        // it). Only an https GitHub page or the version file's own site gets here
+                        // (UpdateCheck.h), and WebLink opens only a plain, safe address.
+                        if (g_Updates && !g_Updates->info().download.empty() &&
+                            !weblink::open(g_Updates->info().download)) {
+                            std::cerr << "[Update] Couldn't open " << g_Updates->info().download << std::endl;
+                        }
                     } else if (actionResult == "multiplayer") {
                         // Multiplayer -> server list (multiplayer.lua)
                         g_CurrentGameState = GameState::MULTIPLAYER;
@@ -9145,6 +9253,25 @@ int main(int argc, char** argv) {
                 static std::string current;
                 static std::map<std::string, GLFWcursor*> cursors;
                 std::string want = uidraw::takeCursorRequest();
+                // (the new-version check: asked in the background; the title screen shows it)
+                if (g_Updates) {
+                    g_Updates->update(glfwGetTime());
+                    if (g_Updates->takeNews()) {
+                        const std::string line = g_Updates->summary();
+                        if (!line.empty()) std::cout << "[Update] " << line << std::endl;
+                        if (g_Updates->warning()) {   // the details behind a warning
+                            for (const auto& t : g_Updates->trace()) std::cout << "[Update]   " << t << std::endl;
+                        }
+                    }
+                    if (g_MainMenu) {
+                        const update::Info& u = g_Updates->info();
+                        std::string notice;
+                        if (u.required) notice = "Update required: " + u.latest;
+                        else if (u.available) notice = "Update available: " + u.latest;
+                        if (!notice.empty() && !u.download.empty()) notice += " - click to download";
+                        g_MainMenu->setUpdateNotice(notice, u.required);
+                    }
+                }
                 if (glfwGetInputMode(window, GLFW_CURSOR) != GLFW_CURSOR_NORMAL || want == "arrow") want.clear();
                 if (want != current) {
                     current = want;

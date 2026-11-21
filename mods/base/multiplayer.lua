@@ -31,11 +31,14 @@
 --   engine.get_server_status(address)     -> nil, or { state = "pinging"|"online"|"offline",
 --                                             motd, players, max_players, ping, names = {...},
 --                                             version, same_game, compatible, error,
---                                             game, game_title, game_installed }
+--                                             game, game_title, game_installed,
+--                                             engine_version, engine_commit, engine_compare = "newer"|"older"|"same"|"" }
 --   engine.get_lan_games()                -> { { host, address, motd, players, max_players }, ... }
 --   engine.cancel_join()
 --   engine.get_connection_status()        -> { state = "idle"|"connecting"|"joined", address, error }
 --   engine.get_game_info()                -> { selected, loaded, title, can_play }
+--   engine.get_update_info()              -> { available, required, latest, download, ... } (a newer BlockSmith)
+--   engine.open_update_page()             -- its download page, in the player's browser
 --   engine.back_to_title()
 --   ui.draw_server_icon(address, x, y, size) -> true if the server has an icon
 --
@@ -425,7 +428,15 @@ local function joinable(e)
     if not can_play() then return false, "This game isn't loaded. Restart with it selected to join its servers." end
     local st = status_of(e.address)
     if st and st.state == "online" then
-        if st.compatible == false then return false, "This server runs a different version (" .. (st.version or "?") .. ")." end
+        if st.compatible == false then
+            -- which way round: the server's BlockSmith against this game's
+            if st.engine_compare == "newer" then
+                return false, "This server runs a newer BlockSmith (" .. st.engine_version .. "): update your game to join."
+            elseif st.engine_compare == "older" then
+                return false, "This server runs an older BlockSmith (" .. st.engine_version .. "): it needs updating."
+            end
+            return false, "This server runs a different version (" .. (st.version or "?") .. ")."
+        end
         if st.same_game == false then
             local title = st.game_title or st.game or "another game"
             if st.game_installed then return false, "It plays " .. title .. ": select that game on the title screen to join." end
@@ -773,8 +784,23 @@ local function draw_details(L, hmx, hmy)
         info("Players", (st.players or 0) .. " / " .. (st.max_players or "?"))
         info("Ping", (st.ping or "?") .. " ms", (st.ping or 9999) < 150 and C.online or ((st.ping or 9999) < 600 and C.pinging or C.offline))
         if st.game_title or st.game then info("Game", st.game_title or st.game) end
+        if st.engine_version and st.engine_version ~= "" then
+            local vc = (st.engine_compare == "newer") and C.accent or ((st.engine_compare == "older") and C.faint or C.text)
+            info("BlockSmith", st.engine_version, vc)
+        end
     elseif e.players and e.max_players then
         info("Players", e.players .. " / " .. e.max_players)
+    end
+
+    -- A newer BlockSmith on the server (still joinable): there's an update for this game
+    if st and st.state == "online" and st.engine_compare == "newer" and st.compatible ~= false then
+        text(fit("Update available: this server runs " .. st.engine_version, L.dw, fs * 0.62), L.dx, y, fs * 0.62, C.accent, false, S)
+        y = y + text_height(fs * 0.62) + 6 * S
+    end
+    -- An older BlockSmith on the server: a newer game can still join it
+    if st and st.state == "online" and st.engine_compare == "older" and st.compatible ~= false then
+        text(fit("Runs an older BlockSmith (" .. st.engine_version .. "): you can still join", L.dw, fs * 0.62), L.dx, y, fs * 0.62, C.detail, false, S)
+        y = y + text_height(fs * 0.62) + 6 * S
     end
 
     -- Description (two lines), or what's wrong
@@ -783,8 +809,18 @@ local function draw_details(L, hmx, hmy)
     rect(L.dx, y, L.dw, 1, C.divider)
     y = y + 7 * S
     if not ok and why then
-        text(fit(why, L.dw, fs * 0.62), L.dx, y, fs * 0.62, C.error, false, S)
-        y = y + text_height(fs * 0.62) + 6 * S
+        -- (wrapped: these say what to do, so all of it shows - up to 4 lines)
+        local line, lines = "", {}
+        for word in why:gmatch("%S+") do
+            local try = (line == "") and word or (line .. " " .. word)
+            if text_width(try, fs * 0.62) > L.dw and line ~= "" then lines[#lines + 1] = line; line = word else line = try end
+        end
+        if line ~= "" then lines[#lines + 1] = line end
+        for i = 1, math.min(4, #lines) do
+            text(fit(lines[i], L.dw, fs * 0.62), L.dx, y, fs * 0.62, C.error, false, S)
+            y = y + text_height(fs * 0.62) + 3 * S
+        end
+        y = y + 3 * S
     elseif st and st.state == "offline" then
         text(fit((st.error and st.error ~= "") and st.error or "Can't reach this server right now.", L.dw, fs * 0.62),
              L.dx, y, fs * 0.62, C.offline, false, S)
@@ -917,7 +953,25 @@ local function draw_main(L, W, H, mx, my, interactive)
     if not can_play() then note, color = "This game isn't loaded. Restart with it selected to join its servers.", C.error end
     if state.message and not state.dialog then note, color = state.message, C.error end
     local nx = L.refreshBtn.x + L.refreshBtn.w + 12 * S
-    text_mid(fit(note, L.cardX + L.cardW - L.pad - nx, fs * 0.66), nx, L.footerY, L.footerH, fs * 0.66, color, false, S)
+    -- A newer BlockSmith (the game's own update check): a link on the right of the footer
+    state.update_link = nil
+    local u = engine.get_update_info and engine.get_update_info() or nil
+    local right = L.cardX + L.cardW - L.pad
+    if u and (u.available or u.required) then
+        local label = (u.required and "Update required: " or "Update available: ") .. (u.latest or "?")
+        if u.download and u.download ~= "" then label = label .. "  -  Download" end
+        local lf = fs * 0.7
+        local lw = text_width(label, lf) + 14 * S
+        local lx, ly, lh = right - lw, L.footerY + 5 * S, 16 * S
+        local col = u.required and C.error or C.accent
+        local hov = interactive and inside(mx, my, lx, ly, lw, lh)
+        box(lx, ly, lw, lh, S, col, hov and 0.28 or 0.16)
+        outline(lx, ly, lw, lh, S, col)
+        text_center(label, lx + lw / 2, ly, lh, lf, col, false, S)
+        if u.download and u.download ~= "" then state.update_link = { x = lx, y = ly, w = lw, h = lh } end
+        right = lx - 10 * S
+    end
+    text_mid(fit(note, right - nx, fs * 0.66), nx, L.footerY, L.footerH, fs * 0.66, color, false, S)
 end
 
 local function draw_edit(L, W, H, mx, my)
@@ -1048,6 +1102,12 @@ function handle_multiplayer_click(mx, my, W, H)
     end
 
     state.message = nil
+    local ul = state.update_link
+    if ul and inside(mx, my, ul.x, ul.y, ul.w, ul.h) then
+        -- the new version's download page, in the player's browser
+        if not (engine.open_update_page and engine.open_update_page()) then state.message = "Couldn't open the download page" end
+        return true
+    end
     for _, b in ipairs({ L.directBtn, L.addBtn, L.backBtn, L.refreshBtn }) do
         if click_button(b, mx, my) then return true end
     end

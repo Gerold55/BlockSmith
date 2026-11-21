@@ -67,7 +67,15 @@ public:
                     int screenWidth, int screenHeight);
     glm::vec4 buttonTextColor(bool hovered) const;
 
+    // A new version of BlockSmith (UpdateCheck.h): a line above the version text, gold - or red
+    // when it has to be installed. Clicking it makes handleMouseClick return "update". "" hides it.
+    void setUpdateNotice(const std::string& text, bool required) { updateNotice = text; updateRequired = required; }
+
 private:
+    std::string updateNotice;
+    bool updateRequired = false;
+    glm::vec4 updateRect{0.0f};          // where it was drawn (pixels: x, y, w, h)
+    double lastMouseX = -1.0, lastMouseY = -1.0;
     GLuint vao = 0;
     GLuint vbo = 0;
     GLuint headerVAO = 0;

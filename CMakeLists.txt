@@ -115,6 +115,7 @@ target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
 add_executable(BlockSmith
     main.cpp
+    Diagnostics.cpp
     Player.cpp
     World.cpp
     ChunkMesh.cpp
@@ -230,8 +231,23 @@ endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
 # just the world, the mods and the networking.
 # Build it with:  cmake --build build --config Release --target BlockSmithServer
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Build info: the git commit, stamped into generated/BuildInfo.h on every build (Version.h reads
+# it; the server prints it). Override with -DBLOCKSMITH_COMMIT=<hash> or the environment variable.
+# ---------------------------------------------------------------------------
+set(BLOCKSMITH_COMMIT "" CACHE STRING "Commit hash to stamp into the build (empty: ask git)")
+set(BLOCKSMITH_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+add_custom_target(blocksmith_buildinfo ALL
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+            -DOUT=${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h -DCOMMIT=${BLOCKSMITH_COMMIT}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildInfo.cmake
+    BYPRODUCTS ${BLOCKSMITH_GENERATED_DIR}/BuildInfo.h
+    COMMENT "Stamping the git commit into BuildInfo.h"
+    VERBATIM)
+
 add_executable(BlockSmithServer
     ServerMain.cpp
+    Diagnostics.cpp
     ChunkGenerator.cpp
     Fluids.cpp
     World.cpp
@@ -254,7 +270,9 @@ if (WIN32)
     target_sources(BlockSmithServer PRIVATE BlockSmith.rc)   # same icon for the server .exe
 endif()
 
+add_dependencies(BlockSmithServer blocksmith_buildinfo)
 target_include_directories(BlockSmithServer PRIVATE
+    ${BLOCKSMITH_GENERATED_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
@@ -281,6 +299,41 @@ endif()
 # from GitHub and approved sites. Windows: WinHTTP (built in). Elsewhere: libcurl if installed;
 # without it the game still builds and remote.* says downloads aren't available.
 # ---------------------------------------------------------------------------
+# Debug info in release builds too, so traces and crash reports can be turned into file:line
+# (addr2line -e <program> <offset>, or a debugger). GCC / Clang: line tables only (-g1, small);
+# MSVC: a .pdb next to the .exe, which the Windows traces read by themselves. No effect on speed.
+option(BLOCKSMITH_DEBUG_INFO "Keep debug info (file and line numbers) in release builds" ON)
+if (BLOCKSMITH_DEBUG_INFO)
+    foreach(target BlockSmith BlockSmithServer)
+        if (TARGET ${target})
+            if (MSVC)
+                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Zi>)
+                target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+            else()
+                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-g1>)
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# Diagnostics.cpp: warning traces and crash reports name the functions on the stack. Linux /
+# macOS: export the program's symbols (and dladdr's library); Windows: DbgHelp.
+foreach(target BlockSmith BlockSmithServer)
+    if (TARGET ${target})
+        if (WIN32)
+            target_link_libraries(${target} PRIVATE dbghelp)
+        else()
+            set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
+            target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+        endif()
+    endif()
+endforeach()
+
+if (TARGET BlockSmith)
+    add_dependencies(BlockSmith blocksmith_buildinfo)
+    target_include_directories(BlockSmith PRIVATE ${BLOCKSMITH_GENERATED_DIR})
+endif()
+
 if (WIN32)
     if (TARGET BlockSmith)
         target_link_libraries(BlockSmith PRIVATE winhttp)

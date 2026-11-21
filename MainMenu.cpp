@@ -1,4 +1,5 @@
 #include "MainMenu.h"
+#include "Version.h"
 #include "FontRenderer.h"
 #include "Types.h"
 #include <glm/gtc/matrix_transform.hpp>
@@ -493,6 +494,8 @@ bool MainMenu::renderBackdrop(int screenWidth, int screenHeight) {
 
 void MainMenu::updateAndBuildBuffers(double mouseX, double mouseY, int screenWidth, int screenHeight) {
     if (screenWidth == 0 || screenHeight == 0) return;
+    lastMouseX = mouseX;
+    lastMouseY = mouseY;
     layout(screenWidth, screenHeight);
 
     float ndcX = (static_cast<float>(mouseX) / screenWidth) * 2.0f - 1.0f;
@@ -803,6 +806,12 @@ std::string MainMenu::handleMouseClick(double mouseX, double mouseY, int screenW
     float ndcX = (static_cast<float>(mouseX) / screenWidth) * 2.0f - 1.0f;
     float ndcY = 1.0f - (static_cast<float>(mouseY) / screenHeight) * 2.0f;
 
+    // 0. The "new version" line (bottom left)
+    if (!updateNotice.empty() && updateRect.z > 0.0f && mouseX >= updateRect.x && mouseX < updateRect.x + updateRect.z &&
+        mouseY >= updateRect.y && mouseY < updateRect.y + updateRect.w) {
+        return "update";
+    }
+
     // 1. The game selector: its arrows, then its tiles
     for (int side : { -1, 1 }) {
         const glm::vec4 a = (side < 0) ? arrowLeft : arrowRight;
@@ -1098,9 +1107,21 @@ void MainMenu::render(GLuint uiShader, GLuint texturedUIShader, GLuint fontShade
         const float margin = std::round(capPx * 1.5f);
         const float baseline = std::round(screenHeight - margin);
         const glm::vec4 grey(0.88f, 0.88f, 0.88f, 1.0f);
-        const std::string version = "BlockSmith 5.17.0-dev";
+        const std::string version = "BlockSmith " BLOCKSMITH_VERSION;
         const std::string copyright = "(c) 2010-2026 Developer Studio";
         shadowed(version, margin, baseline, sc, capPx, grey);
+        // A new version: one line above it, which opens the download page when clicked
+        updateRect = glm::vec4(0.0f);
+        if (!updateNotice.empty()) {
+            const float y = std::round(baseline - capPx * 2.4f);
+            const float w = fontRenderer.textWidth(updateNotice, sc.x, screenRes);
+            updateRect = glm::vec4(margin - 4.0f, y - capPx * 1.4f, w + 8.0f, capPx * 2.0f);
+            const bool hover = lastMouseX >= updateRect.x && lastMouseX < updateRect.x + updateRect.z &&
+                               lastMouseY >= updateRect.y && lastMouseY < updateRect.y + updateRect.w;
+            const glm::vec4 colour = updateRequired ? (hover ? glm::vec4(1.0f, 0.62f, 0.58f, 1.0f) : glm::vec4(1.0f, 0.45f, 0.40f, 1.0f))
+                                                    : (hover ? glm::vec4(1.0f, 0.88f, 0.55f, 1.0f) : glm::vec4(1.0f, 0.78f, 0.28f, 1.0f));
+            shadowed(updateNotice, margin, y, sc, capPx, colour);
+        }
         const float cw = fontRenderer.textWidth(copyright, sc.x, screenRes);
         shadowed(copyright, std::round(screenWidth - margin - cw), baseline, sc, capPx, grey);
     }

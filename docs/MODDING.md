@@ -3361,11 +3361,11 @@ Commands work like Minecraft's: typed in the server console (no slash), or in ch
 
 | level | may | commands |
 |---|---|---|
-| everyone | talk and look | `help`, `list`, `msg`/`tell`, `me` |
+| everyone | talk and look | `help`, `list`, `msg`/`tell`, `me`, `report`, `version` |
 | 1 | build inside spawn protection | |
 | 2 | change the game | `gamemode`, `tp`/`teleport`, `give`, `clear`, `kill`, `time`, `gamerule`, `setworldspawn`, `spawnpoint`, `seed`, `say`, `tps` |
-| 3 | manage players | `kick`, `ban`, `unban`/`pardon`, `ban-ip`, `pardon-ip`, `banlist [players\|ips]`, `whitelist`, `op`, `deop`, `ops` |
-| 4 | run the server | `stop`, `save`/`save-all`, `save-off`, `save-on`, `reload`, `games`, `mods`, `motd`, `name`, `password reset` |
+| 3 | manage players | `reports`, `kick`, `ban`, `unban`/`pardon`, `ban-ip`, `pardon-ip`, `banlist [players\|ips]`, `whitelist`, `op`, `deop`, `ops` |
+| 4 | run the server | `stop`, `save`/`save-all`, `save-off`, `save-on`, `reload`, `games`, `mods`, `motd`, `name`, `password reset`, `diag` |
 
 An operator can't give a higher level than their own. Mods' commands get `is_operator` (any level) and decide for themselves.
 
@@ -3410,6 +3410,85 @@ The survival mod follows them. Your mods can too: a rule's value is the shared v
 **Spawn protection.** `spawn_protection = 16` in `server.conf`: blocks within that many blocks of the world's spawn can only be changed by operators (0 = off). As in Minecraft, it's off while there are no operators.
 
 **The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
+
+**Player reports.** Anyone can type `/report <player> <reason>` in chat (or `report` in the console). The report is saved in `reports.txt` next to `server.conf`, so the owner can read it later, whether or not they were online when it happened. Each report keeps:
+
+- who reported whom, when, and why;
+- where both players were (or that the reported player was offline);
+- the chat around it: everything either of them said in the 15 minutes before (up to 30 lines).
+
+The player who was reported has to be on the server or have played on it (any capitals). A player can send one report a minute and at most 3 open reports about the same person, and can't report themselves.
+
+Reading and handling them, in the console or as an operator (level 3) in chat:
+
+```
+reports                       the open reports, newest first
+reports all                   the closed ones too
+reports show 2                one report in full: positions, reason, the chat
+reports close 2 warned them   dealt with (who closed it, and the note, are kept)
+reports reopen 2
+reports delete 2              (level 4 / the console)
+```
+
+New reports show in the console straight away and go to the operators online (level 3+). Operators who join later are told how many are open, and the console says so when the server starts. Mods get `on_player_report(id, reporter, reported, reason)`.
+
+**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 5.17.0) is older than this server (BlockSmith 5.18.0). An update is available..."). Builds of the same release play together (`5.18.0-dev` counts as 5.18.0). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (5.17.0): you can still join").
+
+**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 5.17.0-dev (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+
+**Diagnostics (the game and the server).** Both write everything they print to `logs/latest.log` (next to `server.conf`, or next to the game's `settings.txt`), with the time on each line; the previous log is kept as `logs/<date>-<n>.log`. To find what went wrong:
+
+- **System report** at the start: version, commit, protocol, build type, compiler, architecture, OS, CPU, threads, memory, Lua version, process and folder, and for the game its graphics card and OpenGL version.
+- **A trace under every warning and error** (everything printed to the error stream): the build, the thread, how long it had been running, and the native call stack that printed it. A warning that repeats gets the full trace the 1st, 10th, 100th, 1000th... time, with the count.
+- **Lua errors with their Lua stack**: every Lua error the engine catches, and every error a mod catches with `pcall` (`[Lua] Error caught by pcall`), is printed with its Lua traceback: which file and line, called from where, through which mods. `pcall` itself works exactly as in plain Lua.
+- **Crash reports**: a crash (bad memory access, abort, illegal instruction...) or an uncaught C++ exception prints what happened and the call stack, to the console, the end of `latest.log`, and `logs/crash-<date>_<time>.txt`.
+- **`diag`** (server console, or operators level 4): the system report, ticks per second, chunks and players, the update check, and the warnings so far, most frequent first.
+
+```
+[Lua] on_chat_command: mods/mymod/init.lua:20: command blew up
+    | trace: server BlockSmith 5.17.0-dev (commit 2d5ea37fe8) | thread 1406907518 | up 7.0 s
+    |   #0 ??  (BlockSmithServer+0x8118f)
+    |   #1 main+0x533b  (BlockSmithServer+0x7a6cb)
+```
+
+Stack frames name the function where the platform can; every frame also gives its module and offset. `addr2line -f -C -i -e BlockSmithServer 0x8118f` (Linux / macOS) turns an offset into the function, file and line; on Windows the `.pdb` next to the `.exe` is read by the traces themselves. Release builds keep line tables for this (`-DBLOCKSMITH_DEBUG_INFO=OFF` leaves them out).
+
+**New versions.** The game and the server check now and then (at start, then every 6 hours) whether a newer BlockSmith is out. They read one small JSON file, `version.json`, as data, like any remote content (HTTPS, whitelisted hosts, checked to really be JSON); nothing is ever downloaded or installed for you.
+
+```json
+{
+  "latest": "5.18.0",
+  "min_supported": "5.17.0",
+  "commit": "1a2b3c4d5e",
+  "download": "https://github.com/Gerold55/testvoxel/releases/latest",
+  "notes": "New biomes and menus"
+}
+```
+
+- `latest`: the newest version. Newer than this build: *update available*.
+- `min_supported` (optional): older than this: *update required* (it can't play with up-to-date games and servers any more).
+- `download` (optional): where to get it. Only an `https` page on `github.com`, `*.github.io` or the version file's own site is used; anything else is left out.
+- `commit` and `notes` (optional): shown with it. Notes are one line, up to 300 characters.
+
+Where it shows: the title screen gets a gold "Update available: 5.18.0 - click to download" line above the version (red "Update required" when it must be installed); clicking it opens the download page in your browser. The server prints it in its console (and log) when it changes, tells operators when they join, and adds it to `version`. With a warning (an update available or required, or a check that failed) the details follow on the next lines: the file that was checked, the HTTP result, this build's version and commit, the latest and minimum versions, what it decided and why, and the error if there was one:
+
+```
+[Server] Couldn't check for updates: the site answered 404
+[Server]   version file: https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json
+[Server]   result: HTTP 404, download failed
+[Server]   this build: 5.17.0-dev (commit 2d5ea37fe8)
+[Server]   error: the site answered 404
+```
+
+**Between games and servers.** Each server says which BlockSmith it runs when the server list asks it, and each game says which one it is when it joins, so:
+
+- The Multiplayer screen shows a server's BlockSmith version in its details: gold with "Update available: this server runs 5.18.0" when it's newer than your game. A server you can't join because of the version says which way round: "This server runs a newer BlockSmith (6.0.0): update your game to join", or "...an older BlockSmith (5.1.0): it needs updating". When the game's own check found a newer version, the Multiplayer footer has an "Update available: 5.18.0 - Download" link.
+- A player whose game is older than the server (or than the newest release, from the server's own check) is told so in chat when they join, with the download link. The server's console logs which BlockSmith each player has, and notes when a player's game is newer than the server.
+- `engine.get_server_status(address)` has `engine_version`, `engine_commit` and `engine_compare` (`"newer"`, `"older"`, `"same"`, or `""` for older servers that don't say), and `engine.open_update_page()` opens the download page from a title-screen page.
+
+Older games and servers that don't send their version still work together as before; they just don't get these messages.
+
+Settings: `update_check = false` turns it off, `update_url = <address>` reads another file (it must be allowed like any remote content: GitHub or a domain in `remote_domains`). Both go in `settings.txt` for the game and `server.conf` for a server. The default is `https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json`: publish a new version by changing that file. Mods can read the answer with `engine.get_update_info()` -> `{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }`.
 
 ### Game modes and permissions
 
@@ -3509,7 +3588,7 @@ button_text_hover_color = #ffffa0
 ```
 
 Mostly used by the base mod's menus. You'll only need these to replace those menus:
-- <a id="fn-engine-create_world"></a><a id="fn-engine-delete_world"></a><a id="fn-engine-get_active_world"></a><a id="fn-engine-get_game_info"></a><a id="fn-engine-get_worlds"></a><a id="fn-engine-list_worlds"></a><a id="fn-engine-play_world"></a><a id="fn-engine-save_world"></a><a id="fn-engine-set_active_world"></a><a id="fn-engine-start_game"></a><a id="fn-engine-take_world_error"></a>**Worlds:** `engine.list_worlds`, `create_world`, `play_world`, `delete_world`, `save_world`, `get_game_info`, and the older `get_worlds`, `get_active_world`, `set_active_world`, `start_game`. `engine.take_world_error()` returns why the last world was closed or couldn't be opened (for example, its world generator failed), once, else `nil`; the world list shows it. Each `engine.list_worlds()` entry is `{ name, seed, game_mode, played, has_thumbnail }`, newest first: `played` reads like "2 hours ago", and `has_thumbnail` says the world has a picture. The engine takes that picture (`saves/<world>/thumbnail.png`, 320x180) from the game view whenever you pause, every five minutes while you play, and a few seconds after a world without one is opened; `ui.world_thumbnail(name)` returns it for `ui.draw_image` (or `nil`), and picks up a newer one by itself.
+- <a id="fn-engine-create_world"></a><a id="fn-engine-delete_world"></a><a id="fn-engine-get_active_world"></a><a id="fn-engine-get_game_info"></a><a id="fn-engine-get_worlds"></a><a id="fn-engine-list_worlds"></a><a id="fn-engine-play_world"></a><a id="fn-engine-save_world"></a><a id="fn-engine-set_active_world"></a><a id="fn-engine-start_game"></a><a id="fn-engine-take_world_error"></a>**Worlds:** `engine.list_worlds`, `create_world`, `play_world`, `delete_world`, `save_world`, `get_game_info`, and the older `get_worlds`, `get_active_world`, `set_active_world`, `start_game`. `engine.play_world(name)` returns `true`, or `false` and why not: the name isn't a world folder in `saves/`, the selected game isn't installed, or the world was made with another game than the selected one. It doesn't have to be the game that's loaded: playing a world whose game or mods differ from the loaded ones reloads the mods for it first, behind the loading screen. `engine.take_world_error()` returns why the last world was closed or couldn't be opened (for example, its world generator failed), once, else `nil`; the world list shows it. Each `engine.list_worlds()` entry is `{ name, seed, game_mode, played, has_thumbnail }`, newest first: `played` reads like "2 hours ago", and `has_thumbnail` says the world has a picture. The engine takes that picture (`saves/<world>/thumbnail.png`, 320x180) from the game view whenever you pause, every five minutes while you play, and a few seconds after a world without one is opened; `ui.world_thumbnail(name)` returns it for `ui.draw_image` (or `nil`), and picks up a newer one by itself.
 - <a id="fn-engine-get_keybinds"></a><a id="fn-engine-get_video_settings"></a><a id="fn-engine-key_name"></a><a id="fn-engine-reset_keybinds"></a><a id="fn-engine-set_keybind"></a><a id="fn-engine-set_video_setting"></a>**Settings:** `engine.get_keybinds`, `set_keybind`, `reset_keybinds`, `key_name`, `get_video_settings`, `set_video_setting`
   - <a id="fn-hooks-handle_settings_mouse"></a>**Mouse buttons as controls:** keybinds store a mouse button as `1000 + button` (1002 = middle, 1003 and up = side buttons). `engine.key_name(1002)` returns `"Middle Mouse"`. Movement, jump, sneak, sprint and pick block can use mouse buttons, but not left or right, which dig and place. The engine calls `handle_settings_mouse(code)` when a mouse button is pressed on the Settings screen. Return true to use the press (the base settings menu binds it to the control waiting for a key).
 - <a id="fn-engine-back_to_title"></a><a id="fn-engine-close_settings"></a><a id="fn-engine-is_in_game"></a><a id="fn-engine-is_paused"></a><a id="fn-engine-open_settings"></a><a id="fn-engine-pause"></a><a id="fn-engine-quit"></a><a id="fn-engine-quit_to_menu"></a><a id="fn-engine-resume"></a>**Game flow:** `engine.open_settings`, `close_settings`, `pause`, `resume`, `is_paused`, `is_in_game`, `quit_to_menu`, `back_to_title`, `quit`
