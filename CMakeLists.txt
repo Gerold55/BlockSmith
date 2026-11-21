@@ -29,6 +29,7 @@ if (NOT BLOCKSMITH_SERVER_ONLY)
 endif()
 find_package(glm CONFIG REQUIRED)
 find_package(sol2 CONFIG REQUIRED)
+find_package(Backtrace REQUIRED)
 
 # vcpkg ships Lua as unofficial-lua, other platforms use CMake's FindLua
 find_package(unofficial-lua CONFIG QUIET)
@@ -200,6 +201,7 @@ target_link_libraries(BlockSmith PRIVATE
     ${VOXEL_LUA_TARGET}
     enet
     OpenAL::OpenAL
+    ${Backtrace_LIBRARIES}
 )
 
 # The BlockSmith icon on the .exe files (icons/blocksmith.ico, via BlockSmith.rc)
@@ -327,6 +329,7 @@ target_link_libraries(BlockSmithServer PRIVATE
     sol2::sol2
     ${VOXEL_LUA_TARGET}
     enet
+    ${Backtrace_LIBRARIES}
 )
 
 if (WIN32)
