@@ -973,7 +973,11 @@ std::string worldGame(const std::string& world);
 std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world);
 extern std::set<std::string> g_LoadedGlobalMods;
 
+extern bool g_HudHidden;
+
 void beginLoadingWorld(GLFWwindow* win) {
+    // Every world starts with the HUD showing (F1 hides it only until you leave that world)
+    g_HudHidden = false;
     // This world runs other mods (or is another game's): load those first, then open it
     const std::string game = worldGame(g_ActiveWorldName);
     if (!g_Reload.pending && (game != g_LoadedGameFolder || resolveGlobalMods(game, g_ActiveWorldName) != g_LoadedGlobalMods)) {
@@ -1682,6 +1686,18 @@ std::string textureSearchHint() {
     return where.empty() ? "no game or mods folder found" : where;
 }
 
+// Block textures no game, mod or pack had, so far (one warning lists them all)
+static std::vector<std::string> g_MissingTextures;
+static bool g_MissingTexturesReported = false;   // after that: each one as it's asked for
+static void reportMissingTextures() {
+    g_MissingTexturesReported = true;
+    if (g_MissingTextures.empty()) return;
+    std::string list;
+    for (size_t i = 0; i < g_MissingTextures.size(); ++i) list += (i ? ", " : "") + g_MissingTextures[i];
+    std::cerr << "[Texture] " << g_MissingTextures.size() << " block texture(s) not found: " << list << std::endl;
+
+}
+
 int loadTextureToLayer(const std::string& path) {
     std::string finalPath = path;
 
@@ -1708,7 +1724,12 @@ int loadTextureToLayer(const std::string& path) {
     }
 
     if (!found && packOverride(path).empty()) {
-        std::cerr << "[Texture] Missing block texture: " << path << std::endl;
+        // listed once, together, after the mods have loaded (reportMissingTextures)
+        const std::string name = fs::path(path).filename().string();
+        if (std::find(g_MissingTextures.begin(), g_MissingTextures.end(), name) == g_MissingTextures.end()) {
+            g_MissingTextures.push_back(name);
+            if (g_MissingTexturesReported) std::cerr << "[Texture] Missing block texture: " << path << std::endl;
+        }
     }
     if (found && packOverride(path).empty()) {
         int w, h, n;
@@ -2232,7 +2253,10 @@ local out = {}
 local function add(s) out[#out + 1] = s end
 local function sorted_keys(t, want)
     local k = {}
-    for name, v in pairs(t) do
+    if type(t) ~= "table" then return k end
+    -- next, not pairs: a table's own keys, without its __pairs (some engine objects - model
+    -- animations - refuse to be listed that way)
+    for name, v in next, t do
         if type(name) == "string" and want(v) then k[#k + 1] = name end
     end
     table.sort(k)
@@ -2465,7 +2489,6 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     auto lua = std::make_unique<sol::state>();
     lua->open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                         sol::lib::coroutine, sol::lib::utf8);
-    diag::installLuaTraceback(lua->lua_state());
     installModSandbox(*lua);
     (*lua)["print"] = [](sol::variadic_args) {};
     lua->new_usertype<ChunkData>("Chunk",
@@ -2495,8 +2518,10 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     lua->script(kWorkerNoopLua);
     for (const auto& file : modFiles) {
         (*lua)["g_CurrentModPath"] = file.parent_path().string();
-        try { lua->script_file(file.string()); } catch (const std::exception&) {}   // errors shown by the main thread
+        // errors shown by the main thread (here, where only world generation works, they're noise)
+        try { lua->safe_script_file(file.string(), sol::script_pass_on_error); } catch (const std::exception&) {}
     }
+    diag::installLuaTraceback(lua->lua_state());   // generating chunks: errors with their Lua stack
     return lua;
 }
 
@@ -6077,6 +6102,7 @@ int main(int argc, char** argv) {
 
         engineTable["quit_to_menu"] = [window, &lua]() {
             g_SettingsInGame = false;
+            g_HudHidden = false;   // (F1 is for the world you were in: the next one shows the HUD)
             // Save, then unload the world so the next one starts clean (blocks still falling
             // land first, so none is lost in the air)
             if (g_CurrentGameState == GameState::PLAYING) {
@@ -6282,6 +6308,7 @@ int main(int argc, char** argv) {
                 return std::make_tuple(false, std::string("Restart the game with this game selected to join its servers."));
             }
             if (g_Server.running()) g_Server.stop();
+            g_HudHidden = false;   // joining a server: the HUD shows (F1 was for the last world)
             std::string error;
             g_NetError.clear();
             const int view = g_WorldInstance ? g_WorldInstance->renderDistance() : 8;
@@ -7108,6 +7135,7 @@ int main(int argc, char** argv) {
         }
 
         // lua_api.txt: everything modders can use in this build (see writeApiReference)
+        reportMissingTextures();
         writeApiReference(lua);
         engineTable["write_api_reference"] = [&lua]() { return writeApiReference(lua); };
 
@@ -9258,10 +9286,9 @@ int main(int argc, char** argv) {
                     g_Updates->update(glfwGetTime());
                     if (g_Updates->takeNews()) {
                         const std::string line = g_Updates->summary();
-                        if (!line.empty()) std::cout << "[Update] " << line << std::endl;
-                        if (g_Updates->warning()) {   // the details behind a warning
-                            for (const auto& t : g_Updates->trace()) std::cout << "[Update]   " << t << std::endl;
-                        }
+                        // one line (the full details: the server's "update" command / the Lua info)
+                        if (!line.empty()) std::cout << "[Update] " << line
+                                                     << (g_Updates->info().checked ? "" : " (" + g_Updates->url() + ")") << std::endl;
                     }
                     if (g_MainMenu) {
                         const update::Info& u = g_Updates->info();

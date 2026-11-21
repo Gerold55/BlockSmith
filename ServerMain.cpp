@@ -1102,7 +1102,9 @@ void installSandbox(sol::state& lua, const std::string& game) {
 void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                        sol::lib::coroutine, sol::lib::utf8);
-    diag::installLuaTraceback(lua.lua_state());   // every Lua error the server catches: with its Lua stack
+    // every Lua error the server catches: with its Lua stack (world-generator threads: once their
+    // mods have loaded - see the generator below)
+    if (!worker) diag::installLuaTraceback(lua.lua_state());
     installSandbox(lua, ctx.config->game);        // require / dofile only inside mods and lualib
     luasandbox::installTimeLimitHook(lua);
     if (worker) lua["print"] = [](sol::variadic_args) {};
@@ -1617,10 +1619,14 @@ int main(int argc, char** argv) {
     ChunkGenerator generator(config.generatorThreads, [&ctx, modFiles]() {
         auto workerLua = std::make_unique<sol::state>();
         setupLua(*workerLua, ctx, true);
+        // Each thread runs its own copy of the mods (for generate_chunk). Their load errors are
+        // the main thread's to report (it loads the same files, with the whole engine there);
+        // here, where only world generation works, they'd be noise - kept quiet
         for (const auto& file : modFiles) {
             (*workerLua)["g_CurrentModPath"] = file.parent_path().string();
-            try { workerLua->script_file(file.string()); } catch (const std::exception&) {}
+            try { workerLua->safe_script_file(file.string(), sol::script_pass_on_error); } catch (const std::exception&) {}
         }
+        diag::installLuaTraceback(workerLua->lua_state());   // from now on (generating chunks): with the Lua stack
         return workerLua;
     }, meta.seed);
     world.setGenerator(&generator);
@@ -2726,11 +2732,8 @@ int main(int argc, char** argv) {
             // said when it changes (not again every few hours when nothing's new)
             const std::string line = updates.summary();
             if (!line.empty() && line != lastUpdateLine) {
-                std::cout << "[Server] " << line << std::endl;
-                // a warning (new version, must update, or the check failed): the details too
-                if (updates.warning()) {
-                    for (const auto& t : updates.trace()) std::cout << "[Server]   " << t << std::endl;
-                }
+                // one line (the details: the "update" command)
+                std::cout << "[Server] " << line << (updates.info().checked ? "" : " (" + updates.url() + ")") << std::endl;
                 lastUpdateLine = line;
             }
         }

@@ -11,6 +11,14 @@ class ChunkData {
 public:
     ChunkData();
 
+    // Terrain versions (World.h): the world generator's terrain_version this chunk was made with,
+    // and whether anything but nature changed it since (a player, a bucket, a mod's structure...).
+    // A chunk nobody built in, from an older terrain_version, is made again when it loads, so a
+    // changed world generator doesn't leave old terrain standing next to new.
+    uint16_t terrainVersion = 0;
+    bool terrainKnown = false;   // false: saved before this was recorded (always kept as it is)
+    bool built = false;
+
     // Coordinates are local to the chunk (0..15, 0..255, 0..15).
     void setBlock(int x, int y, int z, uint8_t blockId);
     void setBlockWithMeta(int x, int y, int z, uint8_t blockId, uint8_t meta);

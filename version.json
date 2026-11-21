@@ -1,6 +1,6 @@
 {
-  "latest": "5.17.0-dev",
-  "min_supported": "5.17.0-dev",
+  "latest": "0.1-alpha",
+  "min_supported": "0.1-alpha",
   "commit": "",
   "download": "https://github.com/Gerold55/testvoxel/releases/latest",
   "notes": ""

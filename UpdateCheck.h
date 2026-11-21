@@ -10,8 +10,8 @@
 //
 // The manifest (version.json):
 //   {
-//     "latest": "5.18.0",                     the newest version
-//     "min_supported": "5.17.0",              optional: older than this must update (it can't
+//     "latest": "0.2-alpha",                  the newest version
+//     "min_supported": "0.1-alpha",           optional: older than this must update (it can't
 //                                             play with up-to-date games and servers any more)
 //     "commit": "1a2b3c4d5e",                 optional: the newest version's commit
 //     "download": "https://github.com/Gerold55/testvoxel/releases/latest",
@@ -48,7 +48,7 @@ struct Info {
 };
 
 // ---------------------------------------------------------------------------
-// Versions: "5.17.0", "5.17", "5.18.0-dev". Numbers compare one by one (missing ones are 0); a
+// Versions: "0.1", "0.1.0", "0.1-alpha", "0.2-beta". Numbers compare one by one (missing ones are 0); a
 // version with a "-something" after the numbers comes before the same numbers without it.
 // ---------------------------------------------------------------------------
 struct Version {
@@ -93,11 +93,11 @@ inline int compare(const Version& a, const Version& b) {
         const int y = k < b.parts.size() ? b.parts[k] : 0;
         if (x != y) return x < y ? -1 : 1;
     }
-    if (a.pre.empty() != b.pre.empty()) return a.pre.empty() ? 1 : -1;   // 5.18.0-dev < 5.18.0
+    if (a.pre.empty() != b.pre.empty()) return a.pre.empty() ? 1 : -1;   // 0.1-alpha < 0.1
     return a.pre == b.pre ? 0 : (a.pre < b.pre ? -1 : 1);
 }
 
-// Releases only: "5.18.0-dev" counts as 5.18.0 (who may join whom: builds of the same release
+// Releases only: "0.1-alpha" counts as 0.1 (who may join whom: builds of the same release
 // play together, a newer release can join an older one, an older one can't join a newer one)
 inline int compareRelease(const Version& a, const Version& b) {
     Version x = a, y = b;

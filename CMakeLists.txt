@@ -363,7 +363,10 @@ if (BLOCKSMITH_DEBUG_INFO)
     foreach(target BlockSmith BlockSmithServer)
         if (TARGET ${target})
             if (MSVC)
-                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Zi>)
+                # /Z7, not /Zi: the debug info goes in each .obj (no shared vc*.pdb that files
+                # compiled at the same time fight over - error C1041); the linker still writes
+                # the program's .pdb
+                target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Z7>)
                 target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
             else()
                 target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-g1>)
@@ -372,8 +375,20 @@ if (BLOCKSMITH_DEBUG_INFO)
     endforeach()
 endif()
 
-# Diagnostics.cpp: warning traces and crash reports name the functions on the stack. Linux /
-# macOS: export the program's symbols (and dladdr's library); Windows: DbgHelp.
+# Diagnostics.cpp: warning traces and crash reports name the functions on the stack.
+#   Windows: DbgHelp (part of Windows) walks and names the stack.
+#   Elsewhere: backtrace() from execinfo.h - in the C library on glibc Linux and macOS, in a
+#   separate libexecinfo on musl (Alpine) and the BSDs (FindBacktrace links what's needed). The
+#   program's symbols are exported so the frames get names, and dladdr's library linked. With
+#   no backtrace() at all the build still works: traces just have no stack.
+if (NOT WIN32)
+    find_package(Backtrace)
+    if (Backtrace_FOUND)
+        message(STATUS "BlockSmith: stack traces with ${Backtrace_HEADER}")
+    else()
+        message(STATUS "BlockSmith: no backtrace() on this system (execinfo.h) - warning traces and crash reports won't show the call stack")
+    endif()
+endif()
 foreach(target BlockSmith BlockSmithServer)
     if (TARGET ${target})
         if (WIN32)
@@ -381,6 +396,13 @@ foreach(target BlockSmith BlockSmithServer)
         else()
             set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
             target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+            if (Backtrace_FOUND)
+                target_include_directories(${target} PRIVATE ${Backtrace_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${Backtrace_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE BLOCKSMITH_BACKTRACE=1)
+            else()
+                target_compile_definitions(${target} PRIVATE BLOCKSMITH_BACKTRACE=0)
+            endif()
         endif()
     endif()
 endforeach()

@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <sstream>
 #include <streambuf>
@@ -31,7 +32,13 @@
 #else
 #  include <cxxabi.h>
 #  include <dlfcn.h>
-#  include <execinfo.h>
+#  if !defined(BLOCKSMITH_BACKTRACE) || BLOCKSMITH_BACKTRACE
+#    include <execinfo.h>
+#  else
+// No backtrace() on this system (CMakeLists.txt: FindBacktrace found nothing): no call stacks
+static int backtrace(void**, int) { return 0; }
+static void backtrace_symbols_fd(void* const*, int, int) {}
+#  endif
 #  include <fcntl.h>
 #  include <sys/utsname.h>
 #  include <unistd.h>
@@ -171,11 +178,63 @@ std::string describeAddress(void* addr) {
 }
 #endif
 
+}  // namespace
+std::vector<std::string> stackTraceResolved(int skip, int max, std::string& resolve);
+namespace {
+
 // Frames that are only the printing machinery (iostreams, this file)
 bool boring(const std::string& frame) {
     static const char* skip[] = { "diag::", "std::basic_ostream", "std::__ostream_insert", "std::basic_streambuf",
                                   "std::endl", "std::operator<<", "std::ostream::", "basic_ostream<", "__ostream_insert" };
     for (const char* s : skip) if (frame.find(s) != std::string::npos) return true;
+    return false;
+}
+
+// The last time this thread printed a Lua error with its Lua stack: the lines right after it
+// (sol's "an error occurred", "Failed to load ...") are the same error, and get no native trace
+thread_local double t_lastLuaError = -100.0;
+
+// A frame, short: "loadTextureToLayer  main.cpp:1714" (no template arguments, no offsets;
+// the module and offset only when there's no file:line)
+std::string shortFrame(const std::string& f) {
+    const size_t sep = f.find("  (");
+    std::string name = f.substr(0, sep);
+    std::string rest = sep == std::string::npos ? "" : f.substr(sep + 2);
+    const size_t plus = name.rfind("+0x");
+    if (plus != std::string::npos) name.erase(plus);
+    std::string n;
+    int depth = 0;
+    for (size_t i = 0; i < name.size(); ++i) {
+        if (name.compare(i, 8, "<lambda_") == 0 && depth == 0) { n += "(lambda)"; }
+        if (name[i] == '<' && !(i >= 8 && name.compare(i - 8, 8, "operator") == 0)) { ++depth; continue; }
+        if (name[i] == '>' && depth > 0) { --depth; continue; }
+        if (name[i] == '(' && depth == 0 && name.compare(i, 8, "(lambda)") != 0 &&
+            name.compare(i, 11, "(anonymous ") != 0) { ++depth; continue; }   // (the parameter list)
+        if (name[i] == ')' && depth > 0) { --depth; continue; }
+        if (depth == 0) n += name[i];
+    }
+    if (n.size() > 90) n = n.substr(0, 87) + "...";
+    const size_t close = rest.find(')');
+    std::string module = close == std::string::npos ? rest : rest.substr(0, close + 1);
+    std::string line = close == std::string::npos ? "" : rest.substr(close + 1);
+    const size_t a = line.find_first_not_of(' ');
+    line = a == std::string::npos ? "" : line.substr(a);
+    return n + "  " + (line.empty() ? module : line);
+}
+
+// Frames of Lua itself / sol (where the engine was called from a mod): the trace stops there
+bool luaFrame(const std::string& f) {
+    if (f.rfind("sol::", 0) == 0) return true;
+    static const char* mods[] = { "(lua", "(liblua", "(Lua" };
+    for (const char* m : mods) if (f.find(m) != std::string::npos) return true;
+    return false;
+}
+
+// The system's own frames (thread start, C runtime, exception unwinding): left out
+bool systemFrame(const std::string& f) {
+    static const char* s[] = { "ntdll", "KERNEL32", "KERNELBASE", "VCRUNTIME", "ucrtbase", "libc.so", "libsystem_",
+                               "__scrt_common_main", "_CxxFrameHandler", "start_thread", "__libc_start", "libstdc++" };
+    for (const char* x : s) if (f.find(x) != std::string::npos) return true;
     return false;
 }
 
@@ -210,6 +269,9 @@ private:
 #endif
     void finish(const std::string& line) {
         std::lock_guard<std::mutex> lock(g_mutex);
+        // sol's own copy of a Lua error that was just printed with its Lua stack: not again
+        if (line.rfind("[sol2] An error occurred and has been passed to an error handler", 0) == 0 &&
+            uptime() - t_lastLuaError < 1.0) return;
         m_out->sputn(line.data(), static_cast<std::streamsize>(line.size()));
         std::string text = line;
         while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
@@ -217,20 +279,35 @@ private:
         Seen& seen = g_seen[normalize(text)];
         if (seen.first.empty()) seen.first = text.substr(0, 200);
         const size_t count = ++seen.count;
-        if (!traceDue(count)) { m_out->pubsync(); return; }
-        std::ostringstream t;
-        t << "    | trace: " << g_role << " BlockSmith " << BLOCKSMITH_VERSION << " (commit " << BLOCKSMITH_COMMIT
-          << ") | thread " << threadName() << " | up " << std::fixed;
-        t.precision(1);
-        t << uptime() << " s";
-        if (count > 1) t << " | seen " << count << " times";
-        t << "\n";
-        int k = 0;
-        for (const auto& f : stackTrace(2, 40)) {
-            if (boring(f)) continue;
-            t << "    |   #" << k++ << " " << f << "\n";
-            if (k >= 16) break;
+        if (count > 1) {   // the same warning again: just the count, now and then
+            if (traceDue(count)) {
+                const std::string c = "    | (seen " + std::to_string(count) + " times)\n";
+                m_out->sputn(c.data(), static_cast<std::streamsize>(c.size()));
+            }
+            m_out->pubsync(); return;
         }
+        if (uptime() - t_lastLuaError < 1.0) { m_out->pubsync(); return; }   // (the Lua stack said where)
+        // Where it was printed from: the engine's own frames, up to where a mod called in
+        std::string resolve;
+        std::vector<std::string> frames;
+        bool fromLua = false;
+        for (const auto& f : stackTraceResolved(2, 40, resolve)) {
+            if (boring(f) || systemFrame(f)) continue;
+            if (luaFrame(f)) { if (!frames.empty()) { fromLua = true; break; } continue; }
+            frames.push_back(shortFrame(f));
+            if (frames.size() >= 6) break;
+        }
+        // Several warnings from the same place (one per missing texture...): the trace once
+        std::string site;
+        for (size_t i = 0; i < frames.size() && i < 3; ++i) site += frames[i] + "|";
+        static std::set<std::string> sitesShown;
+        if (frames.empty() || !sitesShown.insert(site).second) { m_out->pubsync(); return; }
+        std::ostringstream t;
+        t << "    | at ";
+        for (size_t i = 0; i < frames.size(); ++i) t << (i ? "\n    |    < " : "") << frames[i];
+        if (fromLua) t << "\n    |    < (called from a mod's Lua)";
+        t << "\n";
+        (void)resolve;   // (the full stack and its addr2line command: crash reports)
         const std::string s = t.str();
         m_out->sputn(s.data(), static_cast<std::streamsize>(s.size()));
         m_out->pubsync();
@@ -302,7 +379,9 @@ void onTerminate() {
     }
     std::string text = crashHeader(what);
     int k = 0;
-    for (const auto& f : stackTrace(1, 40)) text += "  #" + std::to_string(k++) + " " + f + "\n";
+    std::string resolve;
+    for (const auto& f : stackTraceResolved(1, 40, resolve)) text += "  #" + std::to_string(k++) + " " + f + "\n";
+    if (!resolve.empty()) text += "Exact names and lines: " + resolve + "\n";
     text += "===============================================\n";
     writeCrashText(text);
 #ifndef _WIN32
@@ -387,7 +466,8 @@ void onSignal(int sig, siginfo_t* info, void*) {
         sigWrite(fd, "\nAfter:  ");
         sigWriteNum(fd, static_cast<unsigned long long>(std::time(nullptr) - g_startWall), 10);
         sigWrite(fd, " s\nStack (module(function+offset) [address] - addr2line -e <module> <offset> gives file:line):\n");
-        backtrace_symbols_fd(frames, n, fd);
+        if (n > 0) backtrace_symbols_fd(frames, n, fd);
+        else sigWrite(fd, "(no call stack: this build has no backtrace())\n");
         sigWrite(fd, "===============================================\n");
     }
     if (fds[1] >= 0) close(fds[1]);
@@ -442,6 +522,7 @@ void logLuaError(lua_State* L, const char* label) {
     luaL_traceback(L, L, msg.c_str(), 1);
     std::string tb = lua_tostring(L, -1) ? lua_tostring(L, -1) : msg;
     lua_pop(L, 1);
+    t_lastLuaError = uptime();
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         Seen& seen = g_seen[std::string("[Lua] ") + label + ": " + normalize(msg)];
@@ -645,6 +726,48 @@ std::vector<std::string> warningSummary(size_t max) {
     std::vector<std::string> out;
     for (size_t i = 0; i < list.size() && i < max; ++i) out.push_back(std::to_string(list[i].first) + " x " + list[i].second);
     return out;
+}
+
+// The stack (as stackTrace), and a command that turns its frames in this program into exact
+// function, file and line: addr2line (Linux) or atos (macOS). The names above come from the
+// program's exported symbols; a function that isn't exported shows as the nearest one that is,
+// which can mislead - the command never does (with debug info: BLOCKSMITH_DEBUG_INFO).
+std::vector<std::string> stackTraceResolved(int skip, int max, std::string& resolve) {
+    resolve.clear();
+#ifdef _WIN32
+    return stackTrace(skip + 1, max);   // (Windows: DbgHelp already reads the .pdb)
+#else
+    std::vector<std::string> out;
+    void* frames[64];
+    const int n = backtrace(frames, std::min(64, max + skip + 1));
+    Dl_info self{};
+    dladdr(reinterpret_cast<void*>(&init), &self);   // this program: where it's loaded, its file
+    std::string addrs;
+    for (int i = skip + 1; i < n; ++i) {
+        out.push_back(describeAddress(frames[i]));
+        Dl_info info{};
+        if (self.dli_fbase && dladdr(frames[i], &info) && info.dli_fbase == self.dli_fbase) {
+            std::ostringstream a;
+#if defined(__APPLE__)
+            a << " 0x" << std::hex << reinterpret_cast<uintptr_t>(frames[i]);
+#else
+            a << " 0x" << std::hex << (reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(self.dli_fbase));
+#endif
+            addrs += a.str();
+        }
+    }
+    if (!addrs.empty() && self.dli_fname) {
+        const std::string exe = fs::path(self.dli_fname).filename().string();
+        std::ostringstream c;
+#if defined(__APPLE__)
+        c << "atos -o " << exe << " -l 0x" << std::hex << reinterpret_cast<uintptr_t>(self.dli_fbase) << addrs;
+#else
+        c << "addr2line -f -C -i -e " << exe << addrs;
+#endif
+        resolve = c.str();
+    }
+    return out;
+#endif
 }
 
 std::vector<std::string> stackTrace(int skip, int max) {

@@ -286,7 +286,7 @@ private:
         std::string nonce;
         std::string helloName;
         int helloView = 8;
-        std::string engineVersion;    // their BlockSmith ("5.17.0-dev"), "" from older games
+        std::string engineVersion;    // their BlockSmith ("0.1-alpha"), "" from older games
         std::string mode;             // game mode the server gave them
         bool op = false;
         std::string name;
@@ -557,7 +557,7 @@ struct ServerStatus {
     enum class State { Pinging, Online, Offline } state = State::Pinging;
     std::string motd;
     std::string version;         // the server's kVersionName (the protocol)
-    std::string engineVersion;   // the server's BlockSmith ("5.17.0-dev"), "" from older servers
+    std::string engineVersion;   // the server's BlockSmith ("0.1-alpha"), "" from older servers
     std::string engineCommit;    // ...and its commit
     std::string game;            // game folder the server is playing
     std::string gameTitle;       // that game's title (from its game.conf), "" from older servers

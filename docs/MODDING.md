@@ -1875,6 +1875,14 @@ function generate_chunk(chunk, cx, cz) -- every new chunk (16 x 256 x 16)
 end
 ```
 
+<a id="terrain-version"></a>**When you change the terrain: `terrain_version`.** Set a global number in your world generator, and raise it whenever the terrain it makes changes (heights, biomes, rivers...):
+
+```lua
+terrain_version = 2   -- 1: first version; 2: smoother hills
+```
+
+Saved chunks remember which version made them, and whether anything but nature changed them since. A player digging or building, a bucket, a mod placing a structure: all of those count as building in it. Flowing fluids, falling blocks, ABMs, LBMs and random ticks (grass spreading, leaves decaying, crops growing) don't. When a world opens, a saved chunk **nobody built in** that an **older version** made is generated again, so old terrain doesn't stand next to new as steps and pits. A chunk anyone built in is always kept exactly as it was. Chunks saved before the engine recorded this (BlockSmith 0.1-alpha) are kept too. Without `terrain_version`, nothing is ever regenerated.
+
 **Opening another world in the same session.** `set_world_seed` is called again with the new
 seed. The background threads start from fresh copies of your mods for it, but the main thread's
 copy (it makes the chunks around the spawn and answers `get_grass_color`, `get_biome` and so
@@ -3477,23 +3485,29 @@ For mods:
 
 ```
 [Lua] on_chat_command: mods/mymod/init.lua:20: command blew up
-    | trace: server BlockSmith 5.17.0-dev (commit 2d5ea37fe8) | thread 1406907518 | up 7.0 s
+    | trace: server BlockSmith 0.1-alpha (commit 2d5ea37fe8) | thread 1406907518 | up 7.0 s
     |   #0 ??  (BlockSmithServer+0x8118f)
     |   #1 main+0x533b  (BlockSmithServer+0x7a6cb)
 ```
 
-Stack frames name the function where the platform can; every frame also gives its module and offset. `addr2line -f -C -i -e BlockSmithServer 0x8118f` (Linux / macOS) turns an offset into the function, file and line; on Windows the `.pdb` next to the `.exe` is read by the traces themselves. Release builds keep line tables for this (`-DBLOCKSMITH_DEBUG_INFO=OFF` leaves them out).
+Stack frames name the function where the platform can, with its module and offset. On Linux and macOS only *exported* functions have names there, and a function that isn't exported shows as the nearest one that is, which can mislead. So each trace ends with a ready-made command that gives the exact function, file and line of every frame in the program: copy it and run it next to the program.
 
-**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 5.17.0-dev (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+```
+    |   exact names and lines: addr2line -f -C -i -e BlockSmithServer 0x1752c6 0x96ada 0x78aef
+```
 
-**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 5.17.0) is older than this server (BlockSmith 5.18.0). An update is available..."). Builds of the same release play together (`5.18.0-dev` counts as 5.18.0). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (5.17.0): you can still join").
+That's `addr2line` on Linux and `atos -o BlockSmithServer -l <load address> ...` on macOS. On Windows the traces read the `.pdb` next to the `.exe` themselves. Release builds keep the line tables this needs (`-DBLOCKSMITH_DEBUG_INFO=OFF` leaves them out). A crash from a signal lists `program(+offset)` for each frame; `addr2line -e <program> <offset>` resolves those the same way.
+
+**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 0.1-alpha (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+
+**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 0.1-alpha) is older than this server (BlockSmith 0.2-alpha). An update is available..."). Builds of the same release play together (`0.2-alpha` counts as 0.2, so a `0.2-alpha` game and a `0.2-beta` server play together). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (0.1-alpha): you can still join").
 
 **New versions.** The game and the server check now and then (at start, then every 6 hours) whether a newer BlockSmith is out. They read one small JSON file, `version.json`, as data, like any remote content (HTTPS, whitelisted hosts, checked to really be JSON); nothing is ever downloaded or installed for you.
 
 ```json
 {
-  "latest": "5.18.0",
-  "min_supported": "5.17.0",
+  "latest": "0.2-alpha",
+  "min_supported": "0.1-alpha",
   "commit": "1a2b3c4d5e",
   "download": "https://github.com/Gerold55/testvoxel/releases/latest",
   "notes": "New biomes and menus"
@@ -3505,19 +3519,19 @@ Stack frames name the function where the platform can; every frame also gives it
 - `download` (optional): where to get it. Only an `https` page on `github.com`, `*.github.io` or the version file's own site is used; anything else is left out.
 - `commit` and `notes` (optional): shown with it. Notes are one line, up to 300 characters.
 
-Where it shows: the title screen gets a gold "Update available: 5.18.0 - click to download" line above the version (red "Update required" when it must be installed); clicking it opens the download page in your browser. The server prints it in its console (and log) when it changes, tells operators when they join, and adds it to `version`. With a warning (an update available or required, or a check that failed) the details follow on the next lines: the file that was checked, the HTTP result, this build's version and commit, the latest and minimum versions, what it decided and why, and the error if there was one:
+Where it shows: the title screen gets a gold "Update available: 0.2-alpha - click to download" line above the version (red "Update required" when it must be installed); clicking it opens the download page in your browser. The server prints it in its console (and log) when it changes, tells operators when they join, and adds it to `version`. With a warning (an update available or required, or a check that failed) the details follow on the next lines: the file that was checked, the HTTP result, this build's version and commit, the latest and minimum versions, what it decided and why, and the error if there was one:
 
 ```
 [Server] Couldn't check for updates: the site answered 404
 [Server]   version file: https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json
 [Server]   result: HTTP 404, download failed
-[Server]   this build: 5.17.0-dev (commit 2d5ea37fe8)
+[Server]   this build: 0.1-alpha (commit 2d5ea37fe8)
 [Server]   error: the site answered 404
 ```
 
 **Between games and servers.** Each server says which BlockSmith it runs when the server list asks it, and each game says which one it is when it joins, so:
 
-- The Multiplayer screen shows a server's BlockSmith version in its details: gold with "Update available: this server runs 5.18.0" when it's newer than your game. A server you can't join because of the version says which way round: "This server runs a newer BlockSmith (6.0.0): update your game to join", or "...an older BlockSmith (5.1.0): it needs updating". When the game's own check found a newer version, the Multiplayer footer has an "Update available: 5.18.0 - Download" link.
+- The Multiplayer screen shows a server's BlockSmith version in its details: gold with "Update available: this server runs 0.2-alpha" when it's newer than your game. A server you can't join because of the version says which way round: "This server runs a newer BlockSmith (0.3-alpha): update your game to join", or "...an older BlockSmith (5.1.0): it needs updating". When the game's own check found a newer version, the Multiplayer footer has an "Update available: 0.2-alpha - Download" link.
 - A player whose game is older than the server (or than the newest release, from the server's own check) is told so in chat when they join, with the download link. The server's console logs which BlockSmith each player has, and notes when a player's game is newer than the server.
 - `engine.get_server_status(address)` has `engine_version`, `engine_commit` and `engine_compare` (`"newer"`, `"older"`, `"same"`, or `""` for older servers that don't say), and `engine.open_update_page()` opens the download page from a title-screen page.
 
@@ -3529,7 +3543,7 @@ Settings: `update_check = false` turns it off, `update_url = <address>` reads an
 
 Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated `BlockSmithServer`. Blocks are sent to players by **name**, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.
 
-- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there.
+- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there. Functions about this game's own player or window return nothing there: `engine.get_player_position()` is `nil` on the server (it has no player of its own), so check what you get (`if type(x) == "number"`) or use the player's position from an event or `engine.get_player_info(name)`.
 
 **Shared values** let a mod decide something and have every player see it, the way the weather mod does:
 - <a id="fn-engine-set_shared"></a>`engine.set_shared(key, text)` sets a value. Only whoever runs the world can: singleplayer, the host, or the dedicated server.

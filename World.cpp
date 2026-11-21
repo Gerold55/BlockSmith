@@ -36,6 +36,9 @@ constexpr uint16_t kChunkVersion = 1;
 // Optional section after the blocks: biome colours ("TINT", then per channel: u8 channel,
 // 256 x RGB). Older readers stop after the blocks, so files stay compatible both ways.
 constexpr uint32_t kTintMagic    = 0x544E4954;  // "TINT"
+// Terrain info: u16 terrain version, u8 built (see ChunkData). Written before the colours, so
+// older builds (which read the colours to the end of the file) simply stop at it.
+constexpr uint32_t kTerrainMagic = 0x52524554;  // "TERR"
 constexpr int      kChunkCells   = CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_WIDTH;
 
 // Neighbor slots match ChunkData::neighbors:
@@ -173,8 +176,34 @@ void World::markBlockChanged(const glm::ivec3& loc) {
 }
 
 // Remembers that this chunk differs from its saved/generated state.
+namespace { thread_local int t_naturalDepth = 0; }
+World::NaturalChanges::NaturalChanges() { ++t_naturalDepth; }
+World::NaturalChanges::~NaturalChanges() { --t_naturalDepth; }
+bool World::naturalChange() { return t_naturalDepth > 0; }
+
+// A saved chunk from another terrain version that nobody built in (see ChunkData::built)
+bool World::outdatedTerrain(const ChunkData& c) const {
+    return m_terrainVersion > 0 && c.terrainKnown && !c.built && c.terrainVersion != m_terrainVersion;
+}
+
+// Its file goes (there's nothing in it anyone made); the chunk is generated afresh
+void World::forgetOutdatedChunk(const ChunkCoord& c) {
+    std::error_code ec;
+    std::filesystem::remove(chunkPath(c.first, c.second), ec);
+    m_notOnDisk.insert(c);
+    static int told = 0;
+    if (told++ < 3) {
+        std::cout << "[World] Chunk " << c.first << "," << c.second << " was made by an older version of the world "
+                  << "generator and nobody built in it: making it again" << (told == 3 ? " (not saying again)" : "") << std::endl;
+    }
+}
+
 void World::markModified(const glm::ivec3& loc) {
     m_modified.insert(ChunkCoord{floorDiv(loc.x, CHUNK_WIDTH), floorDiv(loc.z, CHUNK_WIDTH)});
+    // built in, unless nature did it (see NaturalChanges)
+    if (!naturalChange()) {
+        if (ChunkData* c = chunkAt(loc)) c->built = true;
+    }
 }
 
 void World::linkChunk(int cx, int cz) {
@@ -217,6 +246,12 @@ void World::ensureLuaSeeded(sol::state& lua) {
     if (m_luaSeeded) return;
     CaveGenerator::setSeed(m_seed);
     if (m_generator) CaveGenerator::prepare();   // before the threads carve caves
+    // The world generator's terrain version (its global terrain_version, if it has one)
+    {
+        sol::object v = lua["terrain_version"];
+        m_terrainVersion = (v.get_type() == sol::type::number)
+                         ? static_cast<uint16_t>(std::clamp(v.as<double>(), 0.0, 65535.0)) : 0;
+    }
     sol::protected_function setSeed = lua["set_world_seed"];
     if (setSeed.valid()) {
         auto result = setSeed(m_seed);
@@ -339,6 +374,11 @@ void World::loadQueuedChunks(sol::state& lua) {
             std::string why;
             switch (loadChunkFromDisk(c.first, c.second, *chunk, &why)) {
             case DiskLoad::Loaded:
+                if (outdatedTerrain(*chunk)) {          // old terrain nobody built in: made again
+                    forgetOutdatedChunk(c);
+                    generate(c);
+                    break;
+                }
                 computeBiomeTint(*chunk, c.first, c.second, &lua);   // saved before biome colours
                 addLoadedChunk(c.first, c.second, std::move(chunk), true);
                 break;
@@ -425,6 +465,11 @@ void World::addLoadedChunk(int cx, int cz, std::shared_ptr<ChunkData> chunk, boo
     m_diskRetry.erase(ChunkCoord{cx, cz});
     chunk->chunkX = cx;
     chunk->chunkZ = cz;
+    if (!fromDisk) {   // just made: by this terrain version, and nobody has built in it yet
+        chunk->terrainVersion = m_terrainVersion;
+        chunk->terrainKnown = true;
+        chunk->built = false;
+    }
     ChunkData& added = *chunk;
     chunks[ChunkCoord{cx, cz}] = std::move(chunk);
     linkChunk(cx, cz);
@@ -515,7 +560,11 @@ bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
         return false;
     }
     m_diskRetry.erase(c);
-    const bool fromDisk = disk == DiskLoad::Loaded;
+    bool fromDisk = disk == DiskLoad::Loaded;
+    if (fromDisk && outdatedTerrain(*chunk)) {     // old terrain nobody built in: made again
+        forgetOutdatedChunk(c);
+        fromDisk = false;
+    }
 
     // 2. Otherwise generate it (Lua mapgen, or the C++ fallback).
     if (!fromDisk) {
@@ -748,6 +797,13 @@ std::vector<uint8_t> World::encodeChunk(const ChunkData& chunk) {
     }
     out.insert(out.end(), runs.begin(), runs.end());
 
+    // Terrain info (which world generator version made it, and whether anyone built in it)
+    if (chunk.terrainKnown) {
+        put32(out, kTerrainMagic);
+        put16(out, chunk.terrainVersion);
+        out.push_back(chunk.built ? 1 : 0);
+    }
+
     // Biome colours (if this chunk has them)
     bool anyTint = false;
     for (int c = 0; c < ChunkData::kTintChannels; ++c) anyTint = anyTint || chunk.hasTint(c);
@@ -888,6 +944,13 @@ bool World::decodeChunk(const std::vector<uint8_t>& d, ChunkData& chunk) {
             chunk.setBlockWithMeta(x, y, z, id, meta);
         }
     }
+    // Terrain info, if saved
+    if (cell == kChunkCells && p + 7 <= d.size() && get32(d, p) == kTerrainMagic) {
+        chunk.terrainVersion = get16(d, p + 4);
+        chunk.built = d[p + 6] != 0;
+        chunk.terrainKnown = true;
+        p += 7;
+    }
     // Biome colours, if saved
     if (cell == kChunkCells && p + 4 <= d.size() && get32(d, p) == kTintMagic) {
         p += 4;
@@ -927,6 +990,7 @@ std::vector<World::ChunkCoord> World::takeUnloadedChunks() {
 // ---------------------------------------------------------------------------
 
 void World::updateFluids(float dt) {
+    NaturalChanges nature;   // flowing and falling: not building
     m_fluids->update(dt);
     updateFalling(dt);
 }

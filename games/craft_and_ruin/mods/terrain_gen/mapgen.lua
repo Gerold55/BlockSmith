@@ -22,12 +22,22 @@
 --   find_volcano(x, z)              -> the nearest volcano's x, z, rim y and radius (or nil)
 
 local world_seed = 1337
+
+-- Which version of the terrain this makes. Raise it whenever the terrain changes (heights,
+-- biomes, rivers...): when a world is opened, its saved chunks that nobody built in and that
+-- an older version made are generated again, so old terrain doesn't stand next to new as
+-- steps and pits. Chunks anyone built in are always kept as they are.
+--   1: the first biome generator        2: terrain shaped every 4 blocks and blended (smoother)
+--   3: flowers in Minecraft-style patches (far fewer)
+terrain_version = 3
+
 local SEA = 62
 local floor, abs, min, max, sin = math.floor, math.abs, math.min, math.max, math.sin
 
 engine.set_sun_texture("cw_sun.png")
 
 local volcano_cache = {}          -- (where the volcanoes are depends on the seed)
+local grid_cache, grid_cached = {}, 0   -- the terrain's shape every 4 blocks (see grid_point)
 
 -- Called before any generate_chunk, and again whenever another world is opened in the same
 -- game session: everything worked out for the last seed is forgotten, or the new world
@@ -36,6 +46,7 @@ function set_world_seed(seed)
     if seed and seed ~= world_seed then
         world_seed = seed
         volcano_cache = {}
+        grid_cache, grid_cached = {}, 0
     end
 end
 
@@ -105,8 +116,21 @@ function get_biome_parameters(world_x, world_z)
     return continentalness, temperature, humidity, river
 end
 
--- Everything about one column: its height and what decides its biome
-local function base_column(world_x, world_z)
+-- ---------------------------------------------------------------------------
+-- The terrain's shape is worked out every 4 blocks and blended in between, like Minecraft (which
+-- samples its noise on a coarse grid and interpolates). That's what makes slopes smooth and
+-- even, instead of every column making its own small bumps - and it's much less work.
+-- The sharp things are made per column, after blending: river banks, coasts, the mesas'
+-- stepped cliffs (and the volcanoes, in column()).
+-- ---------------------------------------------------------------------------
+local GRID = 4
+
+-- Everything the shape needs, at one grid point
+local function grid_point(gx, gz)
+    local key = gx * 1000003 + gz
+    local g = grid_cache[key]
+    if g then return g end
+    local world_x, world_z = gx * GRID, gz * GRID
     local c, temp, hum, river = get_biome_parameters(world_x, world_z)
     -- the noise stays near the middle; spread it out so hot, cold, dry and wet places all happen
     temp = clamp01((temp - 0.5) * 1.6 + 0.5)
@@ -118,7 +142,7 @@ local function base_column(world_x, world_z)
     local erosion = octave_noise2d(wx, wz, 2, 0.5, 0.0024, 7.0)
     local inland = smoothstep(-0.12, 0.10, c)                 -- 0 at sea, 1 well inland
     local mountain = smoothstep(0.42, 0.30, erosion) * inland
-    local hills = smoothstep(0.52, 0.42, erosion) * inland
+    local hills = smoothstep(0.55, 0.40, erosion) * inland     -- (a wide band: hills rise gently out of the flats)
 
     -- warm and dry, with its own noise: the badlands' mesas
     local bad = smoothstep(0.62, 0.70, temp) * smoothstep(0.40, 0.32, hum)
@@ -127,12 +151,13 @@ local function base_column(world_x, world_z)
     local swamp = smoothstep(0.62, 0.72, hum) * smoothstep(0.36, 0.44, temp) * smoothstep(0.64, 0.56, temp)
                 * (1 - mountain) * (1 - hills * 0.7)
 
+    -- the land itself: continents, gentle rolls, a little detail
     local height = SEA + 2 + c * 16
     height = height + (octave_noise2d(wx, wz, 4, 0.5, 0.008, 5.0) * 2.0 - 1.0) * 7.0
-                    + (octave_noise2d(wx, wz, 2, 0.5, 0.03, 6.0) * 2.0 - 1.0) * 2.0
+                    + (octave_noise2d(wx, wz, 2, 0.5, 0.03, 6.0) * 2.0 - 1.0) * 1.2
 
     if hills > 0 then
-        height = height + hills * (8 + (octave_noise2d(wx, wz, 3, 0.5, 0.013, 8.0) * 2.0 - 1.0) * 16.0)
+        height = height + hills * (8 + (octave_noise2d(wx, wz, 3, 0.5, 0.011, 8.0) * 2.0 - 1.0) * 13.0)
     end
     if mountain > 0 then
         -- ridged noise: sharp crests and valleys between them
@@ -140,10 +165,37 @@ local function base_column(world_x, world_z)
         local crag = (octave_noise2d(wx, wz, 2, 0.5, 0.07, 10.0) * 2.0 - 1.0) * 3.0
         height = height + mountain * (22 + ridge * ridge * 95 + crag)
     end
+    local plateau = 0
+    if bad > 0 then plateau = smoothstep(0.42, 0.58, octave_noise2d(wx, wz, 3, 0.5, 0.011, 12.0)) end
+
+    g = { c = c, temp = temp, hum = hum, river = river, inland = inland, mountain = mountain,
+          hills = hills, bad = bad, swamp = swamp, height = height, plateau = plateau }
+    if grid_cached > 60000 then grid_cache, grid_cached = {}, 0 end   -- (keeps the memory small)
+    grid_cache[key] = g
+    grid_cached = grid_cached + 1
+    return g
+end
+
+local SHAPE_FIELDS = { "c", "temp", "hum", "river", "inland", "mountain", "hills", "bad", "swamp", "height", "plateau" }
+
+-- Everything about one column: its height and what decides its biome
+local function base_column(world_x, world_z)
+    -- blend the four grid points around this column
+    local gx, gz = floor(world_x / GRID), floor(world_z / GRID)
+    local fx, fz = (world_x - gx * GRID) / GRID, (world_z - gz * GRID) / GRID
+    local g00, g10 = grid_point(gx, gz), grid_point(gx + 1, gz)
+    local g01, g11 = grid_point(gx, gz + 1), grid_point(gx + 1, gz + 1)
+    local v = {}
+    for _, k in ipairs(SHAPE_FIELDS) do
+        v[k] = lerp(fz, lerp(fx, g00[k], g10[k]), lerp(fx, g01[k], g11[k]))
+    end
+    local c, temp, hum, river = v.c, v.temp, v.hum, v.river
+    local inland, mountain, hills, bad, swamp = v.inland, v.mountain, v.hills, v.bad, v.swamp
+    local height = v.height
+
     if bad > 0 then
         -- mesas: flat-topped plateaus with steep, stepped sides, standing up out of the flats
-        local plateau = smoothstep(0.42, 0.58, octave_noise2d(wx, wz, 3, 0.5, 0.011, 12.0))
-        local raised = SEA + 4 + plateau * 42 + (height - SEA) * 0.3
+        local raised = SEA + 4 + v.plateau * 42 + (height - SEA) * 0.3
         local step = 6
         local t = raised / step
         local terraced = (floor(t) + smoothstep(0.86, 1.0, t - floor(t))) * step
@@ -369,11 +421,21 @@ local function ids()
         ash = id("volcanic_ash", "gravel"), lava = id("lava", "magma_block"),
         flowers = {}, terracotta = {},
     }
-    for _, n in ipairs({ "poppy", "flower_poppy", "flower_daisy", "flower_bluebell", "flower_tulip_red",
-                         "flower_tulip_pink", "flower_tulip_white", "flower_allium", "flower_azure_bluet" }) do
-        local v = engine.get_block_id(n) or 0
-        if v ~= 0 then B.flowers[#B.flowers + 1] = v end
+    -- flowers, by how common they are (like Minecraft: poppies and the yellow ones everywhere,
+    -- tulips, bluets and the rest now and then); a name listed twice is twice as likely
+    B.flower_by_name = {}
+    for _, f in ipairs({ { "poppy", 4 }, { "flower_poppy", 4 }, { "flower_daisy", 4 }, { "flower_azure_bluet", 2 },
+                         { "flower_tulip_red", 1 }, { "flower_tulip_pink", 1 }, { "flower_tulip_white", 1 },
+                         { "flower_bluebell", 1 }, { "flower_allium", 0.5 } }) do
+        local v = engine.get_block_id(f[1]) or 0
+        if v ~= 0 and not B.flower_by_name[f[1]] then
+            B.flower_by_name[f[1]] = v
+            B.flowers[#B.flowers + 1] = { id = v, weight = f[2] }
+        end
     end
+    local total = 0
+    for _, f in ipairs(B.flowers) do total = total + f.weight end
+    B.flower_weight = total
     -- the badlands' bands, bottom to top, repeating
     for _, n in ipairs({ "terracotta", "terracotta_orange", "terracotta_orange", "terracotta_yellow",
                          "terracotta", "terracotta_white", "terracotta_light_gray", "terracotta_red",
@@ -482,22 +544,62 @@ local function tree_acacia(chunk, x, y, z, wx, wz)
 end
 
 -- ---------------------------------------------------------------------------
+-- Flowers grow in patches, like Minecraft's: each 16x16 area may have one small patch
+-- (radius 2-4) of a single kind, thick in the middle and thinning out; outside the patches,
+-- now and then a lone flower. Same answer from any chunk (it only depends on world x/z).
+local FLOWER_CELL = 16
+local function pick_flower(b, roll)
+    local t = roll * b.flower_weight
+    for _, f in ipairs(b.flowers) do
+        t = t - f.weight
+        if t < 0 then return f.id end
+    end
+    return b.flowers[#b.flowers].id
+end
+
+local function flower_at(wx, wz, def, b)
+    if (def.flowers or 0) <= 0 or #b.flowers == 0 then return nil end
+    local c0x, c1x = floor((wx - 4) / FLOWER_CELL), floor((wx + 4) / FLOWER_CELL)
+    local c0z, c1z = floor((wz - 4) / FLOWER_CELL), floor((wz + 4) / FLOWER_CELL)
+    for ci = c0x, c1x do
+        for cj = c0z, c1z do
+            if hash_rand(ci, cj, 61.1) < def.flowers then
+                local px = ci * FLOWER_CELL + 4 + hash_rand(ci, cj, 61.3) * (FLOWER_CELL - 8)
+                local pz = cj * FLOWER_CELL + 4 + hash_rand(ci, cj, 61.5) * (FLOWER_CELL - 8)
+                local radius = 2 + hash_rand(ci, cj, 61.9) * 2
+                local dx, dz = wx - px, wz - pz
+                local d = math.sqrt(dx * dx + dz * dz)
+                if d < radius and hash_rand(wx, wz, 62.3) < 0.45 * (1 - d / radius) + 0.08 then
+                    if def.flower and b.flower_by_name[def.flower] then return b.flower_by_name[def.flower] end
+                    return pick_flower(b, hash_rand(ci, cj, 61.7))
+                end
+            end
+        end
+    end
+    if hash_rand(wx, wz, 62.9) < 0.0015 * def.flowers / 0.3 then   -- a lone one
+        return pick_flower(b, hash_rand(wx, wz, 63.1))
+    end
+    return nil
+end
+
 -- What grows where: trees per column, plants, and the surface
 -- ---------------------------------------------------------------------------
 local BIOMES = {
-    -- tree chance per column, ground cover chance, flower share of it
-    plains       = { trees = 0.0012, cover = 0.30, flowers = 0.16 },
-    forest       = { trees = 0.030, cover = 0.22, flowers = 0.08 },
-    birch_forest = { trees = 0.030, cover = 0.22, flowers = 0.10 },
+    -- tree chance per column, ground cover (grass) chance, and flowers: the chance that a
+    -- 16x16 area has a patch of them (Minecraft-style: a few small patches of one kind, not
+    -- flowers spread everywhere)
+    plains       = { trees = 0.0012, cover = 0.30, flowers = 0.30 },
+    forest       = { trees = 0.030, cover = 0.22, flowers = 0.22 },
+    birch_forest = { trees = 0.030, cover = 0.22, flowers = 0.22 },
     taiga        = { trees = 0.030, cover = 0.20, flowers = 0.0 },
     snowy_taiga  = { trees = 0.016, cover = 0.0, flowers = 0.0 },
     snowy_plains = { trees = 0.0008, cover = 0.0, flowers = 0.0 },
-    savanna      = { trees = 0.0035, cover = 0.45, flowers = 0.02 },
-    jungle       = { trees = 0.060, cover = 0.45, flowers = 0.04 },
-    swamp        = { trees = 0.020, cover = 0.22, flowers = 0.10 },
+    savanna      = { trees = 0.0035, cover = 0.45, flowers = 0.06 },
+    jungle       = { trees = 0.060, cover = 0.45, flowers = 0.08 },
+    swamp        = { trees = 0.020, cover = 0.22, flowers = 0.12, flower = "flower_bluebell" },
     desert       = { trees = 0, cover = 0.012, flowers = 0 },
     badlands     = { trees = 0, cover = 0.010, flowers = 0 },
-    mountains    = { trees = 0.004, cover = 0.10, flowers = 0.04 },
+    mountains    = { trees = 0.004, cover = 0.10, flowers = 0.06 },
     basalt_hills = { trees = 0.006, cover = 0.12, flowers = 0.02 },
     beach        = { trees = 0, cover = 0, flowers = 0 },
     ocean        = { trees = 0, cover = 0, flowers = 0 },
@@ -656,13 +758,14 @@ function generate_chunk(chunk, chunk_x, chunk_z)
                             chunk:set_block(lx, y + 1, lz, b.dead_bush)
                         end
                     end
-                elseif on_ground and top ~= b.snowy_grass and r < def.cover then
-                    local pick = b.short_grass
-                    local f = hash_rand(wx, wz, 2.2)
-                    if f < def.flowers and #b.flowers > 0 then
-                        pick = b.flowers[1 + floor(hash_rand(wx, wz, 2.9) * #b.flowers)]
-                    elseif (biome == "swamp" or biome == "taiga") and f < 0.06 then
-                        pick = (f < 0.03 and b.mushroom_brown ~= 0) and b.mushroom_brown or b.mushroom_red
+                elseif on_ground and top ~= b.snowy_grass then
+                    local pick = flower_at(wx, wz, def, b)
+                    if not pick and r < def.cover then
+                        pick = b.short_grass
+                        local f = hash_rand(wx, wz, 2.2)
+                        if (biome == "swamp" or biome == "taiga") and f < 0.03 then
+                            pick = (f < 0.015 and b.mushroom_brown ~= 0) and b.mushroom_brown or b.mushroom_red
+                        end
                     end
                     if pick and pick ~= 0 then chunk:set_block(lx, y + 1, lz, pick) end
                 end

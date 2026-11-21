@@ -39,6 +39,25 @@ class LightEngine;
 
 class World {
 public:
+    // The world generator's terrain version (its Lua global terrain_version; 0 = none). New
+    // chunks get it; a saved chunk nobody built in, made with another version, is generated
+    // again when it loads (see ChunkData::built).
+    void setTerrainVersion(uint16_t v) { m_terrainVersion = v; }
+    uint16_t terrainVersion() const { return m_terrainVersion; }
+
+    // While one of these exists (on this thread), block changes are nature's - fluids flowing,
+    // blocks falling, ABMs, LBMs and random ticks (grass spreading, leaves decaying, crops
+    // growing) - and don't count as building in a chunk. Everything else does.
+    struct NaturalChanges {
+        NaturalChanges();
+        ~NaturalChanges();
+        NaturalChanges(const NaturalChanges&) = delete;
+        NaturalChanges& operator=(const NaturalChanges&) = delete;
+    };
+    static bool naturalChange();
+    bool outdatedTerrain(const ChunkData& c) const;
+    void forgetOutdatedChunk(const std::pair<int, int>& c);   // (a ChunkCoord)
+
     using ChunkCoord = std::pair<int, int>;
 
     World();
@@ -201,6 +220,7 @@ private:
     void markDirty(int cx, int cz);
     void markBlockChanged(const glm::ivec3& loc);
     void markModified(const glm::ivec3& loc);
+
     void linkChunk(int cx, int cz);
     void unlinkChunk(int cx, int cz);
 
@@ -309,4 +329,5 @@ private:
     // Saving
     std::string m_saveDir;
     std::unordered_set<ChunkCoord, PairHash> m_modified;   // changed since last save
+    uint16_t m_terrainVersion = 0;
 };

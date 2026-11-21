@@ -6,9 +6,9 @@
 // games compare to see whether they can play together.)
 #pragma once
 
-// (a build can set it instead: -DBLOCKSMITH_VERSION=\"5.18.0\")
+// (a build can set it instead: -DBLOCKSMITH_VERSION=\"0.2-alpha\")
 #ifndef BLOCKSMITH_VERSION
-#  define BLOCKSMITH_VERSION "5.17.0-dev"
+#  define BLOCKSMITH_VERSION "0.1-alpha"
 #endif
 
 #if defined(__has_include)
@@ -20,5 +20,5 @@
 #  define BLOCKSMITH_COMMIT "unknown"
 #endif
 
-// "BlockSmith 5.17.0-dev (commit 1a2b3c4d5e)"
+// "BlockSmith 0.1-alpha (commit 1a2b3c4d5e)"
 #define BLOCKSMITH_VERSION_FULL "BlockSmith " BLOCKSMITH_VERSION " (commit " BLOCKSMITH_COMMIT ")"

@@ -72,6 +72,10 @@ local S = {
 }
 local timers = { regen = 0, starve = 0, drown = 0, fluid = 0, invulnerable = 0, flash = 0, save = 0 }
 local fall_top = nil        -- highest point of the current fall
+-- Falls only count once the player has stood on the ground since joining or respawning: while
+-- the world opens, the player can be in the air before the engine puts them down at the spawn
+-- (or where they were), and that move must never count as a fall
+local fall_ready = false
 local last = nil            -- player state last frame
 local was_on_ground = true
 local loaded = false
@@ -99,7 +103,17 @@ local function load()
     if S.mode ~= "survival" and S.mode ~= "creative" then S.mode = settings.default_mode end
 end
 
-local function survival_on() return S.mode == "survival" end
+-- On a server, the server decides the mode: until it has said (just after joining), nothing
+-- survival-only happens - a creative player can't be hurt before "creative" arrives
+local function joined_to_server()
+    local st = engine.get_connection_status and engine.get_connection_status()
+    return type(st) == "table" and st.state == "joined"
+end
+local function survival_on()
+    if S.mode ~= "survival" then return false end
+    if joined_to_server() and engine.get_server_game_mode and engine.get_server_game_mode() == nil then return false end
+    return true
+end
 
 -- Game rules (/gamerule on a server, or in singleplayer): shared values "gamerule.<name>",
 -- "true"/"false". Not set: the default given here (this mod's own settings)
@@ -243,7 +257,7 @@ end
 function survival.respawn()
     S.dead = false
     S.hp, S.food, S.saturation, S.air, S.exhaustion = settings.max_hp, settings.max_food, 5, settings.max_air, 0
-    fall_top = nil
+    fall_top, fall_ready = nil, false
     engine.set_player_controls{ move = true, jump = true, sprint = true, sneak = true }
     local x, y, z = spawn_point()
     engine.respawn_player(x, y, z)       -- on a server, the server picks its spawn
@@ -345,7 +359,7 @@ local function first_load()
     loaded = true
     engine.set_storage("survival:session", session)
     if survival.inventory then survival.inventory.load() end
-    fall_top, last, was_on_ground = nil, nil, true
+    fall_top, last, was_on_ground, fall_ready = nil, nil, true, false
     S.mode = server_mode() or S.mode   -- on a server, its mode wins
     engine.set_creative(S.mode == "creative")
     engine.set_player_controls{ move = not S.dead, jump = not S.dead, sprint = not S.dead, sneak = not S.dead }
@@ -410,7 +424,18 @@ local function tick(dt)
     engine.set_player_controls{ sprint = S.food >= settings.sprint_min_food }
 
     -- Fall damage: blocks fallen beyond fall_safe, landing anywhere but in a fluid
-    if p.feet_fluid then
+    -- A jump in position no fall could make in one frame (the engine placing the player, /tp,
+    -- a respawn): a teleport, not a fall
+    if last then
+        local dx, dy, dz = p.x - last.x, p.y - last.y, p.z - last.z
+        local reach = math.abs(p.vy or 0) * dt * 2 + 2
+        if math.abs(dy) > reach or dx * dx + dz * dz > 64 then fall_top = nil end
+    end
+    if not fall_ready then
+        -- not until they've stood on the ground (see fall_ready)
+        if p.on_ground then fall_ready = true end
+        fall_top = nil
+    elseif p.feet_fluid then
         fall_top = nil
     elseif not p.on_ground then
         if not fall_top or p.y > fall_top then fall_top = p.y end
