@@ -41,6 +41,22 @@ constexpr uint32_t kMinProtocolVersion = 8;
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
+// Mod messages (engine.send_to_server / send_to_player): a channel is a name of letters,
+// digits and _ : . - (a mod's name first: "hud", "minigame:score"), at most 64 long
+constexpr size_t kMaxModMessage           = 32 * 1024;  // bytes of text from the server
+constexpr size_t kMaxModMessageFromPlayer = 4 * 1024;   // ... and from a player
+constexpr double kModMessageBurst         = 40.0;       // from a player: this many at once,
+constexpr double kModMessageRate          = 20.0;       // then this many a second
+inline bool validModChannel(const std::string& c) {
+    if (c.empty() || c.size() > 64) return false;
+    for (const char ch : c) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                        ch == '_' || ch == ':' || ch == '.' || ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 // Another player as this game sees them (positions are smoothed between updates).
 // Another player as this game sees them. Drawn 100 ms in the past, smoothly between the
 // two snapshots around that moment (entity interpolation), so they never stutter or guess.
@@ -253,6 +269,13 @@ public:
     // the block is loaded and within their reach, at most 10 a second (with entity hits). The
     // server works out what happens from its own world (Lua: on_player_harvest).
     std::function<void(const std::string& name, const std::string& item, const glm::ivec3& pos)> onHarvest;
+    // Mod messages (Lua: engine.send_to_server / send_to_player): text on a named channel
+    // between the server's mods and a player's game. Data only - nothing in them is ever run.
+    // From a player: checked (net::validModChannel, size, at most kModMessageBurst at once and
+    // kModMessageRate a second), then onModMessage.
+    std::function<void(const std::string& name, const std::string& channel, const std::string& text)> onModMessage;
+    bool sendModMessage(const std::string& name, const std::string& channel, const std::string& text);
+    int sendModMessageToAll(const std::string& channel, const std::string& text);   // -> how many got it
     // Changes a block for a joined player with the same checks as their own edits: loaded,
     // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
     // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
@@ -319,6 +342,7 @@ private:
         std::unordered_map<uint32_t, KnownEntity> knownEntities;
         double entityActWindow = 0.0;     // (hits / right-clicks / drops: at most 10 / 30 a second)
         int entityActs = 0, drops = 0;
+        double modTokens = net::kModMessageBurst, modRefillAt = 0.0;   // (mod messages: flood limit)
     };
     void sendEntities();
     EntityManager* m_entityManager = nullptr;
@@ -481,6 +505,11 @@ public:
                       const glm::vec3* velocity = nullptr, float pickupDelay = -1.0f);
     // Used `item` on the block at pos (the scythe): the server decides what it does and yields
     void sendHarvest(const std::string& item, const glm::ivec3& pos);
+    // Mod messages (see GameServer::onModMessage): to the server's mods, and what its mods sent
+    // us since the last call, oldest first
+    bool sendModMessage(const std::string& channel, const std::string& text);
+    struct ModMessage { std::string channel, data; };
+    std::vector<ModMessage> takeModMessages() { std::vector<ModMessage> out; out.swap(m_modMessages); return out; }
 
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
@@ -492,6 +521,7 @@ private:
 
     std::vector<std::string> m_sharedChanges;
     std::vector<Action> m_actions;
+    std::vector<ModMessage> m_modMessages;
     std::string m_completeText, m_completeAsked;   // what the last answer / question was for
     std::vector<std::string> m_completeList;
     bool m_completeHave = false, m_completeArrived = false;

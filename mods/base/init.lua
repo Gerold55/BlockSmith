@@ -29,6 +29,7 @@ end
 
 loadScript("fog.lua")           -- fog settings
 loadScript("chat.lua")          -- chat commands
+loadScript("hud.lua")           -- HUD pieces servers and mods show: timers, scoreboards, titles...
 loadScript("mods_menu.lua")     -- mods menu
 loadScript("texture_packs.lua") -- texture pack picker
 loadScript("settings_menu.lua") -- settings (controls, video)

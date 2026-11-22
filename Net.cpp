@@ -53,6 +53,8 @@ enum Msg : uint8_t {
                       // items dropped next to the player (thrown: with a velocity)
     C_HARVEST = 10,   // str item in hand, i32 x y z   a tool used on a block (the scythe): the
                       // server works out what happens there and gives what it yields
+    C_MOD_MSG = 11,   // str channel, str data   a mod's message to the server's mods (Lua:
+                      // engine.send_to_server -> on_mod_message). Text only, never run.
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -82,6 +84,8 @@ enum Msg : uint8_t {
     S_ENTITY_GONE = 85, // u16 count, { u32 id }   removed, or out of your range
     S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
                       // (older games ignore it and keep their own sky; no protocol change needed)
+    S_MOD_MSG = 86,   // str channel, str data   a server mod's message to this game's mods (Lua:
+                      // engine.send_to_player -> on_server_message). Text only, never run.
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
@@ -733,6 +737,22 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         onHarvest(name, item, pos);
         break;
     }
+    case C_MOD_MSG: {
+        Reader r(data, size);
+        const std::string channel = r.str();
+        const std::string text = r.str();
+        if (!r.ok || !c.joined || !onModMessage || !net::validModChannel(channel) ||
+            text.size() > net::kMaxModMessageFromPlayer) return;
+        // at most kModMessageBurst at once, kModMessageRate a second after that (extra ones dropped)
+        const double now = net::clockSeconds();
+        c.modTokens = std::min(net::kModMessageBurst, c.modTokens + (now - c.modRefillAt) * net::kModMessageRate);
+        c.modRefillAt = now;
+        if (c.modTokens < 1.0) return;
+        c.modTokens -= 1.0;
+        const std::string name = c.name;   // (a mod may kick them: c gone after)
+        onModMessage(name, channel, text);
+        break;
+    }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
@@ -1052,6 +1072,33 @@ bool GameServer::allowChat(Client& c) {
 std::string GameServer::playerEngineVersion(const std::string& name) const {
     for (const auto& [id, c] : m_clients) if (c.joined && c.name == name) return c.engineVersion;
     return "";
+}
+
+bool GameServer::sendModMessage(const std::string& name, const std::string& channel, const std::string& text) {
+    if (!net::validModChannel(channel) || text.size() > net::kMaxModMessage) return false;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        Writer w(S_MOD_MSG);
+        w.str(channel);
+        w.str(text);
+        sendTo(c.peer, w);
+        return true;
+    }
+    return false;
+}
+
+int GameServer::sendModMessageToAll(const std::string& channel, const std::string& text) {
+    if (!net::validModChannel(channel) || text.size() > net::kMaxModMessage) return 0;
+    int n = 0;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined) continue;
+        Writer w(S_MOD_MSG);
+        w.str(channel);
+        w.str(text);
+        sendTo(c.peer, w);
+        ++n;
+    }
+    return n;
 }
 
 bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
@@ -1838,6 +1885,15 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_completeHave = m_completeArrived = true;
         break;
     }
+    case S_MOD_MSG: {
+        if (m_state != State::Joined) return;
+        ModMessage m;
+        m.channel = r.str();
+        m.data = r.str();
+        // (kept for the game's mods to read this frame; a flood beyond 1024 waiting is dropped)
+        if (r.ok && net::validModChannel(m.channel) && m_modMessages.size() < 1024) m_modMessages.push_back(std::move(m));
+        break;
+    }
     case S_ACTION: {
         if (m_state != State::Joined) return;
         Action a;
@@ -2114,6 +2170,15 @@ void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
     w.u8(static_cast<uint8_t>(kind));
     w.str(item);
     sendTo(m_peer, w);
+}
+
+bool GameClient::sendModMessage(const std::string& channel, const std::string& text) {
+    if (m_state != State::Joined || !net::validModChannel(channel) || text.size() > net::kMaxModMessageFromPlayer) return false;
+    Writer w(C_MOD_MSG);
+    w.str(channel);
+    w.str(text);
+    sendTo(m_peer, w);
+    return true;
 }
 
 void GameClient::sendHarvest(const std::string& item, const glm::ivec3& pos) {

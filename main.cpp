@@ -285,6 +285,12 @@ std::string unescapeStorage(const std::string& v) {
 // host, or the server) and seen by every player. Here: this game's own copy.
 std::unordered_map<std::string, std::string> g_SharedValues;
 std::vector<std::string> g_SharedChanged;   // keys to report to on_shared_changed
+// Mod messages that stay in this game (singleplayer, or the host's own): for its own
+// on_server_message (from engine.send_to_player / send_to_all), and for its own
+// on_mod_message (engine.send_to_server while not on someone else's server). Delivered
+// once a frame, so a mod's handler never runs inside the call that sent it.
+struct LocalModMessage { std::string channel, data; };
+std::vector<LocalModMessage> g_ModToOwnGame, g_ModToOwnServer;
 World* g_WorldInstance = nullptr;
 float g_PlaceRepeatSeconds = 0.2f;   // holding right-click places again this often (0 = off)
 FirstPersonView g_FirstPerson;        // the hand / held block in first person (FirstPerson.h)
@@ -903,6 +909,8 @@ bool openActiveWorld(World& world, Player& player) {
     g_LastThumbnailAt = g_WorldOpenedAt;
     g_SharedValues.clear();   // shared values (weather...) belong to a world
     g_SharedChanged.clear();
+    g_ModToOwnGame.clear();
+    g_ModToOwnServer.clear();
     g_ModStorage.clear();     // so does mod storage
     {
         std::ifstream f(dir / "mod_storage.txt");
@@ -2319,6 +2327,8 @@ local hooks = {
     { "on_server_stop",           "()  the server is stopping (in the game: you stopped hosting)" },
     { "on_use_hoe",               "(x, y, z, block) -> true if used  right-click with a hoe (tool_type \"hoe\")" },
     { "on_use_scythe",            "(x, y, z, block) -> true if it reaped (else it digs)  left-click with a scythe" },
+    { "on_mod_message",           "(name, channel, data)  a player's game sent the server's mods a message (engine.send_to_server)" },
+    { "on_server_message",        "(channel, data)  the server's mods sent this game a message (engine.send_to_player / send_to_all)" },
     { "on_player_harvest",        "(name, item, x, y, z)  a joined player's engine.request_harvest (the scythe): the server decides" },
     { "update_player_animation",  "(dt, is_moving, pitch)" },
     { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
@@ -4034,6 +4044,8 @@ void resetForReload() {
     g_ItemUseHandlers.clear();
     g_SharedValues.clear();
     g_SharedChanged.clear();
+    g_ModToOwnGame.clear();
+    g_ModToOwnServer.clear();
     g_ModStorage.clear();
     g_ModStorageDirty = false;
     g_ModelInstances.clear();
@@ -5355,6 +5367,9 @@ int main(int argc, char** argv) {
         g_ServerApi.localMessage = [](const std::string& text, const glm::vec3& color) {
             if (g_ChatSystem) g_ChatSystem->addMessage(text, color);
         };
+        g_ServerApi.localModMessage = [](const std::string& channel, const std::string& data) {
+            if (g_ModToOwnGame.size() < 4096) g_ModToOwnGame.push_back({ channel, data });
+        };
         g_ServerApi.localTeleport = [](const glm::vec3& pos) {
             if (!g_PlayerInstance) return;
             g_PlayerInstance->position = pos;
@@ -6386,6 +6401,9 @@ int main(int argc, char** argv) {
             g_Server.onHarvest = [](const std::string& name, const std::string& item, const glm::ivec3& pos) {
                 g_ServerApi.harvest(name, item, pos);
             };
+            g_Server.onModMessage = [](const std::string& name, const std::string& channel, const std::string& data) {
+                g_ServerApi.modMessage(name, channel, data);
+            };
             g_Server.onDropItem = [](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
                 if (BlockRegistry::getInstance().getBlockId(item) == 0) return;
                 const uint32_t id = how.hasVelocity ? g_Entities.dropItem(item, count, at, how.velocity) : g_EntityLua.drop(item, count, at);
@@ -6701,6 +6719,24 @@ int main(int argc, char** argv) {
             }
             t["players"] = list;
             return t;
+        };
+        // engine.send_to_server(channel, data) -> true if sent: a message for the server's mods
+        // (their on_mod_message(name, channel, data)). In singleplayer, or when hosting, this
+        // game is the server: its own on_mod_message gets it (next frame), with your name.
+        // data is text (numbers become text); at most 4 KB; a flood is dropped by the server.
+        engineTable["send_to_server"] = [](const std::string& channel, sol::object data) {
+            std::string text;
+            if (data.get_type() == sol::type::string) text = data.as<std::string>();
+            else if (data.get_type() == sol::type::number) {
+                char buf[40];
+                std::snprintf(buf, sizeof(buf), "%.14g", data.as<double>());
+                text = buf;
+            } else if (data.valid() && data.get_type() != sol::type::lua_nil) return false;
+            if (!net::validModChannel(channel) || text.size() > net::kMaxModMessageFromPlayer) return false;
+            if (g_Client.active()) return g_Client.sendModMessage(channel, text);
+            if (g_ModToOwnServer.size() >= 4096) return false;
+            g_ModToOwnServer.push_back({ channel, text });
+            return true;
         };
         // engine.send_chat(text) -> sends a chat message to everyone (multiplayer only). True if sent.
         engineTable["send_chat"] = [](const std::string& text) {
@@ -7430,6 +7466,28 @@ int main(int argc, char** argv) {
                         auto r = fn(k, value);
                         if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_shared_changed: " << err.what() << std::endl; }
                     }
+                }
+            }
+
+            // Mod messages: from the server (or this game's own server side) to on_server_message,
+            // and from this game's own mods to on_mod_message when it is the server itself
+            {
+                std::vector<LocalModMessage> toGame, toServer;
+                toGame.swap(g_ModToOwnGame);
+                toServer.swap(g_ModToOwnServer);
+                if (g_Client.state() == GameClient::State::Joined) {
+                    for (auto& m : g_Client.takeModMessages()) toGame.push_back({ std::move(m.channel), std::move(m.data) });
+                }
+                if (!toGame.empty()) {
+                    sol::protected_function fn = lua["on_server_message"];
+                    for (const auto& m : toGame) {
+                        if (!fn.valid()) break;
+                        auto r = fn(m.channel, m.data);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_server_message: " << err.what() << std::endl; }
+                    }
+                }
+                if (!g_Client.active()) {
+                    for (const auto& m : toServer) g_ServerApi.modMessage(playerName(), m.channel, m.data);
                 }
             }
 

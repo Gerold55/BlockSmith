@@ -1571,6 +1571,9 @@ int main(int argc, char** argv) {
         if (kind == 0) entityLua.punch(id, name, at, item);
         else entityLua.rightClick(id, name, item);
     };
+    server.onModMessage = [&ctx](const std::string& name, const std::string& channel, const std::string& data) {
+        ctx.api.modMessage(name, channel, data);
+    };
     server.onHarvest = [&ctx](const std::string& name, const std::string& item, const glm::ivec3& pos) {
         ctx.api.harvest(name, item, pos);
     };

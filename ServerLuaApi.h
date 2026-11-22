@@ -12,11 +12,14 @@
 //   on_player_harvest(name, item, x, y, z)   a joined player used `item` (the scythe) on that
 //       block: the server works out what it does, from its own world (engine.player_set_block)
 //   on_server_start() / on_server_stop()
+//   on_mod_message(name, channel, data)   a player's game sent this (engine.send_to_server):
+//       text on a named channel, checked for size and flooding. Data only - never run it.
 // Each call is time-limited (luasandbox::TimeLimit) and errors are printed once until they change.
 //
 // Functions (engine.*): get_online_players, get_player_info, message_player, kick_player,
 // teleport_player, set_player_mode, get_player_mode, is_player_operator, get_server_info,
-// player_set_block (a change made for a joined player, checked like their own edits).
+// player_set_block (a change made for a joined player, checked like their own edits),
+// send_to_player / send_to_all (mod messages to players' games: on_server_message there).
 // Kicks from mods wait until flush() (after the network update), so a mod can never remove a
 // player while the server is still handling that player's packet.
 
@@ -25,6 +28,7 @@
 #include "Block.h"
 #include <glm/glm.hpp>
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -53,6 +57,8 @@ public:
     std::function<bool(PlayerInfo&)> localPlayer;
     std::function<void(const std::string&, const glm::vec3&)> localMessage;
     std::function<void(const glm::vec3&)> localTeleport;
+    // A mod message for the local player's own game (its on_server_message)
+    std::function<void(const std::string& channel, const std::string& data)> localModMessage;
     // Dedicated server: remember a mode set by a mod (gamemodes.txt)
     std::function<void(const std::string&, const std::string&)> rememberMode;
     // engine.get_server_info() fields
@@ -106,6 +112,10 @@ public:
     // A joined player used `item` on the block at pos (C_HARVEST): on_player_harvest
     void harvest(const std::string& name, const std::string& item, const glm::ivec3& pos) {
         call("on_player_harvest", [](sol::protected_function_result&) {}, name, item, pos.x, pos.y, pos.z);
+    }
+    // A player's game sent its server's mods a message (engine.send_to_server)
+    void modMessage(const std::string& name, const std::string& channel, const std::string& data) {
+        call("on_mod_message", [](sol::protected_function_result&) {}, name, channel, data);
     }
     void serverStarted() { call("on_server_start", [](sol::protected_function_result&) {}); }
     void serverStopping() { call("on_server_stop", [](sol::protected_function_result&) {}); }
@@ -167,6 +177,29 @@ public:
                 return true;
             }
             return server && server->running() && server->messagePlayer(name, text, color);
+        };
+        // engine.send_to_player(name, channel, data) -> true if they're online: a message for that
+        // player's game (its on_server_message(channel, data)). data is text; numbers are turned
+        // into text. channel: letters, digits and _ : . - , your mod's name first ("hud").
+        engine["send_to_player"] = [this](const std::string& name, const std::string& channel, sol::object data) {
+            std::string text;
+            if (!modText(data, text) || !net::validModChannel(channel) || text.size() > net::kMaxModMessage) return false;
+            PlayerInfo local;
+            if (localPlayer && localPlayer(local) && local.name == name) {
+                if (localModMessage) localModMessage(channel, text);
+                return localModMessage != nullptr;
+            }
+            return server && server->running() && server->sendModMessage(name, channel, text);
+        };
+        // engine.send_to_all(channel, data) -> how many players got it (everyone online, the host too)
+        engine["send_to_all"] = [this](const std::string& channel, sol::object data) {
+            std::string text;
+            if (!modText(data, text) || !net::validModChannel(channel) || text.size() > net::kMaxModMessage) return 0;
+            int n = 0;
+            PlayerInfo local;
+            if (localPlayer && localPlayer(local) && localModMessage) { localModMessage(channel, text); ++n; }
+            if (server && server->running()) n += server->sendModMessageToAll(channel, text);
+            return n;
         };
         engine["kick_player"] = [this](const std::string& name, sol::optional<std::string> reason) {
             if (!server || !server->running()) return false;
@@ -232,6 +265,17 @@ private:
     std::vector<std::pair<std::string, std::string>> m_pendingKicks;
     std::map<std::string, std::string> m_lastError;
 
+    static bool modText(const sol::object& o, std::string& out) {
+        if (o.get_type() == sol::type::string) { out = o.as<std::string>(); return true; }
+        if (o.get_type() == sol::type::number) {
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "%.14g", o.as<double>());
+            out = buf;
+            return true;
+        }
+        if (o.get_type() == sol::type::lua_nil || o.get_type() == sol::type::none) { out.clear(); return true; }
+        return false;   // (tables, functions...: send text, e.g. made with a serializer)
+    }
     static std::string blockName(BlockRegistry& reg, uint8_t id) {
         return id == 0 ? std::string("air") : reg.getBlock(id).name;
     }
