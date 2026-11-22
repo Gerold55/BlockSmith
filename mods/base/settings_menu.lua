@@ -275,7 +275,7 @@ local function refresh()
         { id = "motd", kind = "text", label = "Description", max = 200, allowed = "^[ -~]$", wide = true,
           value = sv.motd or "" },
         { id = "max_players", kind = "number", label = "Max Players",
-          value = sv.max_players or 20, min = 2, max = 200, step = 1 },
+          value = sv.max_players or 50, min = 2, max = 200, step = 1 },
         { id = "port", kind = "text", label = "Port", max = 5, allowed = "^%d$",
           value = tostring(sv.port or 30000) },
     }

@@ -212,7 +212,7 @@ struct ServerConfig {
     std::string world = "world";
     std::string seed;
     int port = 30000;
-    int maxPlayers = 20;
+    int maxPlayers = 50;
     int viewDistance = 8;
     int spawnX = 8, spawnZ = 8;
     std::string welcome = "{gold}Welcome to the server, {player}!";

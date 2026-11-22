@@ -3326,7 +3326,7 @@ Command-line options: `--setup`, `--config <file>` (another settings file), `--g
 | `port` | 30000 | the UDP port |
 | `disabled_mods` | | mods not to load (comma separated); players need the same mods as the server |
 | **Players** | | |
-| `max_players` | 20 | |
+| `max_players` | 50 | the most players at once (1 to 4000; a game hosting from its pause menu: up to 200) |
 | `view_distance` | 8 | how far players may see, in chunks (2 to 10); lower is less work |
 | `spawn` | 8 8 | where new players appear (x z) |
 | `welcome` | (a gold welcome) | said to each player who joins; `{player}` is their name |

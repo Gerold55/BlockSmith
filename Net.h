@@ -356,7 +356,7 @@ private:
     int m_maxView = net::kMaxViewDistance;
     std::string m_gameTitle;
     std::string m_motd = "A BlockSmith server";
-    int m_maxPlayers = 20;
+    int m_maxPlayers = 50;
     std::vector<uint8_t> m_icon;
     uint16_t m_nextId = 1;
     // LAN announcements ("Scanning for games on your local network" on other PCs)

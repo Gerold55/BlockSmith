@@ -2142,7 +2142,7 @@ std::string serverMotd() {
     const auto it = g_Settings.find("server_motd");
     return it != g_Settings.end() ? it->second : std::string("A BlockSmith server");
 }
-int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 20), 2, 200); }
+int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 50), 2, 200); }
 int serverPort() {
     const int p = settingInt("server_port", net::kDefaultPort);
     return (p > 0 && p <= 65535) ? p : net::kDefaultPort;
@@ -2554,7 +2554,7 @@ const std::vector<ServerSettingInfo>& serverSettingInfo() {
         {"world", "server_world", "World folder in saves/"},
         {"seed", "", "Seed for a new world (empty = random)"},
         {"port", "30000", "UDP port players connect to"},
-        {"max_players", "20", ""},
+        {"max_players", "50", "Most players at once (up to 4000)"},
         {"view_distance", "8", "Furthest players may see, in chunks"},
         {"spawn", "8 8", "Where new players appear (x z)"},
         {"welcome", "Welcome to the server, {player}!", "Sent to each player who joins"},

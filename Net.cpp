@@ -1331,11 +1331,13 @@ void GameServer::sendEntities() {
         pos.u16(0);
         gone.u16(0);
         uint16_t nInfo = 0, nPos = 0, nGone = 0;
+        // (the peer as its own variable: a lambda capturing the structured binding c is C++20)
+        auto* const peer = c.peer;
         auto flush = [&](Writer& w, uint16_t n, size_t countAt, bool reliable) {
             if (n == 0) return;
             w.d[countAt] = n & 0xFF;
             w.d[countAt + 1] = n >> 8;
-            sendTo(c.peer, w, reliable);
+            sendTo(peer, w, reliable);
         };
         for (const auto& [id, e] : all) {
             if (e.removed) continue;
