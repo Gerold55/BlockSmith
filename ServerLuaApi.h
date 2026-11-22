@@ -57,8 +57,9 @@ public:
     std::function<bool(PlayerInfo&)> localPlayer;
     std::function<void(const std::string&, const glm::vec3&)> localMessage;
     std::function<void(const glm::vec3&)> localTeleport;
-    // A mod message for the local player's own game (its on_server_message)
-    std::function<void(const std::string& channel, const std::string& data)> localModMessage;
+    // A mod message for the local player's own game (its on_server_message). Returns whether
+    // it was accepted (false: its queue is full, and the message is dropped).
+    std::function<bool(const std::string& channel, const std::string& data)> localModMessage;
     // Dedicated server: remember a mode set by a mod (gamemodes.txt)
     std::function<void(const std::string&, const std::string&)> rememberMode;
     // engine.get_server_info() fields
@@ -186,8 +187,7 @@ public:
             if (!modText(data, text) || !net::validModChannel(channel) || text.size() > net::kMaxModMessage) return false;
             PlayerInfo local;
             if (localPlayer && localPlayer(local) && local.name == name) {
-                if (localModMessage) localModMessage(channel, text);
-                return localModMessage != nullptr;
+                return localModMessage && localModMessage(channel, text);
             }
             return server && server->running() && server->sendModMessage(name, channel, text);
         };
@@ -197,7 +197,7 @@ public:
             if (!modText(data, text) || !net::validModChannel(channel) || text.size() > net::kMaxModMessage) return 0;
             int n = 0;
             PlayerInfo local;
-            if (localPlayer && localPlayer(local) && localModMessage) { localModMessage(channel, text); ++n; }
+            if (localPlayer && localPlayer(local) && localModMessage && localModMessage(channel, text)) ++n;
             if (server && server->running()) n += server->sendModMessageToAll(channel, text);
             return n;
         };

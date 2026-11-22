@@ -3627,7 +3627,7 @@ That's `addr2line` on Linux and `atos -o BlockSmithServer -l <load address> ...`
   "latest": "0.2-alpha",
   "min_supported": "0.1-alpha",
   "commit": "1a2b3c4d5e",
-  "download": "https://github.com/Gerold55/testvoxel/releases/latest",
+  "download": "https://github.com/Gerold55/BlockSmith/releases/latest",
   "notes": "New biomes and menus"
 }
 ```
@@ -3641,7 +3641,7 @@ Where it shows: the title screen gets a gold "Update available: 0.2-alpha - clic
 
 ```
 [Server] Couldn't check for updates: the site answered 404
-[Server]   version file: https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json
+[Server]   version file: https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json
 [Server]   result: HTTP 404, download failed
 [Server]   this build: 0.1-alpha (commit 2d5ea37fe8)
 [Server]   error: the site answered 404
@@ -3655,7 +3655,7 @@ Where it shows: the title screen gets a gold "Update available: 0.2-alpha - clic
 
 Older games and servers that don't send their version still work together as before; they just don't get these messages.
 
-Settings: `update_check = false` turns it off, `update_url = <address>` reads another file (it must be allowed like any remote content: GitHub or a domain in `remote_domains`). Both go in `settings.txt` for the game and `server.conf` for a server. The default is `https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json`: publish a new version by changing that file. Mods can read the answer with `engine.get_update_info()` -> `{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }`.
+Settings: `update_check = false` turns it off, `update_url = <address>` reads another file (it must be allowed like any remote content: GitHub or a domain in `remote_domains`). Both go in `settings.txt` for the game and `server.conf` for a server. The default is `https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json`: publish a new version by changing that file. Mods can read the answer with `engine.get_update_info()` -> `{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }`.
 
 ### 17g. Mods on a server
 

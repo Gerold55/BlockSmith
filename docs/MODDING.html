@@ -4795,7 +4795,7 @@ reports delete 2              (level 4 / the console)
   &quot;latest&quot;: &quot;0.2-alpha&quot;,
   &quot;min_supported&quot;: &quot;0.1-alpha&quot;,
   &quot;commit&quot;: &quot;1a2b3c4d5e&quot;,
-  &quot;download&quot;: &quot;https://github.com/Gerold55/testvoxel/releases/latest&quot;,
+  &quot;download&quot;: &quot;https://github.com/Gerold55/BlockSmith/releases/latest&quot;,
   &quot;notes&quot;: &quot;New biomes and menus&quot;
 }
 </code></pre>
@@ -4807,7 +4807,7 @@ reports delete 2              (level 4 / the console)
 </ul>
 <p>Where it shows: the title screen gets a gold &quot;Update available: 0.2-alpha - click to download&quot; line above the version (red &quot;Update required&quot; when it must be installed); clicking it opens the download page in your browser. The server prints it in its console (and log) when it changes, tells operators when they join, and adds it to <code>version</code>. With a warning (an update available or required, or a check that failed) the details follow on the next lines: the file that was checked, the HTTP result, this build's version and commit, the latest and minimum versions, what it decided and why, and the error if there was one:</p>
 <pre><code>[Server] Couldn't check for updates: the site answered 404
-[Server]   version file: https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json
+[Server]   version file: https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json
 [Server]   result: HTTP 404, download failed
 [Server]   this build: 0.1-alpha (commit 2d5ea37fe8)
 [Server]   error: the site answered 404
@@ -4819,7 +4819,7 @@ reports delete 2              (level 4 / the console)
 <li><code>engine.get_server_status(address)</code> has <code>engine_version</code>, <code>engine_commit</code> and <code>engine_compare</code> (<code>&quot;newer&quot;</code>, <code>&quot;older&quot;</code>, <code>&quot;same&quot;</code>, or <code>&quot;&quot;</code> for older servers that don't say), and <code>engine.open_update_page()</code> opens the download page from a title-screen page.</li>
 </ul>
 <p>Older games and servers that don't send their version still work together as before; they just don't get these messages.</p>
-<p>Settings: <code>update_check = false</code> turns it off, <code>update_url = &lt;address&gt;</code> reads another file (it must be allowed like any remote content: GitHub or a domain in <code>remote_domains</code>). Both go in <code>settings.txt</code> for the game and <code>server.conf</code> for a server. The default is <code>https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json</code>: publish a new version by changing that file. Mods can read the answer with <code>engine.get_update_info()</code> -&gt; <code>{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }</code>.</p>
+<p>Settings: <code>update_check = false</code> turns it off, <code>update_url = &lt;address&gt;</code> reads another file (it must be allowed like any remote content: GitHub or a domain in <code>remote_domains</code>). Both go in <code>settings.txt</code> for the game and <code>server.conf</code> for a server. The default is <code>https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json</code>: publish a new version by changing that file. Mods can read the answer with <code>engine.get_update_info()</code> -&gt; <code>{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }</code>.</p>
 <h3 id="17g-mods-on-a-server">17g. Mods on a server<a class="hash" href="#17g-mods-on-a-server" aria-label="Link to this section">#</a></h3>
 <p>Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated <code>BlockSmithServer</code>. Blocks are sent to players by <strong>name</strong>, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.</p>
 <ul>

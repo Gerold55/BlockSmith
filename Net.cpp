@@ -1626,6 +1626,7 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_chat.clear();
     m_shared.clear();
     m_sharedChanges.clear();
+    m_modMessages.clear();
     std::cout << "[Client] Connecting to " << m_addressText << " as " << m_name << std::endl;
     return true;
 }

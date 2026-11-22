@@ -208,7 +208,9 @@ function H.show(target, id, piece)
     -- a timer's on_done runs here, on the server
     local key = (type(target) == "string" and target or "list") .. "|" .. id
     if p.type == "timer" and type(piece.on_done) == "function" and (p.direction or "down") ~= "up" then
-        timers[key] = { done_at = now() + (p.seconds or 0), fn = piece.on_done, id = id, target = target }
+        -- (a list of names is copied: the caller may change theirs later)
+        timers[key] = { done_at = now() + (p.seconds or 0), fn = piece.on_done, id = id,
+                        target = type(target) == "table" and copy(target) or target }
     else
         timers[key] = nil
     end
@@ -263,7 +265,22 @@ function H.clear(target)
         timers = {}
         per_player = {}
     else
-        for_each_name(target, function(name) per_player[name] = nil end)
+        for_each_name(target, function(name)
+            per_player[name] = nil
+            -- their timers stop too, as hud.hide does: one shown to them alone goes; from one
+            -- shown to a list they're taken off it (it goes once nobody is left on it). Timers
+            -- of everyone else, and those shown to "*", are kept.
+            for key, tm in pairs(timers) do
+                if tm.target == name then
+                    timers[key] = nil
+                elseif type(tm.target) == "table" then
+                    for i = #tm.target, 1, -1 do
+                        if tm.target[i] == name then table.remove(tm.target, i) end
+                    end
+                    if #tm.target == 0 then timers[key] = nil end
+                end
+            end
+        end)
     end
     send(target, { op = "clear" })
     return true
@@ -561,7 +578,10 @@ local function sidebar_rows(p)
             return x < y
         end)
     end
-    local max = tonumber(p.max_lines) or 15
+    -- the most rows shown: a whole number >= 0 (0 = none); nothing usable (nil, NaN, infinite) = 15
+    local max = tonumber(p.max_lines)
+    if not max or max ~= max or max == math.huge or max == -math.huge then max = 15 end
+    max = math.max(0, math.floor(max))
     while #rows > max do table.remove(rows) end
     return rows
 end
@@ -796,7 +816,7 @@ function on_update(dt, ...)
     clock = clock + (tonumber(dt) or 0)
     -- timers' on_done, on the server
     for key, tm in pairs(timers) do
-        if clock >= tm.done_at then
+        if timers[key] == tm and clock >= tm.done_at then
             timers[key] = nil
             local ok, err = pcall(tm.fn, tm.id, tm.target)
             if not ok then print("[HUD] timer '" .. tostring(tm.id) .. "' on_done: " .. tostring(err)) end

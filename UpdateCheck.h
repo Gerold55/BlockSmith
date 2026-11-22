@@ -14,7 +14,7 @@
 //     "min_supported": "0.1-alpha",           optional: older than this must update (it can't
 //                                             play with up-to-date games and servers any more)
 //     "commit": "1a2b3c4d5e",                 optional: the newest version's commit
-//     "download": "https://github.com/Gerold55/testvoxel/releases/latest",
+//     "download": "https://github.com/Gerold55/BlockSmith/releases/latest",
 //                                             optional: where to get it (https, github.com or
 //                                             *.github.io, or the manifest's own site)
 //     "notes": "New biomes and menus"         optional: one line about it (up to 300 characters)
@@ -36,7 +36,7 @@
 
 namespace update {
 
-inline const char* kDefaultUrl = "https://raw.githubusercontent.com/Gerold55/testvoxel/main/version.json";
+inline const char* kDefaultUrl = "https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json";
 
 struct Info {
     bool checked = false;     // a manifest has been read (the fields below are from it)

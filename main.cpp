@@ -5368,7 +5368,9 @@ int main(int argc, char** argv) {
             if (g_ChatSystem) g_ChatSystem->addMessage(text, color);
         };
         g_ServerApi.localModMessage = [](const std::string& channel, const std::string& data) {
-            if (g_ModToOwnGame.size() < 4096) g_ModToOwnGame.push_back({ channel, data });
+            if (g_ModToOwnGame.size() >= 4096) return false;   // (full: dropped, and not counted as sent)
+            g_ModToOwnGame.push_back({ channel, data });
+            return true;
         };
         g_ServerApi.localTeleport = [](const glm::vec3& pos) {
             if (!g_PlayerInstance) return;
