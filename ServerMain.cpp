@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <memory>
 #include <chrono>
 #include <csignal>
 #include <deque>
@@ -1592,6 +1593,40 @@ int main(int argc, char** argv) {
     const auto serverStart = Clock::now();
     std::string lastUpdateLine;
     int failed = 0;
+    // engine.find_texture(name) -> the picture's path, or nil: the same answer as in the game
+    // (this mod's folder, then the game's textures, then any mod or game folder by file name).
+    // The server draws nothing, but mods look their pictures up while loading - without this
+    // every lookup said "not found" and they warned about pictures that are there.
+    {
+        auto index = std::make_shared<std::map<std::string, std::string>>();
+        auto built = std::make_shared<bool>(false);
+        const std::string game = config.game;
+        lua["engine"]["find_texture"] = [&lua, index, built, game](const std::string& name) -> sol::optional<std::string> {
+            if (name.empty() || name.find("..") != std::string::npos) return sol::nullopt;
+            auto lower = [](std::string t) { for (auto& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return t; };
+            std::error_code ec;
+            const std::string modPath = lua["g_CurrentModPath"].get_or(std::string());
+            std::vector<fs::path> tries;
+            if (!modPath.empty()) { tries.push_back(fs::path(modPath) / "textures" / name); tries.push_back(fs::path(modPath) / name); }
+            for (const std::string& g : { "games/" + game, "../../games/" + game }) tries.push_back(fs::path(g) / "textures" / name);
+            for (const auto& t : tries) if (fs::is_regular_file(t, ec)) return fs::absolute(t, ec).string();
+            if (!*built) {   // every .png in the game and mod folders, by file name (first found wins)
+                *built = true;
+                std::vector<fs::path> roots = serverModRoots(game);
+                for (const std::string& g : { "games/" + game, "../../games/" + game }) if (fs::is_directory(g, ec)) roots.push_back(g);
+                for (const auto& root : roots) {
+                    for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
+                         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                        if (!it->is_regular_file(ec) || lower(it->path().extension().string()) != ".png") continue;
+                        index->emplace(lower(it->path().filename().string()), fs::absolute(it->path(), ec).string());
+                    }
+                }
+            }
+            const auto f = index->find(lower(fs::path(name).filename().string()));
+            if (f == index->end()) return sol::nullopt;
+            return f->second;
+        };
+    }
     for (const auto& file : findModFiles(config.game, config.disabledMods)) {
         lua["g_CurrentModPath"] = file.parent_path().string();
         try {

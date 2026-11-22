@@ -53,7 +53,7 @@ local settings = {
         armor_half = { "armor_half.png", "survival_armor_half.png" },
         armor_empty = { "armor_empty.png", "survival_armor_empty.png" },
         armor_half_flip = false,
-        air = { "air.png", "survival_air.png" },
+        air = { "air.png", "survival_air.png", "hudbars_icon_breath.png", "bubble.png" },
     },
 
     -- The crack on a block being dug: a vertical strip of square pictures, first stage on
@@ -290,10 +290,7 @@ local function resolve(name)
     -- the engine looks in this mod's folder (while it loads), the game's textures and every mod
     if engine.find_texture then
         local found = engine.find_texture(name)
-        if found then
-            print("[Survival] " .. name .. " -> " .. found)
-            return found
-        end
+        if found then return found end
         print("[Survival] Can't find the picture " .. name .. " - put it in " .. MOD_PATH .. "/textures/")
         return name
     end
@@ -311,9 +308,10 @@ local function resolve_first(list)
     if engine.find_texture then
         for _, name in ipairs(list) do
             local found = engine.find_texture(name)
-            if found then print("[Survival] " .. name .. " -> " .. found) return found end
+            if found then return found end
         end
         print("[Survival] Can't find any of: " .. table.concat(list, ", ") .. " - put one in " .. MOD_PATH .. "/textures/")
+        return list[1]   -- (said once; the engine draws its missing-picture pattern)
     end
     return resolve(list[1])
 end

@@ -1,1080 +1,875 @@
--- inventory.lua — Creative Inventory
+-- Survival inventory, drawn on the game's inventory picture (textures/survival_inventory.png):
+--   8 equipment slots   pet, head, left glove, chest, right glove, feet, legs, backpack
+--   2x2 crafting grid   with its output slot (recipes from survival.register_craft)
+--   bin                 click to throw away what you're holding
+--   27 storage slots and the hotbar
+-- Opened with the inventory key (E) in survival; creative keeps the creative menu.
+--
+--   left click   pick up / put down a stack (same items merge, different ones swap)
+--   right click  pick up half / put down one
+--   hold + drag  with a stack on the pointer: left spreads it evenly over the slots you drag
+--                across, right puts one in each (like Minecraft)
+--   shift+click  move a stack between the hotbar and storage (on the output: craft all you can)
+--
+-- Items dug when the hotbar is full go into storage (engine hook on_hotbar_full).
+--
+-- For other mods:
+--   survival.inventory.add(name, count)  -> how many didn't fit
+--   survival.inventory.get(i)            -> name, count   (i = 1..size)
+--   survival.inventory.set(i, name, count)
+--   survival.inventory.size(), clear(), is_open()
+--   survival.inventory.get_equipment(slot) -> name or nil   (slot = "head", "chest"...)
+--   survival.inventory.pick(name)        -> true if it was put in the hand (pick block rules)
+--   survival.inventory.equipment_slots()  -> { "pet", "head", ... } in screen order
+--   survival.inventory.set_equipment(slot, name) -> false if it doesn't go there ("" / nil empties)
+--   survival.inventory.fits_equipment(slot, name), stack_max(name), is_ready()
+--   (the creative inventory's Inventory tab uses these)
+--
+--   survival.register_equipment(item, slot, { armor = points })  -- what each slot accepts
+--   survival.on_equip(function(slot, item_or_nil) end)
+--   survival.register_craft({ output = "planks", count = 4, recipe = { { "log_oak" } } })
+--   survival.register_craft({ output = "stick", count = 4, recipe = { { "planks" }, { "planks" } } })
+--   survival.register_craft({ type = "shapeless", output = "x", recipe = { "a", "b" } })
+--   (recipes up to 2x2 work in the inventory; up to 3x3 at a workbench)
+--   survival.register_workbench("my_table")   -- right-clicking that block opens the 3x3 grid
+--   survival.inventory.open_workbench(), survival.inventory.get_screen() -> "inventory"|"workbench"|nil
+
+local inv = {}
+survival.inventory = inv
+
+local SIZE = 27
+local MAX_STACK = 64
+local slots = {}            -- storage [1..27] = { name, count } or nil
+local equipment = {}        -- [slot name] = { name, count = 1 }
+local grid = {}             -- crafting [1..4] (2x2, row by row)
+local held = nil            -- stack on the mouse pointer
+local open = false
+
 -- ---------------------------------------------------------------------------
--- A category sidebar on the left; a search box, grid / list view and pages on top; the items
--- in the middle; your hotbar at the bottom. Everything (layout, colours, categories) lives in
--- this file - edit freely.
---
---   click an item        pick up a stack (click a hotbar slot to put it there; click outside
---                        the window to throw it away)
---   click a hotbar slot  put down / pick up / swap
---   shift-click          a hotbar item: deletes it (like Minecraft); an item in the grid: a
---                        stack into your hotbar (the first empty slot)
---   Inventory tab        (bottom of the sidebar) switches to your survival inventory screen
---                        (equipment, crafting, storage); its "Creative" button comes back
---   mouse wheel          next / previous page          type   search (click the box first)
---   Left / Right         previous / next page          Esc    stop typing
---
--- Other mods can add categories or move items between them:
---   creative.register_category{ id = "magic", name = "Magic", icons = { "wand" },
---                               filter = function(name, info) return name:find("wand") end }
---   creative.set_category("ruby_lamp", "decoration")     -- one item, any category id
---
--- ...or give their own blocks and items a tab of their own in the sidebar (below the
--- built-in ones), like mods in Minecraft. From the mod's init.lua:
---   creative.register_tab{ name = "Magic", icon = "wand" }     -- every item this mod registers
--- See creative.register_tab below for picking the items yourself, or drawing a whole page.
---
--- C++ provides ui.draw_rect / draw_text / text_width / text_height / draw_block_icon,
--- ui.get_all_blocks(), ui.get_block_info(name), ui.get_mouse(), ui.get_time(), ui.keys,
--- ui.actions and hotbar.* (1-based). It calls render_creative_inventory(W, H),
--- handle_creative_click / _scroll / _key / _char and on_creative_opened / _closed.
+-- The picture and where its slots are (in the picture's own pixels)
 -- ---------------------------------------------------------------------------
+local PIC_W, PIC_H = 178, 166
+local SLOT = 16
 
-print("[UI] inventory.lua loaded")
-
--- ===========================================================================
--- THEME
--- ===========================================================================
-
-local te = (function()   -- the caret in text boxes (lualib/textedit.lua)
-    local ok, m = pcall(require, "textedit")
-    if ok then return m end
-    print("[UI] lualib/textedit.lua is missing: text boxes can only type at the end")
-    local function view(_, t, w, sc)
-        while #t > 0 and ui.text_width(t, sc) > w do t = t:sub(2) end
-        return t, ui.text_width(t, sc)
-    end
-    return { reset = function() end, focus = function() end, view = view,
-             key = function(_, t, k) if k == ui.keys.BACKSPACE then return t:sub(1, -2), true end return t, false end,
-             insert = function(_, t, s, max) if max and #t >= max then return t end return t .. s end,
-             draw_caret = function(_, x, y, h, r, g, b, a) if ui.get_time() % 1 < 0.5 then ui.draw_rect(x, y, 1, h, r, g, b, a) end end }
-end)()
-
-local C = {
-    dim         = { 0.00, 0.00, 0.00, 0.55 },   -- over the world
-    frame       = { 0.55, 0.60, 0.68, 1.00 },   -- outer border
-    frame_hi    = { 0.72, 0.77, 0.84, 1.00 },
-    frame_lo    = { 0.30, 0.34, 0.40, 1.00 },
-    window      = { 0.17, 0.20, 0.24, 1.00 },   -- inside the window
-    panel       = { 0.12, 0.14, 0.17, 1.00 },   -- sidebar / grid / hotbar backgrounds
-    panel_hi    = { 0.26, 0.30, 0.36, 1.00 },
-    panel_lo    = { 0.07, 0.08, 0.10, 1.00 },
-    slot        = { 0.20, 0.23, 0.28, 1.00 },
-    slot_hi     = { 0.30, 0.34, 0.41, 1.00 },
-    slot_lo     = { 0.10, 0.11, 0.14, 1.00 },
-    hover       = { 1.00, 1.00, 1.00, 0.16 },
-    row         = { 0.18, 0.21, 0.26, 1.00 },   -- sidebar category
-    row_hover   = { 0.23, 0.27, 0.33, 1.00 },
-    accent      = { 0.20, 0.52, 0.92, 1.00 },   -- selected category / view button
-    accent_hi   = { 0.45, 0.72, 1.00, 1.00 },
-    accent_bg   = { 0.13, 0.30, 0.55, 1.00 },
-    text        = { 0.93, 0.95, 0.97, 1.00 },
-    text_dim    = { 0.60, 0.65, 0.72, 1.00 },
-    text_faint  = { 0.42, 0.47, 0.54, 1.00 },
-    field       = { 0.08, 0.09, 0.11, 1.00 },
-    field_focus = { 0.45, 0.72, 1.00, 1.00 },
-    tip_bg      = { 0.06, 0.07, 0.09, 0.96 },
-    tip_border  = { 0.30, 0.55, 0.95, 0.80 },
+local EQUIPMENT_SLOTS = {   -- id, x, y   (ids as used by register_equipment)
+    { "pet", 9, 17 },   { "head", 27, 17 },
+    { "glove_left", 9, 35 }, { "chest", 27, 35 }, { "glove_right", 45, 35 },
+    { "feet", 9, 53 },  { "legs", 27, 53 },  { "backpack", 45, 53 },
 }
+local BIN = { x = 144, y = 60 }
 
-local T = {                 -- sizes in GUI pixels (times the GUI scale)
-    min_w = 600, min_h = 340,   -- the window: at least this, growing with the screen up to max
-    max_w = 780, max_h = 430,
-    pad = 6,
-    sidebar_w = 132, cat_h = 26, cat_gap = 2,
-    top_h = 22,
-    slot = 30, slot_gap = 2,
-    row_h = 22,             -- list view
-    hotbar_h = 58,
-    font = 0.5,             -- text scale at GUI scale 1
-    stack_size = 64,        -- what you get from the creative grid
-    max_search = 32,
+-- Two screens on the same storage and hotbar: the inventory (E) with its 2x2 crafting grid,
+-- and the workbench (right-click a workbench block) with a 3x3 grid
+local SCREENS = {
+    inventory = {
+        pictures = { "inventory.png", "survival_inventory.png", "inventory_survival.png" },
+        grid_w = 2, grid_x = 72, grid_y = 26,
+        output = { x = 140, y = 31, size = 24 },
+        equipment = true, bin = true,
+    },
+    workbench = {
+        pictures = { "workbench_gui.png", "survival_workbench.png", "inventory_workbench.png" },
+        grid_w = 3, grid_x = 30, grid_y = 17,
+        output = { x = 124, y = 32, size = 24 },
+        title = "Crafting",
+    },
 }
+local screen = "inventory"
+local STORAGE = { x = 9, y = 81 }      -- 9 x 3, 18 pixels apart
+local HOTBAR = { x = 9, y = 142 }
+local STEP = 18
+local SLOT_FILL = { 87 / 255, 87 / 255, 85 / 255 }   -- covers the outline icons when a slot is filled
 
--- ===========================================================================
--- CATEGORIES
--- Each item goes in the first category whose filter accepts it (All shows everything).
--- `icons`: the first of these that exists is the category's icon.
--- ===========================================================================
-
-local function has(s, ...)
-    for _, sub in ipairs({ ... }) do
-        if string.find(s, sub, 1, true) then return true end
-    end
-    return false
-end
-
--- A whole word of the name: word(n, "bed") matches "bed" and "red_bed", not "bedrock"
-local function word(n, ...)
-    for _, w in ipairs({ ... }) do
-        for part in n:gmatch("[^_]+") do if part == w then return true end end
-    end
-    return false
-end
-
-local function is_food(name, info)
-    if survival and survival.is_food and survival.is_food(name) then return true end
-    return has(name, "apple", "bread", "beef", "pork", "chicken", "mutton", "cod", "salmon", "steak",
-               "carrot", "potato", "cookie", "pie", "stew", "soup", "melon_slice", "berries", "cake")
-end
-
-local Categories = {
-    { id = "all", name = "All Items", all = true },
-    { id = "spawn_eggs", name = "Spawn Eggs", icons = { "spawn_egg" },
-      filter = function(n) return has(n, "spawn_egg") end },
-    { id = "combat", name = "Combat", icons = { "iron_sword", "sword", "bow" },
-      filter = function(n, i) return (i and i.tool_type == "sword")
-          or has(n, "sword", "bow", "arrow", "helmet", "chestplate", "leggings", "boots", "shield", "armor") end },
-    { id = "tools", name = "Tools", icons = { "iron_pickaxe", "pickaxe", "scythe", "hoe" },
-      filter = function(n, i) return (i and i.tool_type ~= nil and i.tool_type ~= "")
-          or has(n, "pickaxe", "shovel", "_axe", "hoe", "scythe", "shears", "fishing_rod", "flint_and_steel") end },
-    { id = "food", name = "Food", icons = { "apple", "bread", "apple_pie" },
-      filter = function(n, i) return is_food(n, i) end },
-    { id = "redstone", name = "Redstone", icons = { "redstone", "redstone_block", "lever" },
-      filter = function(n) return has(n, "redstone", "piston", "lever", "button", "repeater", "comparator",
-                                      "hopper", "dispenser", "dropper", "observer", "tnt", "rail", "pressure_plate") end },
-    { id = "utility", name = "Utility", icons = { "bucket", "workbench", "chest" },
-      filter = function(n) return has(n, "bucket", "workbench", "crafting", "furnace", "chest", "barrel",
-                                      "anvil", "ladder", "smoker", "enchant") or word(n, "bed") end },
-    { id = "nature", name = "Nature", icons = { "sapling_oak", "sapling", "flower_red", "leaves_oak" },
-      filter = function(n, i) return not word(n, "pot") and ((i and i.pattern == "plantlike") or has(n, "leaves", "sapling",
-          "flower", "grass_tuft", "short_grass", "fern", "mushroom", "cactus", "pumpkin", "melon",
-          "vine", "seeds", "wheat", "reeds", "sugar_cane", "lily")) end },
-    { id = "decoration", name = "Decoration", icons = { "lantern", "torch", "glass" },
-      filter = function(n, i) return (i and (i.light or 0) > 0) or has(n, "torch", "lantern", "lamp", "glass",
-          "carpet", "painting", "banner", "candle", "glowstone", "sea_lantern") or word(n, "pot", "flowerpot") end },
-    { id = "blocks", name = "Blocks", icons = { "grass", "grass_block", "dirt" },
-      filter = function(n, i) return not (i and i.item) and (has(n, "stone", "dirt", "grass", "sand", "gravel",
-          "clay", "bedrock", "obsidian", "netherrack", "farmland", "podzol") or word(n, "ore", "log", "snow", "ice", "mud")) end },
-    { id = "building", name = "Building", icons = { "bricks", "planks_oak", "cobblestone" },
-      filter = function(n, i) return not (i and i.item) or has(n, "door", "fence", "stairs", "slab") end },
-    { id = "misc", name = "Miscellaneous", icons = { "stick", "coal", "diamond" },
-      filter = function() return true end },
-    -- The player's own inventory (survival mod): not a list of items, kept at the bottom
-    { id = "inventory", name = "Inventory", special = true, icons = { "chest" } },
-}
-
-local overrides = {}       -- item name -> category id (creative.set_category)
-local ModTabs = {}         -- tabs from creative.register_tab, in order (also in Categories)
-
--- Which mod registered each block. Newer engines say so (ui.get_block_info(name).mod); on older
--- ones, the blocks registered from here on are noted as they're registered.
-local registered_by = {}
-local function mod_folder() return (g_CurrentModPath or ""):match("([^/\\]+)[/\\]*$") or "" end
-if engine and engine.register_block and not creative_wrapped_register then
-    creative_wrapped_register = true
-    local register_block = engine.register_block
-    engine.register_block = function(name, ...)
-        if type(name) == "string" then registered_by[name] = mod_folder() end
-        return register_block(name, ...)
-    end
-end
-local function mod_of(name, info)
-    if info and info.mod and info.mod ~= "" then return info.mod end
-    return registered_by[name] or ""
-end
-
-creative = creative or {}
--- creative.register_category{ id, name, icons, filter [, before = "id"] }: a new category
--- (placed before the `before` one, else before Miscellaneous)
-function creative.register_category(def)
-    assert(type(def) == "table" and def.id and def.name, "creative.register_category needs { id, name, ... }")
-    def.filter = def.filter or function() return false end
-    local at = #Categories
-    for i, c in ipairs(Categories) do if c.id == (def.before or "misc") then at = i break end end
-    table.insert(Categories, at, def)
-end
--- creative.set_category(item, id): put one item in a category
-function creative.set_category(item, id) overrides[item] = id end
-
-local function block_info(name) end   -- (defined below)
-local cat_cache, all_cache_reset
-
--- creative.register_tab{ name [, id, icon, mod, items, filter, exclusive, draw, width, height] }
---   A tab of the mod's own in the creative inventory's sidebar, under the built-in ones.
---   Which items it shows (pick one; the default is the first):
---     (nothing)      every block and item the calling mod registers
---     mod = "farming" or { "farming", "farming_plus" }: everything those mods register
---     items = { "ruby", "ruby_block", "ruby_sword" }: exactly these, in this order
---     filter = function(name, info) return ... end: your own test
---   icon      an item shown on the tab (default: its first item)
---   exclusive true (default): its items are only in this tab, not also in Blocks, Tools...
---             (they're always in All Items and in search results)
---   draw      function(f, state): instead of an item grid, a whole page of your own, drawn
---             with ui_kit (lualib/ui_kit.lua) in the items area; width, height: its size in
---             units (left out: f.w_units, f.h_units say how much room there is)
---   Returns the tab's id. Call it again with the same id to replace it.
-function creative.register_tab(def)
-    assert(type(def) == "table" and def.name, "creative.register_tab needs at least { name = ... }")
-    local this_mod = mod_folder()
-    local id = def.id or ("tab:" .. (def.mod and tostring(def.mod) or this_mod) .. ":" .. def.name)
-    local tab = { id = id, name = def.name, icons = def.icon and { def.icon } or nil, tab = true,
-                  exclusive = def.exclusive ~= false, before = def.before }
-    if def.items then
-        local order = {}
-        for i, n in ipairs(def.items) do order[n] = i end
-        tab.order = order
-        tab.filter = function(name) return order[name] ~= nil end
-    elseif def.filter then
-        tab.filter = def.filter
-    else
-        local mods = {}
-        local m = def.mod or this_mod
-        for _, x in ipairs(type(m) == "table" and m or { m }) do mods[x] = true end
-        tab.filter = function(name, info) return mods[mod_of(name, info)] == true end
-    end
-    if def.draw then
-        local ok, kit = pcall(require, "ui_kit")
-        assert(ok, "a creative tab with draw needs lualib/ui_kit.lua: " .. tostring(kit))
-        tab.page = kit.embed{ id = "creative:" .. id, width = def.width, height = def.height,
-                              state = def.state or {}, draw = def.draw }
-        tab.page_units = def.width ~= nil and def.height ~= nil
-        if not def.items and not def.filter and not def.mod then tab.filter = function() return false end end
-    end
-    for i, c in ipairs(Categories) do                     -- replacing one with the same id
-        if c.id == id then table.remove(Categories, i) break end
-    end
-    for i, c in ipairs(ModTabs) do if c.id == id then table.remove(ModTabs, i) break end end
-    ModTabs[#ModTabs + 1] = tab
-    local at = #Categories + 1
-    for i, c in ipairs(Categories) do if c.special then at = i break end end   -- above Inventory
-    table.insert(Categories, at, tab)
-    if all_cache_reset then all_cache_reset() end
-    return id
-end
-
--- creative.hold(name [, count]): put an item on the cursor, as if picked from the grid (a custom
--- page uses this, so the player can then put it in the hotbar). creative.get_held() -> name, count
-function creative.hold(name, count) end       -- (defined below, next to the state)
-function creative.get_held() end
-
--- ===========================================================================
--- STATE AND CACHES
--- ===========================================================================
-
-local state = {
-    cat = 1,                -- index into Categories
-    search = "",
-    search_focused = false,
-    page = 1,
-    list_view = false,
-    held = nil,             -- { name, count } on the cursor
-}
-
-local info_cache, all_cache = {}, nil
-cat_cache = {}
-all_cache_reset = function() info_cache, cat_cache, all_cache = {}, {}, nil end
-
-function creative.hold(name, count)
-    state.held = name and { name = name, count = count or T.stack_size } or nil
-end
-function creative.get_held()
-    if state.held then return state.held.name, state.held.count end
-    return nil
-end
-
-function block_info(name)
-    local v = info_cache[name]
-    if v == nil then
-        v = (ui.get_block_info and ui.get_block_info(name)) or false
-        info_cache[name] = v
-    end
-    return v or nil
-end
-
-local function hidden(name)
-    if name == "air" then return true end
-    -- fluids themselves aren't items (their buckets are)
-    return (has(name, "water", "lava") and not has(name, "bucket")) or has(name, "flowing")
-end
-
--- The category an item belongs to (not "all")
-local function category_of(name)
-    local c = cat_cache[name]
-    if c then return c end
-    local info = block_info(name)
-    c = overrides[name]
-    if not c then                                         -- mods' own tabs first...
-        for _, tab in ipairs(ModTabs) do
-            if tab.exclusive and tab.filter(name, info) then c = tab.id break end
+do
+    local resolve = survival.resolve_texture or function(n) return n end
+    for id, sc in pairs(SCREENS) do
+        for _, name in ipairs(sc.pictures) do
+            local found = engine.find_texture and engine.find_texture(name)
+            if found then sc.picture = resolve(name); break end
         end
+        if not sc.picture then print("[Survival] No " .. id .. " picture found (" .. table.concat(sc.pictures, ", ") .. "): drawing a plain one") end
     end
-    if not c then                                         -- ...then the built-in categories
-        for _, cat in ipairs(Categories) do
-            if not cat.all and not cat.special and not cat.tab and cat.filter(name, info) then c = cat.id break end
-        end
-    end
-    c = c or "misc"
-    cat_cache[name] = c
-    return c
 end
-
-local function cat_index(id)
-    for i, c in ipairs(Categories) do if c.id == id then return i end end
-    return #Categories
-end
-
--- Is this item shown in that category / tab?
-local function in_cat(name, cat)
-    if cat.all then return true end
-    if cat.tab and not cat.exclusive then return cat.filter(name, block_info(name)) end
-    return category_of(name) == cat.id
-end
-
--- Every creative item, in category order (registration order inside each)
-local function all_items()
-    if all_cache then return all_cache end
-    local list = {}
-    for i, name in ipairs(ui.get_all_blocks and ui.get_all_blocks() or {}) do
-        if not hidden(name) then list[#list + 1] = { name = name, order = i } end
-    end
-    table.sort(list, function(a, b)
-        local ca, cb = cat_index(category_of(a.name)), cat_index(category_of(b.name))
-        if ca ~= cb then return ca < cb end
-        local tab = Categories[ca]
-        if tab and tab.order then                         -- a tab with a list: its order
-            return (tab.order[a.name] or 0) < (tab.order[b.name] or 0)
-        end
-        return a.order < b.order
-    end)
-    all_cache = {}
-    for i, e in ipairs(list) do all_cache[i] = e.name end
-    return all_cache
-end
-
--- The name players see: the block's description ("Oak Log"), else one made from its name
-local pretty_cache = {}
-local function pretty(name)
-    local cached = pretty_cache[name]
-    if cached then return cached end
-    local info = ui.get_block_info and ui.get_block_info(name)
-    local out = (info and info.description and info.description ~= "") and info.description
-                or (name:gsub("_", " "):gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
-    pretty_cache[name] = out
-    return out
-end
-
--- What's shown: the chosen category, or search results across everything
-local function shown_items()
-    local q = state.search:lower()
-    local cat = Categories[state.cat]
-    local out = {}
-    for _, name in ipairs(all_items()) do
-        local ok
-        if q ~= "" then
-            ok = has(name:lower(), q) or has(pretty(name):lower(), q)
-        else
-            ok = in_cat(name, cat)
-        end
-        if ok then out[#out + 1] = name end
-    end
-    return out
-end
-
-local function count_in(cat)
-    if cat.all then return #all_items() end
-    local n = 0
-    for _, name in ipairs(all_items()) do if in_cat(name, cat) then n = n + 1 end end
-    return n
-end
-
--- ===========================================================================
--- THE PLAYER'S INVENTORY (Inventory tab) - slots: hotbar, storage or equipment
--- ===========================================================================
-
--- survival.inventory once it has loaded this world's inventory (nil before, or without the mod)
-local function player_inv()
-    local inv = survival and survival.inventory
-    if not inv or not inv.get then return nil end
-    if inv.is_ready and not inv.is_ready() then return nil end
-    return inv
-end
-
--- ref = { kind = "hb", i } | { kind = "st", i } | { kind = "eq", slot }
-local function slot_get(r)
-    local inv = player_inv()
-    local name, count
-    if r.kind == "hb" then name, count = hotbar.get_slot(r.i)
-    elseif r.kind == "st" and inv then name, count = inv.get(r.i)
-    elseif r.kind == "eq" and inv then name = inv.get_equipment(r.slot); count = name and 1 or 0 end
-    if not name or name == "" or not count or count <= 0 then return nil, 0 end
-    return name, count
-end
-
-local function slot_set(r, name, count)
-    local inv = player_inv()
-    if not name or not count or count <= 0 then name, count = "", 0 end
-    if r.kind == "hb" then hotbar.set_slot(r.i, name, count)
-    elseif r.kind == "st" and inv then inv.set(r.i, name, count)
-    elseif r.kind == "eq" and inv and inv.set_equipment then inv.set_equipment(r.slot, name) end
-end
+local function grid_w() return SCREENS[screen].grid_w end
 
 local function stack_max(name)
-    local inv = player_inv()
-    return (inv and inv.stack_max) and inv.stack_max(name) or T.stack_size
-end
-local function slot_max(r, name) return r.kind == "eq" and 1 or stack_max(name) end
-local function slot_accepts(r, name)
-    if r.kind ~= "eq" then return true end
-    local inv = player_inv()
-    return inv ~= nil and inv.fits_equipment ~= nil and inv.fits_equipment(r.slot, name)
+    local def = engine.get_block_def and engine.get_block_def(name)
+    if def and def.tool_type and def.tool_type ~= "" then return 1 end   -- tools don't stack
+    return MAX_STACK
 end
 
--- Into the hotbar: onto the same item first, then empty slots. Returns what didn't fit.
-local function into_hotbar(name, count)
-    local n = hotbar.get_slot_count()
-    for pass = 1, 2 do
-        for i = 1, n do
-            if count <= 0 then return 0 end
-            local hn, hc = hotbar.get_slot(i)
-            local empty = not hn or hn == "" or (hc or 0) <= 0
-            if (pass == 1 and not empty and hn == name) or (pass == 2 and empty) then
-                local have = empty and 0 or hc
-                local put = math.min(count, stack_max(name) - have)
-                if put > 0 then hotbar.set_slot(i, name, have + put) count = count - put end
-            end
-        end
+-- ---------------------------------------------------------------------------
+-- Equipment
+-- ---------------------------------------------------------------------------
+local equip_defs = {}      -- [item] = { slot = "head", armor = 2 }
+local equip_callbacks = {}
+
+function survival.register_equipment(item, slot, def)
+    def = def or {}
+    equip_defs[item] = { slot = slot, armor = def.armor or 0 }
+end
+function survival.on_equip(fn) equip_callbacks[#equip_callbacks + 1] = fn end
+function inv.get_equipment(slot) local e = equipment[slot] return e and e.name or nil end
+
+local function update_armor()
+    local points = 0
+    for _, e in pairs(equipment) do
+        local d = equip_defs[e.name]
+        if d then points = points + (d.armor or 0) end
     end
-    return count
+    if survival.set_armor then survival.set_armor(points) end
 end
 
--- A click on a slot: Minecraft's rules (pick up / put down / merge / swap; shift moves)
-local function click_slot(r, shift, inventory_tab)
-    local name, count = slot_get(r)
-    local held = state.held
-    if shift and not held then
-        if not name then return end
-        local inv = player_inv()
-        if r.kind == "hb" then
-            if inventory_tab and inv then                    -- to storage
-                local left = inv.add(name, count)
-                slot_set(r, name, left)
-            else
-                slot_set(r, nil)                             -- other tabs: deleted, like Minecraft
-            end
-        elseif r.kind == "st" then                           -- to the hotbar
-            slot_set(r, name, into_hotbar(name, count))
-        elseif r.kind == "eq" and inv then                   -- take it off, into storage
-            if inv.add(name, 1) == 0 then slot_set(r, nil) end
-        end
-        return
+local function fits_equipment(slot, item)
+    local d = equip_defs[item]
+    return d ~= nil and d.slot == slot
+end
+
+-- ---------------------------------------------------------------------------
+-- Crafting
+-- ---------------------------------------------------------------------------
+local recipes = {}
+
+-- recipe = rows of item names ("" or nil = empty), up to 2x2 here; or a list for shapeless
+function survival.register_craft(def)
+    if not def or not def.output or not def.recipe then return end
+    local r = { output = def.output, count = def.count or 1, shapeless = def.type == "shapeless" }
+    if r.shapeless then
+        r.items = {}
+        for _, it in ipairs(def.recipe) do r.items[#r.items + 1] = it end
+        table.sort(r.items)
+    else
+        r.rows = def.recipe
     end
-    if held then
-        if not slot_accepts(r, held.name) then return end
-        local max = slot_max(r, held.name)
-        if not name then                                     -- put down (as many as fit)
-            local put = math.min(held.count, max)
-            slot_set(r, held.name, put)
-            state.held = (held.count - put > 0) and { name = held.name, count = held.count - put } or nil
-        elseif name == held.name then                        -- merge
-            local put = math.min(held.count, max - count)
-            if put > 0 then
-                slot_set(r, name, count + put)
-                state.held = (held.count - put > 0) and { name = name, count = held.count - put } or nil
-            end
-        elseif held.count <= max then                        -- swap
-            slot_set(r, held.name, held.count)
-            state.held = { name = name, count = count }
+    recipes[#recipes + 1] = r
+end
+
+-- The grid trimmed to its filled part: rows of names, and the sorted list of names
+local function grid_shape()
+    local w = grid_w()
+    local cells = {}
+    for i = 1, w * w do cells[i] = grid[i] and grid[i].name or "" end
+    local minr, maxr, minc, maxc = w + 1, 0, w + 1, 0
+    for r = 1, w do for c = 1, w do
+        if cells[(r - 1) * w + c] ~= "" then
+            minr, maxr = math.min(minr, r), math.max(maxr, r)
+            minc, maxc = math.min(minc, c), math.max(maxc, c)
         end
-    elseif name then                                         -- pick up
-        state.held = { name = name, count = count }
-        slot_set(r, nil)
-    end
-end
-
--- ===========================================================================
--- DRAWING HELPERS
--- ===========================================================================
-
-local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
-local function inside(mx, my, x, y, w, h) return mx >= x and mx < x + w and my >= y and my < y + h end
-
-local function rect(x, y, w, h, c, a)
-    if w <= 0 or h <= 0 then return end
-    ui.draw_rect(x, y, w, h, c[1], c[2], c[3], a or c[4] or 1)
-end
-
-local function th(scale) return ui.text_height and ui.text_height(scale) or 14 * scale end
-local function tw(s, scale) return ui.text_width and ui.text_width(s, scale) or #s * 10 * scale end
-
--- Text with `y` = the top of the capitals
-local function text(s, x, y, scale, c, shadow, S)
-    y = y + th(scale)
-    if shadow then ui.draw_text(s, x + S, y + S, scale, 0, 0, 0, 0.6) end
-    ui.draw_text(s, x, y, scale, c[1], c[2], c[3], c[4] or 1)
-end
-
--- Shortens text to fit `w` pixels (adds "..")
-local function fit(s, w, scale)
-    if tw(s, scale) <= w then return s end
-    while #s > 1 and tw(s .. "..", scale) > w do s = s:sub(1, -2) end
-    return s .. ".."
-end
-
--- A box with a 1-pixel light top-left edge and dark bottom-right edge
-local function bevel(x, y, w, h, S, fill, hi, lo)
-    rect(x, y, w, h, lo)
-    rect(x, y, w - S, h - S, hi)
-    rect(x + S, y + S, w - 2 * S, h - 2 * S, fill)
-end
--- A sunken box (dark top-left, light bottom-right)
-local function sunken(x, y, w, h, S, fill, hi, lo)
-    rect(x, y, w, h, hi)
-    rect(x, y, w - S, h - S, lo)
-    rect(x + S, y + S, w - 2 * S, h - 2 * S, fill)
-end
-local function outline(x, y, w, h, t, c)
-    rect(x, y, w, t, c); rect(x, y + h - t, w, t, c)
-    rect(x, y + t, t, h - 2 * t, c); rect(x + w - t, y + t, t, h - 2 * t, c)
-end
-
-local function draw_slot(x, y, size, S) sunken(x, y, size, size, S, C.slot, C.slot_hi, C.slot_lo) end
-
-local function draw_count(count, x, y, size, fs, S)
-    if not count or count <= 1 then return end
-    local s = tostring(count)
-    text(s, x + size - tw(s, fs) - 2 * S, y + size - th(fs) - 3 * S, fs, C.text, true, S)
-end
-
--- Little pictures drawn from rectangles (no image files needed)
-local function icon_grid(x, y, size, c)                 -- 3 x 3 squares
-    local cell = size / 3
-    for i = 0, 2 do for j = 0, 2 do
-        rect(x + i * cell + cell * 0.15, y + j * cell + cell * 0.15, cell * 0.7, cell * 0.7, c)
     end end
-end
-local function icon_bag(x, y, size, c)                  -- a backpack
-    local u = size / 10
-    rect(x + 3.5 * u, y + 0.5 * u, 3 * u, 1.2 * u, c)
-    rect(x + 1.5 * u, y + 2 * u, 7 * u, 7.5 * u, c)
-    rect(x + 3 * u, y + 4.5 * u, 4 * u, 1 * u, { 0.12, 0.14, 0.17, 1 })
-end
-local function icon_list(x, y, size, c)                 -- 3 bars
-    for j = 0, 2 do rect(x, y + size * (0.12 + j * 0.33), size, size * 0.18, c) end
-end
-local function icon_search(x, y, size, c, S)           -- magnifying glass
-    local r = size * 0.62
-    outline(x, y, r, r, math.max(1, math.floor(1.5 * S)), c)
-    for k = 0, 2 do
-        local d = r - S + k * size * 0.13
-        rect(x + d, y + d, size * 0.16, size * 0.16, c)
+    if maxr == 0 then return nil end
+    local rows, list = {}, {}
+    for r = minr, maxr do
+        local row = {}
+        for c = minc, maxc do
+            local n = cells[(r - 1) * w + c]
+            row[#row + 1] = n
+            if n ~= "" then list[#list + 1] = n end
+        end
+        rows[#rows + 1] = row
     end
-end
-local function arrow(x, y, size, left, c, S)           -- a solid triangle pointing < or >
-    local rows = math.max(3, math.floor(size / S))
-    local rh = size / rows
-    local depth = size * 0.45
-    for k = 0, rows - 1 do
-        local f = 1 - math.abs((k + 0.5) / rows * 2 - 1)    -- 0 at the ends, 1 in the middle
-        local w = depth * f
-        local ax = x + (size - depth) / 2
-        rect(left and (ax + depth - w) or ax, y + k * rh, w, rh + 0.5, c)
-    end
+    table.sort(list)
+    return rows, list
 end
 
-local function category_icon(cat)
-    if cat.icon_cache ~= nil then return cat.icon_cache or nil end
-    local found = false
-    for _, n in ipairs(cat.icons or {}) do
-        local info = block_info(n)
-        if info and info.has_texture then found = n break end
-    end
-    if not found and not cat.all and not cat.special then   -- else: the category's first item
-        for _, n in ipairs(all_items()) do
-            if in_cat(n, cat) then found = n break end
+local function shaped_match(rows, want, mirror)
+    if #rows ~= #want then return false end
+    for r = 1, #want do
+        local wr = want[r]
+        if type(wr) ~= "table" then return false end
+        if #rows[r] ~= #wr then return false end
+        for c = 1, #wr do
+            local w = wr[mirror and (#wr - c + 1) or c] or ""
+            if (rows[r][c] or "") ~= w then return false end
         end
-    end
-    cat.icon_cache = found
-    return found or nil
-end
-
-local function draw_tooltip(lines, mx, my, W, H, S, fs)
-    local pad = 4 * S
-    local w = 0
-    for _, l in ipairs(lines) do w = math.max(w, tw(l[1], l[3] or fs)) end
-    w = w + pad * 2
-    local h = pad * 2 + (#lines - 1) * 4 * S
-    for _, l in ipairs(lines) do h = h + th(l[3] or fs) end
-    local x, y = mx + 12 * S, my - h - 4 * S
-    if x + w > W then x = mx - 12 * S - w end
-    y = clamp(y, 0, H - h)
-    rect(x, y, w, h, C.tip_bg)
-    outline(x, y, w, h, S, C.tip_border)
-    local ty = y + pad
-    for _, l in ipairs(lines) do
-        text(l[1], x + pad, ty, l[3] or fs, l[2], true, S)
-        ty = ty + th(l[3] or fs) + 4 * S
-    end
-end
-
--- ===========================================================================
--- LAYOUT (shared by drawing and clicking)
--- ===========================================================================
-
-local function layout(W, H)
-    local S = clamp(math.floor(math.min(W / (T.min_w + 40), H / (T.min_h + 40)) * 2) / 2, 1, 4)
-    local L = { S = S, fs = T.font * S, fs_small = T.font * 0.8 * S }
-    L.w = math.floor(clamp(W / S - 40, T.min_w, T.max_w)) * S      -- bigger screens: more slots
-    L.h = math.floor(clamp(H / S - 40, T.min_h, T.max_h)) * S
-    L.x, L.y = math.floor((W - L.w) / 2), math.floor((H - L.h) / 2)
-    local p = T.pad * S
-    L.p = p
-
-    -- Sidebar
-    L.sideX, L.sideY = L.x + p, L.y + p
-    L.sideW, L.sideH = T.sidebar_w * S, L.h - 2 * p
-    L.catH, L.catGap = T.cat_h * S, T.cat_gap * S
-
-    -- Right side
-    L.rx = L.sideX + L.sideW + p
-    L.rw = L.x + L.w - p - L.rx
-    L.topY, L.topH = L.y + p, T.top_h * S
-
-    -- Top bar: [ search ............ ] [grid] [list]   [<] 1 / 3 [>]
-    local b = L.topH
-    L.pagerW = b * 2 + 46 * S
-    L.pagerX = L.rx + L.rw - L.pagerW
-    L.listBtnX = L.pagerX - 8 * S - b
-    L.gridBtnX = L.listBtnX - 3 * S - b
-    L.searchX = L.rx
-    L.searchW = L.gridBtnX - 6 * S - L.searchX
-    L.prevX, L.nextX = L.pagerX, L.pagerX + L.pagerW - b
-
-    -- Hotbar section at the bottom, items in between
-    L.hotH = T.hotbar_h * S
-    L.hotY = L.y + L.h - p - L.hotH
-    L.areaX, L.areaY = L.rx, L.topY + L.topH + p
-    L.areaW, L.areaH = L.rw, L.hotY - p - L.areaY
-
-    L.slot, L.pitch = T.slot * S, (T.slot + T.slot_gap) * S
-    local inner = 4 * S
-    L.cols = math.max(1, math.floor((L.areaW - 2 * inner + T.slot_gap * S) / L.pitch))
-    L.rows = math.max(1, math.floor((L.areaH - 2 * inner + T.slot_gap * S) / L.pitch))
-    local gw, gh = L.cols * L.pitch - T.slot_gap * S, L.rows * L.pitch - T.slot_gap * S
-    L.gridX = L.areaX + math.floor((L.areaW - gw) / 2)
-    L.gridY = L.areaY + math.floor((L.areaH - gh) / 2)
-
-    L.rowH = T.row_h * S                    -- list view
-    L.listRows = math.max(1, math.floor((L.areaH - 2 * inner) / L.rowH))
-    L.perPage = state.list_view and L.listRows or (L.cols * L.rows)
-    return L
-end
-
--- The sidebar's entries and where they are: categories from the top (empty ones left out),
--- then mods' tabs under a line, and the Inventory tab pinned to the bottom. When they don't
--- all fit, the list scrolls (mouse wheel over the sidebar): L.list is the visible part.
-local function sidebar(L)
-    local S = L.S
-    local x, w, h = L.sideX + 3 * S, L.sideW - 6 * S, L.catH
-    local inv_cat
-    for _, cat in ipairs(Categories) do if cat.special then inv_cat = cat end end
-    local has_inv = inv_cat and survival and survival.inventory
-    local top = L.sideY + 3 * S
-    local bottom = L.sideY + L.sideH - 3 * S - (has_inv and (h + L.catGap + 3 * S) or 0)
-    L.list = { x = L.sideX + S, y = top, w = L.sideW - 2 * S, h = bottom - top }
-
-    local out, y, divider = {}, 0, false
-    for _, cat in ipairs(Categories) do
-        if not cat.special and (cat.all or cat.page or count_in(cat) > 0) then
-            if cat.tab and not divider then                 -- a line between built-in and mods' tabs
-                divider = true
-                if #out > 0 then
-                    out[#out + 1] = { divider = true, y = y + 3 * S }
-                    y = y + 8 * S
-                end
-            end
-            out[#out + 1] = { cat = cat, x = x, y = y, w = w, h = h }
-            y = y + h + L.catGap
-        end
-    end
-    local total = y - L.catGap
-    L.side_max = math.max(0, total - L.list.h)
-    state.side_scroll = clamp(state.side_scroll or 0, 0, L.side_max)
-    for _, e in ipairs(out) do e.y = e.y + top - state.side_scroll end
-    if has_inv then
-        out[#out + 1] = { cat = inv_cat, x = x, y = L.sideY + L.sideH - 3 * S - h, w = w, h = h, pinned = true }
-    end
-    return out
-end
-
-
-local function hotbar_slots(L)
-    local n = (hotbar and hotbar.get_slot_count and hotbar.get_slot_count()) or 9
-    local S = L.S
-    local pitch = L.pitch
-    local x0 = L.rx + math.floor((L.rw - (n * pitch - T.slot_gap * S)) / 2)    -- centred
-    local y0 = L.hotY + 4 * S + th(L.fs_small) + 5 * S
-    local out = {}
-    for i = 1, n do out[i] = { x = x0 + (i - 1) * pitch, y = y0 } end
-    return out
-end
-
-local function pages(L, count) return math.max(1, math.ceil(count / L.perPage)) end
-
--- Which item is under the mouse (grid or list), or nil
-local function item_at(L, items, mx, my)
-    local first = (state.page - 1) * L.perPage
-    if state.list_view then
-        local x, y = L.areaX + 4 * L.S, L.areaY + 4 * L.S
-        if not inside(mx, my, x, y, L.areaW - 8 * L.S, L.listRows * L.rowH) then return nil end
-        local r = math.floor((my - y) / L.rowH)
-        return items[first + r + 1]
-    end
-    if not inside(mx, my, L.gridX, L.gridY, L.cols * L.pitch, L.rows * L.pitch) then return nil end
-    local c, r = math.floor((mx - L.gridX) / L.pitch), math.floor((my - L.gridY) / L.pitch)
-    if mx - (L.gridX + c * L.pitch) >= L.slot or my - (L.gridY + r * L.pitch) >= L.slot then return nil end
-    return items[first + r * L.cols + c + 1]
-end
-
--- ===========================================================================
--- RENDER
--- ===========================================================================
-
-local last_layout = nil     -- (for the mouse wheel, which comes without the window size)
-
-function render_creative_inventory(W, H)
-    if not ui or not ui.draw_rect then return end
-    local L = layout(W, H)
-    last_layout = L
-    local S, fs, small = L.S, L.fs, L.fs_small
-    local mx, my = ui.get_mouse()
-    local items = shown_items()
-    local npages = pages(L, #items)
-    state.page = clamp(state.page, 1, npages)
-    local tip = nil
-
-    -- Window
-    rect(0, 0, W, H, C.dim)
-    bevel(L.x - 2 * S, L.y - 2 * S, L.w + 4 * S, L.h + 4 * S, S, C.frame, C.frame_hi, C.frame_lo)
-    rect(L.x, L.y, L.w, L.h, C.window)
-
-    -- Sidebar: categories (those with no items are left out, except All)
-    sunken(L.sideX, L.sideY, L.sideW, L.sideH, S, C.panel, C.panel_hi, C.panel_lo)
-    local entries = sidebar(L)
-    local clipped = false
-    for _, e in ipairs(entries) do
-      if e.divider then
-        rect(L.sideX + 8 * S, e.y, L.sideW - 16 * S, S, C.panel_hi)
-      elseif e.pinned or (e.y + e.h > L.list.y and e.y < L.list.y + L.list.h) then
-        if not e.pinned and not clipped and ui.push_clip then ui.push_clip(L.list.x, L.list.y, L.list.w, L.list.h) clipped = true end
-        if e.pinned and clipped then ui.pop_clip() clipped = false end
-        local cat, x, y, w, h = e.cat, e.x, e.y, e.w, e.h
-        local selected = (Categories[state.cat] == cat) and state.search == ""
-        local hov = inside(mx, my, x, y, w, h) and (e.pinned or inside(mx, my, L.list.x, L.list.y, L.list.w, L.list.h))
-        if selected then
-            rect(x, y, w, h, C.accent_bg)
-            outline(x, y, w, h, S, C.accent_hi)
-        else
-            bevel(x, y, w, h, S, hov and C.row_hover or C.row, C.panel_hi, C.panel_lo)
-        end
-        local isz = h - 8 * S
-        if cat.all then
-            icon_grid(x + 5 * S, y + 4 * S, isz, C.text)
-        elseif cat.special and not category_icon(cat) then
-            icon_bag(x + 5 * S, y + 4 * S, isz, C.text)
-        else
-            local icon = category_icon(cat)
-            if icon then ui.draw_block_icon(icon, x + 5 * S, y + 4 * S, isz) end
-        end
-        local tx = x + 10 * S + isz
-        local n = (cat.special or cat.page) and "" or tostring(count_in(cat))
-        local nw = tw(n, small)
-        text(fit(cat.name, w - (tx - x) - nw - 8 * S, fs), tx, y + (h - th(fs)) / 2, fs,
-             selected and C.text or C.text, true, S)
-        text(n, x + w - nw - 5 * S, y + (h - th(small)) / 2, small, selected and C.accent_hi or C.text_faint, false, S)
-      end
-    end
-    if clipped then ui.pop_clip() end
-    if L.side_max > 0 then                                  -- where in the list we are
-        local bh = math.max(12 * S, L.list.h * L.list.h / (L.list.h + L.side_max))
-        local by = L.list.y + (L.list.h - bh) * state.side_scroll / L.side_max
-        rect(L.sideX + L.sideW - 3 * S, by, 2 * S, bh, C.text_faint)
-    end
-
-    -- Search box
-    local sx, sy, sw, sh = L.searchX, L.topY, L.searchW, L.topH
-    sunken(sx, sy, sw, sh, S, C.field, C.panel_hi, C.panel_lo)
-    if state.search_focused then outline(sx, sy, sw, sh, S, C.field_focus) end
-    local isz = sh - 10 * S
-    icon_search(sx + 6 * S, sy + 5 * S, isz, state.search_focused and C.text or C.text_dim, S)
-    local tx, ty = sx + 12 * S + isz, sy + (sh - th(fs)) / 2
-    local clear_w = (state.search ~= "") and sh or 0
-    if state.search == "" and not state.search_focused then
-        text("Search items...", tx, ty, fs, C.text_faint, false, S)
-    else
-        local avail = sw - (tx - sx) - clear_w - 6 * S
-        local shown, caret_x = te.view("creative:search", state.search, avail, fs)
-        text(shown, tx, ty, fs, C.text, false, S)
-        if state.search_focused then
-            te.draw_caret("creative:search", tx + caret_x, ty - S, th(fs) + 2 * S, C.text[1], C.text[2], C.text[3], 1)
-        end
-    end
-    if state.search ~= "" then
-        local hov = inside(mx, my, sx + sw - sh, sy, sh, sh)
-        text("x", sx + sw - sh + (sh - tw("x", fs)) / 2, ty, fs, hov and C.text or C.text_dim, false, S)
-    end
-
-    local page = state.search == "" and Categories[state.cat].page
-    if page then
-        -- A mod's own page (creative.register_tab with draw), drawn with ui_kit
-        sunken(L.areaX, L.areaY, L.areaW, L.areaH, S, C.panel, C.panel_hi, C.panel_lo)
-        if not Categories[state.cat].page_units then page.unit = 16 * S end
-        page:draw(L.areaX + 4 * S, L.areaY + 4 * S, L.areaW - 8 * S, L.areaH - 8 * S)
-    else
-    -- Grid / list buttons
-    for _, b in ipairs({ { L.gridBtnX, false }, { L.listBtnX, true } }) do
-        local bx, on = b[1], (state.list_view == b[2])
-        local hov = inside(mx, my, bx, sy, sh, sh)
-        if on then
-            rect(bx, sy, sh, sh, C.accent_bg); outline(bx, sy, sh, sh, S, C.accent_hi)
-        else
-            bevel(bx, sy, sh, sh, S, hov and C.row_hover or C.row, C.panel_hi, C.panel_lo)
-        end
-        local g = sh - 10 * S
-        if b[2] then icon_list(bx + 5 * S, sy + 5 * S, g, C.text) else icon_grid(bx + 5 * S, sy + 5 * S, g, C.text) end
-        if hov then tip = { { b[2] and "List view" or "Grid view", C.text } } end
-    end
-
-    -- Pager
-    sunken(L.pagerX, sy, L.pagerW, sh, S, C.field, C.panel_hi, C.panel_lo)
-    for _, b in ipairs({ { L.prevX, true, state.page > 1 }, { L.nextX, false, state.page < npages } }) do
-        local hov = b[3] and inside(mx, my, b[1], sy, sh, sh)
-        bevel(b[1], sy, sh, sh, S, hov and C.row_hover or C.row, C.panel_hi, C.panel_lo)
-        arrow(b[1] + 5 * S, sy + 5 * S, sh - 10 * S, b[2], b[3] and C.text or C.text_faint, S)
-    end
-    local pg = state.page .. " / " .. npages
-    text(pg, L.pagerX + (L.pagerW - tw(pg, fs)) / 2, ty, fs, C.text, false, S)
-
-    -- Items
-    sunken(L.areaX, L.areaY, L.areaW, L.areaH, S, C.panel, C.panel_hi, C.panel_lo)
-    local first = (state.page - 1) * L.perPage
-    local hovered = item_at(L, items, mx, my)
-    if state.list_view then
-        local x, w = L.areaX + 4 * S, L.areaW - 8 * S
-        for r = 0, L.listRows - 1 do
-            local name = items[first + r + 1]
-            if not name then break end
-            local y = L.areaY + 4 * S + r * L.rowH
-            rect(x, y, w, L.rowH - S, (r % 2 == 0) and C.slot or C.row)
-            if name == hovered then rect(x, y, w, L.rowH - S, C.hover) end
-            local isz2 = L.rowH - 6 * S
-            ui.draw_block_icon(name, x + 4 * S, y + 2 * S, isz2)
-            text(fit(pretty(name), w * 0.6, fs), x + 10 * S + isz2, y + (L.rowH - th(fs)) / 2, fs, C.text, true, S)
-            local cn = Categories[cat_index(category_of(name))].name
-            text(cn, x + w - tw(cn, small) - 6 * S, y + (L.rowH - th(small)) / 2, small, C.text_dim, false, S)
-        end
-    else
-        for r = 0, L.rows - 1 do
-            for c = 0, L.cols - 1 do
-                local x, y = L.gridX + c * L.pitch, L.gridY + r * L.pitch
-                draw_slot(x, y, L.slot, S)
-                local name = items[first + r * L.cols + c + 1]
-                if name then
-                    ui.draw_block_icon(name, x + 4 * S, y + 4 * S, L.slot - 8 * S)
-                    if name == hovered then rect(x + S, y + S, L.slot - 2 * S, L.slot - 2 * S, C.hover) end
-                end
-            end
-        end
-    end
-    if #items == 0 then
-        local msg = state.search ~= "" and ("Nothing matches \"" .. state.search .. "\"") or "Nothing here yet"
-        text(msg, L.areaX + (L.areaW - tw(msg, fs)) / 2, L.areaY + L.areaH / 2 - th(fs) / 2, fs, C.text_dim, false, S)
-    end
-    if hovered then
-        tip = { { pretty(hovered), C.text },
-                { Categories[cat_index(category_of(hovered))].name, C.accent_hi, small } }
-    end
-    end   -- (not a page)
-
-    -- Hotbar
-    sunken(L.rx, L.hotY, L.rw, L.hotH, S, C.panel, C.panel_hi, C.panel_lo)
-    local hs = hotbar_slots(L)
-    text("HOTBAR", L.rx + (L.rw - tw("HOTBAR", small)) / 2, L.hotY + 4 * S, small, C.text_dim, false, S)
-    for i, s in ipairs(hs) do
-        draw_slot(s.x, s.y, L.slot, S)
-        local name, count = hotbar.get_slot(i)
-        if name and name ~= "" then
-            ui.draw_block_icon(name, s.x + 4 * S, s.y + 4 * S, L.slot - 8 * S)
-            draw_count(count, s.x, s.y, L.slot, small, S)
-        end
-        if inside(mx, my, s.x, s.y, L.slot, L.slot) then
-            rect(s.x + S, s.y + S, L.slot - 2 * S, L.slot - 2 * S, C.hover)
-            if name and name ~= "" then tip = { { pretty(name), C.text } } end
-        end
-        local num = tostring(i % 10)
-        text(num, s.x + (L.slot - tw(num, small)) / 2, s.y + L.slot + 2 * S, small, C.text_faint, false, S)
-    end
-
-    -- Tooltip (not while carrying something, like Minecraft), then the carried item
-    if tip and not state.held and mx >= 0 then draw_tooltip(tip, mx, my, W, H, S, fs) end
-    if state.held and mx >= 0 then
-        local size = L.slot - 8 * S
-        ui.draw_block_icon(state.held.name, mx - size / 2, my - size / 2, size)
-        draw_count(state.held.count, mx - size / 2 - 4 * S, my - size / 2 - 4 * S, L.slot, small, S)
-    end
-end
-
--- ===========================================================================
--- INPUT
--- ===========================================================================
-
-local function set_page(p, L, count)
-    state.page = clamp(p, 1, pages(L, count))
-end
-
-function handle_creative_click(mx, my, W, H, button, shift)
-    local L = layout(W, H)
-    local items = shown_items()
-    local sy, sh = L.topY, L.topH
-
-    local page = state.search == "" and Categories[state.cat].page
-    -- Categories (only the visible part of the scrolling list)
-    for _, e in ipairs(sidebar(L)) do
-        if not e.divider and inside(mx, my, e.x, e.y, e.w, e.h)
-           and (e.pinned or inside(mx, my, L.list.x, L.list.y, L.list.w, L.list.h)) then
-            if e.cat.special then                           -- Inventory: the survival inventory screen
-                local inv = survival and survival.inventory
-                if inv and inv.open_from_creative then
-                    state.held = nil
-                    inv.open_from_creative()
-                end
-                return
-            end
-            if page then page:stop_typing() end
-            state.cat = cat_index(e.cat.id)
-            state.search, state.search_focused, state.page = "", false, 1
-            return
-        end
-    end
-
-    -- Search box (and its clear button)
-    if inside(mx, my, L.searchX, sy, L.searchW, sh) then
-        if state.search ~= "" and mx >= L.searchX + L.searchW - sh then
-            state.search, state.page = "", 1
-            te.reset("creative:search")
-        else                                                  -- the caret goes where you click
-            local tx = L.searchX + 12 * L.S + (L.topH - 10 * L.S)
-            te.focus("creative:search", state.search, mx - tx, L.fs)
-        end
-        state.search_focused = true
-        if page then page:stop_typing() end
-        return
-    end
-    state.search_focused = false
-
-    -- A mod's page: its ui_kit widgets read the mouse themselves
-    if page and inside(mx, my, L.areaX, L.areaY, L.areaW, L.areaH) then return end
-
-    -- View buttons and pager
-    if not page then
-        if inside(mx, my, L.gridBtnX, sy, sh, sh) then state.list_view = false state.page = 1 return end
-        if inside(mx, my, L.listBtnX, sy, sh, sh) then state.list_view = true state.page = 1 return end
-        if inside(mx, my, L.prevX, sy, sh, sh) then set_page(state.page - 1, L, #items) return end
-        if inside(mx, my, L.nextX, sy, sh, sh) then set_page(state.page + 1, L, #items) return end
-    end
-
-    -- An item: pick up a stack (click the same item again to put it back)
-    if not page and inside(mx, my, L.areaX, L.areaY, L.areaW, L.areaH) then
-        local name = item_at(L, items, mx, my)
-        if shift and name and not state.held and hotbar and hotbar.get_slot then
-            -- shift-click: a stack straight into the hotbar (the first empty slot)
-            for i = 1, hotbar.get_slot_count() do
-                local n = hotbar.get_slot(i)
-                if not n or n == "" then hotbar.set_slot(i, name, T.stack_size) return end
-            end
-            return
-        end
-        if not name or (state.held and state.held.name == name) then
-            state.held = nil
-        else
-            state.held = { name = name, count = T.stack_size }
-        end
-        return
-    end
-
-    -- Hotbar: put down / pick up / swap / merge
-    if hotbar and hotbar.get_slot then
-        local hs = hotbar_slots(L)
-        for i, s in ipairs(hs) do
-            if inside(mx, my, s.x, s.y, L.slot, L.slot) then
-                -- shift-click: deleted (like Minecraft's creative tabs)
-                click_slot({ kind = "hb", i = i }, shift, false)
-                if not shift then hotbar.set_active_slot(i) end
-                return
-            end
-        end
-    end
-
-    -- Outside the window while carrying something: drop it into the world, like Minecraft (left
-    -- click: the whole stack, right click: one). An older engine without drop_item: thrown away.
-    if state.held and not inside(mx, my, L.x, L.y, L.w, L.h) then
-        local n = button == "right" and 1 or state.held.count
-        if engine.drop_item then engine.drop_item(state.held.name, n) end
-        state.held.count = state.held.count - n
-        if state.held.count <= 0 then state.held = nil end
-    end
-end
-
--- Mouse wheel: up = previous page, down = next (the last page is clamped while drawing)
-function handle_creative_scroll(dy)
-    local mx, my = ui.get_mouse()
-    local L = last_layout
-    if L and L.list and inside(mx, my, L.sideX, L.sideY, L.sideW, L.sideH) then    -- over the sidebar: scroll it
-        state.side_scroll = clamp((state.side_scroll or 0) - dy * L.catH, 0, L.side_max or 0)
-        return
-    end
-    if state.search == "" and Categories[state.cat].page then return end   -- (a page reads the wheel itself)
-    if dy > 0 then state.page = state.page - 1 elseif dy < 0 then state.page = state.page + 1 end
-    if state.page < 1 then state.page = 1 end
-end
-
-function handle_creative_key(key, action, mods)
-    local page = state.search == "" and Categories[state.cat].page
-    if page and page:is_typing() then                   -- typing in a mod page's text field
-        if key == ui.keys.ESCAPE and action == ui.actions.PRESS then page:stop_typing() end
-        return true                                      -- E / WASD / Escape don't reach the game
-    end
-    if action ~= ui.actions.PRESS and action ~= ui.actions.REPEAT then return state.search_focused end
-    if state.search_focused then
-        if key == ui.keys.ESCAPE or key == ui.keys.ENTER or key == ui.keys.KP_ENTER then
-            state.search_focused = false
-        else                                                 -- Left / Right / Home / End / Backspace / Delete
-            local before = state.search
-            state.search = te.key("creative:search", state.search, key, action, mods)
-            if state.search ~= before then state.page = 1 end
-        end
-        return true                                          -- typing: E / WASD don't reach the game
-    end
-    if ui.keys.LEFT and key == ui.keys.LEFT then state.page = math.max(1, state.page - 1) return true end
-    if ui.keys.RIGHT and key == ui.keys.RIGHT then state.page = state.page + 1 return true end
-    return false
-end
-
-function handle_creative_char(codepoint, ch)
-    local page = state.search == "" and Categories[state.cat].page
-    if page and page:is_typing() then return true end    -- (the page reads typing itself)
-    if not state.search_focused then return false end
-    if codepoint >= 32 and codepoint < 127 then
-        state.search, state.page = te.insert("creative:search", state.search, ch, T.max_search), 1
     end
     return true
 end
 
-function on_creative_opened()
-    all_cache_reset()                                    -- pick up blocks registered since last time
-    for _, c in ipairs(Categories) do c.icon_cache = nil end
-end
-
-function on_creative_closed()
-    local page = Categories[state.cat] and Categories[state.cat].page
-    if page then
-        page:stop_typing()
-        state.cat = 1                                    -- a mod's page: next time, start on All Items
+local function current_recipe()
+    local rows, list = grid_shape()
+    if not rows then return nil end
+    for _, r in ipairs(recipes) do
+        if r.shapeless then
+            if #r.items == #list then
+                local same = true
+                for i = 1, #list do if list[i] ~= r.items[i] then same = false break end end
+                if same then return r end
+            end
+        elseif shaped_match(rows, r.rows, false) or shaped_match(rows, r.rows, true) then
+            return r
+        end
     end
-    state.search_focused = false
-    state.held = nil                                     -- closing drops what's on the cursor
+    return nil
 end
 
--- Kept for older C++ calls
-function set_creative_open(isOpen) end
-function toggle_creative_inventory() end
+local function use_up_grid()
+    for i = 1, 9 do
+        local s = grid[i]
+        if s then
+            s.count = s.count - 1
+            if s.count <= 0 then grid[i] = nil end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Saving (storage and equipment; the crafting grid empties when the screen closes)
+-- ---------------------------------------------------------------------------
+local function save()
+    local parts = {}
+    for i = 1, SIZE do
+        local s = slots[i]
+        parts[#parts + 1] = s and (s.name .. "*" .. s.count) or ""
+    end
+    engine.set_storage("survival:inventory", table.concat(parts, ";"))
+    local eq = {}
+    for id, e in pairs(equipment) do eq[#eq + 1] = id .. "=" .. e.name end
+    engine.set_storage("survival:equipment", table.concat(eq, ";"))
+end
+
+local ready = false                 -- loaded for this world (before that, nothing may be saved)
+function inv.is_ready() return ready end
+
+function inv.load()
+    slots, equipment, grid = {}, {}, {}
+    held = nil
+    local data = engine.get_storage("survival:inventory")
+    if data then
+        local i = 0
+        for part in (data .. ";"):gmatch("([^;]*);") do
+            i = i + 1
+            local name, count = part:match("^(.+)%*(%d+)$")
+            if name and i <= SIZE then slots[i] = { name = name, count = tonumber(count) } end
+        end
+    end
+    local eq = engine.get_storage("survival:equipment")
+    if eq then
+        for id, name in eq:gmatch("([%w_]+)=([^;]+)") do equipment[id] = { name = name, count = 1 } end
+    end
+    update_armor()
+    ready = true
+end
+
+function inv.size() return SIZE end
+function inv.get(i) local s = slots[i] if s then return s.name, s.count end return "", 0 end
+function inv.set(i, name, count)
+    if i < 1 or i > SIZE then return end
+    slots[i] = (name and name ~= "" and (count or 0) > 0) and { name = name, count = count } or nil
+    save()
+end
+function inv.clear() slots = {}; equipment = {}; grid = {}; held = nil; update_armor(); save() end
+-- Everything in the inventory (storage, armour, the crafting grid, the cursor) as a list of
+-- { name, count } - e.g. to drop it all when you die
+function inv.all_stacks()
+    local out = {}
+    local function add(s) if s and s.name and s.name ~= "" and (s.count or 0) > 0 then out[#out + 1] = { name = s.name, count = s.count } end end
+    for _, s in pairs(slots) do add(s) end
+    for _, s in pairs(equipment) do add(s) end
+    for _, s in pairs(grid) do add(s) end
+    add(held)
+    return out
+end
+function inv.is_open() return open end
+
+-- Into storage: onto matching stacks first, then empty slots. Returns what didn't fit.
+function inv.add(name, count)
+    local max = stack_max(name)
+    for i = 1, SIZE do
+        local s = slots[i]
+        if count > 0 and s and s.name == name and s.count < max then
+            local n = math.min(count, max - s.count)
+            s.count, count = s.count + n, count - n
+        end
+    end
+    for i = 1, SIZE do
+        if count > 0 and not slots[i] then
+            local n = math.min(count, max)
+            slots[i], count = { name = name, count = n }, count - n
+        end
+    end
+    save()
+    return count
+end
+
+-- Into the hotbar first, then storage. Returns what didn't fit.
+local function give(name, count)
+    for i = 1, hotbar.get_slot_count() do
+        local hn, hc = hotbar.get_slot(i)
+        if count > 0 and (hn == "" or hc <= 0 or (hn == name and hc < stack_max(name))) then
+            local have = (hn == name) and hc or 0
+            local n = math.min(count, stack_max(name) - have)
+            hotbar.set_slot(i, name, have + n)
+            count = count - n
+        end
+    end
+    if count > 0 then count = inv.add(name, count) end
+    return count
+end
+
+-- For other screens (the creative inventory's Inventory tab)
+function inv.equipment_slots()
+    local out = {}
+    for i, e in ipairs(EQUIPMENT_SLOTS) do out[i] = e[1] end
+    return out
+end
+function inv.fits_equipment(slot, item) return fits_equipment(slot, item) end
+function inv.stack_max(name) return stack_max(name) end
+
+-- ---------------------------------------------------------------------------
+-- Slots: storage 1..27, hotbar "h1".., equipment "e:<slot>", crafting "g1".."g4"
+-- ---------------------------------------------------------------------------
+local function get_slot(id)
+    if type(id) == "number" then return slots[id] end
+    if id:sub(1, 2) == "e:" then return equipment[id:sub(3)] end
+    if id:sub(1, 1) == "g" then return grid[tonumber(id:sub(2))] end
+    local name, count = hotbar.get_slot(tonumber(id:sub(2)))
+    if name == "" or count <= 0 then return nil end
+    return { name = name, count = count }
+end
+
+local function set_slot(id, s)
+    if s and s.count <= 0 then s = nil end
+    if type(id) == "number" then slots[id] = s; save()
+    elseif id:sub(1, 2) == "e:" then
+        local slot = id:sub(3)
+        equipment[slot] = s
+        update_armor()
+        save()
+        for _, fn in ipairs(equip_callbacks) do pcall(fn, slot, s and s.name or nil) end
+    elseif id:sub(1, 1) == "g" then grid[tonumber(id:sub(2))] = s
+    else hotbar.set_slot(tonumber(id:sub(2)), s and s.name or "", s and s.count or 0) end
+end
+
+-- survival.inventory.set_equipment(slot, name): put an item in an equipment slot ("" or nil
+-- empties it). False if that item doesn't go there. Armour and on_equip follow, as when the
+-- player does it.
+function inv.set_equipment(slot, name)
+    if name and name ~= "" and not fits_equipment(slot, name) then return false end
+    set_slot("e:" .. slot, (name and name ~= "") and { name = name, count = 1 } or nil)
+    return true
+end
+
+local function max_in(id, name)
+    if type(id) == "string" and id:sub(1, 2) == "e:" then return 1 end   -- one item per equipment slot
+    return stack_max(name)
+end
+
+-- May this stack go into this slot?
+local function accepts(id, s)
+    if not s then return true end
+    if type(id) == "string" and id:sub(1, 2) == "e:" then return fits_equipment(id:sub(3), s.name) end
+    return true
+end
+
+local function click_slot(id, button, shift)
+    local s = get_slot(id)
+    if shift and button == "left" then
+        if not s then return end
+        if type(id) == "number" then
+            -- storage -> equipment it belongs in, else the hotbar
+            local d = equip_defs[s.name]
+            if d and not equipment[d.slot] then
+                set_slot("e:" .. d.slot, { name = s.name, count = 1 })
+                s.count = s.count - 1
+                set_slot(id, s.count > 0 and s or nil)
+                return
+            end
+            for i = 1, hotbar.get_slot_count() do
+                local h = get_slot("h" .. i)
+                if not h then set_slot("h" .. i, s); set_slot(id, nil); return end
+                if h.name == s.name and h.count < stack_max(s.name) then
+                    local n = math.min(s.count, stack_max(s.name) - h.count)
+                    h.count, s.count = h.count + n, s.count - n
+                    set_slot("h" .. i, h)
+                    if s.count <= 0 then set_slot(id, nil); return end
+                end
+            end
+            set_slot(id, s)
+        else
+            -- hotbar / equipment / crafting -> storage
+            local left = inv.add(s.name, s.count)
+            set_slot(id, left > 0 and { name = s.name, count = left } or nil)
+        end
+        return
+    end
+    if button == "left" then
+        if not held then
+            if s then held = s; set_slot(id, nil) end
+        elseif not s then
+            if not accepts(id, held) then return end
+            local n = math.min(held.count, max_in(id, held.name))
+            set_slot(id, { name = held.name, count = n })
+            held.count = held.count - n
+            if held.count <= 0 then held = nil end
+        elseif s.name == held.name then
+            local n = math.min(held.count, max_in(id, s.name) - s.count)
+            if n <= 0 then return end
+            s.count, held.count = s.count + n, held.count - n
+            set_slot(id, s)
+            if held.count <= 0 then held = nil end
+        else
+            if not accepts(id, held) or held.count > max_in(id, held.name) then return end
+            set_slot(id, held); held = s     -- swap
+        end
+    else -- right
+        if not held then
+            if s then
+                local take = math.ceil(s.count / 2)
+                held = { name = s.name, count = take }
+                s.count = s.count - take
+                set_slot(id, s)
+            end
+        elseif not s then
+            if not accepts(id, held) then return end
+            set_slot(id, { name = held.name, count = 1 })
+            held.count = held.count - 1
+            if held.count <= 0 then held = nil end
+        elseif s.name == held.name and s.count < max_in(id, s.name) then
+            s.count = s.count + 1
+            set_slot(id, s)
+            held.count = held.count - 1
+            if held.count <= 0 then held = nil end
+        end
+    end
+end
+
+-- The output slot: take what the grid makes
+local function click_output(button, shift)
+    local r = current_recipe()
+    if not r then return end
+    if shift then
+        -- as many as the grid allows, straight into the inventory
+        for _ = 1, 64 do
+            if current_recipe() ~= r then break end
+            local left = give(r.output, r.count)
+            use_up_grid()
+            if left > 0 then held = { name = r.output, count = left }; break end
+        end
+        return
+    end
+    if held and (held.name ~= r.output or held.count + r.count > stack_max(r.output)) then return end
+    held = { name = r.output, count = (held and held.count or 0) + r.count }
+    use_up_grid()
+end
+
+-- The bin: left click throws away what you hold, right click one of it
+local function click_bin(button)
+    if not held then return end
+    if button == "right" then held.count = held.count - 1 else held.count = 0 end
+    if held.count <= 0 then held = nil end
+end
+
+-- Whatever is on the pointer, and in the crafting grid, goes back when the screen closes
+local drag = nil   -- { button = "left"|"right", slots = { id, ... }, set = { [id] = true } }
+
+local function put_back()
+    for i = 1, 9 do
+        local s = grid[i]
+        if s then
+            local left = give(s.name, s.count)
+            if left > 0 then print("[Survival] No room for " .. left .. " " .. s.name .. " from the crafting grid") end
+            grid[i] = nil
+        end
+    end
+    if held then
+        local left = give(held.name, held.count)
+        if left > 0 then print("[Survival] No room for " .. left .. " " .. held.name) end
+        held = nil
+    end
+end
+
+function inv.set_open(want)
+    if want == open then return open end
+    open = want
+    if not open then
+        put_back()
+        drag = nil
+        screen = "inventory"
+    end
+    return open
+end
+
+-- survival.inventory.open_from_creative(): the creative inventory's Inventory tab. Closes the
+-- creative inventory and opens this one; in creative mode a "Creative" button goes back.
+function inv.open_from_creative()
+    if hotbar.set_creative_open then hotbar.set_creative_open(false) end
+    screen = "inventory"
+    inv.set_open(true)
+    if engine.set_inventory_open then engine.set_inventory_open(true) end
+    return true
+end
+
+-- The "Creative" button above the screen (creative mode only): x, y, w, h or nil
+local function creative_button(L)
+    if not (engine.is_creative and engine.is_creative()) or screen ~= "inventory" then return nil end
+    if not hotbar.set_creative_open then return nil end
+    local h = math.max(18, 12 * L.s)
+    local w = math.max(70, 52 * L.s)
+    local y = L.y - h - 2 * L.s
+    if y < 0 then y = 0 end
+    return L.x, y, w, h
+end
+
+-- The workbench screen (3x3 crafting). Called when a workbench block is right-clicked.
+function inv.open_workbench()
+    if open then inv.set_open(false) end
+    screen = "workbench"
+    open = true
+    if engine.set_inventory_open then engine.set_inventory_open(true) end
+    return true
+end
+function inv.get_screen() return open and screen or nil end
+
+-- ---------------------------------------------------------------------------
+-- Dragging a stack across slots
+-- ---------------------------------------------------------------------------
+
+local function can_take(id, item)
+    local s = get_slot(id)
+    if not accepts(id, { name = item, count = 1 }) then return false end
+    return not s or (s.name == item and s.count < max_in(id, item))
+end
+
+local function drag_add(id)
+    if not drag or not held or drag.set[id] then return end
+    if not can_take(id, held.name) then return end
+    drag.set[id] = true
+    drag.slots[#drag.slots + 1] = id
+end
+
+-- How many each dragged slot would get right now (also shown while dragging)
+local function drag_shares(d)
+    local shares = {}
+    if not d or not held or #d.slots == 0 then return shares end
+    local n = #d.slots
+    if d.button == "right" then
+        for i = 1, math.min(n, held.count) do shares[d.slots[i]] = 1 end
+    else
+        local per = math.floor(held.count / n)
+        if per == 0 then
+            for i = 1, held.count do shares[d.slots[i]] = 1 end        -- fewer items than slots
+        else
+            for _, id in ipairs(d.slots) do shares[id] = per end
+        end
+    end
+    for id, count in pairs(shares) do                                    -- never past a full stack
+        local s = get_slot(id)
+        shares[id] = math.min(count, max_in(id, held.name) - (s and s.count or 0))
+    end
+    return shares
+end
+
+local function drag_finish()
+    local d = drag
+    drag = nil
+    if not d or not held then return end
+    -- Only one slot (or none that could take it): an ordinary click where it started
+    if #d.slots < 2 then
+        click_slot(d.start, d.button, false)
+        return
+    end
+    local item = held.name
+    for id, n in pairs(drag_shares(d)) do
+        if n > 0 and held then
+            local s = get_slot(id)
+            set_slot(id, { name = item, count = (s and s.count or 0) + n })
+            held.count = held.count - n
+            if held.count <= 0 then held = nil end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Screen
+-- ---------------------------------------------------------------------------
+-- The picture at a whole-number scale (crisp pixels), centred
+local function layout(W, H)
+    local s = math.max(1, math.floor(math.min(W * 0.9 / PIC_W, H * 0.85 / PIC_H)))
+    local L = { s = s, w = PIC_W * s, h = PIC_H * s, rects = {} }
+    L.x = math.floor((W - L.w) / 2)
+    L.y = math.floor((H - L.h) / 2)
+    local function add(id, px, py, size, kind)
+        L.rects[#L.rects + 1] = { id = id, x = L.x + px * s, y = L.y + py * s, size = (size or SLOT) * s, kind = kind or "slot" }
+    end
+    local sc = SCREENS[screen]
+    if sc.equipment then
+        for _, e in ipairs(EQUIPMENT_SLOTS) do add("e:" .. e[1], e[2], e[3], SLOT, "equipment") end
+    end
+    for r = 0, sc.grid_w - 1 do
+        for c = 0, sc.grid_w - 1 do add("g" .. (r * sc.grid_w + c + 1), sc.grid_x + c * STEP, sc.grid_y + r * STEP) end
+    end
+    add("output", sc.output.x, sc.output.y, sc.output.size, "output")
+    if sc.bin then add("bin", BIN.x, BIN.y, SLOT, "bin") end
+    for r = 0, 2 do
+        for c = 0, 8 do add(r * 9 + c + 1, STORAGE.x + c * STEP, STORAGE.y + r * STEP) end
+    end
+    for c = 0, math.min(9, hotbar.get_slot_count()) - 1 do add("h" .. (c + 1), HOTBAR.x + c * STEP, HOTBAR.y) end
+    return L
+end
+
+local function draw_stack(s, x, y, size)
+    if not s then return end
+    ui.draw_block_icon(s.name, x + size * 0.06, y + size * 0.06, size * 0.88)
+    if s.count > 1 then
+        local t = tostring(s.count)
+        local scale = size / 40
+        local tx, ty = x + size - ui.text_width(t, scale) - 1, y + size - ui.text_height(scale)
+        ui.draw_text(t, tx + 1, ty + 1, scale, 0.15, 0.15, 0.15)   -- shadow
+        ui.draw_text(t, tx, ty, scale, 1, 1, 1)
+    end
+end
+
+local function draw_plain_panel(L)
+    -- No picture: a plain panel with the same slots
+    ui.draw_rect(L.x, L.y, L.w, L.h, 0.45, 0.44, 0.44, 0.97)
+    ui.draw_text("Inventory", L.x + 70 * L.s, L.y + 3 * L.s, L.s * 0.45, 0.1, 0.1, 0.1)
+    for _, r in ipairs(L.rects) do
+        ui.draw_rect(r.x - L.s, r.y - L.s, r.size + 2 * L.s, r.size + 2 * L.s, 0.6, 0.58, 0.58, 1)
+        ui.draw_rect(r.x, r.y, r.size, r.size, SLOT_FILL[1], SLOT_FILL[2], SLOT_FILL[3], 1)
+    end
+end
+
+local previous_render_inventory = render_inventory   -- another mod's screen (chained)
+function render_inventory(W, H)
+    if not open then
+        if previous_render_inventory then return previous_render_inventory(W, H) end
+        return
+    end
+    local L = layout(W, H)
+    ui.draw_rect(0, 0, W, H, 0, 0, 0, 0.45)                          -- dim the world
+    local sc = SCREENS[screen]
+    if sc.picture then ui.draw_image(sc.picture, L.x, L.y, L.w, L.h) else draw_plain_panel(L) end
+    if sc.title then ui.draw_text(sc.title, L.x + 8 * L.s, L.y + 5 * L.s, L.s * 0.3, 0.25, 0.25, 0.25) end
+
+    local mx, my, left_down, right_down = ui.get_mouse()
+    do  -- creative mode: a button back to the creative inventory
+        local bx, by, bw, bh = creative_button(L)
+        if bx then
+            local hov = mx >= bx and mx < bx + bw and my >= by and my < by + bh
+            local label, ts = "< Creative", L.s * 0.28
+            if not (ui.draw_button and ui.draw_button(bx, by, bw, bh, hov and "hover" or "normal")) then
+                ui.draw_rect(bx, by, bw, bh, 0.2, 0.2, 0.2, 0.9)
+                ui.draw_rect(bx + 1, by + 1, bw - 2, bh - 2, hov and 0.45 or 0.35, hov and 0.45 or 0.35, hov and 0.5 or 0.38, 1)
+            end
+            local r, g, b = 1, 1, 1
+            if ui.get_button_text_color then r, g, b = ui.get_button_text_color(hov) end
+            local tw = ui.text_width and ui.text_width(label, ts) or #label * 8 * ts
+            local th = ui.text_height and ui.text_height(ts) or 10 * ts
+            ui.draw_text(label, bx + (bw - tw) / 2, by + (bh + th) / 2, ts, r, g, b)
+        end
+    end
+    local hover = nil
+    local result = current_recipe()
+
+    -- A drag in progress: add the slots the pointer passes over; let go to share the stack out
+    if drag then
+        local still = (drag.button == "left") and left_down or right_down
+        if still then
+            for _, r in ipairs(L.rects) do
+                if (r.kind == "slot" or r.kind == "equipment") and mx >= r.x and mx < r.x + r.size and my >= r.y and my < r.y + r.size then
+                    drag_add(r.id)
+                end
+            end
+        else
+            drag_finish()
+        end
+    end
+    local shares = drag and #drag.slots >= 2 and drag_shares(drag) or {}
+    for _, r in ipairs(L.rects) do
+        local over = mx >= r.x and mx < r.x + r.size and my >= r.y and my < r.y + r.size
+        if over then hover = r end
+        local s
+        if r.kind == "output" then
+            s = result and { name = result.output, count = result.count } or nil
+        elseif r.kind ~= "bin" then
+            s = get_slot(r.id)
+        end
+        -- a filled slot hides the picture's outline icon (equipment, output)
+        if s and (r.kind == "equipment" or r.kind == "output") then
+            ui.draw_rect(r.x, r.y, r.size, r.size, SLOT_FILL[1], SLOT_FILL[2], SLOT_FILL[3], 1)
+        end
+        -- while dragging, a slot shows what it would have after letting go
+        if shares[r.id] and held then
+            s = { name = held.name, count = (s and s.count or 0) + shares[r.id] }
+        end
+        draw_stack(s, r.x, r.y, r.size)
+        if shares[r.id] then ui.draw_rect(r.x, r.y, r.size, r.size, 1, 1, 1, 0.18)
+        elseif over then ui.draw_rect(r.x, r.y, r.size, r.size, 1, 1, 1, 0.25) end   -- highlight
+    end
+
+    -- Name of what's under the pointer (or what the slot is for)
+    if hover and not held then
+        local label
+        if hover.kind == "output" then label = result and result.output
+        elseif hover.kind == "bin" then label = nil
+        else
+            local s = get_slot(hover.id)
+            label = s and s.name or (hover.kind == "equipment" and hover.id:sub(3))
+        end
+        if label then
+            label = label:gsub("_", " ")
+            local scale = L.s * 0.3
+            local w = ui.text_width(label, scale) + 12
+            ui.draw_rect(mx + 14, my - 8, w, ui.text_height(scale) + 12, 0.1, 0.05, 0.15, 0.92)
+            ui.draw_text(label, mx + 20, my - 2, scale, 1, 1, 1)
+        end
+    end
+    if held then
+        local left = held.count
+        for _, n in pairs(shares) do left = left - n end
+        if left > 0 then draw_stack({ name = held.name, count = left }, mx - 8 * L.s, my - 8 * L.s, SLOT * L.s) end
+    end
+end
+
+local previous_inventory_click = handle_inventory_click
+function handle_inventory_click(mx, my, W, H, button, shift)
+    if not open then
+        if previous_inventory_click then return previous_inventory_click(mx, my, W, H, button, shift) end
+        return false
+    end
+    local L = layout(W, H)
+    button = button or "left"
+    do  -- back to the creative inventory (creative mode)
+        local bx, by, bw, bh = creative_button(L)
+        if bx and mx >= bx and mx < bx + bw and my >= by and my < by + bh then
+            inv.set_open(false)                       -- what's on the cursor goes back first
+            if engine.set_inventory_open then engine.set_inventory_open(false) end
+            hotbar.set_creative_open(true)
+            return true
+        end
+    end
+    -- Outside the window while holding a stack: drop it into the world (left: all, right: one)
+    if held and not (mx >= L.x and mx < L.x + L.w and my >= L.y and my < L.y + L.h) then
+        local n = button == "right" and 1 or held.count
+        if engine.drop_item then engine.drop_item(held.name, n) end
+        held.count = held.count - n
+        if held.count <= 0 then held = nil end
+        save()
+        return true
+    end
+    for _, r in ipairs(L.rects) do
+        if mx >= r.x and mx < r.x + r.size and my >= r.y and my < r.y + r.size then
+            if r.kind == "output" then click_output(button, shift)
+            elseif r.kind == "bin" then click_bin(button)
+            elseif held and not shift then
+                -- holding a stack: wait to see whether this is a click or a drag (render_inventory
+                -- adds slots while the button stays down, and shares the stack out on release)
+                drag = { button = button, start = r.id, slots = {}, set = {} }
+                drag_add(r.id)                     -- only if this slot can take the stack
+            else click_slot(r.id, button, shift) end
+            return true
+        end
+    end
+    return true
+end
+
+-- E in survival: open/close (the engine frees the mouse while it's open)
+local previous_toggle = toggle_main_inventory
+function toggle_main_inventory()
+    -- E or Esc with a screen of ours open (the inventory or a workbench, in any mode): close it
+    if open then return inv.set_open(false) end
+    if survival.is_dead() then return false end
+    if survival.get_mode() ~= "survival" then
+        if previous_toggle then return previous_toggle() end
+        return false
+    end
+    return inv.set_open(true)
+end
+
+-- ---------------------------------------------------------------------------
+-- Workbenches: right-click one to craft on a 3x3 grid (sneak + right-click with a block in
+-- hand places it against the workbench instead, like Minecraft)
+-- ---------------------------------------------------------------------------
+local workbenches = {}
+function survival.register_workbench(block) workbenches[block] = true end
+survival.register_workbench("workbench")
+
+local previous_right_click = on_right_click_block
+function on_right_click_block(x, y, z, block, held, sneaking, repeat_click, ...)
+    if workbenches[block] and not survival.is_dead() then
+        local holding_something = held and held ~= "" and held ~= "air"
+        if not (sneaking and holding_something) then
+            if not repeat_click then inv.open_workbench() end
+            return true
+        end
+    end
+    if previous_right_click then return previous_right_click(x, y, z, block, held, sneaking, repeat_click, ...) end
+    return false
+end
+
+-- Pick block (middle mouse) in survival, like Minecraft: select the block if it's in the
+-- hotbar; otherwise move it from storage into the hotbar (the selected slot if empty, else the
+-- next empty one, else swap with the selected slot) and select it. Not in your inventory: nothing.
+-- In creative the engine's own pick block runs instead (it gives you the block).
+function inv.pick(name)
+    local n = hotbar.get_slot_count()
+    for i = 1, n do
+        if hotbar.get_slot(i) == name then hotbar.set_active_slot(i) return true end
+    end
+    local from = nil
+    for i = 1, SIZE do
+        if slots[i] and slots[i].name == name then from = i break end
+    end
+    if not from then return false end
+
+    local active = hotbar.get_active_slot()
+    local to = active
+    if hotbar.get_slot(active) ~= "" then
+        for k = 1, n - 1 do
+            local i = (active - 1 + k) % n + 1
+            if hotbar.get_slot(i) == "" then to = i break end
+        end
+    end
+    local old_name, old_count = hotbar.get_slot(to)
+    local s = slots[from]
+    hotbar.set_slot(to, s.name, s.count)
+    slots[from] = (old_name ~= "" and old_count > 0) and { name = old_name, count = old_count } or nil
+    hotbar.set_active_slot(to)
+    save()
+    return true
+end
+
+local previous_pick = on_pick_block
+function on_pick_block(x, y, z, item, meta, ...)
+    if survival.get_mode() == "survival" then
+        if not survival.is_dead() and not open then inv.pick(item) end
+        return true                -- survival never conjures blocks, found or not
+    end
+    if previous_pick then return previous_pick(x, y, z, item, meta, ...) end
+    return false
+end
+
+-- Dug items that don't fit in the hotbar
+local previous_full = on_hotbar_full
+function on_hotbar_full(name, count)
+    if survival.get_mode() == "survival" then
+        local left = inv.add(name, count)
+        if left < count then return true end
+    end
+    if previous_full then return previous_full(name, count) end
+    return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Starting recipes, only for items this game has (games add their own with register_craft)
+-- ---------------------------------------------------------------------------
+local function has(name) return engine.get_block_id and engine.get_block_id(name) ~= 0 end
+local woods = { "oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry" }
+local planks_any = nil
+for _, wood in ipairs(woods) do
+    -- 1 log -> 4 planks of the same wood ("log_oak" or "oak_log" -> "planks_oak" or "oak_planks")
+    local log = has("log_" .. wood) and ("log_" .. wood) or (has(wood .. "_log") and (wood .. "_log"))
+    local planks = has("planks_" .. wood) and ("planks_" .. wood) or (has(wood .. "_planks") and (wood .. "_planks"))
+    if log and planks then
+        survival.register_craft({ output = planks, count = 4, recipe = { { log } } })
+    end
+    planks_any = planks_any or planks
+    -- 4 planks in a square -> a workbench (fits the inventory's 2x2 grid, like Minecraft)
+    if planks and has("workbench") then
+        survival.register_craft({ output = "workbench", count = 1, recipe = { { planks, planks }, { planks, planks } } })
+    end
+    -- 2 planks stacked -> 4 sticks
+    if planks and has("stick") then
+        survival.register_craft({ output = "stick", count = 4, recipe = { { planks }, { planks } } })
+    end
+end
