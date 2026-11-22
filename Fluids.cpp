@@ -441,3 +441,8 @@ void addFluidLuaApi(sol::state& /*lua*/, sol::table engine, std::function<World*
         return list;
     };
 }
+
+void FluidRegistry::reset() {
+    *this = FluidRegistry();
+    g_fluidExtras.clear();
+}

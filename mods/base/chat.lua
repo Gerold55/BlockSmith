@@ -5,7 +5,10 @@
 --   /time add <hours>
 --   /time speed <x>          1 normal, 2 twice as fast, 0 stops time
 --   /rain                    rain for a bit
---   /gamerule [rule] [true|false|default], /give <item> [count], /clear, /kill, /tp <x y z>
+--   /gamerule [rule] [true|false|default], /clear, /kill, /tp <x y z>
+--   /give [@s|@p|@a|you] <item> [count]   like Minecraft: the item by its name ("basalt"), or
+--                            its full name like Luanti ("core_blocks:basalt"; any "mod:" or
+--                            "game:" in front works, the name after it decides)
 --                            in your own world (singleplayer, or hosting); on a server, the
 --                            server's commands of the same names answer instead
 --
@@ -79,16 +82,40 @@ end
 -- Tab completion of these commands' arguments (the names come from the registrations below).
 -- on_chat_complete(words, word): words = the words before the one being typed, without the "/".
 -- Hooks chain: each mod adds to what the one before it returned.
-local function item_names()
+local function item_names(with_mods)
     local out = {}
     if ui and ui.get_all_blocks then
         for _, b in ipairs(ui.get_all_blocks() or {}) do
             local n = type(b) == "table" and (b.name or b.id) or b
-            if type(n) == "string" and n ~= "" and n ~= "air" then out[#out + 1] = n end
+            if type(n) == "string" and n ~= "" and n ~= "air" then
+                out[#out + 1] = n
+                -- also the full "mod:name" form, when the word typed so far has a ":" in it
+                if with_mods and ui.get_block_info then
+                    local info = ui.get_block_info(n)
+                    if info and info.full_name and info.full_name ~= n then out[#out + 1] = info.full_name end
+                end
+            end
         end
     end
     table.sort(out)
     return out
+end
+
+-- "basalt", "core_blocks:basalt", "craft_and_ruin:basalt" or "minecraft:basalt" -> "basalt"
+local function find_item(word)
+    if not word or word == "" then return nil end
+    if engine.get_block_id(word) ~= 0 then return word end
+    local after = word:match("^[%w_%-%.]+:(.+)$")
+    if after and engine.get_block_id(after) ~= 0 then return after end
+    return nil
+end
+local function item_title(item)
+    return (engine.get_block_description and engine.get_block_description(item) ~= "" and engine.get_block_description(item)) or item
+end
+local function is_target(word)
+    if not word then return false end
+    if word:sub(1, 1) == "@" then return true end
+    return engine.get_player_name and word == engine.get_player_name()
 end
 local TIMES = { "day", "noon", "night", "midnight", "sunrise", "sunset" }
 local previous_complete = on_chat_complete
@@ -106,7 +133,8 @@ function on_chat_complete(words, word, ...)
             add(NUMERIC[find_rule(words[2])] and { "0", "3", "10", "default" } or { "true", "false", "default" })
         end
     elseif cmd == "give" then
-        if n == 1 or (n == 2 and words[2] == "@s") then add(item_names()) end
+        if n == 1 then add({ "@s", "@p" }) end
+        if n == 1 or (n == 2 and is_target(words[2])) then add(item_names((word or ""):find(":", 1, true) ~= nil)) end
     elseif cmd == "tp" or cmd == "teleport" then
         if n <= 3 then add({ "~" }) end
     end
@@ -116,7 +144,7 @@ end
 if chat and chat.register_command then
     chat.register_command("time", "/time [set|add|speed|query] [value]", "Show or change the time of day")
     chat.register_command("gamerule", "/gamerule [rule] [true|false|default]", "Show or change the game rules")
-    chat.register_command("give", "/give <item> [count]", "Give yourself an item")
+    chat.register_command("give", "/give [@s] <item> [count]", "Give yourself an item (\"basalt\" or \"core_blocks:basalt\")")
     chat.register_command("clear", "/clear", "Empty your inventory")
     chat.register_command("kill", "/kill", "Die and respawn")
     chat.register_command("tp", "/tp <x y z>", "Teleport (~ = where you are)")
@@ -185,17 +213,25 @@ function on_chat_command(cmd, player, is_operator, reply)
             apply_rules(rules)
             reply("Game rule " .. rule .. " is now " .. v)
         elseif name == "give" then
-            local item, count = a[1], tonumber(a[2] or "1")
-            if a[1] == "@s" then item, count = a[2], tonumber(a[3] or "1") end
-            if not item or not count or count < 1 then reply("Usage: /give <item> [count]") return true end
-            if engine.get_block_id(item) == 0 then reply("There's no item called '" .. item .. "'") return true end
+            -- Minecraft's order: /give <who> <item> [count]; who can be left out (it's you)
+            if is_target(a[1]) then
+                local who = a[1]
+                if who ~= "@s" and who ~= "@p" and who ~= "@a" and who ~= "@r" and not (engine.get_player_name and who == engine.get_player_name()) then
+                    reply("You can only give items to yourself here") return true
+                end
+                table.remove(a, 1)
+            end
+            local word, count = a[1], tonumber(a[2] or "1")
+            if not word or not count or count < 1 then reply("Usage: /give [@s] <item> [count]") return true end
+            local item = find_item(word)
+            if not item then reply("There's no item called '" .. word .. "'") return true end
             local left = math.min(count, 4096)
             while left > 0 do
                 local n = math.min(left, 64)
                 if not engine.give_item(item, n) then break end
                 left = left - n
             end
-            reply("Gave " .. (math.min(count, 4096) - left) .. " " .. item)
+            reply("Gave " .. (math.min(count, 4096) - left) .. " [" .. item_title(item) .. "]")
         elseif name == "clear" then
             for i = 1, hotbar.get_slot_count() do hotbar.set_slot(i, "", 0) end
             if survival and survival.inventory then survival.inventory.clear() end

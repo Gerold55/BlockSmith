@@ -10,6 +10,8 @@
 #include <enet/enet.h>
 
 #include "Net.h"
+#include "Version.h"
+#include "UpdateCheck.h"
 #include "Sha256.h"
 #include "Auth.h"
 #include "ChunkData.h"
@@ -51,6 +53,8 @@ enum Msg : uint8_t {
                       // items dropped next to the player (thrown: with a velocity)
     C_HARVEST = 10,   // str item in hand, i32 x y z   a tool used on a block (the scythe): the
                       // server works out what happens there and gives what it yields
+    C_MOD_MSG = 11,   // str channel, str data   a mod's message to the server's mods (Lua:
+                      // engine.send_to_server -> on_mod_message). Text only, never run.
 
     // server -> client
     S_WELCOME = 64,   // u16 yourId, u32 seed, f32 spawn x y z, str hostName
@@ -80,6 +84,8 @@ enum Msg : uint8_t {
     S_ENTITY_GONE = 85, // u16 count, { u32 id }   removed, or out of your range
     S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
                       // (older games ignore it and keep their own sky; no protocol change needed)
+    S_MOD_MSG = 86,   // str channel, str data   a server mod's message to this game's mods (Lua:
+                      // engine.send_to_player -> on_server_message). Text only, never run.
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
 };
 
@@ -731,6 +737,22 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         onHarvest(name, item, pos);
         break;
     }
+    case C_MOD_MSG: {
+        Reader r(data, size);
+        const std::string channel = r.str();
+        const std::string text = r.str();
+        if (!r.ok || !c.joined || !onModMessage || !net::validModChannel(channel) ||
+            text.size() > net::kMaxModMessageFromPlayer) return;
+        // at most kModMessageBurst at once, kModMessageRate a second after that (extra ones dropped)
+        const double now = net::clockSeconds();
+        c.modTokens = std::min(net::kModMessageBurst, c.modTokens + (now - c.modRefillAt) * net::kModMessageRate);
+        c.modRefillAt = now;
+        if (c.modTokens < 1.0) return;
+        c.modTokens -= 1.0;
+        const std::string name = c.name;   // (a mod may kick them: c gone after)
+        onModMessage(name, channel, text);
+        break;
+    }
     case C_COMMAND: {
         Reader r(data, size);
         std::string command = r.str();
@@ -759,11 +781,36 @@ void GameServer::handleHello(Client& c, const uint8_t* data, size_t size) {
     const int view = r.u8();
     if (!r.ok) { kick(c, "Bad hello packet"); return; }
     (void)r.u8();   // hasPassword (informational)
+    std::string engine;                 // their BlockSmith, if their game is new enough to say
+    uint32_t theirMin = protocol;       // the oldest protocol they can speak (older games: only their own)
+    {
+        Reader extra = r;
+        const std::string v = extra.str();
+        if (extra.ok) {
+            for (char ch : v.substr(0, 40)) {
+                if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '.' || ch == '-') engine += ch;
+            }
+            const uint32_t m = extra.u32();
+            if (extra.ok && m <= protocol) theirMin = m;
+        }
+    }
+    c.engineVersion = engine;
 
-    if (protocol != net::kProtocolVersion) {
-        kick(c, protocol < net::kProtocolVersion ? "Your game is older than the server - please update"
-                                                 : "The server is running an older version");
+    // Who may join: a game as new as this server or newer (a newer game speaks the older
+    // protocol); an older game has to update first
+    const std::string theirs = engine.empty() ? std::string("an older BlockSmith") : "BlockSmith " + engine;
+    const std::string olderGame = "Your game (" + theirs + ") is older than this server (BlockSmith " BLOCKSMITH_VERSION
+                                  "). An update is available - please install it to join.";
+    if (protocol < net::kProtocolVersion) { kick(c, olderGame); return; }
+    if (theirMin > net::kProtocolVersion) {
+        kick(c, "This server (BlockSmith " BLOCKSMITH_VERSION ") is too old for your game (" + theirs +
+                ") - it no longer speaks this server's version. Ask the owner to update it.");
         return;
+    }
+    {
+        update::Version mine, them;
+        update::parseVersion(BLOCKSMITH_VERSION, mine);
+        if (!update::parseVersion(engine, them) || update::compareRelease(them, mine) < 0) { kick(c, olderGame); return; }
     }
     if (!net::validPlayerName(name)) { kick(c, "Invalid name (use 1-16 letters, numbers, _ or -)"); return; }
     if (game != m_game) {
@@ -1020,6 +1067,38 @@ bool GameServer::allowChat(Client& c) {
         sendMessageTo(c, "You're sending messages too fast - slow down.", glm::vec3(1.0f, 0.55f, 0.55f));
     }
     return false;
+}
+
+std::string GameServer::playerEngineVersion(const std::string& name) const {
+    for (const auto& [id, c] : m_clients) if (c.joined && c.name == name) return c.engineVersion;
+    return "";
+}
+
+bool GameServer::sendModMessage(const std::string& name, const std::string& channel, const std::string& text) {
+    if (!net::validModChannel(channel) || text.size() > net::kMaxModMessage) return false;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        Writer w(S_MOD_MSG);
+        w.str(channel);
+        w.str(text);
+        sendTo(c.peer, w);
+        return true;
+    }
+    return false;
+}
+
+int GameServer::sendModMessageToAll(const std::string& channel, const std::string& text) {
+    if (!net::validModChannel(channel) || text.size() > net::kMaxModMessage) return 0;
+    int n = 0;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined) continue;
+        Writer w(S_MOD_MSG);
+        w.str(channel);
+        w.str(text);
+        sendTo(c.peer, w);
+        ++n;
+    }
+    return n;
 }
 
 bool GameServer::messagePlayer(const std::string& name, const std::string& text, const glm::vec3& color) {
@@ -1299,11 +1378,13 @@ void GameServer::sendEntities() {
         pos.u16(0);
         gone.u16(0);
         uint16_t nInfo = 0, nPos = 0, nGone = 0;
+        // (the peer as its own variable: a lambda capturing the structured binding c is C++20)
+        auto* const peer = c.peer;
         auto flush = [&](Writer& w, uint16_t n, size_t countAt, bool reliable) {
             if (n == 0) return;
             w.d[countAt] = n & 0xFF;
             w.d[countAt + 1] = n >> 8;
-            sendTo(c.peer, w, reliable);
+            sendTo(peer, w, reliable);
         };
         for (const auto& [id, e] : all) {
             if (e.removed) continue;
@@ -1392,6 +1473,8 @@ void GameServer::sendStatus(ENetPeer* peer) {
     w.u32(static_cast<uint32_t>(m_icon.size()));
     w.bytes(m_icon);
     w.str(m_gameTitle);
+    w.str(BLOCKSMITH_VERSION);   // then which BlockSmith the server runs (newer servers only)
+    w.str(BLOCKSMITH_COMMIT);
     sendTo(peer, w);
 }
 
@@ -1543,6 +1626,7 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_chat.clear();
     m_shared.clear();
     m_sharedChanges.clear();
+    m_modMessages.clear();
     std::cout << "[Client] Connecting to " << m_addressText << " as " << m_name << std::endl;
     return true;
 }
@@ -1610,6 +1694,8 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
             w.str(m_game);
             w.u8(static_cast<uint8_t>(m_viewDistance));
             w.u8(m_password.empty() ? 0 : 1);   // the password itself is never sent (S_CHALLENGE)
+            w.str(BLOCKSMITH_VERSION);           // last: older servers stop reading before it
+            w.u32(net::kMinProtocolVersion);     // ...and the oldest protocol we can still speak
             sendTo(m_peer, w);
             break;
         }
@@ -1798,6 +1884,15 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_completeText = text;
         m_completeList = std::move(list);
         m_completeHave = m_completeArrived = true;
+        break;
+    }
+    case S_MOD_MSG: {
+        if (m_state != State::Joined) return;
+        ModMessage m;
+        m.channel = r.str();
+        m.data = r.str();
+        // (kept for the game's mods to read this frame; a flood beyond 1024 waiting is dropped)
+        if (r.ok && net::validModChannel(m.channel) && m_modMessages.size() < 1024) m_modMessages.push_back(std::move(m));
         break;
     }
     case S_ACTION: {
@@ -2078,6 +2173,15 @@ void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
     sendTo(m_peer, w);
 }
 
+bool GameClient::sendModMessage(const std::string& channel, const std::string& text) {
+    if (m_state != State::Joined || !net::validModChannel(channel) || text.size() > net::kMaxModMessageFromPlayer) return false;
+    Writer w(C_MOD_MSG);
+    w.str(channel);
+    w.str(text);
+    sendTo(m_peer, w);
+    return true;
+}
+
 void GameClient::sendHarvest(const std::string& item, const glm::ivec3& pos) {
     if (m_state != State::Joined || item.empty() || item.size() > 64) return;
     Writer w(C_HARVEST);
@@ -2288,11 +2392,21 @@ void ServerPinger::update() {
                             extra.p += len;
                             const std::string title = extra.str();
                             if (extra.ok) st.gameTitle = title;
+                            const std::string engine = extra.str();
+                            const std::string commit = extra.str();
+                            if (extra.ok) { st.engineVersion = engine.substr(0, 40); st.engineCommit = commit.substr(0, 48); }
                         }
                     }
                     if (r.ok) {
                         st.state = ServerStatus::State::Online;
-                        st.compatible = protocol == net::kProtocolVersion;
+                        // Can we join? Its protocol is one we speak, and its BlockSmith isn't newer
+                        // than ours (a newer game joins an older server, not the other way round)
+                        st.compatible = protocol <= net::kProtocolVersion && protocol >= net::kMinProtocolVersion;
+                        {
+                            update::Version theirs, mine;
+                            if (update::parseVersion(st.engineVersion, theirs) && update::parseVersion(BLOCKSMITH_VERSION, mine) &&
+                                update::compareRelease(theirs, mine) > 0) st.compatible = false;
+                        }
                         // The server answers the moment the handshake finishes: one round trip
                         st.ping = static_cast<int>((nowSeconds() - (q.connectedAt > 0 ? q.connectedAt : q.started)) * 1000.0);
                         q.result = st;

@@ -1,10 +1,13 @@
 -- settings_menu.lua - Settings screen (title screen "Settings", or pause menu "Options...")
 -- ---------------------------------------------------------------------------
--- Three tabs:
---   Controls - click a control, then press the new key. Escape cancels.
---              Keys used by more than one control are shown in red.
---   Video    - Field of View, Render Distance, VSync (applied immediately).
---   Player   - your name (used in multiplayer and chat). Click the box, type, press Enter.
+-- A card in the middle of the screen: categories down the left, their settings on the right.
+--   Controls - click a key, then press the new one (a key or a mouse button). Escape cancels.
+--              Keys used by more than one control are outlined in red.
+--   Video    - Field of View, Render Distance, Brightness (sliders), VSync (a switch),
+--              Main Hand (Left / Right). Applied straight away.
+--   Sound    - the volumes (sliders).
+--   Player   - your name (used in multiplayer and chat) and the password that protects it on
+--              servers. Click the box, type, press Enter.
 --   Server   - what other players see in their server list when you host: the description
 --              (MOTD), max players and port.
 -- Everything is saved to settings.txt automatically. Everything here is editable.
@@ -17,8 +20,10 @@
 --   engine.set_video_setting(id, v)    -> true, or false + reason
 --   engine.get_player_name()           -> "Steve"
 --   engine.set_player_name(name)       -> true, or false + reason
+--   engine.has_player_password(), engine.set_player_password(text)
 --   engine.get_server_settings()       -> { motd, max_players, port }
 --   engine.set_server_setting(id, v)   -> true, or false + reason   (id: motd, max_players, port)
+--   engine.has_server_icon()
 --   engine.close_settings()
 --   engine.is_in_game()
 --
@@ -28,7 +33,9 @@
 --   handle_settings_scroll(dy)
 --   handle_settings_key(key, action, mods)   -> true = handled
 --   handle_settings_char(codepoint, char)    -> true = handled
+--   handle_settings_mouse(code)              -> true = handled (a mouse button as a key)
 --   on_settings_opened()
+-- For other mods: settings_set_tab("video") opens a category.
 -- ---------------------------------------------------------------------------
 
 print("[UI] settings_menu.lua loaded")
@@ -53,50 +60,62 @@ end)()
 
 local Theme = {
     colors = {
-        background      = { 0.10, 0.10, 0.10, 1.00 },
-        background_game = { 0.00, 0.00, 0.00, 0.65 },   -- over the world when opened in-game
-        panel_bg        = { 0.00, 0.00, 0.00, 0.45 },
-        row_hover       = { 1.00, 1.00, 1.00, 0.06 },
+        backdrop        = { 0.02, 0.03, 0.05, 0.62 },   -- over the title screen's panorama
+        backdrop_game   = { 0.00, 0.00, 0.00, 0.55 },   -- over the world, opened from the pause menu
+        sidebar         = { 0.05, 0.06, 0.08, 0.94 },
+        content         = { 0.09, 0.10, 0.13, 0.92 },
+        card_edge       = { 1.00, 1.00, 1.00, 0.10 },
+        divider         = { 1.00, 1.00, 1.00, 0.07 },
+        accent          = { 1.00, 0.78, 0.28, 1.00 },   -- gold, like the title screen's
+        accent_text     = { 0.10, 0.08, 0.04, 1.00 },   -- text on the accent
         title           = { 1.00, 1.00, 1.00, 1.00 },
-        name            = { 1.00, 1.00, 1.00, 1.00 },
-        detail          = { 0.63, 0.63, 0.63, 1.00 },
-        conflict        = { 1.00, 0.40, 0.35, 1.00 },
+        text            = { 0.90, 0.91, 0.93, 1.00 },
+        detail          = { 0.60, 0.62, 0.67, 1.00 },
+        section         = { 0.55, 0.58, 0.65, 1.00 },
+        nav_hover       = { 1.00, 1.00, 1.00, 0.05 },
+        nav_active      = { 1.00, 1.00, 1.00, 0.09 },
+        row_hover       = { 1.00, 1.00, 1.00, 0.035 },
+        control         = { 0.13, 0.14, 0.18, 1.00 },   -- key caps, fields, switch tracks
+        control_edge    = { 1.00, 1.00, 1.00, 0.16 },
+        control_hover   = { 1.00, 1.00, 1.00, 0.42 },
+        track           = { 1.00, 1.00, 1.00, 0.12 },
+        knob            = { 0.96, 0.97, 0.98, 1.00 },
+        conflict        = { 1.00, 0.38, 0.33, 1.00 },
         waiting         = { 1.00, 0.85, 0.35, 1.00 },
         error           = { 1.00, 0.45, 0.40, 1.00 },
-        outline         = { 0.00, 0.00, 0.00, 1.00 },
-        outline_hover   = { 1.00, 1.00, 1.00, 1.00 },
-        button          = { 0.44, 0.44, 0.44, 1.00 },
-        button_hover    = { 0.50, 0.55, 0.78, 1.00 },
-        button_off      = { 0.27, 0.27, 0.27, 1.00 },
-        tab_active      = { 0.55, 0.55, 0.55, 1.00 },
-        bevel_light     = { 1.00, 1.00, 1.00, 0.30 },
-        bevel_dark      = { 0.00, 0.00, 0.00, 0.35 },
-        text            = { 0.88, 0.88, 0.88, 1.00 },
-        text_hover      = { 1.00, 1.00, 0.63, 1.00 },
-        text_off        = { 0.63, 0.63, 0.63, 1.00 },
-        field_bg        = { 0.00, 0.00, 0.00, 1.00 },
-        field_border    = { 0.63, 0.63, 0.63, 1.00 },
-        field_focus     = { 1.00, 1.00, 1.00, 1.00 },
+        disabled        = { 1.00, 1.00, 1.00, 0.25 },
     },
 
     -- Font metrics at scale 1.0 (PixeloidSans is about 20px tall at scale 1)
     font = { char_w = 10, char_h = 14, base_scale = 0.5, y_offset = 1.0 },
-    line_gap = 4,
 
     -- Sizes in GUI pixels (multiplied by the GUI scale)
-    panel_w = 320,
-    row_h = 24,
-    key_w = 110,              -- width of the key button on each Controls row
-    small_w = 22,             -- the - / + buttons on the Video tab
-    button_w = 150, button_h = 20, button_gap = 4,
-    tab_w = 80,
-    name_field_w = 150,       -- text boxes (player name, port)
-    wide_field_w = 200,       -- the server description box
+    card_w = 560, card_h = 340,
+    sidebar_w = 132,
+    nav_h = 22,
+    row_h = 24, section_h = 20,
+    control_h = 17,
+    key_w = 96,
+    slider_w = 150,
+    field_w = 150, wide_field_w = 210,
 }
 
 local C = Theme.colors
 
-local VIDEO_LABELS = {
+local TABS = {
+    { id = "controls", label = "Controls", title = "Controls",
+      desc = "Click a key, then press the new one. Red keys are used more than once." },
+    { id = "video",    label = "Video",    title = "Video",
+      desc = "How the world looks. Changes apply straight away." },
+    { id = "sound",    label = "Sound",    title = "Sound",
+      desc = "How loud each kind of sound is." },
+    { id = "player",   label = "Player",   title = "Player",
+      desc = "Your name in chat and multiplayer, and the password that protects it." },
+    { id = "server",   label = "Server",   title = "Server",
+      desc = "What other players see when you host a game." },
+}
+
+local LABELS = {
     fov             = "Field of View",
     render_distance = "Render Distance",
     vsync           = "VSync",
@@ -108,7 +127,17 @@ local VIDEO_LABELS = {
     volume_ambient  = "Weather & Ambience",
 }
 
-local function video_value_text(s)
+-- Which section each control is listed under (in this order)
+local CONTROL_SECTIONS = {
+    { "Movement", { forward = 1, back = 2, left = 3, right = 4, jump = 5, sneak = 6, sprint = 7 } },
+    { "Actions", { pick_block = 1, drop = 2, inventory = 3 } },
+    { "Chat & Multiplayer", { chat = 1, command = 2, player_list = 3 } },
+    { "View", { third_person = 1, hide_hud = 2, debug_info = 3 } },
+    { "Hotbar", nil },          -- hotbar1..9
+    { "Other", false },         -- anything else (controls mods add)
+}
+
+local function value_text(s)
     if s.id == "vsync" then return (s.value ~= 0) and "On" or "Off" end
     if s.id == "main_hand" then return (s.value ~= 0) and "Left" or "Right" end
     if s.id == "render_distance" then return s.value .. " chunks" end
@@ -126,204 +155,183 @@ end
 -- ===========================================================================
 
 local state = {
-    tab = "controls",     -- "controls", "video", "player" or "server"
+    tab = "controls",
     binds = {},
     video = {},
+    sound = {},
     player = {},
     server = {},
     editing = nil,        -- the text item being typed in (nil = none)
     edit_text = "",       -- what's in the box while typing
-    scroll = 0,
+    scroll = 0,           -- first entry shown (entries are rows and section headings)
     waiting = nil,        -- action waiting for a key press
+    dragging = nil,       -- the slider being dragged
     message = nil,
 }
 
 -- ===========================================================================
--- HELPERS
+-- DRAWING HELPERS
 -- ===========================================================================
 
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function inside(mx, my, x, y, w, h) return mx >= x and mx < x + w and my >= y and my < y + h end
 
-local function inside(mx, my, x, y, w, h)
-    return mx >= x and mx < x + w and my >= y and my < y + h
-end
-
-local function rect(x, y, w, h, c)
+local function rect(x, y, w, h, c, a)
     if w <= 0 or h <= 0 then return end
-    ui.draw_rect(x, y, w, h, c[1], c[2], c[3], c[4] or 1)
+    ui.draw_rect(x, y, w, h, c[1], c[2], c[3], (c[4] or 1) * (a or 1))
+end
+-- A box with its corners clipped by `r` (a pixel-art rounded box), and its outline
+local function box(x, y, w, h, r, c)
+    rect(x + r, y, w - 2 * r, h, c)
+    rect(x, y + r, r, h - 2 * r, c)
+    rect(x + w - r, y + r, r, h - 2 * r, c)
+end
+local function outline(x, y, w, h, r, c, t)
+    t = t or 1
+    rect(x + r, y, w - 2 * r, t, c)
+    rect(x + r, y + h - t, w - 2 * r, t, c)
+    rect(x, y + r, t, h - 2 * r, c)
+    rect(x + w - t, y + r, t, h - 2 * r, c)
 end
 
 local function text_width(str, scale)
-    if ui.text_width then return ui.text_width(str, scale) end   -- exact, from the engine
+    if ui.text_width then return ui.text_width(str, scale) end
     return #str * Theme.font.char_w * scale
 end
 local function text_height(scale)
-    if ui.text_height then return ui.text_height(scale) end      -- capital letter height
+    if ui.text_height then return ui.text_height(scale) end
     return Theme.font.char_h * scale
 end
-
 -- `y` is the TOP of the text
 local function text(str, x, y, scale, c, shadow, S)
-    y = y + (ui.text_height and ui.text_height(scale) or Theme.font.char_h * scale) * Theme.font.y_offset
-    if shadow then
-        ui.draw_text(str, x + S, y + S, scale, c[1] * 0.25, c[2] * 0.25, c[3] * 0.25, c[4] or 1)
-    end
+    y = y + text_height(scale) * Theme.font.y_offset
+    if shadow then ui.draw_text(str, x + S, y + S, scale, 0, 0, 0, (c[4] or 1) * 0.45) end
     ui.draw_text(str, x, y, scale, c[1], c[2], c[3], c[4] or 1)
 end
-
-local function text_centered(str, cx, y, scale, c, S)
-    text(str, cx - text_width(str, scale) / 2, y, scale, c, true, S)
+-- Text centred vertically in a band from y to y + h
+local function text_mid(str, x, y, h, scale, c, shadow, S)
+    text(str, x, y + (h - text_height(scale)) / 2, scale, c, shadow, S)
+end
+-- Shortened with "..." to fit a width
+local function fit(str, w, scale)
+    if text_width(str, scale) <= w then return str end
+    while #str > 1 and text_width(str .. "...", scale) > w do str = str:sub(1, -2) end
+    return str .. "..."
 end
 
 local function gui_scale(W, H)
     return clamp(math.floor(math.min(W / 480, H / 360) * 2) / 2, 1, 4)
 end
 
+-- The categories' little pictures, drawn with rectangles (s = their size)
+local function icon(id, x, y, s, c)
+    local u = math.max(1, math.floor(s / 8))
+    if id == "controls" then          -- a key cap
+        outline(x, y + u, s, s - 2 * u, u, c, u)
+        rect(x + 2 * u, y + s - 4 * u, s - 4 * u, u, c)
+        rect(x + 2 * u, y + 3 * u, u, u, c); rect(x + 4 * u, y + 3 * u, u, u, c); rect(x + 6 * u, y + 3 * u, u, u, c)
+    elseif id == "video" then         -- a screen on a stand
+        outline(x, y, s, s - 3 * u, u, c, u)
+        rect(x + 3 * u, y + s - 2 * u, s - 6 * u, u, c)
+        rect(x + s / 2 - u / 2, y + s - 3 * u, u, u, c)
+    elseif id == "sound" then         -- a speaker and its waves
+        rect(x, y + 3 * u, 2 * u, 2 * u, c)
+        rect(x + 2 * u, y + 2 * u, u, 4 * u, c)
+        rect(x + 3 * u, y + u, u, 6 * u, c)
+        rect(x + 5 * u, y + 3 * u, u, 2 * u, c)
+        rect(x + 7 * u, y + 2 * u, u, 4 * u, c)
+    elseif id == "player" then        -- a head and shoulders
+        box(x + 2 * u, y, s - 4 * u, 3 * u, 0, c)
+        box(x + u, y + 4 * u, s - 2 * u, s - 4 * u, u, c)
+    elseif id == "server" then        -- stacked server units with lights
+        for k = 0, 2 do
+            outline(x, y + k * 3 * u, s, 2 * u + 1, 0, c, u)
+            rect(x + s - 3 * u, y + k * 3 * u + u, u, u, c)
+        end
+    end
+end
+
+-- ===========================================================================
+-- DATA
+-- ===========================================================================
+
 local function refresh()
     state.binds = (engine and engine.get_keybinds and engine.get_keybinds()) or {}
-    state.video = (engine and engine.get_video_settings and engine.get_video_settings()) or {}
+    state.video, state.sound = {}, {}
+    for _, s in ipairs((engine and engine.get_video_settings and engine.get_video_settings()) or {}) do
+        if s.id:find("^volume_") then state.sound[#state.sound + 1] = s else state.video[#state.video + 1] = s end
+    end
     -- Text items: kind = "text", value, max (length), allowed (pattern for one character)
     state.player = {
         { id = "name", kind = "text", label = "Player Name", max = 16, allowed = "^[%w_%-]$",
-          value = (engine and engine.get_player_name and engine.get_player_name()) or "" },
+          hint = "Letters, numbers, _ and -", value = (engine.get_player_name and engine.get_player_name()) or "" },
         -- Protects your name on servers. Never shown or stored - only a hash of it is kept.
         { id = "password", kind = "text", label = "Server Password", max = 64, allowed = "^[ -~]$",
-          secret = true, value = "",
-          is_set = engine and engine.has_player_password and engine.has_player_password() or false },
+          secret = true, value = "", hint = "Protects your name on servers",
+          is_set = engine.has_player_password and engine.has_player_password() or false },
     }
-    local sv = (engine and engine.get_server_settings and engine.get_server_settings()) or {}
+    local sv = (engine.get_server_settings and engine.get_server_settings()) or {}
     state.server = {
         { id = "motd", kind = "text", label = "Description", max = 200, allowed = "^[ -~]$", wide = true,
           value = sv.motd or "" },
         { id = "max_players", kind = "number", label = "Max Players",
-          value = sv.max_players or 20, min = 2, max = 200, step = 1 },
+          value = sv.max_players or 50, min = 2, max = 200, step = 1 },
         { id = "port", kind = "text", label = "Port", max = 5, allowed = "^%d$",
           value = tostring(sv.port or 30000) },
     }
 end
 
+-- The list for the open category: section headings and rows, in order
+local function entries()
+    local out = {}
+    local function section(title) out[#out + 1] = { section = title } end
+    local function row(item) out[#out + 1] = { item = item } end
+    if state.tab == "controls" then
+        local used = {}
+        for _, sec in ipairs(CONTROL_SECTIONS) do
+            local list = {}
+            for _, b in ipairs(state.binds) do
+                if not used[b.action] then
+                    local order
+                    if sec[2] == nil then order = b.action:match("^hotbar(%d+)$") and tonumber(b.action:match("%d+"))
+                    elseif sec[2] == false then order = 1000 + #list
+                    else order = sec[2][b.action] end
+                    if order then list[#list + 1] = { b, order } end
+                end
+            end
+            table.sort(list, function(a, b) return a[2] < b[2] end)
+            if #list > 0 then
+                section(sec[1])
+                for _, e in ipairs(list) do used[e[1].action] = true; row(e[1]) end
+            end
+        end
+    elseif state.tab == "video" then
+        section("Display")
+        for _, s in ipairs(state.video) do if s.id ~= "main_hand" then row(s) end end
+        for _, s in ipairs(state.video) do
+            if s.id == "main_hand" then section("Hand"); row(s) end
+        end
+    elseif state.tab == "sound" then
+        section("Volume")
+        for _, s in ipairs(state.sound) do row(s) end
+    elseif state.tab == "player" then
+        section("Profile"); row(state.player[1])
+        section("Security"); row(state.player[2])
+    elseif state.tab == "server" then
+        section("Hosting")
+        for _, s in ipairs(state.server) do row(s) end
+    end
+    return out
+end
+
 -- How many controls use each key (to highlight duplicates)
 local function key_counts()
     local counts = {}
-    for _, b in ipairs(state.binds) do
-        counts[b.key] = (counts[b.key] or 0) + 1
-    end
+    for _, b in ipairs(state.binds) do counts[b.key] = (counts[b.key] or 0) + 1 end
     return counts
 end
 
-local function draw_button(b, mx, my, S, fs, label_color)
-    local enabled = b.enabled ~= false
-    local hovered = enabled and inside(mx, my, b.x, b.y, b.w, b.h)
-    local fill = (not enabled) and C.button_off or (b.selected and C.tab_active)
-                 or (hovered and C.button_hover or C.button)
-    -- The game's button picture (like the title screen); plain boxes if the engine has none
-    local state = ((not enabled) and "disabled") or (b.selected and "selected") or (hovered and "hover") or "normal"
-    if not (ui.draw_button and ui.draw_button(b.x, b.y, b.w, b.h, state, b.danger)) then
-        rect(b.x, b.y, b.w, b.h, hovered and C.outline_hover or C.outline)
-        rect(b.x + S, b.y + S, b.w - 2 * S, b.h - 2 * S, fill)
-        if enabled then
-            rect(b.x + S, b.y + S, b.w - 2 * S, S, C.bevel_light)
-            rect(b.x + S, b.y + 2 * S, S, b.h - 3 * S, C.bevel_light)
-            rect(b.x + S, b.y + b.h - 2 * S, b.w - 2 * S, S, C.bevel_dark)
-        end
-    end
-    local tc = label_color or ((not enabled) and C.text_off or (hovered and C.text_hover or C.text))
-    text_centered(b.label, b.x + b.w / 2, b.y + (b.h - text_height(fs)) / 2, fs, tc, S)
-end
-
--- ===========================================================================
--- LAYOUT
--- ===========================================================================
-
-local function layout(W, H)
-    local S = gui_scale(W, H)
-    local fs = Theme.font.base_scale * S
-    local bw, bh, gap = Theme.button_w * S, Theme.button_h * S, Theme.button_gap * S
-
-    local L = { S = S, fs = fs }
-    L.titleY = 8 * S
-    L.noteY = L.titleY + text_height(fs) + Theme.line_gap * S
-
-    -- Tabs
-    local tw = Theme.tab_w * S
-    local tabsY = L.noteY + text_height(fs * 0.8) + 6 * S
-    local tx = math.floor((W - (tw * 4 + gap * 3)) / 2)
-    L.tabs = {
-        { id = "controls", label = "Controls", x = tx,                  y = tabsY, w = tw, h = bh },
-        { id = "video",    label = "Video & Sound",    x = tx + tw + gap,       y = tabsY, w = tw, h = bh },
-        { id = "player",   label = "Player",   x = tx + (tw + gap) * 2, y = tabsY, w = tw, h = bh },
-        { id = "server",   label = "Server",   x = tx + (tw + gap) * 3, y = tabsY, w = tw, h = bh },
-    }
-
-    -- Panel with the rows
-    local margin = 10 * S
-    local buttonsY = H - margin - bh
-    L.panelW = math.min(Theme.panel_w * S, W - 2 * margin)
-    L.panelX = math.floor((W - L.panelW) / 2)
-    L.panelY = tabsY + bh + 6 * S
-    L.panelH = buttonsY - 8 * S - L.panelY
-    L.rowH = Theme.row_h * S
-    L.visible = math.max(1, math.floor((L.panelH - 4 * S) / L.rowH))
-
-    -- Bottom buttons
-    local totalW = bw * 2 + gap
-    local bx = math.floor((W - totalW) / 2)
-    L.buttons = {
-        { x = bx,            y = buttonsY, w = bw, h = bh, label = "Reset Keys",
-          enabled = state.tab == "controls",
-          action = function()
-              engine.reset_keybinds()
-              state.waiting = nil
-              refresh()
-          end },
-        { x = bx + bw + gap, y = buttonsY, w = bw, h = bh, label = "Done",
-          action = function()
-              state.waiting = nil
-              engine.close_settings()
-          end },
-    }
-    return L
-end
-
--- Position of row i (1-based, after scrolling) inside the panel
-local function row_rect(L, row)
-    local S = L.S
-    return L.panelX + 4 * S, L.panelY + 2 * S + (row - 1) * L.rowH, L.panelW - 8 * S, L.rowH - 2 * S
-end
-
--- Buttons for one row on the current tab
-local function row_widgets(L, item, rx, ry, rw, rh)
-    local S = L.S
-    local bh = Theme.button_h * S
-    local by = ry + (rh - bh) / 2
-    if state.tab == "controls" then
-        local kw = Theme.key_w * S
-        return { key = { x = rx + rw - kw, y = by, w = kw, h = bh } }
-    end
-    if item.kind == "text" then
-        local fw = (item.wide and Theme.wide_field_w or Theme.name_field_w) * S
-        fw = math.min(fw, rw * 0.65)
-        return { field = { x = rx + rw - fw, y = by, w = fw, h = bh } }
-    end
-    if item.id == "vsync" or item.id == "main_hand" then
-        local kw = Theme.key_w * S
-        return { toggle = { x = rx + rw - kw, y = by, w = kw, h = bh } }
-    end
-    local sw = Theme.small_w * S
-    return {
-        plus  = { x = rx + rw - sw,              y = by, w = sw, h = bh },
-        minus = { x = rx + rw - sw * 2 - 4 * S,  y = by, w = sw, h = bh },
-    }
-end
-
-local function current_items()
-    if state.tab == "controls" then return state.binds end
-    if state.tab == "player" then return state.player end
-    if state.tab == "server" then return state.server end
-    return state.video
-end
-
--- Saves a setting (text box, +/- or toggle) through the right engine function.
+-- Saves a setting through the right engine function
 local function set_value(item, value)
     if item.id == "name" then return engine.set_player_name(value) end
     if item.id == "password" then
@@ -334,92 +342,247 @@ local function set_value(item, value)
     return engine.set_video_setting(item.id, value)
 end
 
--- Saves what's typed. Keeps the box open (with the error shown) if it's not allowed.
 local function commit_edit()
     if not state.editing then return end
     local ok, err = set_value(state.editing, state.edit_text)
-    if ok == false then
-        state.message = err
-        return
-    end
+    if ok == false then state.message = err; return end   -- not allowed: stay in the box
     state.editing = nil
     state.message = nil
     refresh()
 end
-
 local function cancel_edit()
     state.editing = nil
     state.message = nil
 end
 
-local function draw_text_field(f, item, S, fs)
-    local focused = state.editing ~= nil and state.editing.id == item.id
-    rect(f.x, f.y, f.w, f.h, focused and C.field_focus or C.field_border)
-    rect(f.x + S, f.y + S, f.w - 2 * S, f.h - 2 * S, C.field_bg)
-    local ty = f.y + (f.h - text_height(fs)) / 2
-    if focused then
-        -- What's typed (stars for a password), scrolled so the caret stays in view
-        local shown, caret_x = te.view("settings", state.edit_text, f.w - 8 * S, fs, item.secret and "*" or nil)
-        text(shown, f.x + 4 * S, ty, fs, C.name, false, S)
-        te.draw_caret("settings", f.x + 4 * S + caret_x, ty - S, text_height(fs) + 2 * S,
-                      C.name[1], C.name[2], C.name[3], 1)
-        return
+-- ===========================================================================
+-- LAYOUT
+-- ===========================================================================
+
+local function layout(W, H)
+    local S = gui_scale(W, H)
+    local fs = Theme.font.base_scale * S
+    local L = { S = S, fs = fs }
+    local m = 10 * S
+    L.cardW = math.floor(math.min(Theme.card_w * S, W - 2 * m))
+    L.cardH = math.floor(math.min(Theme.card_h * S, H - 2 * m))
+    L.cardX = math.floor((W - L.cardW) / 2)
+    L.cardY = math.floor((H - L.cardH) / 2)
+    L.sideW = math.floor(clamp(L.cardW * 0.25, 104 * S, Theme.sidebar_w * S))
+
+    -- Sidebar: title, the categories, Done at the bottom
+    L.nav = {}
+    local ny = L.cardY + 46 * S
+    for i, t in ipairs(TABS) do
+        L.nav[i] = { id = t.id, label = t.label, x = L.cardX + 6 * S, y = ny, w = L.sideW - 12 * S, h = Theme.nav_h * S }
+        ny = ny + (Theme.nav_h + 2) * S
     end
-    local value = tostring(item.value)
-    if item.secret then value = item.is_set and "********" or "Not set" end   -- never show a password
-    -- Long text: its start
-    while #value > 1 and (ui.text_width and ui.text_width(value, fs) or #value * 8 * fs) > f.w - 8 * S do
-        value = value:sub(1, -2)
+    L.done = { x = L.cardX + 10 * S, y = L.cardY + L.cardH - 30 * S, w = L.sideW - 20 * S, h = 20 * S, label = "Done" }
+
+    -- Content: a header, the list, a status line
+    L.cx = L.cardX + L.sideW
+    L.cw = L.cardW - L.sideW
+    L.pad = 16 * S
+    L.headerY = L.cardY + 12 * S
+    L.dividerY = L.cardY + 44 * S
+    L.reset = nil
+    if state.tab == "controls" then
+        local w = 78 * S
+        L.reset = { x = L.cx + L.cw - L.pad - w, y = L.cardY + 14 * S, w = w, h = 18 * S, label = "Reset All" }
     end
-    text(value, f.x + 4 * S, ty, fs, C.text, false, S)
+    L.listX = L.cx + L.pad - 6 * S
+    L.listW = L.cw - 2 * L.pad + 12 * S
+    L.listY = L.dividerY + 6 * S
+    L.statusY = L.cardY + L.cardH - 18 * S
+    L.listH = L.statusY - 6 * S - L.listY
+    return L
+end
+
+local function entry_h(L, e) return ((e.section and Theme.section_h) or Theme.row_h) * L.S end
+
+-- The entries shown, from the scroll position, and where each one is
+local function visible(L)
+    local list = entries()
+    -- the furthest it can scroll: the last entries just fill the list
+    local maxScroll, used = #list, 0
+    for i = #list, 1, -1 do
+        used = used + entry_h(L, list[i])
+        if used > L.listH then break end
+        maxScroll = i - 1
+    end
+    state.scroll = clamp(state.scroll, 0, math.max(0, maxScroll))
+    local shown, y = {}, L.listY
+    for i = state.scroll + 1, #list do
+        local h = entry_h(L, list[i])
+        if y + h > L.listY + L.listH + 0.5 then break end
+        shown[#shown + 1] = { e = list[i], y = y, h = h, index = i }
+        y = y + h
+    end
+    return shown, list, maxScroll
+end
+
+-- The control on the right of a row (by the kind of setting)
+local function widget(L, item, ry, rh)
+    local S = L.S
+    local right = L.listX + L.listW - 8 * S
+    local ch = Theme.control_h * S
+    local cy = ry + math.floor((rh - ch) / 2)
+    if state.tab == "controls" then
+        local w = Theme.key_w * S
+        return { kind = "key", x = right - w, y = cy, w = w, h = ch }
+    end
+    if item.kind == "text" then
+        local w = math.min((item.wide and Theme.wide_field_w or Theme.field_w) * S, L.listW * 0.6)
+        return { kind = "field", x = right - w, y = cy, w = w, h = ch }
+    end
+    if item.id == "vsync" then
+        local w = 26 * S
+        return { kind = "switch", x = right - w, y = ry + math.floor((rh - 13 * S) / 2), w = w, h = 13 * S }
+    end
+    if item.id == "main_hand" then
+        local w = 46 * S
+        return { kind = "segments", x = right - 2 * w, y = cy, w = 2 * w, h = ch, seg = w,
+                 options = { { "Left", 1 }, { "Right", 0 } } }
+    end
+    local valueW = 46 * S
+    local w = Theme.slider_w * S
+    return { kind = "slider", x = right - valueW - w, y = cy, w = w, h = ch, valueX = right - valueW + 8 * S, valueW = valueW - 8 * S }
+end
+
+local function slider_value(item, wdg, mx)
+    local t = clamp((mx - wdg.x) / wdg.w, 0, 1)
+    local steps = math.floor((item.max - item.min) / item.step + 0.5)
+    return item.min + math.floor(t * steps + 0.5) * item.step
 end
 
 -- ===========================================================================
 -- DRAWING
 -- ===========================================================================
 
-local function draw_rows(L, mx, my)
+local function draw_primary(b, mx, my, S, fs)
+    local hov = inside(mx, my, b.x, b.y, b.w, b.h)
+    local c = hov and { 1.00, 0.85, 0.42, 1 } or C.accent
+    box(b.x, b.y, b.w, b.h, 2 * S, c)
+    rect(b.x + 2 * S, b.y + b.h - S, b.w - 4 * S, S, { 0, 0, 0, 0.25 })
+    text_mid(b.label, b.x + (b.w - text_width(b.label, fs)) / 2, b.y, b.h, fs, C.accent_text, false, S)
+end
+
+local function draw_secondary(b, mx, my, S, fs)
+    local hov = inside(mx, my, b.x, b.y, b.w, b.h)
+    box(b.x, b.y, b.w, b.h, S, { 1, 1, 1, hov and 0.14 or 0.06 })
+    outline(b.x, b.y, b.w, b.h, S, hov and C.control_hover or C.control_edge)
+    text_mid(b.label, b.x + (b.w - text_width(b.label, fs * 0.85)) / 2, b.y, b.h, fs * 0.85, C.text, false, S)
+end
+
+local function draw_field(w, item, S, fs)
+    local focused = state.editing ~= nil and state.editing.id == item.id
+    box(w.x, w.y, w.w, w.h, S, C.control)
+    outline(w.x, w.y, w.w, w.h, S, focused and C.accent or C.control_edge)
+    local tx, tw = w.x + 5 * S, w.w - 10 * S
+    if focused then
+        local shown, caret_x = te.view("settings", state.edit_text, tw, fs, item.secret and "*" or nil)
+        text_mid(shown, tx, w.y, w.h, fs, C.title, false, S)
+        local th = text_height(fs)
+        te.draw_caret("settings", tx + caret_x, w.y + (w.h - th) / 2 - S, th + 2 * S, C.accent[1], C.accent[2], C.accent[3], 1)
+        return
+    end
+    local value, color = tostring(item.value), C.text
+    if item.secret then value, color = item.is_set and "********" or "Not set", item.is_set and C.text or C.detail end
+    if value == "" then value, color = "Empty", C.detail end
+    text_mid(fit(value, tw, fs), tx, w.y, w.h, fs, color, false, S)
+end
+
+local function draw_list(L, mx, my)
     local S, fs = L.S, L.fs
-    local items = current_items()
+    local shown, list, maxScroll = visible(L)
     local counts = key_counts()
+    local _, _, left_down = ui.get_mouse()
 
-    rect(L.panelX, L.panelY, L.panelW, L.panelH, C.panel_bg)
-    state.scroll = clamp(state.scroll, 0, math.max(0, #items - L.visible))
-
-    for row = 1, L.visible do
-        local item = items[row + state.scroll]
-        if not item then break end
-
-        local rx, ry, rw, rh = row_rect(L, row)
-        if inside(mx, my, rx, ry, rw, rh) then rect(rx, ry, rw, rh, C.row_hover) end
-
-        local label = item.label or VIDEO_LABELS[item.id] or item.id
-        text(label, rx + 4 * S, ry + (rh - text_height(fs)) / 2, fs, C.name, true, S)
-
-        local wdg = row_widgets(L, item, rx, ry, rw, rh)
-        if wdg.field then
-            draw_text_field(wdg.field, item, S, fs)
-        elseif wdg.key then
-            local waiting = state.waiting == item.action
-            local k = wdg.key
-            local color = nil
-            if waiting then
-                color = C.waiting
-            elseif (counts[item.key] or 0) > 1 then
-                color = C.conflict
-            end
-            draw_button({ x = k.x, y = k.y, w = k.w, h = k.h,
-                          label = waiting and "> press a key <" or item.key_name }, mx, my, S, fs, color)
-        elseif wdg.toggle then
-            local t = wdg.toggle
-            draw_button({ x = t.x, y = t.y, w = t.w, h = t.h, label = video_value_text(item) }, mx, my, S, fs)
+    for _, v in ipairs(shown) do
+        local e, ry, rh = v.e, v.y, v.h
+        if e.section then
+            local sfs = fs * 0.72
+            text(string.upper(e.section), L.listX + 8 * S, ry + rh - text_height(sfs) - 4 * S, sfs, C.section, false, S)
+            rect(L.listX + 8 * S + text_width(string.upper(e.section), sfs) + 6 * S, ry + rh - 4 * S - text_height(sfs) / 2,
+                 L.listW - 16 * S - text_width(string.upper(e.section), sfs) - 6 * S, 1, C.divider)
         else
-            local m, p = wdg.minus, wdg.plus
-            draw_button({ x = m.x, y = m.y, w = m.w, h = m.h, label = "-", enabled = item.value > item.min }, mx, my, S, fs)
-            draw_button({ x = p.x, y = p.y, w = p.w, h = p.h, label = "+", enabled = item.value < item.max }, mx, my, S, fs)
-            local value = video_value_text(item)
-            text(value, m.x - 8 * S - text_width(value, fs), ry + (rh - text_height(fs)) / 2, fs, C.detail, false, S)
+            local item = e.item
+            if inside(mx, my, L.listX, ry, L.listW, rh) then box(L.listX, ry, L.listW, rh, S, C.row_hover) end
+            local label = item.label or LABELS[item.id] or item.id
+            local wdg = widget(L, item, ry, rh)
+            text_mid(fit(label, wdg.x - L.listX - 20 * S, fs), L.listX + 8 * S, ry, rh, fs, C.text, false, S)
+
+            local hov = inside(mx, my, wdg.x, wdg.y, wdg.w, wdg.h)
+            if wdg.kind == "key" then
+                local waiting = state.waiting == item.action
+                local conflict = (counts[item.key] or 0) > 1
+                box(wdg.x, wdg.y, wdg.w, wdg.h, S, C.control)
+                rect(wdg.x + S, wdg.y + wdg.h - S, wdg.w - 2 * S, S, { 0, 0, 0, 0.35 })      -- the cap's lower edge
+                local edge = waiting and C.waiting or (conflict and C.conflict or (hov and C.control_hover or C.control_edge))
+                if waiting then edge = { C.waiting[1], C.waiting[2], C.waiting[3], 0.55 + 0.45 * math.abs(math.sin(ui.get_time() * 4)) } end
+                outline(wdg.x, wdg.y, wdg.w, wdg.h, S, edge)
+                local label2 = waiting and "Press a key..." or (item.key_name or "?")
+                local col = waiting and C.waiting or (conflict and C.conflict or C.title)
+                text_mid(fit(label2, wdg.w - 8 * S, fs * 0.9), wdg.x + (wdg.w - text_width(fit(label2, wdg.w - 8 * S, fs * 0.9), fs * 0.9)) / 2,
+                         wdg.y, wdg.h, fs * 0.9, col, false, S)
+            elseif wdg.kind == "field" then
+                draw_field(wdg, item, S, fs)
+            elseif wdg.kind == "switch" then
+                local on = item.value ~= 0
+                local track = on and C.accent or { 1, 1, 1, hov and 0.22 or 0.14 }
+                box(wdg.x, wdg.y, wdg.w, wdg.h, 3 * S, track)
+                local k = wdg.h - 4 * S
+                local kx = on and (wdg.x + wdg.w - 2 * S - k) or (wdg.x + 2 * S)
+                box(kx, wdg.y + 2 * S, k, k, 2 * S, C.knob)
+                local vt = on and "On" or "Off"
+                text_mid(vt, wdg.x - 8 * S - text_width(vt, fs * 0.85), wdg.y, wdg.h, fs * 0.85, C.detail, false, S)
+            elseif wdg.kind == "segments" then
+                box(wdg.x, wdg.y, wdg.w, wdg.h, S, C.control)
+                outline(wdg.x, wdg.y, wdg.w, wdg.h, S, C.control_edge)
+                for i, opt in ipairs(wdg.options) do
+                    local sx = wdg.x + (i - 1) * wdg.seg
+                    local sel = item.value == opt[2]
+                    if sel then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, C.accent)
+                    elseif inside(mx, my, sx, wdg.y, wdg.seg, wdg.h) then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, { 1, 1, 1, 0.08 }) end
+                    text_mid(opt[1], sx + (wdg.seg - text_width(opt[1], fs * 0.85)) / 2, wdg.y, wdg.h, fs * 0.85,
+                             sel and C.accent_text or C.text, false, S)
+                end
+            elseif wdg.kind == "slider" then
+                -- dragging: follow the mouse while the button is held
+                if state.dragging == item.id then
+                    if left_down then
+                        local v = slider_value(item, wdg, mx)
+                        if v ~= item.value then
+                            local ok, err = set_value(item, v)
+                            if ok == false then state.message = err else item.value = v end
+                        end
+                    else
+                        state.dragging = nil
+                        refresh()
+                    end
+                end
+                local t = (item.max > item.min) and (item.value - item.min) / (item.max - item.min) or 0
+                local ty = wdg.y + math.floor(wdg.h / 2) - 2 * S
+                box(wdg.x, ty, wdg.w, 4 * S, S, C.track)
+                box(wdg.x, ty, math.max(2 * S, math.floor(wdg.w * t)), 4 * S, S, C.accent)
+                local kw, kh = 6 * S, 12 * S
+                local kx = math.floor(wdg.x + wdg.w * t - kw / 2)
+                local active = hov or state.dragging == item.id
+                box(kx, wdg.y + math.floor((wdg.h - kh) / 2), kw, kh, S, C.knob)
+                if active then outline(kx - S, wdg.y + math.floor((wdg.h - kh) / 2) - S, kw + 2 * S, kh + 2 * S, S, C.accent) end
+                text_mid(value_text(item), wdg.valueX, wdg.y, wdg.h, fs * 0.85, C.text, false, S)
+            end
         end
+    end
+
+    -- A scroll bar when the list is longer than its space
+    if maxScroll > 0 then
+        local trackX = L.cx + L.cw - 7 * S
+        rect(trackX, L.listY, 2 * S, L.listH, { 1, 1, 1, 0.06 })
+        local frac = #shown / math.max(1, #list)
+        local th = math.max(16 * S, math.floor(L.listH * frac))
+        local ty = L.listY + math.floor((L.listH - th) * (state.scroll / maxScroll))
+        box(trackX, ty, 2 * S, th, 0, { 1, 1, 1, 0.35 })
     end
 end
 
@@ -427,11 +590,22 @@ end
 -- ENTRY POINTS (called from C++)
 -- ===========================================================================
 
+function settings_set_tab(id)
+    for _, t in ipairs(TABS) do
+        if t.id == id then
+            state.tab, state.scroll, state.waiting, state.editing = id, 0, nil, nil
+            return true
+        end
+    end
+    return false
+end
+
 function on_settings_opened()
     state.scroll = 0
     state.waiting = nil
     state.message = nil
     state.editing = nil
+    state.dragging = nil
     refresh()
 end
 
@@ -442,36 +616,63 @@ function render_settings(W, H)
     local L = layout(W, H)
     local S, fs = L.S, L.fs
     local mx, my = ui.get_mouse()
-
     local in_game = engine.is_in_game and engine.is_in_game()
-    rect(0, 0, W, H, in_game and C.background_game or C.background)
 
-    text_centered("Settings", W / 2, L.titleY, fs, C.title, S)
-    local note, note_color = "Changes are saved automatically.", C.detail
-    if state.message then
-        note, note_color = state.message, C.error
-    elseif state.waiting then
-        note, note_color = "Press a key or mouse button for this control (Escape to cancel).", C.waiting
-    elseif state.editing then
-        note, note_color = "Type, then press Enter (Escape to cancel).", C.waiting
-    elseif state.tab == "controls" then
-        note = "Click a control, then press a key. Red keys are used more than once."
-    elseif state.tab == "player" then
-        note = "Name: 1-16 letters, numbers, _ or -. The password protects your name on servers."
-    elseif state.tab == "server" then
-        note = engine.has_server_icon and engine.has_server_icon()
-            and "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Icon: server_icon.png found."
-            or "Colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} = 2nd line. Add server_icon.png for an icon."
+    rect(0, 0, W, H, in_game and C.backdrop_game or C.backdrop)
+
+    -- The card: a soft shadow, the sidebar and the content
+    box(L.cardX - 3 * S, L.cardY - 3 * S + 3 * S, L.cardW + 6 * S, L.cardH + 6 * S, 4 * S, { 0, 0, 0, 0.30 })
+    box(L.cardX, L.cardY, L.sideW, L.cardH, 3 * S, C.sidebar)
+    rect(L.cx, L.cardY, L.cw - 3 * S, L.cardH, C.content)
+    rect(L.cx + L.cw - 3 * S, L.cardY + 3 * S, 3 * S, L.cardH - 6 * S, C.content)
+    outline(L.cardX, L.cardY, L.cardW, L.cardH, 3 * S, C.card_edge)
+    rect(L.cx, L.cardY + S, 1, L.cardH - 2 * S, C.divider)
+
+    -- Sidebar
+    text("Settings", L.cardX + 12 * S, L.cardY + 12 * S, fs * 1.2, C.title, true, S)
+    text("Saved automatically", L.cardX + 12 * S, L.cardY + 12 * S + text_height(fs * 1.2) + 5 * S, fs * 0.68, C.detail, false, S)
+    for _, n in ipairs(L.nav) do
+        local active = state.tab == n.id
+        local hov = inside(mx, my, n.x, n.y, n.w, n.h)
+        if active then
+            box(n.x, n.y, n.w, n.h, S, C.nav_active)
+            rect(n.x, n.y + 3 * S, 2 * S, n.h - 6 * S, C.accent)
+        elseif hov then
+            box(n.x, n.y, n.w, n.h, S, C.nav_hover)
+        end
+        local col = active and C.title or (hov and C.text or C.detail)
+        local is = 8 * S
+        icon(n.id, n.x + 9 * S, n.y + math.floor((n.h - is) / 2), is, active and C.accent or col)
+        text_mid(n.label, n.x + 9 * S + is + 7 * S, n.y, n.h, fs, col, false, S)
     end
-    text_centered(note, W / 2, L.noteY, fs * 0.8, note_color, S)
+    draw_primary(L.done, mx, my, S, fs)
 
-    for _, t in ipairs(L.tabs) do
-        draw_button({ x = t.x, y = t.y, w = t.w, h = t.h, label = t.label, selected = (state.tab == t.id) },
-                    mx, my, S, fs)
+    -- Content header
+    local tab
+    for _, t in ipairs(TABS) do if t.id == state.tab then tab = t end end
+    text(tab.title, L.cx + L.pad, L.headerY, fs * 1.1, C.title, true, S)
+    local descW = L.cw - 2 * L.pad - (L.reset and (L.reset.w + 8 * S) or 0)
+    local desc = tab.desc
+    if state.tab == "server" then
+        desc = (engine.has_server_icon and engine.has_server_icon()) and "What players see when you host. Your server_icon.png is used as its icon."
+            or "What players see when you host. Add server_icon.png for an icon."
     end
+    text(fit(desc, descW, fs * 0.72), L.cx + L.pad, L.headerY + text_height(fs * 1.1) + 5 * S, fs * 0.72, C.detail, false, S)
+    if L.reset then draw_secondary(L.reset, mx, my, S, fs) end
+    rect(L.cx + L.pad - 6 * S, L.dividerY, L.cw - 2 * L.pad + 12 * S, 1, C.divider)
 
-    draw_rows(L, mx, my)
-    for _, b in ipairs(L.buttons) do draw_button(b, mx, my, S, fs) end
+    draw_list(L, mx, my)
+
+    -- Status line: what to do now, or what went wrong
+    local note, color = nil, C.detail
+    if state.message then note, color = state.message, C.error
+    elseif state.waiting then note, color = "Press a key or mouse button for this control. Escape cancels.", C.waiting
+    elseif state.editing then note, color = "Type, then press Enter. Escape cancels.", C.waiting
+    elseif state.tab == "server" then note = "Description colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} starts a 2nd line"
+    elseif state.tab == "player" then note = "Your name: 1-16 letters, numbers, _ or -. The password is never shown or stored." end
+    if note then
+        text_mid(fit(note, L.cw - 2 * L.pad, fs * 0.7), L.cx + L.pad, L.statusY, 12 * S, fs * 0.7, color, false, S)
+    end
 end
 
 function handle_settings_click(mx, my, W, H)
@@ -479,72 +680,70 @@ function handle_settings_click(mx, my, W, H)
 
     -- Clicking anywhere except the box being typed in saves what was typed
     if state.editing then
-        local items = current_items()
-        for row = 1, L.visible do
-            local item = items[row + state.scroll]
+        for _, v in ipairs((visible(L))) do
+            local item = v.e.item
             if item and item.id == state.editing.id then
-                local rx, ry, rw, rh = row_rect(L, row)
-                local f = row_widgets(L, item, rx, ry, rw, rh).field
-                if f and inside(mx, my, f.x, f.y, f.w, f.h) then   -- (the caret goes where you click)
-                    te.focus("settings", state.edit_text, mx - (f.x + 4 * L.S), L.fs, item.secret and "*" or nil)
+                local f = widget(L, item, v.y, v.h)
+                if inside(mx, my, f.x, f.y, f.w, f.h) then   -- (the caret goes where you click)
+                    te.focus("settings", state.edit_text, mx - (f.x + 5 * L.S), L.fs, item.secret and "*" or nil)
                     return true
                 end
             end
         end
         commit_edit()
-        if state.editing then return true end   -- not allowed: stay in the box
+        if state.editing then return true end
     end
     state.message = nil
 
-    for _, t in ipairs(L.tabs) do
-        if inside(mx, my, t.x, t.y, t.w, t.h) then
-            state.tab = t.id
-            state.scroll = 0
-            state.waiting = nil
-            return true
-        end
+    for _, n in ipairs(L.nav) do
+        if inside(mx, my, n.x, n.y, n.w, n.h) then settings_set_tab(n.id); return true end
+    end
+    if inside(mx, my, L.done.x, L.done.y, L.done.w, L.done.h) then
+        state.waiting = nil
+        engine.close_settings()
+        return true
+    end
+    if L.reset and inside(mx, my, L.reset.x, L.reset.y, L.reset.w, L.reset.h) then
+        engine.reset_keybinds()
+        state.waiting = nil
+        refresh()
+        return true
     end
 
-    for _, b in ipairs(L.buttons) do
-        if b.enabled ~= false and inside(mx, my, b.x, b.y, b.w, b.h) then
-            b.action()
-            return true
-        end
-    end
-
-    local items = current_items()
-    for row = 1, L.visible do
-        local item = items[row + state.scroll]
-        if not item then break end
-        local rx, ry, rw, rh = row_rect(L, row)
-        local wdg = row_widgets(L, item, rx, ry, rw, rh)
-
-        if wdg.field and inside(mx, my, wdg.field.x, wdg.field.y, wdg.field.w, wdg.field.h) then
-            state.editing = item
-            state.edit_text = item.secret and "" or tostring(item.value)
-            te.reset("settings")
-            te.focus("settings", state.edit_text)   -- caret at the end
-            state.waiting = nil
-            return true
-        elseif wdg.key and inside(mx, my, wdg.key.x, wdg.key.y, wdg.key.w, wdg.key.h) then
-            -- Click again to cancel
-            state.waiting = (state.waiting == item.action) and nil or item.action
-            return true
-        elseif wdg.toggle and inside(mx, my, wdg.toggle.x, wdg.toggle.y, wdg.toggle.w, wdg.toggle.h) then
-            local ok, err = set_value(item, (item.value ~= 0) and 0 or 1)
-            if ok == false then state.message = err end
-            refresh()
-            return true
-        elseif wdg.minus and inside(mx, my, wdg.minus.x, wdg.minus.y, wdg.minus.w, wdg.minus.h) then
-            local ok, err = set_value(item, item.value - item.step)
-            if ok == false then state.message = err end
-            refresh()
-            return true
-        elseif wdg.plus and inside(mx, my, wdg.plus.x, wdg.plus.y, wdg.plus.w, wdg.plus.h) then
-            local ok, err = set_value(item, item.value + item.step)
-            if ok == false then state.message = err end
-            refresh()
-            return true
+    for _, v in ipairs((visible(L))) do
+        local item = v.e.item
+        if item then
+            local w = widget(L, item, v.y, v.h)
+            local hit = inside(mx, my, w.x, w.y - 3 * L.S, w.w, w.h + 6 * L.S)
+            if hit and w.kind == "field" then
+                state.editing = item
+                state.edit_text = item.secret and "" or tostring(item.value)
+                te.reset("settings")
+                te.focus("settings", state.edit_text)
+                state.waiting = nil
+                return true
+            elseif hit and w.kind == "key" then
+                state.waiting = (state.waiting == item.action) and nil or item.action   -- click again to cancel
+                return true
+            elseif hit and w.kind == "switch" then
+                local ok, err = set_value(item, (item.value ~= 0) and 0 or 1)
+                if ok == false then state.message = err end
+                refresh()
+                return true
+            elseif hit and w.kind == "segments" then
+                local i = clamp(math.floor((mx - w.x) / w.seg) + 1, 1, #w.options)
+                local ok, err = set_value(item, w.options[i][2])
+                if ok == false then state.message = err end
+                refresh()
+                return true
+            elseif w.kind == "slider" and inside(mx, my, w.x - 6 * L.S, w.y - 3 * L.S, w.w + 12 * L.S, w.h + 6 * L.S) then
+                local val = slider_value(item, w, mx)
+                local ok, err = set_value(item, val)
+                if ok == false then state.message = err else item.value = val end
+                state.dragging = item.id            -- keeps following the mouse while held
+                state.waiting = nil
+                return true
+            end
         end
     end
 
@@ -555,11 +754,10 @@ end
 function handle_settings_scroll(dy)
     if dy > 0 then state.scroll = state.scroll - 1
     elseif dy < 0 then state.scroll = state.scroll + 1 end
-    if state.scroll < 0 then state.scroll = 0 end   -- upper bound clamped while rendering
+    if state.scroll < 0 then state.scroll = 0 end   -- upper bound clamped while drawing
 end
 
 function handle_settings_key(key, action, mods)
-    -- Typing a name
     if state.editing then
         if action ~= ui.actions.PRESS and action ~= ui.actions.REPEAT then return true end
         if key == ui.keys.ESCAPE then
@@ -572,8 +770,6 @@ function handle_settings_key(key, action, mods)
         end
         return true
     end
-
-    -- Capturing a key for a control
     if state.waiting then
         if action ~= ui.actions.PRESS then return true end
         if key == ui.keys.ESCAPE then

@@ -179,6 +179,7 @@ void BlockModifiers::report(const std::string& where, const std::string& message
 
 void BlockModifiers::update(float dt, World& world, const std::vector<glm::vec3>& players) {
     if (!m_lua || world.isRemote()) return;
+    World::NaturalChanges nature;   // ABMs, LBMs and random ticks: nature, not building
     resolve();
 
     // ---- LBMs: chunks that just arrived ----

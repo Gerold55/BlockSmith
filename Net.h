@@ -34,8 +34,28 @@ namespace net {
 constexpr uint16_t kDefaultPort      = 30000;
 constexpr uint32_t kProtocolVersion  = 8;   // 7: the server decides each player's game mode
                                             // 8: passwords by per-server challenge-response (Auth.h)
+// The oldest server protocol this game can still play on. A newer game may join an older server
+// (it speaks the older protocol), never the other way round. Raise it when support for an old
+// protocol is dropped.
+constexpr uint32_t kMinProtocolVersion = 8;
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
+
+// Mod messages (engine.send_to_server / send_to_player): a channel is a name of letters,
+// digits and _ : . - (a mod's name first: "hud", "minigame:score"), at most 64 long
+constexpr size_t kMaxModMessage           = 32 * 1024;  // bytes of text from the server
+constexpr size_t kMaxModMessageFromPlayer = 4 * 1024;   // ... and from a player
+constexpr double kModMessageBurst         = 40.0;       // from a player: this many at once,
+constexpr double kModMessageRate          = 20.0;       // then this many a second
+inline bool validModChannel(const std::string& c) {
+    if (c.empty() || c.size() > 64) return false;
+    for (const char ch : c) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                        ch == '_' || ch == ':' || ch == '.' || ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
 
 // Another player as this game sees them (positions are smoothed between updates).
 // Another player as this game sees them. Drawn 100 ms in the past, smoothly between the
@@ -216,6 +236,8 @@ public:
     std::string playerMode(const std::string& name) const;   // "" if not online
     bool setPlayerOperator(const std::string& name, bool op);
 
+    // The BlockSmith version a player joined with ("" = an older game that doesn't say)
+    std::string playerEngineVersion(const std::string& name) const;
     bool messagePlayer(const std::string& name, const std::string& text,
                        const glm::vec3& color = glm::vec3(1.0f, 1.0f, 0.4f));
     // The furthest any player may see, in chunks (they can choose less).
@@ -247,6 +269,13 @@ public:
     // the block is loaded and within their reach, at most 10 a second (with entity hits). The
     // server works out what happens from its own world (Lua: on_player_harvest).
     std::function<void(const std::string& name, const std::string& item, const glm::ivec3& pos)> onHarvest;
+    // Mod messages (Lua: engine.send_to_server / send_to_player): text on a named channel
+    // between the server's mods and a player's game. Data only - nothing in them is ever run.
+    // From a player: checked (net::validModChannel, size, at most kModMessageBurst at once and
+    // kModMessageRate a second), then onModMessage.
+    std::function<void(const std::string& name, const std::string& channel, const std::string& text)> onModMessage;
+    bool sendModMessage(const std::string& name, const std::string& channel, const std::string& text);
+    int sendModMessageToAll(const std::string& channel, const std::string& text);   // -> how many got it
     // Changes a block for a joined player with the same checks as their own edits: loaded,
     // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
     // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
@@ -280,6 +309,7 @@ private:
         std::string nonce;
         std::string helloName;
         int helloView = 8;
+        std::string engineVersion;    // their BlockSmith ("0.1-alpha"), "" from older games
         std::string mode;             // game mode the server gave them
         bool op = false;
         std::string name;
@@ -312,6 +342,7 @@ private:
         std::unordered_map<uint32_t, KnownEntity> knownEntities;
         double entityActWindow = 0.0;     // (hits / right-clicks / drops: at most 10 / 30 a second)
         int entityActs = 0, drops = 0;
+        double modTokens = net::kModMessageBurst, modRefillAt = 0.0;   // (mod messages: flood limit)
     };
     void sendEntities();
     EntityManager* m_entityManager = nullptr;
@@ -349,7 +380,7 @@ private:
     int m_maxView = net::kMaxViewDistance;
     std::string m_gameTitle;
     std::string m_motd = "A BlockSmith server";
-    int m_maxPlayers = 20;
+    int m_maxPlayers = 50;
     std::vector<uint8_t> m_icon;
     uint16_t m_nextId = 1;
     // LAN announcements ("Scanning for games on your local network" on other PCs)
@@ -474,6 +505,11 @@ public:
                       const glm::vec3* velocity = nullptr, float pickupDelay = -1.0f);
     // Used `item` on the block at pos (the scythe): the server decides what it does and yields
     void sendHarvest(const std::string& item, const glm::ivec3& pos);
+    // Mod messages (see GameServer::onModMessage): to the server's mods, and what its mods sent
+    // us since the last call, oldest first
+    bool sendModMessage(const std::string& channel, const std::string& text);
+    struct ModMessage { std::string channel, data; };
+    std::vector<ModMessage> takeModMessages() { std::vector<ModMessage> out; out.swap(m_modMessages); return out; }
 
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
@@ -485,6 +521,7 @@ private:
 
     std::vector<std::string> m_sharedChanges;
     std::vector<Action> m_actions;
+    std::vector<ModMessage> m_modMessages;
     std::string m_completeText, m_completeAsked;   // what the last answer / question was for
     std::vector<std::string> m_completeList;
     bool m_completeHave = false, m_completeArrived = false;
@@ -549,7 +586,9 @@ private:
 struct ServerStatus {
     enum class State { Pinging, Online, Offline } state = State::Pinging;
     std::string motd;
-    std::string version;         // the server's kVersionName
+    std::string version;         // the server's kVersionName (the protocol)
+    std::string engineVersion;   // the server's BlockSmith ("0.1-alpha"), "" from older servers
+    std::string engineCommit;    // ...and its commit
     std::string game;            // game folder the server is playing
     std::string gameTitle;       // that game's title (from its game.conf), "" from older servers
     int players = 0, maxPlayers = 0;

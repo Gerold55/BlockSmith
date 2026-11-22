@@ -39,6 +39,9 @@ public:
     // Looks up the block types caves use. carveChunk does this itself the first time, but
     // call it once before generating on several threads so they don't all do it at once.
     static void prepare();
+    // The blocks changed completely (the mods were loaded again): forget the block types and the
+    // settings mods gave
+    static void reset();
 
     // Carves caves into a freshly generated chunk.
     static void carveChunk(ChunkData& chunk, int chunkX, int chunkZ);

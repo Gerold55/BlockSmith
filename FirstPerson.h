@@ -30,15 +30,28 @@ public:
     void render(GLuint blockShader, GLuint modelShader, GLuint textureArray, int width, int height,
                 const glm::vec4& light, const std::shared_ptr<AnimatedModel>& playerModel, bool leftHanded);
 
+    // Third person (F5): the same block or item in the player model's hand, drawn in the world
+    // (`view` / `proj` = the world camera). `modelWorld` = where the player model is drawn. The
+    // hand is the bottom of the first bone in `rightHandBones` (or left) the model has.
+    void renderThirdPerson(GLuint blockShader, GLuint textureArray, const glm::mat4& view, const glm::mat4& proj,
+                           const glm::vec4& light, const std::shared_ptr<AnimatedModel>& playerModel,
+                           const glm::mat4& modelWorld, bool leftHanded);
+
     // Lua settings
     bool enabled = true;                         // engine.set_first_person_hand(false) hides it
+    bool showInThirdPerson = true;               // engine.set_third_person_item(false) hides it
+    std::vector<std::string> rightHandBones = { "lower_arm_right", "right_hand", "hand_right", "forearm_right",
+                                                "upper_arm_right", "right_arm", "arm_right", "rightArm", "RightArm", "arm_r" };
+    std::vector<std::string> leftHandBones  = { "lower_arm_left", "left_hand", "hand_left", "forearm_left",
+                                                "upper_arm_left", "left_arm", "arm_left", "leftArm", "LeftArm", "arm_l" };
     std::vector<std::string> rightArmBones = { "upper_arm_right", "right_arm", "arm_right", "rightArm", "RightArm", "arm_r" };
     std::vector<std::string> leftArmBones  = { "upper_arm_left", "left_arm", "arm_left", "leftArm", "LeftArm", "arm_l" };
     glm::vec3 skinColor{0.88f, 0.69f, 0.55f};    // the plain arm when the model has no arm bone
 
 private:
     void buildMesh(uint8_t id);
-    void drawVertices(GLuint shader, const glm::mat4& model, const glm::mat4& proj);
+    void drawVertices(GLuint shader, const glm::mat4& model, const glm::mat4& proj,
+                      const glm::mat4& view = glm::mat4(1.0f));
 
     float m_swing = -1.0f;       // 0..1 while swinging, -1 = not
     float m_equip = 1.0f;        // 0 = just switched (hand lowered), 1 = up

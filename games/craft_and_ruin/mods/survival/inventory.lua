@@ -62,13 +62,13 @@ local BIN = { x = 144, y = 60 }
 -- and the workbench (right-click a workbench block) with a 3x3 grid
 local SCREENS = {
     inventory = {
-        pictures = { "inventory.png", "survival_inventory.png" },
+        pictures = { "inventory.png", "survival_inventory.png", "inventory_survival.png" },
         grid_w = 2, grid_x = 72, grid_y = 26,
         output = { x = 140, y = 31, size = 24 },
         equipment = true, bin = true,
     },
     workbench = {
-        pictures = { "workbench_gui.png", "survival_workbench.png" },
+        pictures = { "workbench_gui.png", "survival_workbench.png", "inventory_workbench.png" },
         grid_w = 3, grid_x = 30, grid_y = 17,
         output = { x = 124, y = 32, size = 24 },
         title = "Crafting",

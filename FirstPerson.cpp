@@ -127,9 +127,13 @@ void FirstPersonView::buildMesh(uint8_t id) {
                 vert( 0.5f,  0.5f, 0, 1, 0, color, static_cast<float>(layer), -1, tint, false, 1.0f),
                 vert(-0.5f,  0.5f, 0, 0, 0, color, static_cast<float>(layer), -1, tint, false, 1.0f),
             };
+            // The two sides a hair apart (front facing +z, back facing -z): on the same plane they
+            // fought over which one shows, and the item flickered as the hand moved
+            constexpr float kSideGap = 0.004f;
+            for (Vertex& v : q) v.posZ = kSideGap;
             pushQuad(verts, q);
             Vertex back[4] = { q[1], q[0], q[3], q[2] };
-            for (Vertex& v : back) v.faceShading = 0.8f;
+            for (Vertex& v : back) { v.faceShading = 0.8f; v.posZ = -kSideGap; }
             pushQuad(verts, back);
         } else {
             // A block: a little cube with its own textures
@@ -162,10 +166,10 @@ void FirstPersonView::buildMesh(uint8_t id) {
     m_vertexCount = static_cast<int>(verts.size());
 }
 
-void FirstPersonView::drawVertices(GLuint shader, const glm::mat4& model, const glm::mat4& proj) {
+void FirstPersonView::drawVertices(GLuint shader, const glm::mat4& model, const glm::mat4& proj, const glm::mat4& view) {
     glUseProgram(shader);
     glUniformMatrix4fv(glGetUniformLocation(shader, "model"), 1, GL_FALSE, glm::value_ptr(model));
-    glUniformMatrix4fv(glGetUniformLocation(shader, "view"), 1, GL_FALSE, glm::value_ptr(glm::mat4(1.0f)));
+    glUniformMatrix4fv(glGetUniformLocation(shader, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(shader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
     glBindVertexArray(m_vao);
     glDrawArrays(GL_TRIANGLES, 0, m_vertexCount);
@@ -285,4 +289,61 @@ void FirstPersonView::render(GLuint blockShader, GLuint modelShader, GLuint text
         }
     }
     glClear(GL_DEPTH_BUFFER_BIT);   // the HUD draws on top without fighting the hand
+}
+
+void FirstPersonView::renderThirdPerson(GLuint blockShader, GLuint textureArray, const glm::mat4& view,
+                                        const glm::mat4& proj, const glm::vec4& light,
+                                        const std::shared_ptr<AnimatedModel>& playerModel,
+                                        const glm::mat4& modelWorld, bool leftHanded) {
+    if (!showInThirdPerson || m_held == 0 || !playerModel || !playerModel->loaded) return;
+
+    // The hand: the bottom middle of the forearm's cubes (the bone's own pivot if it has none),
+    // moved with the bone as the animations pose it
+    glm::mat4 arm(1.0f);
+    std::shared_ptr<Bone> bone;
+    for (const std::string& name : leftHanded ? leftHandBones : rightHandBones) {
+        if (playerModel->boneMatrix(name, modelWorld, arm)) { bone = playerModel->getBone(name); break; }
+    }
+    if (!bone) return;
+    glm::vec3 hand = bone->pivot;
+    if (bone->hasBounds) {
+        const glm::vec3 c = (bone->boundsMin + bone->boundsMax) * 0.5f;
+        hand = glm::vec3(c.x, bone->boundsMin.y, c.z);
+    }
+
+    if (m_meshFor != m_held || m_vao == 0) buildMesh(m_held);
+
+    // In the arm's own frame: down the arm is -Y and the model's front is -Z, as it hangs at rest
+    glm::mat4 m = arm * glm::translate(glm::mat4(1.0f), hand);
+    if (m_meshIsFlat) {
+        // Like Minecraft: the picture stands on its edge beside the hand, the handle in the fist
+        // and the tip pointing forward and a little up
+        m = glm::translate(m, glm::vec3(0.0f, -0.0625f, -0.06f));
+        m = glm::rotate(m, glm::radians(180.0f), glm::vec3(0, 1, 0));   // the head end to the front
+        m = glm::rotate(m, glm::radians(-70.0f), glm::vec3(1, 0, 0));   // picture's up -> forward
+        m = glm::rotate(m, glm::radians(90.0f), glm::vec3(0, 1, 0));    // seen from the side
+        m = glm::rotate(m, glm::radians(45.0f), glm::vec3(0, 0, 1));    // its diagonal along the arm
+        m = glm::scale(m, glm::vec3(0.55f));
+        m = glm::translate(m, glm::vec3(0.25f, 0.25f, 0.0f));           // the handle end in the hand
+    } else {
+        // A block: a small cube held in the fist, turned a little
+        m = glm::translate(m, glm::vec3(0.0f, -0.09f, -0.06f));
+        m = glm::rotate(m, glm::radians(45.0f), glm::vec3(0, 1, 0));
+        m = glm::scale(m, glm::vec3(0.3f));
+    }
+
+    glUseProgram(blockShader);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, textureArray);
+    glUniform1i(glGetUniformLocation(blockShader, "textureArray"), 0);
+    glUniform1i(glGetUniformLocation(blockShader, "u_IsGUI"), 0);
+    glUniform1i(glGetUniformLocation(blockShader, "u_Unlit"), 0);
+    glUniform1i(glGetUniformLocation(blockShader, "u_VoxelLight"), 0);
+    glUniform4f(glGetUniformLocation(blockShader, "u_FallbackLight"), light.x, light.y, light.z, light.w);
+    glUniform1f(glGetUniformLocation(blockShader, "u_ChunkFade"), 1.0f);
+    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    drawVertices(blockShader, m, proj, view);
+    if (cullWas) glEnable(GL_CULL_FACE);
 }

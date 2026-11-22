@@ -55,6 +55,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [C19. A client mod: light level and coordinates](#c19-a-client-mod-light-level-and-coordinates)
    - [C20. A rearrangeable inventory (drag and drop)](#c20-a-rearrangeable-inventory-drag-and-drop)
    - [C21. A laptop with its own desktop (windows)](#c21-a-laptop-with-its-own-desktop-windows)
+   - [C22. A minigame HUD: timers, scoreboards and titles](#c22-a-minigame-hud-timers-scoreboards-and-titles)
 3. [Part 3: Reference](#part-3-reference)
    - [Function index](#function-index): every function and hook, A to Z per table
    - [1. Folders](#1-folders)
@@ -97,7 +98,7 @@ BlockSmith is split in two:
 When you start a world, this happens in order:
 
 1. The engine starts with no blocks and no rules.
-2. It runs the **global mods** in `mods/`, in alphabetical order by folder name.
+2. It runs the **global mods** in `mods/` that are switched on for this world (see [Which mods a world runs](#which-mods-a-world-runs)), in alphabetical order by folder name.
 3. It runs the **game's mods** in `games/<game>/mods/`, also alphabetically.
    - Folder names are sorted the same way on every computer, ignoring capitals.
    - Mods with an `init.lua` run first, then single-file mods (a loose `something.lua` in `mods/`).
@@ -113,6 +114,21 @@ A mod's code runs at two different times, and it matters which one you're in:
 | **Run time:** inside hooks the engine calls later | *React* to things: a click, a frame, a new chunk | `function on_update(dt) ... end` |
 
 > **Rule of thumb:** register at load time, act at run time. Calling `engine.set_block` at the top level of your file does nothing useful, because there's no world yet.
+
+<a id="which-mods-a-world-runs"></a>
+### Which mods a world runs
+
+Like Luanti, each world has its own mod list; like Minecraft, a game sets the defaults for its worlds.
+
+- **A game's own mods** (`games/<game>/mods/`) always run with that game.
+- **Mods in the `mods/` folder** run only where they're switched on:
+  - **For a game:** tick it on the **Mods** screen on the title screen. Every world of that game runs it, unless the world chose otherwise. Saved in `mods/game_mods_<game>.txt`.
+  - **For one world:** pick the world under **Singleplayer** and click **Mods**. Tick or untick mods for that world alone; **Use Game's Mods** clears its own choices. Saved in `saves/<world>/world_mods.txt`. A mod the world doesn't mention follows the game.
+  - A mod neither list mentions is **off**, so installing a new mod changes no world until you switch it on.
+  - `base`, and any mod whose `mod.conf` says `required = true`, always runs.
+- **No restart.** Opening a world whose mods (or game) differ from the ones loaded reloads everything behind the loading screen, then opens the world. All mods start again from scratch, exactly as at startup: the Lua state, blocks, items, textures, sounds and entities are made anew, so a mod needs nothing special to support it. Worlds save blocks by name, so a world opened with a mod missing just shows air where its blocks were.
+- Upgrading from an older BlockSmith: the first time a game's list is needed it starts from `mods/mod_settings.txt` (every mod on unless switched off there), so existing worlds keep the mods they had.
+- Client mods (`clientmods/`) are separate: they're yours, not the world's (see [L10](#l10-client-mods-scripts-for-your-own-game)).
 
 ## L2. Your first mod, step by step
 
@@ -358,7 +374,7 @@ function ruby.is_gem(name) return name == "ruby_block" or name == "ruby" end
 if survival then survival.register_food("ruby_candy", 2) end
 ```
 
-Mods that come with BlockSmith offer `survival`, `survival.inventory`, `weather`, `doors`, `buckets`, `leafdecay` and `default_sounds`. `lua_api.txt` lists every table your loaded mods offer.
+The engine itself offers no gameplay tables: they come from whichever game and mods are loaded. Craft & Ruin's own mods (`games/craft_and_ruin/mods/`) offer `survival`, `survival.inventory`, `weather`, `doors`, `leafdecay` and `default_sounds`. The example `buckets` mod in the `mods/` folder offers `buckets`. Another game may offer none of these, so check before using one (`if survival then ... end`). `lua_api.txt` lists every table your loaded mods offer.
 
 **Saving data with the world.** `engine.set_storage(key, text)` and `engine.get_storage(key)` keep text with the world, the same idea as Luanti's mod storage. Store numbers and lists as text:
 
@@ -440,7 +456,7 @@ In singleplayer there are no limits. A LAN host has no limits either, and the fr
 
 > **Honest games only.** The server can't see what runs in your game, so it can't *force* these rules. Like Luanti's, they're kept by the game itself, which stops honest client mods from becoming accidental cheats. Servers that need real protection must check things on the server, as BlockSmith already does for digging and game modes.
 
-The complete client API is in [Reference §20](#20-client-mods). `clientmods/minimap` comes with BlockSmith and is a complete example. Switch it on on the Mods screen, then press **M** to show or hide it, and use `.wp add home` to set a waypoint.
+The complete client API is in [Reference §20](#20-client-mods). The example client mod `clientmods/minimap` is a complete one to copy from. Switch it on on the Mods screen, then press **M** to show or hide it, and use `.wp add home` to set a waypoint.
 
 ## L11. Screens and menus: how BlockSmith UI works
 
@@ -876,6 +892,7 @@ end
 - `W` and `H` are the window's size in pixels. Place things relative to them so the HUD fits any window.
 - To place something next to the hotbar, `local bx, by, bw, bh = hotbar.get_rect(W, H)`.
 - Pictures: `ui.draw_image("compass.png", x, y, 32, 32)`. Look up its path while your mod loads, as in [L6](#l6-pictures-sounds-and-models-how-files-are-found).
+- For timers, scoreboards and titles a **server** shows to its players, use the `hud` library instead: [C22](#c22-a-minigame-hud-timers-scoreboards-and-titles).
 
 ## C12. Your own screen
 
@@ -1078,11 +1095,13 @@ entities.register_spawn({ name = "mymod:cow", on = { "grass" }, min_light = 9, s
 - **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, bumping into each other and into players (overlapping mobs are nudged apart, as in Minecraft), jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
 - **Each cow animates on its own.** Animations play from when you set them, so cows walk out of step.
 - **Spawn one yourself:** `entities.spawn("mymod:cow", x, y, z)`.
-- The `mobs` mod that comes with BlockSmith has a full cow and a zombie (one that chases you and burns in the sun) to copy from. Everything is in [Reference §13a](#13a-mobs-and-other-entities).
+- The example `mobs` mod in the `mods/` folder has a full cow and a zombie (one that chases you and burns in the sun) to copy from. Everything is in [Reference §13a](#13a-mobs-and-other-entities).
 
 ## C15. Your own terrain
 
 A complete world generator: rolling grass hills, sand beaches and a sea. It replaces the game's terrain, so put it in a new game, or in a mod that loads after the game's terrain mod.
+
+For a much bigger example, read Craft & Ruin's own generator, `games/craft_and_ruin/mods/terrain_gen/mapgen.lua`. Smooth noise picks each column's continentalness, erosion, temperature and humidity, and the biome follows from those. Its biomes are oceans, beaches, rivers, plains, forests, birch forests, taiga, snowy plains and taiga, hills, mountains with snowy peaks, savannas, deserts, badlands mesas, jungles, swamps and basalt hills. The basalt hills are volcanoes with their tops blown off, a lava pool in the crater and a lava river down one side. While that game runs, other mods can call `get_biome(x, z)` (the biome's name), `get_surface_height(x, z)` and `find_volcano(x, z)` (the nearest volcano's `x, z`, rim height and radius, or nil).
 
 ```lua
 local SEA = 62
@@ -1498,6 +1517,65 @@ Ideas: a file manager (icons + [drag and drop](#drag-and-drop) onto folder icons
 
 ---
 
+## C22. A minigame HUD: timers, scoreboards and titles
+
+A round of "last one standing": a countdown everyone sees, a deaths scoreboard, a big title when the round starts, and a line above the hotbar for each death. It runs wherever the world is: the dedicated server, or your game in singleplayer and when hosting. **Players need nothing of their own**: the `hud` library is part of the base mod, so their games draw what the server sends.
+
+```lua
+-- mods/last_standing/init.lua
+local deaths = {}
+
+local function scoreboard()
+    local lines = {}
+    for name, n in pairs(deaths) do lines[#lines + 1] = { name, n } end
+    hud.sidebar("*", "Deaths", lines, { sort = "asc" })      -- "*" = everyone
+end
+
+local function start_round()
+    deaths = {}
+    for _, p in ipairs(engine.get_online_players()) do deaths[p.name] = 0 end
+    scoreboard()
+    hud.title("*", "Round start!", "Die the least to win", { color = "#ffcc33" })
+    hud.timer("*", "round", 300, {
+        label = "Round ends in",
+        on_done = function()                              -- runs here, on the server
+            local best, fewest = nil, math.huge
+            for name, n in pairs(deaths) do if n < fewest then best, fewest = name, n end end
+            hud.title("*", (best or "Nobody") .. " wins!", fewest .. " deaths", { duration = 6 })
+            hud.hide("*", "round")
+        end,
+    })
+end
+
+chat.register_command("round", "/round", "Starts a round")
+local prev_cmd = on_chat_command
+function on_chat_command(text, player, is_operator, reply, ...)
+    if text == "round" then
+        if is_operator then start_round() elseif reply then reply("Only operators can start a round.") end
+        return true
+    end
+    if prev_cmd then return prev_cmd(text, player, is_operator, reply, ...) end
+    return false
+end
+
+-- Craft & Ruin's survival mod tells the server when a player dies
+local prev_death = on_player_death
+function on_player_death(name, reason, ...)
+    if deaths[name] then
+        deaths[name] = deaths[name] + 1
+        scoreboard()
+        hud.actionbar(name, "Deaths: " .. deaths[name])  -- only them
+    end
+    if prev_death then return prev_death(name, reason, ...) end
+end
+```
+
+- **Who sees it:** the first argument is a player's name, a list of names (`{ "Alex", "Sam" }`), or `"*"` for everyone. Pieces shown to everyone are remembered, so a player who joins in the middle of a round sees the timer with the right time left.
+- **Changing a piece:** `hud.update("*", "round", { label = "Overtime!" })` changes only those fields; `hud.hide(who, id)` removes one, `hud.clear(who)` removes all of them.
+- **Timers count down by themselves** in each player's game: the server sends a timer once, not every second. `on_done` runs on the server when it reaches 0.
+- **Your own look:** every kind of piece is drawn by Lua you can replace or add to; see [14.8](#148-hud-pieces-from-the-server-hud).
+- **Deaths:** `on_player_death(name, reason)` comes from Craft & Ruin's survival mod (each player's game works out its own health and tells the server). Another game can do the same with [mod messages](#mod-messages-between-the-server-and-players-games).
+
 # Part 3: Reference
 
 Every function, grouped by what it's for. Each section is complete on its own, so you can jump straight in from the index.
@@ -1508,8 +1586,8 @@ Type in the search box (in `MODDING.html`) or use your browser's find (Ctrl+F) t
 
 Every function and hook, by table, each linking to where it's explained. `lua_api.txt` (written by the engine at startup) lists what your build has.
 
-**engine** (131)  
-[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.player_set_block`](#fn-engine-player_set_block) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.request_harvest`](#fn-engine-request_harvest) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
+**engine** (134)  
+[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_description`](#fn-engine-get_block_description) · [`engine.set_block_name_display`](#fn-engine-set_block_name_display) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.get_camera_mode`](#fn-engine-get_camera_mode) · [`engine.set_camera_mode`](#fn-engine-set_camera_mode) · [`engine.set_player_look`](#fn-engine-set_player_look) · [`engine.get_player_look`](#fn-engine-get_player_look) · [`engine.set_hud_visible`](#fn-engine-set_hud_visible) · [`engine.is_hud_visible`](#fn-engine-is_hud_visible) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.get_world_mods`](#fn-engine-get_world_mods) · [`engine.set_world_mod`](#fn-engine-set_world_mod) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.player_set_block`](#fn-engine-player_set_block) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.request_harvest`](#fn-engine-request_harvest) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.send_to_all`](#fn-engine-send_to_all) · [`engine.send_to_player`](#fn-engine-send_to_player) · [`engine.send_to_server`](#fn-engine-send_to_server) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_third_person_item`](#fn-engine-set_third_person_item) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
 
 **remote** (8)  
 [`remote.check_url`](#fn-remote-check_url) · [`remote.fetch`](#fn-remote-fetch) · [`remote.get_cached`](#fn-remote-get_cached) · [`remote.is_available`](#fn-remote-is_available) · [`remote.null`](#fn-remote-null) · [`remote.refresh`](#fn-remote-refresh) · [`remote.unwatch`](#fn-remote-unwatch) · [`remote.watch`](#fn-remote-watch)
@@ -1525,6 +1603,9 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 
 **ui** (37)  
 [`ui.draw_block_icon`](#fn-ui-draw_block_icon) · [`ui.draw_button`](#fn-ui-draw_button) · [`ui.draw_circle`](#fn-ui-draw_circle) · [`ui.draw_gradient`](#fn-ui-draw_gradient) · [`ui.draw_image`](#fn-ui-draw_image) · [`ui.draw_line`](#fn-ui-draw_line) · [`ui.draw_pie`](#fn-ui-draw_pie) · [`ui.draw_polygon`](#fn-ui-draw_polygon) · [`ui.draw_rect`](#fn-ui-draw_rect) · [`ui.draw_rect_outline`](#fn-ui-draw_rect_outline) · [`ui.draw_ring`](#fn-ui-draw_ring) · [`ui.draw_rounded_rect`](#fn-ui-draw_rounded_rect) · [`ui.draw_server_icon`](#fn-ui-draw_server_icon) · [`ui.draw_text`](#fn-ui-draw_text) · [`ui.draw_triangle`](#fn-ui-draw_triangle) · [`ui.get_all_blocks`](#fn-ui-get_all_blocks) · [`ui.get_block_info`](#fn-ui-get_block_info) · [`ui.get_button_text_color`](#fn-ui-get_button_text_color) · [`ui.get_clipboard`](#fn-ui-get_clipboard) · [`ui.get_image_size`](#fn-ui-get_image_size) · [`ui.get_key_events`](#fn-ui-get_key_events) · [`ui.get_mouse`](#fn-ui-get_mouse) · [`ui.get_mouse_events`](#fn-ui-get_mouse_events) · [`ui.get_mouse_pos`](#fn-ui-get_mouse_pos) · [`ui.get_scroll`](#fn-ui-get_scroll) · [`ui.get_time`](#fn-ui-get_time) · [`ui.get_typed_text`](#fn-ui-get_typed_text) · [`ui.is_key_down`](#fn-ui-is_key_down) · [`ui.is_mouse_down`](#fn-ui-is_mouse_down) · [`ui.keys`](#fn-ui-keys) · [`ui.mods`](#fn-ui-mods) · [`ui.pop_clip`](#fn-ui-pop_clip) · [`ui.push_clip`](#fn-ui-push_clip) · [`ui.set_clipboard`](#fn-ui-set_clipboard) · [`ui.set_cursor`](#fn-ui-set_cursor) · [`ui.text_height`](#fn-ui-text_height) · [`ui.text_width`](#fn-ui-text_width)
+
+**hud** (21, mods/base/hud.lua)  
+[`hud.actionbar`](#fn-hud-actionbar) · [`hud.bossbar`](#fn-hud-bossbar) · [`hud.clear`](#fn-hud-show) · [`hud.decode`](#fn-hud-encode) · [`hud.encode`](#fn-hud-encode) · [`hud.get`](#fn-hud-get) · [`hud.hide`](#fn-hud-hide) · [`hud.hide_here`](#fn-hud-show_here) · [`hud.image`](#fn-hud-image) · [`hud.is_visible`](#fn-hud-set_visible) · [`hud.list`](#fn-hud-get) · [`hud.register_type`](#fn-hud-register_type) · [`hud.set_visible`](#fn-hud-set_visible) · [`hud.show`](#fn-hud-show) · [`hud.show_here`](#fn-hud-show_here) · [`hud.shown`](#fn-hud-shown) · [`hud.sidebar`](#fn-hud-sidebar) · [`hud.style`](#fn-hud-style) · [`hud.text`](#fn-hud-text) · [`hud.timer`](#fn-hud-timer) · [`hud.title`](#fn-hud-title) · [`hud.update`](#fn-hud-update)
 
 **hotbar** (17)  
 [`hotbar.get_active_slot`](#fn-hotbar-get_active_slot) · [`hotbar.get_rect`](#fn-hotbar-get_rect) · [`hotbar.get_size`](#fn-hotbar-get_size) · [`hotbar.get_slot_block`](#fn-hotbar-get_slot_block) · [`hotbar.get_slot_count`](#fn-hotbar-get_slot_count) · [`hotbar.get_slot`](#fn-hotbar-get_slot) · [`hotbar.is_creative_open`](#fn-hotbar-is_creative_open) · [`hotbar.set_active_slot`](#fn-hotbar-set_active_slot) · [`hotbar.set_creative_open`](#fn-hotbar-set_creative_open) · [`hotbar.set_position`](#fn-hotbar-set_position) · [`hotbar.set_selected_texture`](#fn-hotbar-set_selected_texture) · [`hotbar.set_size`](#fn-hotbar-set_size) · [`hotbar.set_slot_size`](#fn-hotbar-set_slot_size) · [`hotbar.set_slot`](#fn-hotbar-set_slot) · [`hotbar.set_texture_scale`](#fn-hotbar-set_texture_scale) · [`hotbar.set_texture`](#fn-hotbar-set_texture) · [`hotbar.toggle_creative`](#fn-hotbar-toggle_creative)
@@ -1560,10 +1641,10 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`chunk:get_block`](#fn-chunk-get_block) · [`chunk:get_metadata`](#fn-chunk-get_metadata) · [`chunk:set_block`](#fn-chunk-set_block) · [`chunk:set_block_with_meta`](#fn-chunk-set_block_with_meta) · [`chunk:set_metadata`](#fn-chunk-set_metadata) · [`chunk:set_tint`](#fn-chunk-set_tint)
 
 **model, bone and animation objects** (12)  
-[`model:get_bone`](#fn-model-get_bone) · [`model:reset_pose`](#fn-model-reset_pose) · [`bone:get_rotation`](#fn-bone-get_rotation) · [`bone:set_position`](#fn-bone-set_position) · [`bone:set_rotation`](#fn-bone-set_rotation) · [`anims:get`](#fn-animationset-get) · [`anims:names`](#fn-animationset-names) · [`anim:apply`](#fn-animation-apply) · [`anim:get_length`](#fn-animation-get_length) · [`anim:get_name`](#fn-animation-get_name) · [`anim:is_looping`](#fn-animation-is_looping) · [`anim:set_loop`](#fn-animation-set_loop)
+[`model:get_bone`](#fn-model-get_bone) · [`model:reset_pose`](#fn-model-reset_pose) · [`model:is_loaded`](#fn-model-is_loaded) · [`bone:get_rotation`](#fn-bone-get_rotation) · [`bone:set_position`](#fn-bone-set_position) · [`bone:set_rotation`](#fn-bone-set_rotation) · [`anims:get`](#fn-animationset-get) · [`anims:names`](#fn-animationset-names) · [`anim:apply`](#fn-animation-apply) · [`anim:get_length`](#fn-animation-get_length) · [`anim:get_name`](#fn-animation-get_name) · [`anim:is_looping`](#fn-animation-is_looping) · [`anim:set_loop`](#fn-animation-set_loop)
 
-**Hooks (functions you define)** (36)  
-[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`can_pick_up_item`](#fn-hooks-can_pick_up_item) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_player_drop`](#fn-hooks-on_player_drop) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_harvest`](#fn-hooks-on_player_harvest) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
+**Hooks (functions you define)** (39)  
+[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`can_pick_up_item`](#fn-hooks-can_pick_up_item) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_player_drop`](#fn-hooks-on_player_drop) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_mod_message`](#fn-hooks-on_mod_message) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_death`](#fn-hooks-on_player_death) · [`on_player_harvest`](#fn-hooks-on_player_harvest) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_message`](#fn-hooks-on_server_message) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
 
 **weather (mods/weather)** (11)  
 [`weather.get`](#fn-weather-get) · [`weather.get_def`](#fn-weather-get_def) · [`weather.is_cold`](#fn-weather-is_cold) · [`weather.is_cycling`](#fn-weather-is_cycling) · [`weather.list`](#fn-weather-list) · [`weather.on_change`](#fn-weather-on_change) · [`weather.on_lightning`](#fn-weather-on_lightning) · [`weather.register`](#fn-weather-register) · [`weather.set`](#fn-weather-set) · [`weather.set_cycle`](#fn-weather-set_cycle) · [`weather.time_left`](#fn-weather-time_left)
@@ -1613,7 +1694,7 @@ mods/                           global mods: loaded with any game, can be switch
 texturepacks/
   MyPack/pack.conf              any image with the same file name replaces a game texture
 saves/<world>/                  worlds
-servers/<profile>/              dedicated server setups (made with My Servers)
+servers/<profile>/              dedicated server setups (engine.create_server_profile)
 ```
 
 **How a mod's files run:**
@@ -1717,6 +1798,7 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 | `gravity` | false | falls like sand: with nothing solid below, it drops smoothly (speeding up, as in Minecraft) and lands on the first solid block. It falls through air, fluids and things you walk through (grass, flowers, torches are crushed). See [`world.get_falling_blocks`](#fn-world-get_falling_blocks). |
 | `tint` | false | tint all faces with r, g, b |
 | `in_creative` | true | listed in the creative inventory |
+| `description` | made from the name | the name players see, like Luanti's: `"Oak Log"`. It's shown above the hotbar for a moment when it's picked, in the inventory, and in `/give`'s answer. Without one, `log_oak` shows as "Log Oak". |
 | `inventory_image` | none | shows a flat picture in the inventory and hotbar. The block becomes an **item**: right-click never places it |
 | `pick` | the block itself | what [pick block](#pick-block) gives for this block, e.g. `"wheat_seeds"` for a crop, or `"ruby_lamp"` for a lit lamp |
 
@@ -1856,6 +1938,21 @@ function generate_chunk(chunk, cx, cz) -- every new chunk (16 x 256 x 16)
     end
 end
 ```
+
+<a id="terrain-version"></a>**When you change the terrain: `terrain_version`.** Set a global number in your world generator, and raise it whenever the terrain it makes changes (heights, biomes, rivers...):
+
+```lua
+terrain_version = 2   -- 1: first version; 2: smoother hills
+```
+
+Saved chunks remember which version made them, and whether anything but nature changed them since. A player digging or building, a bucket, a mod placing a structure: all of those count as building in it. Flowing fluids, falling blocks, ABMs, LBMs and random ticks (grass spreading, leaves decaying, crops growing) don't. When a world opens, a saved chunk **nobody built in** that an **older version** made is generated again, so old terrain doesn't stand next to new as steps and pits. A chunk anyone built in is always kept exactly as it was. Chunks saved before the engine recorded this (BlockSmith 0.1-alpha) are kept too. Without `terrain_version`, nothing is ever regenerated.
+
+**Opening another world in the same session.** `set_world_seed` is called again with the new
+seed. The background threads start from fresh copies of your mods for it, but the main thread's
+copy (it makes the chunks around the spawn and answers `get_grass_color`, `get_biome` and so
+on) carries on. So if you keep anything worked out from the seed (a cache of where structures
+or volcanoes are, a noise table), clear it in `set_world_seed`, or the new world's chunks won't
+match each other.
 
 **If `set_world_seed` raises an error.** New terrain is never generated without a seed: those
 chunks wait. The world generator runs on background threads, each with its own copy of your
@@ -2208,9 +2305,42 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
 - <a id="fn-underwater-set_full_depth"></a><a id="fn-underwater-set_visibility"></a>`underwater.set_visibility(shallow_blocks, deep_blocks)`, `set_full_depth(blocks)`
 - <a id="fn-underwater-set_fade"></a><a id="fn-underwater-set_tint_strength"></a>`underwater.set_fade(in_seconds, out_seconds)`, `set_tint_strength(0..1)`. The tint colours everything like the water, however close, so a small pool looks underwater too. The fog only shows on things far away. The default strength is 0.42.
 
+<a id="particles"></a>**Particles** (Minecraft style). The engine makes these on its own:
+- **Blocks:** bits when a block breaks (also when another player breaks one), and chips flying off the face you're digging.
+- **Movement:** dust kicked up while sprinting, and a puff when you land from a fall (more the harder you land).
+- **Water:** a splash when you drop in, and bubbles while your head is under.
+- **Mobs:** crit sparks bursting round a mob when it's hit, and a white "poof" when one dies.
+
+The pictures are part of Craft & Ruin's `core_blocks` (`games/craft_and_ruin/mods/core_blocks/textures/`: `particle_smoke_0.png` to `particle_smoke_7.png`, `particle_flame.png`, `_lava`, `_spark`, `_bubble`, `_splash`, `_drip`, `_crit`, `_heart`, `_happy`, `_note`), so a texture pack can replace them, and another game can ship its own with the same names. `core_blocks/particles.lua` also gives blocks effects of their own: torches flicker and smoke, lava pops, leaves drift down, and water drips through ceilings. Particles are drawn by each player's game only: they're lit by the light where they are (coloured light too) unless they glow, and fog and the underwater tint apply to them.
+
+<a id="fn-particles-spawn"></a>`particles.spawn{ ... }` makes some. Everything but `pos` and a picture is optional:
+
+```lua
+particles.spawn{
+    pos = { x, y, z },
+    velocity = { 0, 1, 0 },        -- blocks a second
+    gravity = 12,                  -- or acceleration = { x, y, z }
+    drag = 0,                      -- speed lost a second (air resistance)
+    life = 1, size = 0.1, size_end = 0.03,          -- seconds, blocks across
+    color = "#ff8800", color_end = { 0.2, 0.2, 0.2 },
+    texture = "particle_flame.png",                 -- or { frames... } played over its life
+    -- block = "stone",            -- instead of a texture: bits of that block
+    glow = false,                  -- full bright, whatever the light
+    collide = true, bounce = false,                 -- stop on (or bounce off) blocks
+    amount = 1, spread = { 0.3, 0, 0.3 }, velocity_spread = { 1, 1, 1 },   -- several, scattered
+}
+```
+
+<a id="fn-particles-add_spawner"></a><a id="fn-particles-remove_spawner"></a>`particles.add_spawner{ ... }` keeps making them: the same fields, plus `rate` (per second), `time` (seconds, 0 means until removed), `follow_player`, and `life` and `size` as `{ min, max }`. It returns an id for `particles.remove_spawner(id)`.
+
+<a id="fn-particles-register_ambient"></a>`particles.register_ambient{ nodenames = { "mymod:candle" }, action = function(x, y, z, block) ... end }` is Minecraft's "animate tick". Each frame, random blocks near the player are looked at, roughly 3 times a second for each block within 16. For the listed kinds, `action` runs and can spawn particles (a candle's flame, a cauldron's bubbles). Use `math.random` in it to make effects rarer.
+
+<a id="fn-particle_effects"></a>Ready-made effects from `core_blocks/particles.lua`: `particle_effects.hearts(x, y, z)`, `.happy`, `.smoke`, `.flame`, `.notes`, `.sparks`.
+
 <a id="fn-hooks-get_water_color"></a>Define `get_water_color(x, z)` to return `{ r, g, b, deep_r, deep_g, deep_b }` per place, for example by biome.
 
-<a id="fn-engine-is_third_person"></a><a id="fn-engine-set_fov"></a>**Camera:** `engine.set_fov(degrees)`, `engine.is_third_person()`
+<a id="fn-engine-is_third_person"></a><a id="fn-engine-set_fov"></a><a id="fn-engine-get_camera_mode"></a><a id="fn-engine-set_camera_mode"></a>**Camera:** `engine.set_fov(degrees)`, `engine.is_third_person()` (true behind or in front). F5 cycles like Minecraft: first person, then behind the player, then in front of them looking back (no crosshair in that view). `engine.get_camera_mode()` returns `"first"`, `"back"` or `"front"`. `engine.set_camera_mode(mode)` switches to one of those and returns false for any other name.
+<a id="fn-engine-set_player_look"></a><a id="fn-engine-get_player_look"></a><a id="fn-engine-set_hud_visible"></a><a id="fn-engine-is_hud_visible"></a>`engine.set_player_look(yaw, pitch)` turns the player's view, in degrees: yaw −90 looks north (−Z), 0 east (+X); pitch 90 is straight up, kept within ±89.9. `engine.get_player_look()` returns `yaw, pitch`. **F1** hides the HUD, crosshair and hand for screenshots, like Minecraft. `engine.set_hud_visible(on)` and `engine.is_hud_visible()` do the same from a mod.
 
 ## 10. Light
 
@@ -2418,9 +2548,14 @@ engine.remove_model(id)
 
 **Moving bones:**
 - <a id="fn-model-get_bone"></a>`model:get_bone(name)` returns a bone, or nil.
-- <a id="fn-bone-set_rotation"></a><a id="fn-bone-get_rotation"></a>`bone:set_rotation(x, y, z)` / `bone:get_rotation()`: degrees, relative to the model file's pose.
+- <a id="fn-bone-set_rotation"></a><a id="fn-bone-get_rotation"></a>`bone:set_rotation(x, y, z)` / `bone:get_rotation()`: degrees, relative to the model file's pose. For a Blockbench/Bedrock model these are Blockbench's numbers and behave exactly as Blockbench shows them:
+  - an arm or leg at -X swings forward;
+  - a knee (lower leg) at +X bends back, and an elbow (lower arm) at -X bends forward;
+  - a head or body at +X leans or looks down;
+  - the right arm goes out to the side at +Z, the left at -Z.
 - <a id="fn-bone-set_position"></a>`bone:set_position(x, y, z)`: an offset from where the model file puts the bone, in the model's own coordinates, so the model's scale applies to it. For a Blockbench/Bedrock `.json` model, 1 is one block (its cubes' pixels are already divided by 16). For a `.b3d` model it's the file's units, shrunk by the model's scale (0.1 by default, so 10 units = 1 block). `model:reset_pose()` sets it back to 0; the file's own positions are never lost.
 - <a id="fn-model-reset_pose"></a>`model:reset_pose()` puts every bone back to the model file's pose.
+- <a id="fn-model-is_loaded"></a>`model:is_loaded()` is false when the file was missing or couldn't be read. `engine.load_model` still returns a model then, which draws nothing, so check this before relying on it. `g_PlayerModel` is the model drawn as the player in third person (F5). If it's nil or not loaded, the console says so once: `[Player] Third person: no player model to draw: ...`.
 
 <a id="fn-hooks-on_update"></a><a id="fn-hooks-update_player_animation"></a>Use `on_update(dt)` to move them every frame. The player model is the global `g_PlayerModel`, and the engine calls `update_player_animation(dt, is_moving, pitch)`.
 
@@ -2430,6 +2565,7 @@ In first person the engine shows what you're holding at the bottom of the screen
 
 - <a id="fn-engine-set_first_person_arm"></a>`engine.set_first_person_arm({ right = "upper_arm_right", left = "upper_arm_left", color = { 224, 176, 140 } })`: which bone of the player model is the arm (it's drawn with everything attached to it, in the model file's pose), and the plain arm's colour. Without this, common names such as `right_arm` and `arm_right` are tried.
 - <a id="fn-engine-set_first_person_hand"></a>`engine.set_first_person_hand(false)` hides it, for example for a cutscene.
+- <a id="fn-engine-set_third_person_item"></a>In third person (F5), what you're holding shows in the player model's hand and moves with the arm through walking, swings and every other animation. A block is held as a small cube in the fist; an item picture (a tool, a stick) is held by its handle, pointing forward. The hand is the bottom of the model's forearm bone: the first of `lower_arm_right`, `right_hand`, `hand_right`, `forearm_right`, then the arm names `set_first_person_arm` accepts (the left side for left-handed players). `engine.set_third_person_item(false)` hides it. `engine.set_third_person_item(true, "my_right_hand", "my_left_hand")` names the bones of a model whose hands are called something else.
 - <a id="fn-engine-swing_hand"></a>`engine.swing_hand()` plays the swing, for example when your mod's item is used.
 - <a id="fn-engine-get_swing"></a>`engine.get_swing()` returns how far through the swing you are (0–1), or -1 when you're not swinging. The player mod uses it to swing the model's arm in third person.
 - <a id="fn-engine-is_left_handed"></a>`engine.is_left_handed()` returns the player's Main Hand setting.
@@ -2459,7 +2595,28 @@ end
 - **Molang** (expressions like `"math.sin(query.anim_time * 360) * 20"`) isn't supported yet. Those values count as 0, and the console says so. Use keyframes instead.
 - <a id="fn-animation-get_length"></a><a id="fn-animation-is_looping"></a><a id="fn-animation-get_name"></a>`walk:get_length()`, `is_looping()` and `get_name()` tell you about an animation.
 
-The Craft & Ruin player mod (`mods/player/animations.lua`) plays its walk cycle this way. It fades in when you start moving, plays faster when you sprint, and fades out when you stop.
+**Exactly as in Blockbench.** Bedrock models and animations look in the game just as they do in Blockbench: the same side is the right, and rotations turn the same way. Bedrock files store X mirrored and Blockbench flips it back when it shows them; the engine does the same.
+
+<a id="player-animations"></a>**The Craft & Ruin player** (`mods/player/`) has a model with two joints in every limb, so knees and elbows bend. Its animations are in `models/player.animation.json`:
+- **Movement:** `idle` (breathing), `idle_look` (glancing about now and then), `walk`, `sprint`, `sneak`, `sneak_walk`, `jump`, `fall`, `land`, `swim`, `tread_water`, `fly` and `fly_move`.
+- **Actions:** `attack` (every swing: digging, hitting, placing), `use`, `eat`, `hurt`, `death`, `wave` and `blink`.
+- **Poses:** `sit` (as on a chair or seat), `sit_ground` (on the floor: leaning back on the hands, one knee up) and `sleep` (lying on the back, eyes shut, breathing slowly).
+
+`animations.lua` picks the movement animation from what the player is doing and crossfades from one to the next. Walking and sprinting speed up or slow down with your speed. On top of that it plays the swing, `hurt` when you lose health, `eat` when the survival mod feeds you, `death` while you're dead, `land` after a fall, and a blink every few seconds. The head follows the camera.
+
+<a id="fn-player_anim"></a>Other mods can play any of the actions on the player:
+- `player_anim.play("wave")` plays one once;
+- `player_anim.play("sit", true)` holds one until `player_anim.stop("sit")`;
+- `player_anim.is_playing(name)` and `player_anim.list()` tell you what's playing and what's available.
+
+<a id="fn-player_anim-sit"></a><a id="fn-player_anim-sleep"></a><a id="fn-player_anim-stand"></a>Sitting and sleeping are poses: the whole body takes them, with no walking legs underneath, and they fade in. Only one pose plays at a time.
+- `player_anim.sit()` sits on the floor; `player_anim.sit("chair")` sits as on a seat. Put the player on the seat's top yourself.
+- `player_anim.sleep()` lies down on the back, centred where the player stands. The head doesn't follow the camera and the eyes stay shut.
+- `player_anim.stand()` gets up again. `player_anim.get_pose()` returns `"sit"`, `"sit_ground"`, `"sleep"` or nil.
+- Started like this, a pose ends by itself when the player walks, jumps, flies or swims. Pass `true` as the last argument (`player_anim.sleep(true)`, `player_anim.sit("chair", true)`) to keep it until `player_anim.stand()`, for a bed or chair mod that holds the player in place. `player_anim.play("sleep")` also holds the pose.
+- Players can type `/sit`, `/sit chair`, `/sleep` (or `/lay`) and `/stand`.
+
+The pose only changes how the model looks in third person (F5). The first-person camera stays at eye height.
 
 For mobs, use `entities` instead ([§13a](#13a-mobs-and-other-entities)). The engine places them, animates each one separately, and shows them to everyone in multiplayer.
 
@@ -2604,9 +2761,9 @@ Players drop things the way they do in Minecraft:
 
 **Players and entities.** Left-click hits the entity you're looking at (within 4.5 blocks), right-click uses it. Nothing is dug or placed behind it. A hit runs `on_punch`; unless that returns true, the engine takes `damage` off its health, knocks it back, makes it flash red, and stops it being hit again for half a second. At 0 health `on_death` runs, its `drops` fall, and it's gone. On a server, hits are checked: the player has to be within reach, and no more than 10 a second.
 
-**Models.** Build them facing north (-z), as Blockbench does for Bedrock entities. Animations are played by name, and each entity runs its own from when you set it. Mobs are lit by the light where they stand: dark in caves and at night, lit by torches.
+**Models.** Build them facing north (-z), as Blockbench does for Bedrock entities. They look and move in the game exactly as in Blockbench. Animations are played by name, the full name or the short one (`"walk"` finds `animation.cow.walk`), and each entity runs its own from when you set it. Mobs are lit by the light where they stand: dark in caves and at night, lit by torches.
 
-The `mobs` mod that comes with BlockSmith (`mods/mobs`) is a complete example:
+The example `mobs` mod (`mods/mobs`) is a complete example:
 - **Cows** wander on grass, run when hit, and drop beef and leather.
 - **Zombies** come out in the dark, chase the nearest player they can see (and where they last saw you), hit for 3, and burn in sunlight.
 - **Spawn eggs** are in the creative inventory's Mobs tab.
@@ -2707,7 +2864,8 @@ end
 
 **Blocks and items:**
 - <a id="fn-ui-get_all_blocks"></a>`ui.get_all_blocks()` returns every block and item meant for the creative inventory, as a list of names.
-- <a id="fn-ui-get_block_info"></a>`ui.get_block_info(name)` returns `{ id, name, pattern, has_texture, in_creative, inventory_image, item, tool_type, tool, light, walkable, transparent, mod }`, or `nil`. `mod` is the folder name of the mod that registered it (`""` for the engine's own).
+- <a id="fn-ui-get_block_info"></a>`ui.get_block_info(name)` returns `{ id, name, pattern, has_texture, in_creative, inventory_image, item, tool_type, tool, light, walkable, transparent, mod }`, or `nil`. `mod` is the folder name of the mod that registered it (`""` for the engine's own). `description` is the name players see, and `full_name` is `"mod:name"`, for example `"core_blocks:basalt"`.
+- <a id="fn-engine-get_block_description"></a><a id="fn-engine-set_block_name_display"></a>`engine.get_block_description(name)` returns the name players see (`"Oak Log"`, or `""` for no such block). `engine.get_block_def(name)` has `description` and `full_name` too. `engine.set_block_name_display(false)` hides the held item's name above the hotbar.
 
 ### 14.3 Mouse and keyboard
 
@@ -3119,6 +3277,60 @@ F7 or Escape closes it. It also adds two tabs to the creative inventory ([how](#
 - **Close your screen when it no longer applies:** for example, when the player walks away from the block (check the distance in `on_update`), or dies.
 - **Screens are your player's own.** Drawing happens in each player's game; on a server, a shop must ask the server to do the actual change (give items, take coins) through server-side code such as a chat command or block events, or players could cheat.
 
+### 14.8 HUD pieces from the server (`hud`)
+
+<a id="fn-hud"></a>The `hud` library (`mods/base/hud.lua`, part of every game) shows **pieces** on players' screens: timers, scoreboards, titles, boss bars, a line above the hotbar, text and pictures. The server (or your game, in singleplayer and when hosting) decides; each player's game draws. Players don't need a mod of their own. Only data travels (text, numbers, colours, picture names); nothing a server sends is ever run. A recipe: [C22](#c22-a-minigame-hud-timers-scoreboards-and-titles).
+
+**Showing pieces** (where the world is: the server, singleplayer, the host). `who` is a player's name, a list of names, or `"*"` (everyone, now and players who join later). Each returns `true` when shown; on a player's game joined to someone else's server they return `false` (that server decides).
+
+| function | shows |
+|---|---|
+| <a id="fn-hud-timer"></a>`hud.timer(who, id, seconds [, opts])` | a countdown (`opts.direction = "up"` counts up). `opts`: `label`, `position` (`"top"`), `color`, `warn_at` (10: red and blinking from then), `format` (`"clock"` 1:05, `"seconds"` 65s), `hide_when_done` (seconds to stay at 0:00 before going), `on_done(id)` (runs on the server at 0) |
+| <a id="fn-hud-sidebar"></a>`hud.sidebar(who, title, lines [, opts])` | a scoreboard. `lines`: `{ "text", ... }` or `{ { "Alex", 3 }, ... }` (the value on the right; a third entry is that row's colour). `opts`: `sort` (`"desc"` / `"asc"` by the value), `max_lines` (15), `id` (`"sidebar"`), `position` (`"right"`) |
+| <a id="fn-hud-title"></a>`hud.title(who, text [, subtitle [, opts]])` | a big title in the middle that fades in and out. `opts`: `duration` (3 s), `fade_in` (0.25), `fade_out` (0.6), `color`, `sub_color`, `id` (`"title"`) |
+| <a id="fn-hud-bossbar"></a>`hud.bossbar(who, id, text, progress [, color [, opts]])` | a bar across the top; `progress` 0..1. Change it with `hud.update(who, id, { progress = 0.4 })` |
+| <a id="fn-hud-actionbar"></a>`hud.actionbar(who, text [, seconds [, opts]])` | one line above the hotbar for a moment (2.5 s) |
+| <a id="fn-hud-text"></a>`hud.text(who, id, text [, opts])` | text, `\n` for more lines. `opts`: `position` (`"top_left"`), `color`, `scale`, `background` (`false`: none) |
+| <a id="fn-hud-image"></a>`hud.image(who, id, picture [, opts])` | a picture players' games have (from a mod they also have). `opts`: `width`, `height` (48), `position` |
+| <a id="fn-hud-show"></a>`hud.show(who, id, piece)` | any piece: `piece.type` is a kind above (`"timer"`, `"sidebar"`, `"title"`, `"bar"`, `"actionbar"`, `"text"`, `"image"`) or one a mod registered, with that kind's fields |
+| <a id="fn-hud-update"></a>`hud.update(who, id, changes)` | changes only those fields of a piece already shown |
+| <a id="fn-hud-hide"></a>`hud.hide(who, id)`, `hud.clear(who)` | removes one piece, or every piece shown to them |
+| <a id="fn-hud-shown"></a>`hud.shown(who, id)` | a copy of a piece the server is showing (for `"*"` or one player), or `nil` |
+
+**Every piece also takes:** `position`, `order` (a number: pieces at one position stack in this order), `duration` (seconds, then it goes), `fade_in` / `fade_out`, `scale`, `color`.
+
+<a id="fn-hud-positions"></a>**Positions:** `"top"`, `"top_left"`, `"top_right"`, `"left"`, `"right"`, `"center"`, `"bottom"` (above the hotbar), `"bottom_left"`, `"bottom_right"`, or `{ x = 0..1, y = 0..1 }`, a point on the window the piece is centred on. Pieces at the same position stack instead of overlapping. **Colours** are `"#rrggbb"` or `{ r, g, b }` (0..1 or 0..255).
+
+**In a player's own game** (client mods, or a mod's own HUD in singleplayer):
+
+| function | |
+|---|---|
+| <a id="fn-hud-show_here"></a>`hud.show_here(id, piece)`, `hud.update_here(id, changes)`, `hud.hide_here(id)` | pieces only in this game. They stay when you leave a server; the server's go. |
+| <a id="fn-hud-get"></a>`hud.get(id)`, `hud.list()` | what's on screen now (pieces from the server and your own) |
+| <a id="fn-hud-set_visible"></a>`hud.set_visible(on)`, `hud.is_visible()` | hide every piece in this game, e.g. for a screenshot mode. F1 hides them too, with the rest of the HUD. |
+
+**Making it your own.** Each kind of piece is drawn by two functions: `size(piece, ctx)` returns its width and height in pixels, and `draw(piece, x, y, w, h, ctx)` draws it. `ctx` has `W`, `H` (the window), `time`, `alpha` (0..1 while fading) and `align` (`"left"`, `"center"` or `"right"`, from its position). <a id="fn-hud-register_type"></a>`hud.register_type(name, { size = ..., draw = ... })` adds a kind, or replaces how a built-in one looks:
+
+```lua
+-- a client mod (or a game's mod): timers as a ring that empties
+hud.register_type("timer", {
+    size = function(p, ctx) return 64, 64 end,
+    draw = function(p, x, y, w, h, ctx)
+        local left = p.seconds - (ctx.time - p._got)            -- (p._got: when it arrived)
+        local done = math.max(0, math.min(1, left / (p.total or p.seconds)))
+        ui.draw_circle(x + 32, y + 32, 30, 0, 0, 0, 0.5 * ctx.alpha)
+        ui.draw_pie(x + 32, y + 32, 28, -90, -90 + 360 * done, 1, 0.8, 0.3, ctx.alpha)
+        hud.draw_text(hud.format_time(math.max(0, left)), x + 14, y + 26, 0.4, 1, 1, 1, ctx.alpha)
+    end,
+})
+```
+
+A new kind travels the same way: the server shows `hud.show("*", "flag", { type = "ctf_flag", team = "red", carried = true })`, and a mod both the server and its players have registers `"ctf_flag"`. A player's game that doesn't know a kind draws nothing for it.
+
+- <a id="fn-hud-style"></a>`hud.style`: colours and sizes every built-in piece uses: `scale`, `padding`, `gap`, `margin`, `radius`, `background`, `text`, `dim`, `accent`, `warning`, `bar`, `bar_back`. Change them from any mod: `hud.style.accent = { 0.4, 0.8, 1 }`.
+- Helpers for your own kinds: `hud.draw_text(text, x, top, scale, r, g, b, a)` (by its top, not its baseline), `hud.panel(x, y, w, h, alpha)` (the usual dark box), `hud.color(c [, fallback])` (`r, g, b, a`), `hud.format_time(seconds [, format])`.
+- <a id="fn-hud-encode"></a>`hud.encode(value)` / `hud.decode(text)`: the text format pieces travel in (strings, numbers, booleans and tables of them). Useful for your own [mod messages](#mod-messages-between-the-server-and-players-games). `decode` returns `nil` for anything damaged or too big, and never runs anything.
+
 ## 15. Hotbar
 
 Slots are numbered from 1:
@@ -3183,91 +3395,108 @@ Define any of these as globals. Only the ones you need. If another mod may alrea
 
 ## 17. Multiplayer and servers
 
-**Shared values** let a mod decide something and have every player see it, the way the weather mod does:
-- <a id="fn-engine-set_shared"></a>`engine.set_shared(key, text)` sets a value. Only whoever runs the world can: singleplayer, the host, or the dedicated server.
-- <a id="fn-engine-get_shared"></a>`engine.get_shared(key)` reads one.
-- `on_shared_changed(key, value)` runs on every player's game when a value changes, and when they join.
-- <a id="fn-engine-is_authority"></a>`engine.is_authority()` tells your mod whether it's the one deciding.
+This chapter has two halves:
 
-On the dedicated server, `on_update(dt)` runs every tick. `/commands` the server doesn't know go to `on_chat_command(text, player, is_operator, reply)`, and `reply(text)` answers only that player. Commands added with `chat.register_command` show up in the server's `help`. When you host a LAN game, your guests' `/commands` reach `on_chat_command` too, with `is_operator` false.
+- **Running a server** ([17a](#17a-running-a-server) to [17f](#17f-logs-diagnostics-and-updates)): for whoever owns a server. Setting it up, the settings, everyday moderation, reports, and keeping it healthy. No Lua needed.
+- **Mods on a server** ([17g](#17g-mods-on-a-server)): for mod authors. What runs where, server events and functions, and the limits mods run under.
 
-### Server events
+A world can be played three ways, and mods run the same in all of them: **singleplayer**; **a LAN game** (open a world, press Esc, click Host Game; people on your network see it under Multiplayer > Local Network); and **the dedicated server**, `BlockSmithServer`, a program of its own with no window, for a server that stays up.
 
-These run wherever the world is: on the dedicated server, and in the game for singleplayer and when you host a LAN game. Chain them like any hook (`local previous = on_player_join`).
+### 17a. Running a server
 
-| event | when | return |
+**Quick start.**
+
+1. Put `BlockSmithServer` (`BlockSmithServer.exe` on Windows) next to the game's `games/` and `mods/` folders. It's built with the game, or on its own with `cmake --build build --config Release --target BlockSmithServer`.
+2. Run `BlockSmithServer --setup` and answer the questions (name, game, world, port, max players...). Or just start it: it writes a `server.conf` with the defaults, which you can edit.
+3. Start it: `BlockSmithServer`. It says `'My Server' is listening on port 30000`, and anything you type in its window is a [server command](#17c-server-commands) (no `/` needed).
+4. Join from the game: Multiplayer > + Add Server, with the address (`localhost` on the same PC; otherwise its IP, plus `:port` if it isn't 30000). Players outside your network need port 30000 (UDP) forwarded on the router.
+5. Make yourself the boss: type `op <your name>` in the server window. From then on you can use every command in chat too, with `/` in front.
+
+Command-line options: `--setup`, `--config <file>` (another settings file), `--game <folder>`, `--world <name>`, `--port <number>` (these three override `server.conf` for one run), `--list-games`, `--version`.
+
+**The server's files**, all next to `server.conf` unless it says otherwise. They're plain text: you can read and edit them with any editor (edit the lists while the server is stopped, or type `reload` after).
+
+| file | what's in it | changed by |
 |---|---|---|
-| <a id="fn-hooks-on_player_join"></a>`on_player_join(name, info)` | someone joined. `info.operator`, `info.mode` (`"survival"`/`"creative"`), `info.new_account` (they just protected their name with a password) | |
-| <a id="fn-hooks-on_player_leave"></a>`on_player_leave(name, x, y, z)` | someone left (or was kicked), and where they were | |
-| <a id="fn-hooks-on_player_chat"></a>`on_player_chat(name, text)` | a chat line, **before** anyone sees it | `false` drops it; a string replaces it; nothing lets it through |
-| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` | a player is about to change a block: break or place one, or change only its metadata (opening a door, filling a tank). It is also asked for changes a mod makes for them with `engine.player_set_block`. `old_meta` is what is stored now and `new_meta` what they ask for (0..255). | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
-| `on_player_harvest(name, item, x, y, z)` | a joined player asked to use `item` on that block ([`engine.request_harvest`](#fn-engine-request_harvest); the scythe) | |
-| <a id="fn-hooks-on_server_start"></a>`on_server_start()` | the dedicated server is ready for players (in the game: you started hosting) | |
-| <a id="fn-hooks-on_server_stop"></a>`on_server_stop()` | the server is stopping, before the world is saved (in the game: you stopped hosting) | |
+| `server.conf` | all the settings (below) | you; `motd`, `name`, `setworldspawn` |
+| `ops.txt` | operators, `Name \| level` | `op`, `deop` |
+| `whitelist.txt` | who may join while `whitelist = true` | `whitelist add/remove` |
+| `banned.txt`, `banned-ips.txt` | banned names and addresses, with the reason | `ban`, `unban`, `ban-ip`, `pardon-ip` |
+| `accounts.txt` | names protected by a player's password (only a hash) | players joining with a password; `password reset` |
+| `gamemodes.txt` | players given another game mode | `gamemode` |
+| `reports.txt` | player reports ([17d](#17d-player-reports)) | `/report`, `reports close/reopen/delete` |
+| `server_icon.png` | the icon in the server list (64×64 PNG, up to 64 KB) | you |
+| `logs/latest.log` | everything the server printed, with times; older logs and `crash-*.txt` beside it | the server |
+| `saves/<world>/` | the world: chunks, `players/`, `gamerules.txt`, `spawnpoints.txt`, `mod_storage.txt` | the server |
 
-`on_block_broken` and `on_block_placed` also get the player's name, as their last argument.
+**Settings** (`server.conf`, `key = value`, `#` starts a comment). Change them while it runs by editing the file and typing `reload`; `game`, `world`, `seed` and `port` need a restart.
 
-`can_edit_block` checks players on a server and LAN guests. Your own edits in singleplayer, or as the host, aren't checked. Nothing the player's game does can skip it: the server asks it before changing anything.
+| setting | default | |
+|---|---|---|
+| **In the server list** | | |
+| `name` | BlockSmith Server | the server's name |
+| `motd` | (a gold title) | the description under it: `{gold}`, `{red}`, `{#ff8800}`... colours, `{b}bold{/b}`, `{n}` second line. Also the `motd <text>` command |
+| `icon` | server_icon.png | the icon file |
+| **What runs** | | |
+| `game` | craft_and_ruin | the game (a folder in `games/`; `games` lists them). Players need it too |
+| `world` | world | the world folder in `saves/` (made if it doesn't exist) |
+| `seed` | (random) | the seed for a new world |
+| `port` | 30000 | the UDP port |
+| `disabled_mods` | | mods not to load (comma separated); players need the same mods as the server |
+| **Players** | | |
+| `max_players` | 50 | the most players at once (1 to 4000; a game hosting from its pause menu: up to 200) |
+| `view_distance` | 8 | how far players may see, in chunks (2 to 10); lower is less work |
+| `spawn` | 8 8 | where new players appear (x z) |
+| `welcome` | (a gold welcome) | said to each player who joins; `{player}` is their name |
+| `gamemode` | survival | survival or creative, for everyone not given another |
+| `whitelist` | false | only `whitelist.txt` may join |
+| `require_password` | false | players must set a password (Settings > Player) to join. Recommended for public servers |
+| `spawn_protection` | 16 | blocks around spawn only operators may change (0 = off; off while there are no operators) |
+| `op_level` | 4 | the level `op <name>` gives when no level is said ([levels](#17c-server-commands)) |
+| **Players' client mods** | | |
+| `client_mods` | true | may players run their own client mods here ([§20](#20-client-mods)) |
+| `client_mods_chat` | false | may those send chat and commands for the player |
+| `client_mods_players` | true | may they see other players' names and positions |
+| `client_mods_block_range` | 64 | how far from the player they may read blocks (0 = any distance) |
+| **Performance and time** | | |
+| `tick_rate` | 30 | updates a second (20 to 60) |
+| `generator_threads` | 0 | threads making new terrain (0 = CPU cores - 1) |
+| `autosave_seconds` | 60 | |
+| `day_length` | 20 | minutes in a whole day |
+| `lua_time_limit` | 5 | seconds one mod event may run before it's stopped (0 = no limit) |
+| **Online content and updates** | | |
+| `remote_content` | true | may mods download data (never code) ([§21](#21-online-content)) |
+| `remote_domains` | | sites approved besides GitHub |
+| `update_check` | true | look for a newer BlockSmith ([17f](#17f-logs-diagnostics-and-updates)) |
+| `update_url` | (the BlockSmith repo) | where its version file is |
 
-```lua
--- Spawn protection: only operators may build within 24 blocks of 0, 0
-local previous = can_edit_block
-function can_edit_block(player, x, y, z, old, new)
-    if previous and previous(player, x, y, z, old, new) == false then return false end
-    if math.abs(x) < 24 and math.abs(z) < 24 and not engine.is_player_operator(player) then
-        return false, "Spawn is protected"
-    end
-end
+### 17b. Everyday moderation
 
--- Welcome message and a simple word filter
-local previous_join = on_player_join
-function on_player_join(name, info)
-    if previous_join then previous_join(name, info) end
-    engine.message_player(name, "Welcome, " .. name .. "!", 1, 0.85, 0.3)
-end
+What you'll do most, and the command for it. Type them in the server window, or in chat with `/` in front as an operator.
 
-local previous_chat = on_player_chat
-function on_player_chat(name, text)
-    if previous_chat then
-        local r = previous_chat(name, text)
-        if r == false then return false end
-        if type(r) == "string" then text = r end
-    end
-    return (text:gsub("[Bb]adword", "****"))
-end
-```
-
-### Server functions
-
-| function | |
+| to... | type |
 |---|---|
-| <a id="fn-engine-get_online_players"></a>`engine.get_online_players()` | `{ { name, x, y, z, mode, operator }, ... }`: everyone in the world. In singleplayer that's you; as a LAN host, you and your guests. |
-| <a id="fn-engine-get_player_info"></a>`engine.get_player_info(name)` | that table for one player, or `nil` if they're not online |
-| <a id="fn-engine-message_player"></a>`engine.message_player(name, text [, r, g, b])` | a chat line only they see (colour 0..1 or 0..255). True if they're online. |
-| <a id="fn-engine-kick_player"></a>`engine.kick_player(name [, reason])` | disconnects them (right after the current event, never in the middle of it). True if they're online. |
-| <a id="fn-engine-teleport_player"></a>`engine.teleport_player(name, x, y, z)` | moves them |
-| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block [, meta])` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). It also returns false, with no reason, when the block and metadata are already exactly what was asked for: nothing changed. Use it for anything a player earns from a change, and give the reward only on true. |
-| <a id="fn-engine-set_player_mode"></a><a id="fn-engine-get_player_mode"></a>`engine.set_player_mode(name, "survival"\|"creative")`, `engine.get_player_mode(name)` | their game mode. On the dedicated server, a change is remembered in `gamemodes.txt`. |
-| <a id="fn-engine-is_player_operator"></a>`engine.is_player_operator(name)` | is that player an operator? (LAN guests never are; you are, in your own world) |
-| <a id="fn-engine-get_server_info"></a>`engine.get_server_info()` | `{ dedicated, running, online, game, max_players, name, world, ... }` |
-| `engine.get_storage(key)`, `engine.set_storage(key, value)` | on the dedicated server too: saved in the world's `mod_storage.txt`, with the world |
+| make someone an operator (or limit what they may do) | `op Alex`, `op Alex 3` (levels below); `deop Alex` |
+| see who's online | `list` |
+| warn someone privately | `msg Alex please stop` |
+| send someone away / keep them away | `kick Alex spamming`; `ban Alex griefing`, `unban Alex`; `ban-ip Alex` |
+| only let friends in | `whitelist on`, `whitelist add Alex`, `whitelist list` |
+| read and handle player reports | `reports`, `reports show 3`, `reports close 3 warned them` ([17d](#17d-player-reports)) |
+| change someone's game mode | `gamemode creative Alex` |
+| bring someone to you, or go to them | `tp Alex @s`, `tp Alex` |
+| fix someone's inventory or rescue them | `give Alex torch 16`, `clear Alex`, `kill Alex` |
+| set the time or the rules | `time set day`, `gamerule keepInventory true` |
+| move the spawn | `setworldspawn` (where you stand) |
+| change the description in the list | `motd {gold}Season 2 is live!` |
+| someone forgot their password | `password reset Alex` |
+| save, reload the lists, stop | `save`, `reload`, `stop` |
+| is everything all right? | `tps`, `diag` |
 
-### Server safety
+**Protecting the spawn.** `spawn_protection = 16` (the default): blocks within 16 of the spawn can only be changed by operators (level 1 or more). It only works once there's an operator, as in Minecraft.
 
-- **Mods can't freeze the server.** If one call into a mod (`on_update`, an event, a command) runs longer than `lua_time_limit` seconds (default 5, set in `server.conf`; 0 = no limit), it's stopped with an error and the server carries on. In the game the limit is 5 seconds for the events above.
-- **Errors aren't spammed.** A mod error that repeats every tick is printed once, until the message changes.
-- **Chat and command flooding is limited.** Each player gets a burst of 6 messages, then one every 0.75 s. More are dropped with a "slow down" warning, and 25 dropped in a row gets them kicked.
-- **Clean chat.** Control characters are removed from chat and commands, so nobody can fake extra lines.
-- **What mods can read** is limited to the mods, games and `lualib/` folders, and they can't load native code. See [Lua modules: require](#lua-modules-require).
+**Protecting names.** A player who joins with a password (Settings > Player) owns that name on your server: nobody can use it without the password. `require_password = true` makes everyone do it. Passwords never leave the player's PC: the server keeps a per-server proof, not the password.
 
-Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated `BlockSmithServer`. Blocks are sent to players by **name**, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.
-
-- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there.
-- **Server setup:** run `BlockSmithServer --setup` once, or use My Servers in the game.
-- **Settings:** in `server.conf` (name, description and colours, icon, game, world, port, max players, whitelist, passwords, disabled mods, tick rate, world generation threads, `lua_time_limit`, `day_length`, `spawn_protection`, `op_level`).
-- **Operator commands:** `/op`, `/gamemode`, `/tp`, `/give`, `/time`, `/gamerule`, `/kick`, `/ban`, `/whitelist`, `/save`, `/stop` and more: see [Server commands](#server-commands). `day_length` in `server.conf` sets how many minutes a day lasts (20 by default). Type `help` in the server console. The console completes with **Tab**: commands, then their arguments (online players and known names for `kick`, `ban`, `op` and `msg`, banned names for `unban`, `on/off/add/remove` for `whitelist`, `survival/creative` for `gamemode`, mod ids for `mods enable/disable`, and mods' own commands). Press Tab twice to list the choices. **Up/Down** bring back earlier commands, and what the server prints appears above the line you're typing.
-
-### Server commands
+### 17c. Server commands
 
 Commands work like Minecraft's: typed in the server console (no slash), or in chat by players with `/` in front.
 
@@ -3275,11 +3504,11 @@ Commands work like Minecraft's: typed in the server console (no slash), or in ch
 
 | level | may | commands |
 |---|---|---|
-| everyone | talk and look | `help`, `list`, `msg`/`tell`, `me` |
+| everyone | talk and look | `help`, `list`, `msg`/`tell`, `me`, `report`, `version` |
 | 1 | build inside spawn protection | |
 | 2 | change the game | `gamemode`, `tp`/`teleport`, `give`, `clear`, `kill`, `time`, `gamerule`, `setworldspawn`, `spawnpoint`, `seed`, `say`, `tps` |
-| 3 | manage players | `kick`, `ban`, `unban`/`pardon`, `ban-ip`, `pardon-ip`, `banlist [players\|ips]`, `whitelist`, `op`, `deop`, `ops` |
-| 4 | run the server | `stop`, `save`/`save-all`, `save-off`, `save-on`, `reload`, `games`, `mods`, `motd`, `name`, `password reset` |
+| 3 | manage players | `reports`, `kick`, `ban`, `unban`/`pardon`, `ban-ip`, `pardon-ip`, `banlist [players\|ips]`, `whitelist`, `op`, `deop`, `ops` |
+| 4 | run the server | `stop`, `save`/`save-all`, `save-off`, `save-on`, `reload`, `games`, `mods`, `motd`, `name`, `password reset`, `diag` |
 
 An operator can't give a higher level than their own. Mods' commands get `is_operator` (any level) and decide for themselves.
 
@@ -3317,19 +3546,39 @@ An operator can't give a higher level than their own. Mods' commands get `is_ope
 | `doMobSpawning` | true | mobs appear by themselves ([§13a](#entity-spawning)) |
 | `randomTickSpeed` | 3 | blocks picked per 16×16×16 section per tick ([random ticks](#abm)): how fast grass spreads and crops grow. 0 = never |
 
-The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too.
+The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too. `/give` works the way Minecraft's does: `/give @s core_blocks:basalt 64`. Who to give to (`@s`, `@p` or your own name) can be left out, and the item is its name (`basalt`) or its full name (`core_blocks:basalt`, the grey name you see when pointing at it). Any `something:` in front works, so `minecraft:stone` gives stone.
 
 <a id="fn-hooks-on_server_action"></a>**`give`, `clear` and `kill` happen in the player's game**, where inventories and health live: the server asks, and the game does it. A mod can do these its own way with `on_server_action(action, a, b)`, returning `true` when it has. `action` is `"give"` (`a` = item, `b` = count), `"clear"` or `"kill"` (`a` = the reason shown on the death screen). The survival mod uses it to kill with its death screen and to clear its inventory too. Chain it like other hooks.
 
-**Spawn protection.** `spawn_protection = 16` in `server.conf`: blocks within that many blocks of the world's spawn can only be changed by operators (0 = off). As in Minecraft, it's off while there are no operators.
+### 17d. Player reports
 
-**The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
+Anyone can type `/report <player> <reason>` in chat (or `report` in the console). The report is saved in `reports.txt` next to `server.conf`, so the owner can read it later, whether or not they were online when it happened. Each report keeps:
 
-### Game modes and permissions
+- who reported whom, when, and why;
+- where both players were (or that the reported player was offline);
+- the chat around it: everything either of them said in the 15 minutes before (up to 30 lines).
+
+The player who was reported has to be on the server or have played on it (any capitals). A player can send one report a minute and at most 3 open reports about the same person, and can't report themselves.
+
+Reading and handling them, in the console or as an operator (level 3) in chat:
+
+```
+reports                       the open reports, newest first
+reports all                   the closed ones too
+reports show 2                one report in full: positions, reason, the chat
+reports close 2 warned them   dealt with (who closed it, and the note, are kept)
+reports reopen 2
+reports delete 2              (level 4 / the console)
+```
+
+New reports show in the console straight away and go to the operators online (level 3+). Operators who join later are told how many are open, and the console says so when the server starts. Mods get `on_player_report(id, reporter, reported, reason)`.
+
+### 17e. Game modes and permissions
+
 
 On a server, **the server decides each player's game mode**, and only its admins can change it. A player who joins a survival server can't put themselves in creative.
 
-- **Dedicated server:** `gamemode = survival` (or `creative`) in `server.conf`, or Game mode on the My Servers settings page, is the mode everyone starts in. Operators change a player's mode with `/gamemode survival|creative [name]`, and it's remembered in `gamemodes.txt`. Anyone can type `/gamemode` on its own to see their mode.
+- **Dedicated server:** `gamemode = survival` (or `creative`) in `server.conf` is the mode everyone starts in. Operators change a player's mode with `/gamemode survival|creative [name]`, and it's remembered in `gamemodes.txt`. Anyone can type `/gamemode` on its own to see their mode.
 - **LAN game:** players who join get the host world's mode. Only the host can change it, with `/gamemode survival|creative <player>`.
 - **Locked in the engine:** while you're on a server, `engine.set_creative` refuses anything but the mode the server gave you (it returns `false`), so no mod can switch you either.
 - **Checked by the server:** outside creative, the server won't let a player break blocks that can't be dug (bedrock, `hardness = -1`), even with a modified game.
@@ -3340,11 +3589,183 @@ For mods:
 - <a id="fn-hooks-on_game_mode"></a>`on_game_mode(mode, is_operator)` runs when the server sets your mode: when you join, and when an operator changes it. `mode` is `nil` after you leave the server. The survival mod uses this to follow the server.
 - `on_chat_command`'s `is_operator` is your real operator status on a server, so mods can keep their own commands for admins.
 
-Lua functions for multiplayer menus:
+### 17f. Logs, diagnostics and updates
+
+**The log.** Everything the server prints also goes to `logs/latest.log` next to `server.conf`, with the time on every line. The previous log is kept as `logs/<date>-<n>.log`.
+
+**Diagnostics (the game and the server).** Both write everything they print to `logs/latest.log` (next to `server.conf`, or next to the game's `settings.txt`), with the time on each line; the previous log is kept as `logs/<date>-<n>.log`. To find what went wrong:
+
+- **System report** at the start: version, commit, protocol, build type, compiler, architecture, OS, CPU, threads, memory, Lua version, process and folder, and for the game its graphics card and OpenGL version.
+- **A trace under every warning and error** (everything printed to the error stream): the build, the thread, how long it had been running, and the native call stack that printed it. A warning that repeats gets the full trace the 1st, 10th, 100th, 1000th... time, with the count.
+- **Lua errors with their Lua stack**: every Lua error the engine catches, and every error a mod catches with `pcall` (`[Lua] Error caught by pcall`), is printed with its Lua traceback: which file and line, called from where, through which mods. `pcall` itself works exactly as in plain Lua.
+- **Crash reports**: a crash (bad memory access, abort, illegal instruction...) or an uncaught C++ exception prints what happened and the call stack, to the console, the end of `latest.log`, and `logs/crash-<date>_<time>.txt`.
+- **`diag`** (server console, or operators level 4): the system report, ticks per second, chunks and players, the update check, and the warnings so far, most frequent first.
+
+```
+[Lua] on_chat_command: mods/mymod/init.lua:20: command blew up
+    | trace: server BlockSmith 0.1-alpha (commit 2d5ea37fe8) | thread 1406907518 | up 7.0 s
+    |   #0 ??  (BlockSmithServer+0x8118f)
+    |   #1 main+0x533b  (BlockSmithServer+0x7a6cb)
+```
+
+Stack frames name the function where the platform can, with its module and offset. On Linux and macOS only *exported* functions have names there, and a function that isn't exported shows as the nearest one that is, which can mislead. So each trace ends with a ready-made command that gives the exact function, file and line of every frame in the program: copy it and run it next to the program.
+
+```
+    |   exact names and lines: addr2line -f -C -i -e BlockSmithServer 0x1752c6 0x96ada 0x78aef
+```
+
+That's `addr2line` on Linux and `atos -o BlockSmithServer -l <load address> ...` on macOS. On Windows the traces read the `.pdb` next to the `.exe` themselves. Release builds keep the line tables this needs (`-DBLOCKSMITH_DEBUG_INFO=OFF` leaves them out). A crash from a signal lists `program(+offset)` for each frame; `addr2line -e <program> <offset>` resolves those the same way.
+
+**Which build.** The server says which BlockSmith it is, with the git commit it was built from, when it starts (`BlockSmith dedicated server 0.1-alpha (commit 1a2b3c4d5e, protocol BlockSmith 0.1)`), as the first line of every log, in the "listening on port" line, and when anyone types `version`. `BlockSmithServer --version` prints it and exits. The commit is stamped in on every build from git (`-dirty` if there were uncommitted changes); without git it's `unknown`, and `-DBLOCKSMITH_COMMIT=<hash>` (or the `BLOCKSMITH_COMMIT` environment variable) sets it for builds from a source archive. The protocol is what games and servers compare to see if they can play together.
+
+**Which versions may play together.** A game may join a server running the same BlockSmith release or an older one; an older game can't join a newer server: it's told to update ("Your game (BlockSmith 0.1-alpha) is older than this server (BlockSmith 0.2-alpha). An update is available..."). Builds of the same release play together (`0.2-alpha` counts as 0.2, so a `0.2-alpha` game and a `0.2-beta` server play together). Underneath, each game says which network protocols it can still speak (`net::kMinProtocolVersion` up to `net::kProtocolVersion`), so a newer game uses the older server's protocol; when support for an old protocol is dropped, raise `kMinProtocolVersion`. The server list marks servers you can't join and why, and older servers you can still join ("Runs an older BlockSmith (0.1-alpha): you can still join").
+
+**New versions.** The game and the server check now and then (at start, then every 6 hours) whether a newer BlockSmith is out. They read one small JSON file, `version.json`, as data, like any remote content (HTTPS, whitelisted hosts, checked to really be JSON); nothing is ever downloaded or installed for you.
+
+```json
+{
+  "latest": "0.2-alpha",
+  "min_supported": "0.1-alpha",
+  "commit": "1a2b3c4d5e",
+  "download": "https://github.com/Gerold55/BlockSmith/releases/latest",
+  "notes": "New biomes and menus"
+}
+```
+
+- `latest`: the newest version. Newer than this build: *update available*.
+- `min_supported` (optional): older than this: *update required* (it can't play with up-to-date games and servers any more).
+- `download` (optional): where to get it. Only an `https` page on `github.com`, `*.github.io` or the version file's own site is used; anything else is left out.
+- `commit` and `notes` (optional): shown with it. Notes are one line, up to 300 characters.
+
+Where it shows: the title screen gets a gold "Update available: 0.2-alpha - click to download" line above the version (red "Update required" when it must be installed); clicking it opens the download page in your browser. The server prints it in its console (and log) when it changes, tells operators when they join, and adds it to `version`. With a warning (an update available or required, or a check that failed) the details follow on the next lines: the file that was checked, the HTTP result, this build's version and commit, the latest and minimum versions, what it decided and why, and the error if there was one:
+
+```
+[Server] Couldn't check for updates: the site answered 404
+[Server]   version file: https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json
+[Server]   result: HTTP 404, download failed
+[Server]   this build: 0.1-alpha (commit 2d5ea37fe8)
+[Server]   error: the site answered 404
+```
+
+**Between games and servers.** Each server says which BlockSmith it runs when the server list asks it, and each game says which one it is when it joins, so:
+
+- The Multiplayer screen shows a server's BlockSmith version in its details: gold with "Update available: this server runs 0.2-alpha" when it's newer than your game. A server you can't join because of the version says which way round: "This server runs a newer BlockSmith (0.3-alpha): update your game to join", or "...an older BlockSmith (5.1.0): it needs updating". When the game's own check found a newer version, the Multiplayer footer has an "Update available: 0.2-alpha - Download" link.
+- A player whose game is older than the server (or than the newest release, from the server's own check) is told so in chat when they join, with the download link. The server's console logs which BlockSmith each player has, and notes when a player's game is newer than the server.
+- `engine.get_server_status(address)` has `engine_version`, `engine_commit` and `engine_compare` (`"newer"`, `"older"`, `"same"`, or `""` for older servers that don't say), and `engine.open_update_page()` opens the download page from a title-screen page.
+
+Older games and servers that don't send their version still work together as before; they just don't get these messages.
+
+Settings: `update_check = false` turns it off, `update_url = <address>` reads another file (it must be allowed like any remote content: GitHub or a domain in `remote_domains`). Both go in `settings.txt` for the game and `server.conf` for a server. The default is `https://raw.githubusercontent.com/Gerold55/BlockSmith/main/version.json`: publish a new version by changing that file. Mods can read the answer with `engine.get_update_info()` -> `{ enabled, checked, available, required, current, commit, latest, min_supported, download, notes, error }`.
+
+### 17g. Mods on a server
+
+Mods run the same way in singleplayer, when hosting a LAN game, and on the dedicated `BlockSmithServer`. Blocks are sent to players by **name**, so the server and its players need the same mods. The server runs world generation, fluids and block changes; players see the results.
+
+- <a id="fn-engine-is_server"></a>**On the server:** drawing, hotbar and sky functions do nothing. `engine.is_server()` is true there. Functions about this game's own player or window return nothing there: `engine.get_player_position()` is `nil` on the server (it has no player of its own), so check what you get (`if type(x) == "number"`) or use the player's position from an event or `engine.get_player_info(name)`.
+
+**Shared values** let a mod decide something and have every player see it, the way the weather mod does:
+- <a id="fn-engine-set_shared"></a>`engine.set_shared(key, text)` sets a value. Only whoever runs the world can: singleplayer, the host, or the dedicated server.
+- <a id="fn-engine-get_shared"></a>`engine.get_shared(key)` reads one.
+- `on_shared_changed(key, value)` runs on every player's game when a value changes, and when they join.
+- <a id="fn-engine-is_authority"></a>`engine.is_authority()` tells your mod whether it's the one deciding.
+
+On the dedicated server, `on_update(dt)` runs every tick. `/commands` the server doesn't know go to `on_chat_command(text, player, is_operator, reply)`, and `reply(text)` answers only that player. Commands added with `chat.register_command` show up in the server's `help`. When you host a LAN game, your guests' `/commands` reach `on_chat_command` too, with `is_operator` false.
+
+#### Mod messages between the server and players' games
+
+Shared values are the same for everyone. To tell **one player's game** something, or for a player's game to tell the server's mods something, use mod messages: text on a named channel, to the same mod on the other side.
+
+| function / hook | where | |
+|---|---|---|
+| <a id="fn-engine-send_to_player"></a>`engine.send_to_player(name, channel, data)` → `true` if they're online | the server (or singleplayer / the host) | to one player's game |
+| <a id="fn-engine-send_to_all"></a>`engine.send_to_all(channel, data)` → how many got it | the server (or singleplayer / the host) | to every player's game (the host's own too) |
+| <a id="fn-hooks-on_server_message"></a>`on_server_message(channel, data)` | each player's game | a message from the server's mods |
+| <a id="fn-engine-send_to_server"></a>`engine.send_to_server(channel, data)` → `true` if sent | a player's game | to the server's mods |
+| `on_mod_message(name, channel, data)` | the server (or singleplayer / the host) | a message from `name`'s game |
+
+- **channel:** letters, digits and `_ : . -`, at most 64 long, your mod's name first (`"ctf:flag"`). Chain the hooks and only handle your own channels.
+- **data** is text (a number becomes text). For a table, use [`hud.encode`](#fn-hud-encode) and `hud.decode`. It's only ever data: the engine never runs it, and neither should you (no `load`).
+- **Limits:** at most 32 KB from the server and 4 KB from a player. A player's game may send 40 at once, then 20 a second; more are dropped. Treat what a player's game sends as a claim, not a fact: check it on the server ("a death every 2 seconds at most", "within reach"...).
+- **In singleplayer and for the host's own game**, nothing goes over the network: `send_to_server` reaches this game's own `on_mod_message` (with your name), and `send_to_player` / `send_to_all` reach its own `on_server_message`, on the next frame.
+- The [`hud`](#148-hud-pieces-from-the-server-hud) library uses the channel `"hud"`; Craft & Ruin's survival mod uses `"survival:death"`.
+
+#### Server events
+
+These run wherever the world is: on the dedicated server, and in the game for singleplayer and when you host a LAN game. Chain them like any hook (`local previous = on_player_join`).
+
+| event | when | return |
+|---|---|---|
+| <a id="fn-hooks-on_player_join"></a>`on_player_join(name, info)` | someone joined. `info.operator`, `info.mode` (`"survival"`/`"creative"`), `info.new_account` (they just protected their name with a password) | |
+| <a id="fn-hooks-on_player_leave"></a>`on_player_leave(name, x, y, z)` | someone left (or was kicked), and where they were | |
+| <a id="fn-hooks-on_player_chat"></a>`on_player_chat(name, text)` | a chat line, **before** anyone sees it | `false` drops it; a string replaces it; nothing lets it through |
+| <a id="fn-hooks-can_edit_block"></a>`can_edit_block(player, x, y, z, old_block, new_block, old_meta, new_meta)` | a player is about to change a block: break or place one, or change only its metadata (opening a door, filling a tank). It is also asked for changes a mod makes for them with `engine.player_set_block`. `old_meta` is what is stored now and `new_meta` what they ask for (0..255). | `false` refuses it, and `false, "reason"` also tells the player why. Their game gets the real block back. |
+| `on_player_harvest(name, item, x, y, z)` | a joined player asked to use `item` on that block ([`engine.request_harvest`](#fn-engine-request_harvest); the scythe) | |
+| <a id="fn-hooks-on_mod_message"></a>`on_mod_message(name, channel, data)` | a player's game sent the server's mods a message ([below](#mod-messages-between-the-server-and-players-games)) | |
+| <a id="fn-hooks-on_player_death"></a>`on_player_death(name, reason)` | (Craft & Ruin's survival mod) a player died. Their game says so, at most once every 2 seconds. | |
+| <a id="fn-hooks-on_server_start"></a>`on_server_start()` | the dedicated server is ready for players (in the game: you started hosting) | |
+| <a id="fn-hooks-on_server_stop"></a>`on_server_stop()` | the server is stopping, before the world is saved (in the game: you stopped hosting) | |
+
+`on_block_broken` and `on_block_placed` also get the player's name, as their last argument.
+
+`can_edit_block` checks players on a server and LAN guests. Your own edits in singleplayer, or as the host, aren't checked. Nothing the player's game does can skip it: the server asks it before changing anything.
+
+```lua
+-- Spawn protection: only operators may build within 24 blocks of 0, 0
+local previous = can_edit_block
+function can_edit_block(player, x, y, z, old, new)
+    if previous and previous(player, x, y, z, old, new) == false then return false end
+    if math.abs(x) < 24 and math.abs(z) < 24 and not engine.is_player_operator(player) then
+        return false, "Spawn is protected"
+    end
+end
+
+-- Welcome message and a simple word filter
+local previous_join = on_player_join
+function on_player_join(name, info)
+    if previous_join then previous_join(name, info) end
+    engine.message_player(name, "Welcome, " .. name .. "!", 1, 0.85, 0.3)
+end
+
+local previous_chat = on_player_chat
+function on_player_chat(name, text)
+    if previous_chat then
+        local r = previous_chat(name, text)
+        if r == false then return false end
+        if type(r) == "string" then text = r end
+    end
+    return (text:gsub("[Bb]adword", "****"))
+end
+```
+
+#### Server functions
+
+| function | |
+|---|---|
+| <a id="fn-engine-get_online_players"></a>`engine.get_online_players()` | `{ { name, x, y, z, mode, operator }, ... }`: everyone in the world. In singleplayer that's you; as a LAN host, you and your guests. |
+| <a id="fn-engine-get_player_info"></a>`engine.get_player_info(name)` | that table for one player, or `nil` if they're not online |
+| <a id="fn-engine-message_player"></a>`engine.message_player(name, text [, r, g, b])` | a chat line only they see (colour 0..1 or 0..255). True if they're online. |
+| <a id="fn-engine-kick_player"></a>`engine.kick_player(name [, reason])` | disconnects them (right after the current event, never in the middle of it). True if they're online. |
+| <a id="fn-engine-teleport_player"></a>`engine.teleport_player(name, x, y, z)` | moves them |
+| <a id="fn-engine-player_set_block"></a>`engine.player_set_block(name, x, y, z, block [, meta])` | changes a block for a joined player, with the same checks as their own edits: within reach (plus a block of slack, for a 3×3 patch), undiggable blocks only in creative, spawn protection, `can_edit_block`. Returns true if the change was made: everyone sees it, and `on_block_placed` / `on_block_broken` run. Otherwise it returns false and the refusal reason, if there is one to show (it doesn't message them itself). It also returns false, with no reason, when the block and metadata are already exactly what was asked for: nothing changed. Use it for anything a player earns from a change, and give the reward only on true. |
+| <a id="fn-engine-set_player_mode"></a><a id="fn-engine-get_player_mode"></a>`engine.set_player_mode(name, "survival"\|"creative")`, `engine.get_player_mode(name)` | their game mode. On the dedicated server, a change is remembered in `gamemodes.txt`. |
+| <a id="fn-engine-is_player_operator"></a>`engine.is_player_operator(name)` | is that player an operator? (LAN guests never are; you are, in your own world) |
+| <a id="fn-engine-get_server_info"></a>`engine.get_server_info()` | `{ dedicated, running, online, game, max_players, name, world, ... }` |
+| `engine.get_storage(key)`, `engine.set_storage(key, value)` | on the dedicated server too: saved in the world's `mod_storage.txt`, with the world |
+
+#### Server safety
+
+- **Mods can't freeze the server.** If one call into a mod (`on_update`, an event, a command) runs longer than `lua_time_limit` seconds (default 5, set in `server.conf`; 0 = no limit), it's stopped with an error and the server carries on. In the game the limit is 5 seconds for the events above.
+- **Errors aren't spammed.** A mod error that repeats every tick is printed once, until the message changes.
+- **Chat and command flooding is limited.** Each player gets a burst of 6 messages, then one every 0.75 s. More are dropped with a "slow down" warning, and 25 dropped in a row gets them kicked.
+- **Clean chat.** Control characters are removed from chat and commands, so nobody can fake extra lines.
+- **What mods can read** is limited to the mods, games and `lualib/` folders, and they can't load native code. See [Lua modules: require](#lua-modules-require).
+
+#### Functions for multiplayer menus
+
 - <a id="fn-engine-host_game"></a><a id="fn-engine-join_server"></a><a id="fn-engine-stop_hosting"></a>`engine.join_server`, `host_game`, `stop_hosting`
 - <a id="fn-engine-get_connection_status"></a><a id="fn-engine-get_network_info"></a><a id="fn-engine-get_player_list"></a>`engine.get_connection_status`, `get_network_info`, `get_player_list`
 - <a id="fn-engine-get_lan_games"></a><a id="fn-engine-get_server_status"></a><a id="fn-engine-ping_server"></a>`engine.ping_server`, `get_server_status`, `get_lan_games`
-- <a id="fn-engine-list_servers"></a><a id="fn-engine-save_servers"></a>`engine.list_servers`, `save_servers`
+- <a id="fn-engine-list_servers"></a><a id="fn-engine-save_servers"></a>`engine.list_servers`, `save_servers`: the saved server list, `{ { name, address, pinned }, ... }` (`servers.txt`). `pinned = true` keeps a server at the top of the Multiplayer list.
 - <a id="fn-engine-get_player_name"></a><a id="fn-engine-has_player_password"></a><a id="fn-engine-set_player_name"></a><a id="fn-engine-set_player_password"></a>`engine.get_player_name`, `set_player_name`, `set_player_password`, `has_player_password`
 - <a id="fn-engine-cancel_join"></a><a id="fn-engine-is_scanning_lan"></a>`engine.cancel_join` stops connecting; `engine.is_scanning_lan` is true while looking for LAN games
 - <a id="fn-engine-get_server_settings"></a><a id="fn-engine-has_server_icon"></a><a id="fn-engine-set_server_setting"></a>`engine.get_server_settings`, `set_server_setting` (Settings > Server: description, max players, port), `has_server_icon`
@@ -3392,14 +3813,18 @@ A game styles the title screen with files in its `menu/` folder (`games/<game>/m
 
 | File | What it is |
 |---|---|
-| `header.png` | The title picture (otherwise the game's title in text) |
+| `header.png` | The title picture, drawn at its own proportions (otherwise the game's title in big gold text) |
+| `panorama_0.png` … `panorama_5.png` | Optional: six square pictures taken from one spot, turning slowly behind the title screen like Minecraft's panorama. In order: 0 front (north, −Z), 1 right, 2 back, 3 left, 4 up, 5 down. Each is a 90° view, as the game's camera sees it with `engine.set_fov(90)` in a square window and `engine.set_player_look(yaw, pitch)` at yaws −90, 0, 90, 180 (pitch 0), then −90 with pitch 89.9 (up) and −90 with pitch −89.9 (down). All six or none. Without them the engine draws its own landscape. |
+| `splashes.txt` | Optional: short lines, one per line (`#` starts a comment, 80 characters at most). One is picked at random and pulses in yellow under the title picture, like Minecraft's splash text. |
 | `icon.png` | The game's icon in the top bar |
 | `button.png` | The picture for every button (otherwise plain grey boxes) |
 | `button_hover.png` | Optional: the button under the mouse. Without it, `button.png` lights up. |
 
+**Behind it all** is the game's panorama, or, without one, an animated scene the engine draws: a sky, a sun, drifting blocky clouds and three layers of hills with trees scrolling past at different speeds.
+
 **No picture?** The engine looks for the game's `menu/button.png`, then `mods/base/menu/button.png` (shared by every game), and otherwise draws its own built-in button. So buttons always look like buttons, even with no texture files at all.
 
-**Every menu uses it:** the pause menu, Settings, Singleplayer, Multiplayer, My Servers, Mods and Texture Packs draw their buttons with the same picture, so they all match the title screen. Disabled buttons are darker, Delete buttons are tinted red, and the open tab uses the hover look.
+**Every menu uses it:** the pause menu, Settings, Singleplayer, Multiplayer, Mods and Texture Packs draw their buttons with the same picture, so they all match the title screen. Disabled buttons are darker, Delete buttons are tinted red, and the open tab uses the hover look.
 
 <a id="fn-ui-draw_button"></a><a id="fn-ui-get_button_text_color"></a>Your own screens can do the same:
 ```lua
@@ -3419,11 +3844,12 @@ button_text_hover_color = #ffffa0
 ```
 
 Mostly used by the base mod's menus. You'll only need these to replace those menus:
-- <a id="fn-engine-create_world"></a><a id="fn-engine-delete_world"></a><a id="fn-engine-get_active_world"></a><a id="fn-engine-get_game_info"></a><a id="fn-engine-get_worlds"></a><a id="fn-engine-list_worlds"></a><a id="fn-engine-play_world"></a><a id="fn-engine-save_world"></a><a id="fn-engine-set_active_world"></a><a id="fn-engine-start_game"></a><a id="fn-engine-take_world_error"></a>**Worlds:** `engine.list_worlds`, `create_world`, `play_world`, `delete_world`, `save_world`, `get_game_info`, and the older `get_worlds`, `get_active_world`, `set_active_world`, `start_game`. `engine.take_world_error()` returns why the last world was closed or couldn't be opened (for example, its world generator failed), once, else `nil`; the world list shows it
+- <a id="fn-engine-create_world"></a><a id="fn-engine-delete_world"></a><a id="fn-engine-get_active_world"></a><a id="fn-engine-get_game_info"></a><a id="fn-engine-get_worlds"></a><a id="fn-engine-list_worlds"></a><a id="fn-engine-play_world"></a><a id="fn-engine-save_world"></a><a id="fn-engine-set_active_world"></a><a id="fn-engine-start_game"></a><a id="fn-engine-take_world_error"></a>**Worlds:** `engine.list_worlds`, `create_world`, `play_world`, `delete_world`, `save_world`, `get_game_info`, and the older `get_worlds`, `get_active_world`, `set_active_world`, `start_game`. `engine.play_world(name)` returns `true`, or `false` and why not: the name isn't a world folder in `saves/`, the selected game isn't installed, or the world was made with another game than the selected one. It doesn't have to be the game that's loaded: playing a world whose game or mods differ from the loaded ones reloads the mods for it first, behind the loading screen. `engine.take_world_error()` returns why the last world was closed or couldn't be opened (for example, its world generator failed), once, else `nil`; the world list shows it. Each `engine.list_worlds()` entry is `{ name, seed, game_mode, played, has_thumbnail }`, newest first: `played` reads like "2 hours ago", and `has_thumbnail` says the world has a picture. The engine takes that picture (`saves/<world>/thumbnail.png`, 320x180) from the game view whenever you pause, every five minutes while you play, and a few seconds after a world without one is opened; `ui.world_thumbnail(name)` returns it for `ui.draw_image` (or `nil`), and picks up a newer one by itself.
 - <a id="fn-engine-get_keybinds"></a><a id="fn-engine-get_video_settings"></a><a id="fn-engine-key_name"></a><a id="fn-engine-reset_keybinds"></a><a id="fn-engine-set_keybind"></a><a id="fn-engine-set_video_setting"></a>**Settings:** `engine.get_keybinds`, `set_keybind`, `reset_keybinds`, `key_name`, `get_video_settings`, `set_video_setting`
   - <a id="fn-hooks-handle_settings_mouse"></a>**Mouse buttons as controls:** keybinds store a mouse button as `1000 + button` (1002 = middle, 1003 and up = side buttons). `engine.key_name(1002)` returns `"Middle Mouse"`. Movement, jump, sneak, sprint and pick block can use mouse buttons, but not left or right, which dig and place. The engine calls `handle_settings_mouse(code)` when a mouse button is pressed on the Settings screen. Return true to use the press (the base settings menu binds it to the control waiting for a key).
 - <a id="fn-engine-back_to_title"></a><a id="fn-engine-close_settings"></a><a id="fn-engine-is_in_game"></a><a id="fn-engine-is_paused"></a><a id="fn-engine-open_settings"></a><a id="fn-engine-pause"></a><a id="fn-engine-quit"></a><a id="fn-engine-quit_to_menu"></a><a id="fn-engine-resume"></a>**Game flow:** `engine.open_settings`, `close_settings`, `pause`, `resume`, `is_paused`, `is_in_game`, `quit_to_menu`, `back_to_title`, `quit`
-- <a id="fn-engine-get_texture_pack"></a><a id="fn-engine-list_mods"></a><a id="fn-engine-list_texture_packs"></a><a id="fn-engine-open_mods_folder"></a><a id="fn-engine-open_texture_packs_folder"></a><a id="fn-engine-set_mod_enabled"></a><a id="fn-engine-set_texture_pack"></a>**Mods and texture packs:** `engine.list_mods`, `set_mod_enabled`, `open_mods_folder`, `list_texture_packs`, `set_texture_pack`, `get_texture_pack`, `open_texture_packs_folder`
+- <a id="fn-engine-get_texture_pack"></a><a id="fn-engine-list_mods"></a><a id="fn-engine-list_texture_packs"></a><a id="fn-engine-open_mods_folder"></a><a id="fn-engine-open_texture_packs_folder"></a><a id="fn-engine-set_mod_enabled"></a><a id="fn-engine-set_texture_pack"></a>**Mods and texture packs:** `engine.list_mods`, `set_mod_enabled`, `open_mods_folder`, `list_texture_packs`, `set_texture_pack`, `get_texture_pack`, `open_texture_packs_folder`. For a `mods/` folder mod, `enabled` and `set_mod_enabled(id, on)` are the selected game's default for its worlds ([which mods a world runs](#which-mods-a-world-runs)).
+- <a id="fn-engine-get_world_mods"></a><a id="fn-engine-set_world_mod"></a>**A world's mods:** `engine.get_world_mods(world)` returns `{ game, mods = { { id, title, description, source, required, enabled, default, choice, loaded }, ... } }`. `source` is `"Global"` (the `mods/` folder) or `"Game"` (always on). `default` is the game's choice, `choice` the world's own (`true`/`false`, nil to follow the game), `enabled` what the world runs, and `loaded` whether it's running right now. `engine.set_world_mod(world, id, on)` returns `true`, or `false` and a reason. Pass `on = nil` to follow the game again. It takes effect the next time the world is opened, reloading mods then if needed.
 - <a id="fn-engine-create_server_profile"></a><a id="fn-engine-delete_server_profile"></a><a id="fn-engine-get_server_profile"></a><a id="fn-engine-has_server_build"></a><a id="fn-engine-list_games"></a><a id="fn-engine-list_mods_for_game"></a><a id="fn-engine-list_server_profiles"></a><a id="fn-engine-open_server_profile_folder"></a><a id="fn-engine-save_server_profile"></a><a id="fn-engine-start_server_profile"></a><a id="fn-engine-stop_server_profile"></a>**Dedicated servers (My Servers):** `engine.list_games`, `list_server_profiles`, `get_server_profile`, `save_server_profile`, `create_server_profile`, `delete_server_profile`, `start_server_profile`, `stop_server_profile`, `list_mods_for_game`, `open_server_profile_folder`, `has_server_build`
 - <a id="fn-menu-get_active_game"></a><a id="fn-menu-get_games"></a><a id="fn-menu-set_active_game"></a>**Choosing a game:** `menu.get_games`, `get_active_game`, `set_active_game`
 

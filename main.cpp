@@ -83,6 +83,9 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "EntityLua.h"
 #include "BlockModifiers.h"
 #include "RemoteLua.h"
+#include "UpdateCheck.h"
+#include "Diagnostics.h"
+#include "WebLink.h"
 #include "Settings.h"
 #include "ParticleSystem.h"
 
@@ -282,6 +285,12 @@ std::string unescapeStorage(const std::string& v) {
 // host, or the server) and seen by every player. Here: this game's own copy.
 std::unordered_map<std::string, std::string> g_SharedValues;
 std::vector<std::string> g_SharedChanged;   // keys to report to on_shared_changed
+// Mod messages that stay in this game (singleplayer, or the host's own): for its own
+// on_server_message (from engine.send_to_player / send_to_all), and for its own
+// on_mod_message (engine.send_to_server while not on someone else's server). Delivered
+// once a frame, so a mod's handler never runs inside the call that sent it.
+struct LocalModMessage { std::string channel, data; };
+std::vector<LocalModMessage> g_ModToOwnGame, g_ModToOwnServer;
 World* g_WorldInstance = nullptr;
 float g_PlaceRepeatSeconds = 0.2f;   // holding right-click places again this often (0 = off)
 FirstPersonView g_FirstPerson;        // the hand / held block in first person (FirstPerson.h)
@@ -332,11 +341,16 @@ std::map<std::string, EntityVisual> g_EntityVisuals;
 struct EntityLook {                              // per entity, this game only: animation clock, red flash
     uint8_t hurtCount = 0;
     double hurtUntil = 0.0;
+    glm::vec3 pos{0.0f};                         // where it was last seen, and its size (for its "poof")
+    float width = 0.6f, height = 1.0f;
+    bool item = false;
     std::string anim;
     double animStart = 0.0;
     bool seen = false;
 };
 std::unordered_map<uint32_t, EntityLook> g_EntityLooks;
+class ParticleSystem;
+ParticleSystem* g_Particles = nullptr;   // the game's particles (made with the GL context)
 bool entitiesHere() { return g_Client.state() != GameClient::State::Joined; }   // we run them
 // The light a model gets where it stands (sunlight - dark in caves and at night - and block
 // light), for the model shader's u_LocalLight. Defined below main's helpers.
@@ -410,6 +424,9 @@ bool g_ShowDebugInfo = false;   // F3: FPS, ping and multiplayer info in the top
 std::string g_GpuName;          // graphics card in use (shown on F3)
 float g_Fps = 0.0f;       // frames per second, updated twice a second (shown by /netstats)   // why the last connection failed/ended (shown on the Multiplayer screen)
 MainMenu* g_MainMenu = nullptr;
+// Is there a newer BlockSmith? (UpdateCheck.h - one small version file, read as data). Made once,
+// on the first session, and kept for the life of the game.
+std::unique_ptr<update::Checker> g_Updates;
 InventorySystem g_Inventory; // Dedicated C++ inventory system instance
 float g_FieldOfView = 70.0f;
 FogSettings g_Fog;
@@ -509,6 +526,18 @@ std::vector<GameInfo> getAvailableGames() {
     return games;
 }
 
+// Is this game installed: a folder of that name in games/ (the same rule the title screen uses
+// to list the games you can pick)
+bool gameInstalled(const std::string& folder) {
+    if (folder.empty() || folder == "." || folder == ".." || folder.find('/') != std::string::npos ||
+        folder.find('\\') != std::string::npos || folder.find(':') != std::string::npos) return false;
+    std::error_code ec;
+    for (const char* root : { "games", "../../games" }) {
+        if (fs::is_directory(fs::path(root) / folder, ec)) return true;
+    }
+    return false;
+}
+
 std::vector<std::string> getAvailableWorlds() {
     std::vector<std::string> worlds;
     std::string savesDir = "saves";
@@ -536,6 +565,16 @@ Player* g_PlayerInstance = nullptr;
 // engine.get_online_players... - the same as on the dedicated server
 ServerLuaApi g_ServerApi;
 bool g_PendingWorldOpen = false;          // open g_ActiveWorldName at the start of LOADING
+// Playing a world that needs other mods (or another game) than the ones loaded: the session ends,
+// everything mods made is thrown away and loaded again for that world, and it opens - all behind
+// the loading screen, in the same window (see main)
+struct ReloadRequest {
+    bool pending = false;
+    std::string world;   // open this world once the mods are loaded ("" = back to the title screen)
+    std::string game;
+};
+ReloadRequest g_Reload;
+int g_SessionGeneration = 0;              // goes up with every reload (caches of the old mods check it)
 double g_LastAutosave = 0.0;
 constexpr double kAutosaveSeconds = 120.0;
 
@@ -694,8 +733,14 @@ void saveCurrentWorld() {
 // Older saves without a "game=" line belong to whichever game opens them first.
 bool worldBelongsToLoadedGame(const WorldMeta& meta, std::string* why = nullptr) {
     if (meta.game.empty() || meta.game == g_LoadedGameFolder) return true;
-    if (why) *why = "This world was made with '" + meta.game + "'. Restart the game with that game selected to play it.";
+    if (why) *why = "This world was made with '" + meta.game + "', but '" + g_LoadedGameFolder + "' is loaded.";
     return false;
+}
+
+std::string worldGame(const std::string& world) {
+    WorldMeta meta;
+    if (!world.empty() && readWorldMeta(savesRoot() / world / "world.dat", meta) && !meta.game.empty()) return meta.game;
+    return g_ActiveGameFolder;
 }
 
 bool canPickUpItem(const std::string& item, int count) {
@@ -726,6 +771,123 @@ glm::vec3 modelLightAt(const glm::vec3& pos) {
 
 // Opens g_ActiveWorldName: creates it if new, otherwise restores seed, player and hotbar.
 // Returns false (and opens nothing) if the world belongs to a different game.
+// ---------------------------------------------------------------------------
+// World thumbnails: saves/<world>/thumbnail.png, a picture of the world for the world list.
+// Taken from the game view (before the hand and HUD are drawn) when the game is paused, and
+// a few seconds after a world first opens if it has none yet.
+// ---------------------------------------------------------------------------
+bool g_ThumbnailWanted = false;       // take one this frame
+bool g_ThumbnailChecked = false;      // (the "has none yet" check, once per opened world)
+double g_WorldOpenedAt = 0.0;
+double g_LastThumbnailAt = 0.0;      // (while playing, the picture is refreshed every few minutes)
+
+// A plain PNG (8-bit RGB, deflate "stored" blocks: no compression library needed)
+bool writePngRGB(const fs::path& file, const std::vector<uint8_t>& rgb, int w, int h) {
+    auto crc32 = [](const uint8_t* d, size_t n, uint32_t c = 0xFFFFFFFFu) {
+        for (size_t i = 0; i < n; ++i) {
+            c ^= d[i];
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+        }
+        return c;
+    };
+    auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(uint8_t(x >> 24)); v.push_back(uint8_t(x >> 16)); v.push_back(uint8_t(x >> 8)); v.push_back(uint8_t(x));
+    };
+    std::vector<uint8_t> raw;                       // each row: filter byte 0, then the pixels
+    raw.reserve(static_cast<size_t>(h) * (w * 3 + 1));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgb.begin() + static_cast<size_t>(y) * w * 3, rgb.begin() + static_cast<size_t>(y + 1) * w * 3);
+    }
+    std::vector<uint8_t> z = { 0x78, 0x01 };        // zlib header, then stored blocks of up to 65535
+    for (size_t pos = 0; pos < raw.size() || pos == 0;) {
+        const size_t len = std::min<size_t>(65535, raw.size() - pos);
+        const bool last = pos + len >= raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back(uint8_t(len)); z.push_back(uint8_t(len >> 8));
+        z.push_back(uint8_t(~len)); z.push_back(uint8_t(~len >> 8));
+        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + len);
+        pos += len;
+        if (last) break;
+    }
+    uint32_t a = 1, b = 0;                          // adler32
+    for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    be32(z, (b << 16) | a);
+
+    std::vector<uint8_t> png = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+    auto chunk = [&](const char* type, const std::vector<uint8_t>& data) {
+        be32(png, static_cast<uint32_t>(data.size()));
+        std::vector<uint8_t> td(type, type + 4);
+        td.insert(td.end(), data.begin(), data.end());
+        png.insert(png.end(), td.begin(), td.end());
+        be32(png, crc32(td.data(), td.size()) ^ 0xFFFFFFFFu);
+    };
+    std::vector<uint8_t> ihdr;
+    be32(ihdr, static_cast<uint32_t>(w)); be32(ihdr, static_cast<uint32_t>(h));
+    ihdr.insert(ihdr.end(), { 8, 2, 0, 0, 0 });    // 8 bits, RGB
+    chunk("IHDR", ihdr);
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        if (!out) return false;
+    }
+    std::error_code ec;
+    return replaceFile(tmp, file, ec);
+}
+
+// Reads the frame being drawn (width x height pixels) and saves a 320x180 thumbnail of its
+// middle (16:9) for the world being played
+void saveWorldThumbnail(int width, int height) {
+    if (g_ActiveWorldName.empty() || width < 16 || height < 16) return;
+    const fs::path dir = savesRoot() / g_ActiveWorldName;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return;
+    std::vector<uint8_t> frame(static_cast<size_t>(width) * height * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, frame.data());
+    // The biggest 16:9 area in the middle, shrunk to 320x180 by averaging
+    const int TW = 320, TH = 180;
+    int cw = width, ch = width * 9 / 16;
+    if (ch > height) { ch = height; cw = height * 16 / 9; }
+    const int ox = (width - cw) / 2, oy = (height - ch) / 2;
+    std::vector<uint8_t> out(static_cast<size_t>(TW) * TH * 3);
+    for (int ty = 0; ty < TH; ++ty) {
+        const int y0 = oy + ty * ch / TH, y1 = std::max(y0 + 1, oy + (ty + 1) * ch / TH);
+        for (int tx = 0; tx < TW; ++tx) {
+            const int x0 = ox + tx * cw / TW, x1 = std::max(x0 + 1, ox + (tx + 1) * cw / TW);
+            uint32_t sum[3] = { 0, 0, 0 }, n = 0;
+            for (int y = y0; y < y1; y += std::max(1, (y1 - y0) / 3)) {
+                for (int x = x0; x < x1; x += std::max(1, (x1 - x0) / 3)) {
+                    const uint8_t* p = &frame[(static_cast<size_t>(y) * width + x) * 3];
+                    sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2]; ++n;
+                }
+            }
+            uint8_t* o = &out[(static_cast<size_t>(TH - 1 - ty) * TW + tx) * 3];   // (GL reads bottom-up)
+            for (int c = 0; c < 3; ++c) o[c] = static_cast<uint8_t>(sum[c] / std::max(1u, n));
+        }
+    }
+    if (writePngRGB(dir / "thumbnail.png", out, TW, TH)) {
+        std::cout << "[World] Thumbnail saved for '" << g_ActiveWorldName << "'" << std::endl;
+    }
+}
+
+// "Just now", "5 minutes ago", "Yesterday", "3 days ago"...
+std::string playedAgo(fs::file_time_type when) {
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(fs::file_time_type::clock::now() - when).count();
+    if (secs < 90) return "Just now";
+    const long long mins = secs / 60, hours = mins / 60, days = hours / 24;
+    if (mins < 60) return std::to_string(mins) + " minutes ago";
+    if (hours < 24) return hours == 1 ? "An hour ago" : std::to_string(hours) + " hours ago";
+    if (days < 2) return "Yesterday";
+    if (days < 31) return std::to_string(days) + " days ago";
+    if (days < 62) return "Last month";
+    return std::to_string(days / 30) + " months ago";
+}
+
 bool openActiveWorld(World& world, Player& player) {
     const fs::path dir = savesRoot() / g_ActiveWorldName;
 
@@ -742,8 +904,13 @@ bool openActiveWorld(World& world, Player& player) {
     fs::create_directories(dir / "chunks", ec);
 
     world.reset();
+    g_ThumbnailChecked = false;          // (a new world gets its first thumbnail after a few seconds)
+    g_WorldOpenedAt = glfwGetTime();
+    g_LastThumbnailAt = g_WorldOpenedAt;
     g_SharedValues.clear();   // shared values (weather...) belong to a world
     g_SharedChanged.clear();
+    g_ModToOwnGame.clear();
+    g_ModToOwnServer.clear();
     g_ModStorage.clear();     // so does mod storage
     {
         std::ifstream f(dir / "mod_storage.txt");
@@ -810,7 +977,21 @@ bool openActiveWorld(World& world, Player& player) {
 }
 
 // Switches to the loading screen; the world itself is opened from the main loop.
+std::string worldGame(const std::string& world);
+std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world);
+extern std::set<std::string> g_LoadedGlobalMods;
+
+extern bool g_HudHidden;
+
 void beginLoadingWorld(GLFWwindow* win) {
+    // Every world starts with the HUD showing (F1 hides it only until you leave that world)
+    g_HudHidden = false;
+    // This world runs other mods (or is another game's): load those first, then open it
+    const std::string game = worldGame(g_ActiveWorldName);
+    if (!g_Reload.pending && (game != g_LoadedGameFolder || resolveGlobalMods(game, g_ActiveWorldName) != g_LoadedGlobalMods)) {
+        std::cout << "[Mods] '" << g_ActiveWorldName << "' needs other mods than the ones loaded: reloading for it" << std::endl;
+        g_Reload = ReloadRequest{ true, g_ActiveWorldName, game };
+    }
     g_CurrentGameState = GameState::LOADING;
     g_PendingWorldOpen = true;
     g_SpawnPlaced = false;
@@ -883,19 +1064,21 @@ std::string createWorld(const std::string& rawName, const std::string& seedText,
 
     std::error_code ec;
     fs::create_directories(savesRoot() / name / "chunks", ec);
-    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_LoadedGameFolder,
+    // (for the game selected on the title screen: playing it loads that game's mods)
+    writeWorldMeta(savesRoot() / name / "world.dat", seedFromText(seedText), nullptr, g_ActiveGameFolder,
                    false);   // a new world starts with an empty hotbar
     if (!options.empty()) {
         std::ofstream f(savesRoot() / name / "mod_storage.txt");
         for (const auto& [k, v] : options) f << escapeStorage("world:" + k) << '\t' << escapeStorage(v) << '\n';
     }
-    std::cout << "[World] Created save folder '" << name << "' for game '" << g_LoadedGameFolder << "'" << std::endl;
+    std::cout << "[World] Created save folder '" << name << "' for game '" << g_ActiveGameFolder << "'" << std::endl;
     return name;
 }
 
-// Can the world list be used right now? Only if the selected game is the one whose mods are loaded.
+// Can the world list be used right now? Always: playing a world of another game (or with other
+// mods) reloads the mods for it first.
 bool selectedGameIsLoaded() {
-    return g_ActiveGameFolder == g_LoadedGameFolder;
+    return true;
 }
 
 // Permanently deletes saves/<name>. Refuses anything that isn't a world folder directly
@@ -1085,9 +1268,20 @@ void applyLoadStatus(ModInfo& m, const std::vector<fs::path>& files) {
     m.status = !m.error.empty() ? "error" : (ran ? "loaded" : "not_loaded");
 }
 
+std::map<std::string, bool> loadGameModDefaults(const std::string& game);
+bool writeOnOffFile(const fs::path& file, const std::map<std::string, bool>& values, const std::string& header);
+fs::path gameModsFile(const std::string& game);
+bool validFolderName(const std::string& name);
+bool globalModOn(const std::string& game, const std::string& world, const std::string& id,
+                 const std::map<std::string, bool>* gameDefaults = nullptr,
+                 const std::map<std::string, bool>* worldChoices = nullptr);
+
 // Every mod folder and loose .lua file in the mods/ folder (game mods are not listed).
 std::vector<ModInfo> listInstalledMods() {
     std::vector<ModInfo> mods;
+    // "enabled" = on by default for the selected game's worlds (the Mods screen sets that)
+    const auto gameDefaults = loadGameModDefaults(g_ActiveGameFolder);
+    const std::map<std::string, bool> noWorld;
     for (const auto& root : modRoots()) {
         if (root.source != "Global") continue;   // only the mods/ folder
 
@@ -1126,13 +1320,13 @@ std::vector<ModInfo> listInstalledMods() {
             if (m.title.empty()) m.title = m.id;
             m.luaFiles = static_cast<int>(files.size());
             m.required = modIsRequired(entry.path(), m.id);
-            m.enabled = modIsEnabled(root.path, m.id);
+            m.enabled = globalModOn(g_ActiveGameFolder, "", m.id, &gameDefaults, &noWorld);
 
             applyLoadStatus(m, files);
             const auto started = g_ModEnabledAtStartup.find(m.id);
             const bool wasOn = started == g_ModEnabledAtStartup.end() || started->second;
             if (!wasOn) m.status = "disabled";
-            m.restartNeeded = (wasOn != m.enabled);
+            m.restartNeeded = false;   // applied when a world is opened (no restart)
 
             mods.push_back(m);
         }
@@ -1143,7 +1337,7 @@ std::vector<ModInfo> listInstalledMods() {
     return mods;
 }
 
-// Switches a mod in mods/ on or off (applies on restart). Returns false + reason on failure.
+// Switches a mod in mods/ on or off for the selected game's worlds (they pick it up when opened).
 bool setModEnabled(const std::string& id, bool on, std::string& error) {
     if (id.empty() || id.find('/') != std::string::npos || id.find('\\') != std::string::npos ||
         id.find("..") != std::string::npos) {
@@ -1161,15 +1355,149 @@ bool setModEnabled(const std::string& id, bool on, std::string& error) {
         return false;
     }
 
-    auto settings = loadModSettings();
-    settings[id] = on;
-    if (!saveModSettings(settings)) {
-        error = "Could not save " + modSettingsFile().string();
+    // The selected game's default (worlds that haven't chosen for themselves follow it)
+    auto defaults = loadGameModDefaults(g_ActiveGameFolder);
+    defaults[id] = on;
+    if (!validFolderName(g_ActiveGameFolder) ||
+        !writeOnOffFile(gameModsFile(g_ActiveGameFolder), defaults,
+                        "# Mods from the mods/ folder that worlds of '" + g_ActiveGameFolder + "' run, unless a world\n"
+                        "# chooses otherwise (saves/<world>/world_mods.txt). Set on the Mods screen.\n")) {
+        error = "Could not save " + gameModsFile(g_ActiveGameFolder).string();
         return false;
     }
-    std::cout << "[Mods] " << id << " will be " << (on ? "enabled" : "disabled") << " after a restart" << std::endl;
+    std::cout << "[Mods] " << id << " is now " << (on ? "on" : "off") << " for worlds of " << g_ActiveGameFolder << std::endl;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Which mods a world runs (like Luanti's world.mt, with Minecraft-style game-wide defaults)
+//   - A game's own mods (games/<game>/mods) always run with it.
+//   - Mods in the mods/ folder run only where they're switched on:
+//       mods/game_mods_<game>.txt      the game's defaults: "my_mod = true" (Mods screen)
+//       saves/<world>/world_mods.txt   one world's own choice, which wins (world list > Mods)
+//     A mod neither file mentions is off, so a newly installed mod changes no world until it's
+//     switched on. "base" and mods with "required = true" always run.
+//   - The first time a game's defaults are needed they start from the old mods/mod_settings.txt
+//     (every mod on unless switched off there), so existing worlds keep the mods they had.
+// Opening a world whose mods (or game) differ from the ones loaded reloads everything in place.
+// ---------------------------------------------------------------------------
+
+std::string g_SessionWorld;                 // the world whose mods this session loaded ("" = the game's defaults)
+std::set<std::string> g_LoadedGlobalMods;   // mods/ folder mods running this session
+
+bool validModId(const std::string& id) {
+    return !id.empty() && id.size() <= 128 && id.find('/') == std::string::npos &&
+           id.find('\\') == std::string::npos && id.find("..") == std::string::npos && id.find('=') == std::string::npos;
+}
+bool validFolderName(const std::string& name) {
+    return validModId(name) && name != "." && name.find(':') == std::string::npos;
+}
+
+// The mods in the mods/ folder that are real mods (a folder with .lua files, or a loose .lua)
+std::vector<std::string> installedGlobalModIds() {
+    std::vector<std::string> ids;
+    const fs::path root = globalModsFolder();
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(root, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (entry.is_directory(ec)) {
+            if (name == "clientmods") continue;
+            bool hasLua = false;
+            for (const auto& f : fs::recursive_directory_iterator(entry.path(), ec)) {
+                if (f.is_regular_file() && f.path().extension() == ".lua") { hasLua = true; break; }
+            }
+            if (hasLua) ids.push_back(name);
+        } else if (entry.is_regular_file(ec) && entry.path().extension() == ".lua") {
+            ids.push_back(name);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::map<std::string, bool> readOnOffFile(const fs::path& file) {
+    std::map<std::string, bool> out;
+    for (const auto& [key, val] : readConfFile(file)) {
+        out[key] = !(val == "false" || val == "0" || val == "off" || val == "no");
+    }
+    return out;
+}
+
+bool writeOnOffFile(const fs::path& file, const std::map<std::string, bool>& values, const std::string& header) {
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (!out) return false;
+        out << header;
+        for (const auto& [id, on] : values) out << id << " = " << (on ? "true" : "false") << "\n";
+        if (!out) return false;
+    }
+    if (!replaceFile(tmp, file, ec)) {
+        std::cerr << "[Mods] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
+    }
+    return true;
+}
+
+fs::path gameModsFile(const std::string& game) {
+    return globalModsFolder() / ("game_mods_" + game + ".txt");
+}
+
+std::map<std::string, bool> loadGameModDefaults(const std::string& game) {
+    const fs::path file = gameModsFile(game);
+    std::error_code ec;
+    if (fs::exists(file, ec)) return readOnOffFile(file);
+    // First time: what the old global on/off list said (on unless switched off), written down
+    // so that mods installed from now on start off
+    std::map<std::string, bool> seeded;
+    const auto legacy = loadModSettings();
+    for (const auto& id : installedGlobalModIds()) {
+        const auto it = legacy.find(id);
+        seeded[id] = it == legacy.end() || it->second;
+    }
+    if (validFolderName(game)) {
+        writeOnOffFile(file, seeded, "# Mods from the mods/ folder that worlds of '" + game + "' run, unless a world\n"
+                                     "# chooses otherwise (saves/<world>/world_mods.txt). Set on the Mods screen.\n");
+    }
+    return seeded;
+}
+
+fs::path worldModsFile(const std::string& world) {
+    return savesRoot() / world / "world_mods.txt";
+}
+
+std::map<std::string, bool> loadWorldModChoices(const std::string& world) {
+    if (world.empty() || !validFolderName(world)) return {};
+    return readOnOffFile(worldModsFile(world));
+}
+
+// Is a mods/ folder mod on for this game and world? (world = "" -> the game's default)
+bool globalModOn(const std::string& game, const std::string& world, const std::string& id,
+                 const std::map<std::string, bool>* gameDefaults,
+                 const std::map<std::string, bool>* worldChoices) {
+    if (modIsRequired(globalModsFolder() / id, id)) return true;
+    std::map<std::string, bool> w, g;
+    if (!worldChoices) { w = loadWorldModChoices(world); worldChoices = &w; }
+    if (auto it = worldChoices->find(id); it != worldChoices->end()) return it->second;
+    if (!gameDefaults) { g = loadGameModDefaults(game); gameDefaults = &g; }
+    if (auto it = gameDefaults->find(id); it != gameDefaults->end()) return it->second;
+    return false;
+}
+
+std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world) {
+    const auto g = loadGameModDefaults(game);
+    const auto w = loadWorldModChoices(world);
+    std::set<std::string> on;
+    for (const auto& id : installedGlobalModIds()) {
+        if (globalModOn(game, world, id, &g, &w)) on.insert(id);
+    }
+    return on;
+}
+
+// The game a saved world belongs to ("" if it has no world.dat yet: the selected game)
+std::string worldGame(const std::string& world);
 
 // Opens the main mods folder in Explorer / Finder / the desktop file manager.
 void openModsFolder() {
@@ -1366,6 +1694,18 @@ std::string textureSearchHint() {
     return where.empty() ? "no game or mods folder found" : where;
 }
 
+// Block textures no game, mod or pack had, so far (one warning lists them all)
+static std::vector<std::string> g_MissingTextures;
+static bool g_MissingTexturesReported = false;   // after that: each one as it's asked for
+static void reportMissingTextures() {
+    g_MissingTexturesReported = true;
+    if (g_MissingTextures.empty()) return;
+    std::string list;
+    for (size_t i = 0; i < g_MissingTextures.size(); ++i) list += (i ? ", " : "") + g_MissingTextures[i];
+    std::cerr << "[Texture] " << g_MissingTextures.size() << " block texture(s) not found: " << list << std::endl;
+
+}
+
 int loadTextureToLayer(const std::string& path) {
     std::string finalPath = path;
 
@@ -1392,18 +1732,30 @@ int loadTextureToLayer(const std::string& path) {
     }
 
     if (!found && packOverride(path).empty()) {
-        std::cerr << "[Texture] Missing block texture: " << path << std::endl;
+        // listed once, together, after the mods have loaded (reportMissingTextures)
+        const std::string name = fs::path(path).filename().string();
+        if (std::find(g_MissingTextures.begin(), g_MissingTextures.end(), name) == g_MissingTextures.end()) {
+            g_MissingTextures.push_back(name);
+            if (g_MissingTexturesReported) std::cerr << "[Texture] Missing block texture: " << path << std::endl;
+        }
     }
     if (found && packOverride(path).empty()) {
         int w, h, n;
         if (!stbi_info(finalPath.c_str(), &w, &h, &n)) return -1;   // unreadable image
     }
+    // The same picture file used by several blocks (or particles) shares one layer
+    static std::unordered_map<std::string, int> layerOfFile;
+    static int layerGen = -1;                       // (a mod reload starts the layers again)
+    if (layerGen != g_SessionGeneration) { layerOfFile.clear(); layerGen = g_SessionGeneration; }
+    const std::string fileKey = found ? fs::path(finalPath).lexically_normal().generic_string() : ("?" + path);
+    if (auto it = layerOfFile.find(fileKey); it != layerOfFile.end() && it->second < g_NextTextureLayer) return it->second;
     if (g_NextTextureLayer >= MAX_TEXTURE_LAYERS) {
         std::cerr << "[Texture] Out of texture layers (max " << MAX_TEXTURE_LAYERS << "): " << path << std::endl;
         return -1;
     }
 
     const int layer = g_NextTextureLayer++;
+    layerOfFile[fileKey] = layer;
     if (static_cast<int>(g_LayerSources.size()) <= layer) g_LayerSources.resize(layer + 1);
     g_LayerSources[layer] = TextureSource{ path, found ? finalPath : "" };
     uploadLayer(layer, g_LayerSources[layer]);
@@ -1657,6 +2009,13 @@ struct ModelInstance {
 std::map<int, ModelInstance> g_ModelInstances;   // models placed with engine.add_model
 int g_NextModelInstance = 1;
 bool g_ThirdPerson = false;                      // F5 camera (the player model is only drawn in third person)
+bool g_ThirdPersonFront = false;
+bool g_HudHidden = false;                        // F1: no HUD, crosshair or hand (screenshots)
+// The name of what's held (above the hotbar, for a moment after switching)
+bool g_ShowBlockNames = true;                    // engine.set_block_name_display(false) hides it
+uint8_t g_HeldNameFor = 0;                       // the held item whose name is showing
+int g_HeldNameSlot = -1;
+double g_HeldNameSince = -100.0;                 // when it changed (the name fades after 2 s)                 // ...in front of the player, looking back at them (F5 twice)
 
 // ===========================================================================
 // Settings (settings.txt next to the mods folder) and key bindings
@@ -1693,6 +2052,7 @@ const std::vector<KeyAction>& keyActions() {
         { "chat",      "Open Chat",      GLFW_KEY_T },
         { "command",   "Open Command",   GLFW_KEY_SLASH },
         { "third_person", "Toggle Camera View", GLFW_KEY_F5 },
+        { "hide_hud",    "Hide HUD",       GLFW_KEY_F1 },
         { "debug_info",  "Show FPS / Network Info", GLFW_KEY_F3 },
         { "player_list", "List Players",  GLFW_KEY_TAB },
         { "hotbar1",   "Hotbar Slot 1",  GLFW_KEY_1 },
@@ -1790,7 +2150,7 @@ std::string serverMotd() {
     const auto it = g_Settings.find("server_motd");
     return it != g_Settings.end() ? it->second : std::string("A BlockSmith server");
 }
-int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 20), 2, 200); }
+int serverMaxPlayers() { return std::clamp(settingInt("server_max_players", 50), 2, 200); }
 int serverPort() {
     const int p = settingInt("server_port", net::kDefaultPort);
     return (p > 0 && p <= 65535) ? p : net::kDefaultPort;
@@ -1901,7 +2261,10 @@ local out = {}
 local function add(s) out[#out + 1] = s end
 local function sorted_keys(t, want)
     local k = {}
-    for name, v in pairs(t) do
+    if type(t) ~= "table" then return k end
+    -- next, not pairs: a table's own keys, without its __pairs (some engine objects - model
+    -- animations - refuse to be listed that way)
+    for name, v in next, t do
         if type(name) == "string" and want(v) then k[#k + 1] = name end
     end
     table.sort(k)
@@ -1964,6 +2327,8 @@ local hooks = {
     { "on_server_stop",           "()  the server is stopping (in the game: you stopped hosting)" },
     { "on_use_hoe",               "(x, y, z, block) -> true if used  right-click with a hoe (tool_type \"hoe\")" },
     { "on_use_scythe",            "(x, y, z, block) -> true if it reaped (else it digs)  left-click with a scythe" },
+    { "on_mod_message",           "(name, channel, data)  a player's game sent the server's mods a message (engine.send_to_server)" },
+    { "on_server_message",        "(channel, data)  the server's mods sent this game a message (engine.send_to_player / send_to_all)" },
     { "on_player_harvest",        "(name, item, x, y, z)  a joined player's engine.request_harvest (the scythe): the server decides" },
     { "update_player_animation",  "(dt, is_moving, pitch)" },
     { "get_water_color",          "(x, z) -> { r, g, b, deep_r, deep_g, deep_b }  underwater fog colour here" },
@@ -2163,8 +2528,10 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     lua->script(kWorkerNoopLua);
     for (const auto& file : modFiles) {
         (*lua)["g_CurrentModPath"] = file.parent_path().string();
-        try { lua->script_file(file.string()); } catch (const std::exception&) {}   // errors shown by the main thread
+        // errors shown by the main thread (here, where only world generation works, they're noise)
+        try { lua->safe_script_file(file.string(), sol::script_pass_on_error); } catch (const std::exception&) {}
     }
+    diag::installLuaTraceback(lua->lua_state());   // generating chunks: errors with their Lua stack
     return lua;
 }
 
@@ -2197,7 +2564,7 @@ const std::vector<ServerSettingInfo>& serverSettingInfo() {
         {"world", "server_world", "World folder in saves/"},
         {"seed", "", "Seed for a new world (empty = random)"},
         {"port", "30000", "UDP port players connect to"},
-        {"max_players", "20", ""},
+        {"max_players", "50", "Most players at once (up to 4000)"},
         {"view_distance", "8", "Furthest players may see, in chunks"},
         {"spawn", "8 8", "Where new players appear (x z)"},
         {"welcome", "Welcome to the server, {player}!", "Sent to each player who joins"},
@@ -2423,9 +2790,9 @@ void openFolderInExplorer(const fs::path& folder) {
     std::system(cmd.c_str());
 }
 
-struct SavedServer { std::string name, address; };
+struct SavedServer { std::string name, address; bool pinned = false; };
 
-// servers.txt: one server per line, "name|address"
+// servers.txt: one server per line, "name|address", or "name|address|pinned" for one pinned to the top
 std::vector<SavedServer> loadServers() {
     std::vector<SavedServer> out;
     std::ifstream in(serversFile());
@@ -2434,7 +2801,14 @@ std::vector<SavedServer> loadServers() {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const size_t bar = line.find('|');
         if (line.empty() || line[0] == '#' || bar == std::string::npos) continue;
-        out.push_back({line.substr(0, bar), line.substr(bar + 1)});
+        std::string rest = line.substr(bar + 1);
+        bool pinned = false;
+        const size_t bar2 = rest.find('|');
+        if (bar2 != std::string::npos) {
+            pinned = rest.substr(bar2 + 1) == "pinned";
+            rest = rest.substr(0, bar2);
+        }
+        out.push_back({line.substr(0, bar), rest, pinned});
     }
     return out;
 }
@@ -2445,7 +2819,7 @@ void saveServers(const std::vector<SavedServer>& servers) {
         std::cerr << "[Multiplayer] Could not write " << serversFile().string() << std::endl;
         return;
     }
-    out << "# Saved servers (name|address). Edited from the Multiplayer screen.\n";
+    out << "# Saved servers (name|address, then |pinned if pinned to the top). Edited from the Multiplayer screen.\n";
     for (const auto& s : servers) {
         std::string name = s.name, address = s.address;
         for (auto* str : {&name, &address}) {
@@ -2453,7 +2827,7 @@ void saveServers(const std::vector<SavedServer>& servers) {
                                       [](char ch) { return ch == '|' || ch == '\n' || ch == '\r'; }),
                        str->end());
         }
-        out << name << "|" << address << "\n";
+        out << name << "|" << address << (s.pinned ? "|pinned" : "") << "\n";
     }
 }
 
@@ -2674,6 +3048,8 @@ void addClientModWorldApi(ClientMods& cm) {
     // tinted like the block (for maps). Worked out once per block.
     client["get_block_color"] = [](const std::string& name) {
         static std::map<std::string, glm::vec3> cache;
+        static int cacheGen = -1;                   // (other mods, other blocks)
+        if (cacheGen != g_SessionGeneration) { cache.clear(); cacheGen = g_SessionGeneration; }
         const auto it = cache.find(name);
         if (it != cache.end()) return std::make_tuple(it->second.r, it->second.g, it->second.b);
         glm::vec3 c(0.5f);
@@ -2762,6 +3138,25 @@ static std::unordered_map<std::string, std::string> g_BlockMod;
 std::string blockModOf(const std::string& name) {
     auto it = g_BlockMod.find(name);
     return it == g_BlockMod.end() ? std::string() : it->second;
+}
+
+// The name players see: the block's description ("Oak Log"), or one made from its name
+// (log_oak -> "Log Oak") when it has none
+std::string blockDisplayName(const BlockProperty& b) {
+    if (!b.description.empty()) return b.description;
+    std::string out;
+    bool up = true;
+    for (char ch : b.name) {
+        if (ch == '_' || ch == ':') { out += ' '; up = true; continue; }
+        out += up ? static_cast<char>(std::toupper(static_cast<unsigned char>(ch))) : ch;
+        up = false;
+    }
+    return out;
+}
+// "mod:name", like Luanti's item names: the mod that registered it, then its name
+std::string blockFullName(const BlockProperty& b) {
+    const std::string mod = blockModOf(b.name);
+    return mod.empty() ? b.name : mod + ":" + b.name;
 }
 
 void registerBlockFromLua(const std::string& name, float r, float g, float b, sol::object texObj, sol::object overlayObj, sol::optional<sol::table> propsTable) {
@@ -2911,6 +3306,172 @@ void HeldLight::update(const World& w) {
     if (id >= static_cast<int>(all.size()) || (id >= 0 && !all[id].active)) id = -1;   // cleared by sky.reset
     if (id < 0) id = g_LightingSystem->addPointLight(pos, color, radius, 0.9f);
     else g_LightingSystem->updatePointLight(id, pos, color, radius, 0.9f);
+}
+
+// ---- Particles: pictures by name, block bits, and Lua's particle definitions ----
+// A particle picture's texture layer by file name ("particle_flame.png"), -1 if there's no such
+// picture. Loaded the first time it's asked for (from any mod's folder) and kept.
+int particleTexture(const std::string& name) {
+    static std::unordered_map<std::string, int> cache;
+    static int cacheGen = -1;                       // (a mod reload starts the layers again)
+    if (cacheGen != g_SessionGeneration) { cache.clear(); cacheGen = g_SessionGeneration; }
+    if (name.empty() || name.size() > 128) return -1;
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+    int layer = -1;
+    const std::string indexed = indexedTexture(name);
+    if (!indexed.empty() || fs::exists(name)) layer = loadTextureToLayer(name);
+    cache[name] = layer;
+    return layer;
+}
+int particleSprite(const char* what) { return particleTexture(std::string("particle_") + what + ".png"); }
+// The picture a block's bits show: its side (or any face it has)
+int blockParticleLayer(uint8_t id) {
+    if (id == 0) return -1;
+    const auto& prop = BlockRegistry::getInstance().getBlock(id);
+    for (int f : { 4, 0, 2, 1, 5, 3 }) if (prop.faces[f].baseLayer >= 0) return prop.faces[f].baseLayer;
+    return -1;
+}
+
+bool readParticleVec(const sol::object& o, glm::vec3& out, float limit) {
+    if (!o.is<sol::table>()) return false;
+    sol::table t = o.as<sol::table>();
+    float v[3];
+    const char* keys[3] = { "x", "y", "z" };
+    for (int i = 0; i < 3; ++i) {
+        sol::optional<float> n = t[keys[i]];
+        if (!n) n = t.get<sol::optional<float>>(i + 1);
+        if (!n || !std::isfinite(*n)) return false;
+        v[i] = std::clamp(*n, -limit, limit);
+    }
+    out = glm::vec3(v[0], v[1], v[2]);
+    return true;
+}
+bool readParticleColor(const sol::object& o, glm::vec3& out) {
+    if (o.is<std::string>()) {
+        std::string hex = o.as<std::string>();
+        if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
+        if (hex.size() != 6 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return false;
+        const unsigned long v = std::strtoul(hex.c_str(), nullptr, 16);
+        out = glm::vec3(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f);
+        return true;
+    }
+    glm::vec3 c;
+    if (!readParticleVec(o, c, 255.0f)) return false;
+    if (c.x > 1.0f || c.y > 1.0f || c.z > 1.0f) c /= 255.0f;
+    out = glm::clamp(c, glm::vec3(0.0f), glm::vec3(1.0f));
+    return true;
+}
+// A Lua particle definition (see particles.spawn) -> spec, how many, and the random spread
+bool readParticleDef(sol::table def, ParticleSpec& s, int& amount, glm::vec3& spread, glm::vec3& velSpread) {
+    sol::object posObj = def["pos"];
+    if (!readParticleVec(posObj, s.pos, 1.0e7f)) {
+        sol::optional<float> x = def["x"], y = def["y"], z = def["z"];
+        if (!x || !y || !z || !std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z)) return false;
+        s.pos = glm::vec3(*x, *y, *z);
+    }
+    readParticleVec(def["velocity"], s.vel, 100.0f);
+    s.acc = glm::vec3(0.0f);
+    if (!readParticleVec(def["acceleration"], s.acc, 200.0f)) {
+        const float g = def.get_or("gravity", 0.0f);
+        if (std::isfinite(g)) s.acc = glm::vec3(0.0f, -std::clamp(g, -200.0f, 200.0f), 0.0f);
+    }
+    auto num = [&](const char* key, float fallback, float lo, float hi) {
+        const float v = def.get_or(key, fallback);
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    s.drag = num("drag", 0.0f, 0.0f, 50.0f);
+    s.life = num("life", 1.0f, 0.01f, 60.0f);
+    s.size = num("size", 0.1f, 0.005f, 4.0f);
+    s.sizeEnd = def["size_end"].valid() ? num("size_end", s.size, 0.0f, 4.0f) : -1.0f;
+    readParticleColor(def["color"], s.color);
+    glm::vec3 ce;
+    if (readParticleColor(def["color_end"], ce)) s.colorEnd = ce;
+    s.glow = def.get_or("glow", false);
+    s.collide = def.get_or("collide", true);
+    s.bounce = def.get_or("bounce", false);
+    s.frames.clear();
+    sol::object tex = def["texture"];
+    if (tex.is<std::string>()) {
+        const int l = particleTexture(tex.as<std::string>());
+        if (l >= 0) s.frames.push_back(l);
+    } else if (tex.is<sol::table>()) {
+        for (const auto& kv : tex.as<sol::table>()) {
+            if (!kv.second.is<std::string>() || s.frames.size() >= 32) continue;
+            const int l = particleTexture(kv.second.as<std::string>());
+            if (l >= 0) s.frames.push_back(l);
+        }
+    } else if (sol::optional<std::string> block = def["block"]) {
+        const uint8_t id = BlockRegistry::getInstance().getBlockId(*block);
+        const int l = blockParticleLayer(id);
+        if (l >= 0) {
+            s.frames.push_back(l);
+            s.piece = true;
+            const auto& prop = BlockRegistry::getInstance().getBlock(id);
+            for (const auto& f : prop.faces) if (f.baseLayer == l && f.tintBase) { s.color *= prop.defaultTint; break; }
+        }
+    }
+    if (s.frames.empty()) return false;
+    amount = std::clamp(def.get_or("amount", 1), 1, 512);
+    readParticleVec(def["spread"], spread, 64.0f);
+    readParticleVec(def["velocity_spread"], velSpread, 100.0f);
+    spread = glm::abs(spread); velSpread = glm::abs(velSpread);
+    return true;
+}
+
+// particles.register_ambient: Minecraft's "animate tick" - each frame some random blocks near
+// the player are looked at, and those of these kinds run their action (smoke from torches...)
+struct AmbientEffect {
+    std::vector<std::string> names;
+    sol::protected_function action;
+    std::string label;
+};
+std::vector<AmbientEffect> g_AmbientEffects;
+size_t g_AmbientResolvedFor = 0;
+std::vector<std::vector<int>> g_AmbientByBlock;   // block id -> effects
+
+void runAmbientEffects(const World& world, const glm::vec3& player, float dt) {
+    if (g_AmbientEffects.empty() || dt <= 0.0f) return;
+    auto& reg = BlockRegistry::getInstance();
+    const size_t blocks = reg.getAllBlocks().size();
+    if (g_AmbientResolvedFor != blocks || g_AmbientByBlock.size() != 256) {
+        g_AmbientResolvedFor = blocks;
+        g_AmbientByBlock.assign(256, {});
+        for (size_t i = 0; i < g_AmbientEffects.size(); ++i) {
+            for (const auto& n : g_AmbientEffects[i].names) {
+                const uint8_t id = reg.getBlockId(n);
+                if (id != 0) g_AmbientByBlock[id].push_back(static_cast<int>(i));
+            }
+        }
+    }
+    static std::mt19937 rng(1234567u);
+    static float owed = 0.0f;
+    // about 3 looks a second at each block within 16 (33^3 blocks): ~110,000 a second, of which
+    // this many each frame (it's cheap: the action only runs for the kinds that have one)
+    owed += 110000.0f * std::min(dt, 0.1f);
+    int samples = static_cast<int>(owed);
+    owed -= static_cast<float>(samples);
+    samples = std::min(samples, 12000);
+    std::uniform_int_distribution<int> d(-16, 16);
+    const glm::ivec3 c(glm::floor(player));
+    int calls = 0;
+    for (int i = 0; i < samples && calls < 64; ++i) {
+        const glm::ivec3 p(c.x + d(rng), c.y + d(rng), c.z + d(rng));
+        if (p.y < 0 || p.y >= CHUNK_HEIGHT) continue;
+        const uint8_t id = world.getBlockAt(p);
+        if (id == 0 || g_AmbientByBlock[id].empty()) continue;
+        const std::string& name = reg.getBlock(id).name;
+        for (int e : g_AmbientByBlock[id]) {
+            ++calls;
+            luasandbox::TimeLimit limit(0.05, "particles ambient");
+            auto r = g_AmbientEffects[static_cast<size_t>(e)].action(p.x, p.y, p.z, name);
+            if (!r.valid()) {
+                static std::string lastError;
+                sol::error err = r;
+                if (lastError != err.what()) { lastError = err.what(); std::cerr << "[Particles] " << g_AmbientEffects[static_cast<size_t>(e)].label << ": " << err.what() << std::endl; }
+            }
+        }
+    }
 }
 
 const char* vertexShaderSource = R"(
@@ -3451,6 +4012,73 @@ void drawLoadingScreen(GLuint uiProgram, GLuint fontProgram, float progress, int
     }
 }
 
+// Between two sessions (see main): everything the old mods set up is forgotten, so the next
+// session starts as if the game had just been started - with the next world's mods.
+void resetForReload() {
+    std::cout << "[Mods] Reloading for '" << g_Reload.world << "' (game " << g_Reload.game << ")" << std::endl;
+    ++g_SessionGeneration;
+
+    // Blocks, fluids and what's worked out from them
+    resetBlockDefinitions();   // the registry, and ids start from 1 again
+    FluidRegistry::get().reset();
+    light::invalidateBlockLights();
+    CaveGenerator::reset();
+
+    // Textures: the block texture array and every picture loaded by name
+    if (g_TextureArrayID) { glDeleteTextures(1, &g_TextureArrayID); g_TextureArrayID = 0; }
+    g_NextTextureLayer = 0;
+    g_LayerSources.clear();
+    for (const auto& [tex, src] : g_StandardTextureSources) { GLuint t = tex; glDeleteTextures(1, &t); }
+    g_StandardTextureSources.clear();
+    g_TextureIndex.clear();
+    g_TextureIndexRoots.clear();
+    if (g_CrackTexture) { glDeleteTextures(1, &g_CrackTexture); g_CrackTexture = 0; }
+    g_CrackStages = 10;
+
+    // Which mods ran, and what they set
+    g_ModFolders.clear();
+    g_ModFileStatus.clear();
+    g_ModEnabledAtStartup.clear();
+    g_CurrentModPath.clear();
+    g_BlockMod.clear();
+    g_ItemUseHandlers.clear();
+    g_SharedValues.clear();
+    g_SharedChanged.clear();
+    g_ModToOwnGame.clear();
+    g_ModToOwnServer.clear();
+    g_ModStorage.clear();
+    g_ModStorageDirty = false;
+    g_ModelInstances.clear();
+    g_NextModelInstance = 1;
+    g_EntityVisuals.clear();
+
+    // Settings mods change, back to the engine's own
+    g_FootstepDistance = 1.3f;
+    g_FlyAllowed = true;
+    g_MoveKeyMask = 0xFF;   // every movement control back (a disabled mod may have frozen some: set_player_controls)
+    g_PlaceRepeatSeconds = 0.2f;
+    g_LuaInventoryOpen = false;
+    g_FirstPerson = FirstPersonView{};
+    g_LightSettings = LightSettings{};
+    g_HeldLight = HeldLight{};
+    g_Fog = FogSettings{};
+    g_Underwater = UnderwaterSettings{};
+    g_UnderwaterBlend = 0.0f;
+    g_Inventory = InventorySystem{};
+    g_ThirdPerson = false;
+    g_ThirdPersonFront = false;
+    g_HudHidden = false;
+    g_ShowBlockNames = true;
+    g_Paused = false;
+    g_SettingsInGame = false;
+
+    // The next session: this game, with this world's mods, opening it (main does that)
+    g_ActiveGameFolder = g_Reload.game;
+    g_SessionWorld = g_Reload.world;
+    g_CurrentGameState = GameState::LOADING;
+    g_LoadingProgress = 0.0f;
+}
+
 int main(int argc, char** argv) {
     // Remember where the game's .exe is: BlockSmithServer is built next to it (My Servers screen)
     if (argc > 0 && argv[0]) {
@@ -3458,6 +4086,13 @@ int main(int argc, char** argv) {
         const fs::path exe = fs::absolute(fs::path(argv[0]), exeEc);
         if (!exeEc) g_ExeDir = exe.parent_path();
     }
+    // Diagnostics (Diagnostics.h): crash reports, logs/latest.log next to settings.txt, a trace
+    // under every warning, and (once the graphics card is known) the system report
+    diag::init("client");
+    diag::startLogFile(settingsFile().parent_path());
+    diag::enableWarningTraces();
+    std::cout << "BlockSmith " << BLOCKSMITH_VERSION << " (commit " << BLOCKSMITH_COMMIT << ", protocol "
+              << net::kVersionName << ")" << std::endl;
     try {
         if (!glfwInit()) return -1;
 
@@ -3498,11 +4133,38 @@ int main(int argc, char** argv) {
             return -1;
         }
 
-        // Closes the window LAST. Everything that owns OpenGL objects (the hotbar, fonts, sky,
-        // and locals declared below such as the world renderer and particles) deletes them in
-        // its destructor, which needs the context to still exist. Locals are destroyed in reverse
-        // order, so this one - made before all of them - goes after them. (Closing the window
-        // first made quitting the game crash in ~Hotbar.)
+        // The window and its OpenGL context last the whole run - through every mod reload below
+        struct WindowShutdown {
+            GLFWwindow* window;
+            ~WindowShutdown() {
+                glfwDestroyWindow(window);
+                glfwTerminate();
+            }
+        } windowShutdown{ window };
+
+        // ===================================================================================
+        // SESSIONS. Everything mods make - the Lua state, blocks, textures, entities, sounds,
+        // the menus' objects - belongs to one session. Playing a world that runs other mods
+        // (or another game) ends the session behind the loading screen, forgets all of it and
+        // starts a new one with that world's mods, which then opens the world: like Luanti, but
+        // in the same window without a restart. (The body below keeps its old indentation.)
+        // ===================================================================================
+        for (;;) {
+        {
+        if (g_SessionGeneration > 0) {
+            // The window's title names the game now loaded
+            std::string title = "BlockSmith";
+            for (const auto& g : getAvailableGames()) {
+                if (g.folderName == g_ActiveGameFolder) title = g.title + " - BlockSmith";
+            }
+            glfwSetWindowTitle(window, title.c_str());
+            windowTitle = title;
+        }
+        // Frees this session's OpenGL objects LAST. Everything that owns OpenGL objects (the
+        // hotbar, fonts, sky, and locals declared below such as the world renderer and
+        // particles) deletes them in its destructor, which needs the context to still exist.
+        // Locals are destroyed in reverse order, so this one - made before all of them - goes
+        // after them. (The window itself goes after every session: WindowShutdown.)
         struct GlShutdown {
             GLFWwindow* window;
             ~GlShutdown() {
@@ -3515,8 +4177,7 @@ int main(int argc, char** argv) {
                 delete g_Skybox;         g_Skybox = nullptr;
                 delete g_Clouds;         g_Clouds = nullptr;
                 delete g_MainMenu;       g_MainMenu = nullptr;
-                glfwDestroyWindow(window);
-                glfwTerminate();
+                glfwSetWindowUserPointer(window, nullptr);   // the session's EngineContext is gone
             }
         } glShutdown{ window };
 
@@ -3528,6 +4189,15 @@ int main(int argc, char** argv) {
             g_GpuName = renderer ? renderer : "unknown";
             std::cout << "[Graphics] GPU: " << g_GpuName << " (" << (vendor ? vendor : "?") << ", OpenGL "
                       << (version ? version : "?") << ")" << std::endl;
+            static bool reported = false;   // (once, not again for every session)
+            if (!reported) {
+                reported = true;
+                diag::addReportLine(std::string("Protocol: ") + net::kVersionName);
+                diag::addReportLine("Graphics: " + g_GpuName + " (" + (vendor ? vendor : "?") + ", OpenGL " +
+                                    (version ? version : "?") + ")");
+                diag::addReportLine("Settings: " + fs::absolute(settingsFile()).string());
+                diag::printSystemReport();
+            }
         }
 
         glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -3542,7 +4212,7 @@ int main(int argc, char** argv) {
         g_Skybox->init();
         g_Clouds = new Clouds();
         g_Clouds->init();
-        if (!g_Weather.init()) std::cerr << "[Weather] Couldn't set up weather effects" << std::endl;
+        if (g_SessionGeneration == 0 && !g_Weather.init()) std::cerr << "[Weather] Couldn't set up weather effects" << std::endl;
         g_Audio.init();   // no sound card: the game runs silently
         for (const char* group : { "master", "music", "effects", "ambient" }) {
             const std::string id = std::string("volume_") + group;
@@ -3713,8 +4383,16 @@ int main(int argc, char** argv) {
                     return;
                 }
 
+                if (key == keyForAction("hide_hud")) {
+                    g_HudHidden = !g_HudHidden;
+                    return;
+                }
+
                 if (key == keyForAction("third_person")) {
-                    g_ThirdPerson = !g_ThirdPerson;
+                    // Like Minecraft: first person -> behind the player -> in front of them -> first person
+                    if (!g_ThirdPerson) { g_ThirdPerson = true; g_ThirdPersonFront = false; }
+                    else if (!g_ThirdPersonFront) g_ThirdPersonFront = true;
+                    else { g_ThirdPerson = false; g_ThirdPersonFront = false; }
                     return;
                 }
 
@@ -3773,6 +4451,7 @@ int main(int argc, char** argv) {
                         return;
                     }
                     g_Paused = true;
+                    g_ThumbnailWanted = true;   // a picture of the world for the world list (thumbnail.png)
                     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
                 }
             }
@@ -3787,6 +4466,7 @@ int main(int argc, char** argv) {
         sol::state lua;
         lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                            sol::lib::coroutine, sol::lib::utf8);
+        diag::installLuaTraceback(lua.lua_state());   // every Lua error the game catches: with its Lua stack
         // The player's client mods: their own Lua state, made after (so gone before) the game's
         ClientMods clientMods;
         struct ClientModsPointer {
@@ -3914,6 +4594,26 @@ int main(int argc, char** argv) {
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glBindVertexArray(0);
             glUniform4f(tintLoc, 1.0f, 1.0f, 1.0f, 1.0f);   // (the program is shared: back to no tint)
+        };
+        // ui.world_thumbnail(world) -> a path for ui.draw_image (the world's thumbnail.png), or nil
+        //   if it has none. A newer picture (the world was played since) is loaded fresh.
+        uiTable["world_thumbnail"] = [](const std::string& worldName, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            if (worldName.empty() || worldName.find('/') != std::string::npos || worldName.find('\\') != std::string::npos ||
+                worldName.find("..") != std::string::npos) return sol::make_object(lv, sol::lua_nil);
+            const fs::path file = savesRoot() / worldName / "thumbnail.png";
+            std::error_code ec;
+            if (!fs::exists(file, ec)) return sol::make_object(lv, sol::lua_nil);
+            static std::unordered_map<std::string, fs::file_time_type> seen;
+            const std::string path = file.string();
+            const auto when = fs::last_write_time(file, ec);
+            auto it = seen.find(path);
+            if (it != seen.end() && it->second != when) {          // changed: forget the old picture
+                auto img = s_uiImages.find(path);
+                if (img != s_uiImages.end()) { if (img->second) glDeleteTextures(1, &img->second); s_uiImages.erase(img); }
+            }
+            seen[path] = when;
+            return sol::make_object(lv, path);
         };
         // ui.get_image_size(path) -> width, height in pixels (nil if it can't be loaded)
         uiTable["get_image_size"] = [uiImage](const std::string& path) -> std::tuple<sol::optional<int>, sol::optional<int>> {
@@ -4043,7 +4743,9 @@ int main(int argc, char** argv) {
         lua.new_usertype<AnimatedModel>("Model",
             "get_bone", &AnimatedModel::getBone,
             // model:reset_pose() - every bone back to the pose in the model file
-            "reset_pose", &AnimatedModel::resetPose
+            "reset_pose", &AnimatedModel::resetPose,
+            // model:is_loaded() - false when the file was missing or broken (load_model still returns a model)
+            "is_loaded", [](const AnimatedModel& m) { return m.loaded; }
         );
 
         // ---- Animations (Bedrock / Blockbench .animation.json) ----
@@ -4345,6 +5047,81 @@ int main(int argc, char** argv) {
             CloudSettings s = g_Clouds->settings(); s.clump = std::clamp(v, 0.0f, 1.0f); g_Clouds->setSettings(s);
         };
 
+        // ---- particles.* (ParticleSystem.h): Minecraft-style particles, drawn by this game only ----
+        //   particles.spawn{ pos = {x,y,z}, velocity = {x,y,z}, gravity = 12 (or acceleration = {x,y,z}),
+        //       drag = 0, life = 1, size = 0.1, size_end, color = "#ff8800" / {r,g,b}, color_end,
+        //       texture = "particle_flame.png" (or { frames... } played over its life), or
+        //       block = "stone" (bits of that block), glow = false, collide = true, bounce = false,
+        //       amount = 1, spread = {x,y,z} (random around pos), velocity_spread = {x,y,z} }
+        //   particles.add_spawner{ ...the same, plus rate = 10 (a second), time = 0 (seconds, 0 =
+        //       until removed), follow_player = false, life = {min, max}, size = {min, max} } -> id
+        //   particles.remove_spawner(id)
+        //   particles.register_ambient{ nodenames = {...}, action = function(x, y, z, block) end }:
+        //       blocks near the player are picked at random every frame (Minecraft's "animate
+        //       tick": each block within 16 about 3 times a second); action runs for these kinds,
+        //       e.g. torches puffing smoke, lava popping. Particles never leave this game.
+        {
+            auto particleTable = lua.create_named_table("particles");
+            particleTable["spawn"] = [](sol::table def) {
+                ParticleSpec s;
+                int amount = 1;
+                glm::vec3 spread(0.0f), velSpread(0.0f);
+                if (!g_Particles || !readParticleDef(def, s, amount, spread, velSpread)) return false;
+                if (amount <= 1 && spread == glm::vec3(0.0f) && velSpread == glm::vec3(0.0f)) g_Particles->spawn(s);
+                else g_Particles->burst(s, amount, spread, velSpread);
+                return true;
+            };
+            particleTable["add_spawner"] = [](sol::table def, sol::this_state ts) -> sol::object {
+                sol::state_view lv(ts);
+                ParticleSpawner sp;
+                int amount = 1;
+                glm::vec3 spread(0.0f), velSpread(0.0f);
+                if (!g_Particles || !readParticleDef(def, sp.spec, amount, spread, velSpread)) return sol::make_object(lv, sol::lua_nil);
+                sp.minPos = -spread; sp.maxPos = spread;
+                sp.minVel = -velSpread; sp.maxVel = velSpread;
+                auto range = [&](const char* key, float& lo, float& hi, float def0, float maxV) {
+                    sol::object o = def[key];
+                    if (o.is<sol::table>()) {
+                        sol::table t = o.as<sol::table>();
+                        lo = t.get_or(1, def0); hi = t.get_or(2, lo);
+                    } else if (o.is<double>()) {
+                        lo = hi = static_cast<float>(o.as<double>());
+                    } else {
+                        lo = hi = def0;
+                    }
+                    if (!std::isfinite(lo) || !std::isfinite(hi)) lo = hi = def0;
+                    lo = std::clamp(lo, 0.01f, maxV); hi = std::clamp(std::max(lo, hi), 0.01f, maxV);
+                };
+                range("life", sp.minLife, sp.maxLife, 1.0f, 60.0f);
+                range("size", sp.minSize, sp.maxSize, 0.1f, 4.0f);
+                sp.spec.size = sp.minSize;
+                const float rate = def.get_or("rate", 10.0f);
+                const float time = def.get_or("time", 0.0f);
+                sp.rate = std::isfinite(rate) ? std::clamp(rate, 0.0f, 1000.0f) : 10.0f;
+                sp.time = std::isfinite(time) ? std::clamp(time, 0.0f, 3600.0f) : 0.0f;
+                sp.followPlayer = def.get_or("follow_player", false);
+                const int id = g_Particles->addSpawner(sp);
+                return id < 0 ? sol::make_object(lv, sol::lua_nil) : sol::make_object(lv, id);
+            };
+            particleTable["remove_spawner"] = [](int id) { if (g_Particles) g_Particles->removeSpawner(id); };
+            particleTable["count"] = []() { return g_Particles ? static_cast<int>(g_Particles->count()) : 0; };
+            particleTable["register_ambient"] = [](sol::table def) {
+                AmbientEffect a;
+                if (sol::optional<sol::table> names = def["nodenames"]) {
+                    for (const auto& kv : *names) if (kv.second.is<std::string>()) a.names.push_back(kv.second.as<std::string>());
+                }
+                sol::object fn = def["action"];
+                if (a.names.empty() || fn.get_type() != sol::type::function) {
+                    std::cerr << "[Particles] register_ambient needs nodenames and an action function" << std::endl;
+                    return;
+                }
+                a.action = fn.as<sol::protected_function>();
+                a.label = def.get_or("label", std::string("ambient"));
+                g_AmbientEffects.push_back(std::move(a));
+                g_AmbientResolvedFor = 0;
+            };
+        }
+
         auto fogTable = lua.create_named_table("fog");
         fogTable["set_enabled"]      = [](bool on) { g_Fog.enabled = on; };
         fogTable["set_exponential"]  = [](bool on) { g_Fog.exponential = on; };
@@ -4590,6 +5367,11 @@ int main(int argc, char** argv) {
         g_ServerApi.localMessage = [](const std::string& text, const glm::vec3& color) {
             if (g_ChatSystem) g_ChatSystem->addMessage(text, color);
         };
+        g_ServerApi.localModMessage = [](const std::string& channel, const std::string& data) {
+            if (g_ModToOwnGame.size() >= 4096) return false;   // (full: dropped, and not counted as sent)
+            g_ModToOwnGame.push_back({ channel, data });
+            return true;
+        };
         g_ServerApi.localTeleport = [](const glm::vec3& pos) {
             if (!g_PlayerInstance) return;
             g_PlayerInstance->position = pos;
@@ -4785,6 +5567,41 @@ int main(int argc, char** argv) {
             try { return std::stoi(it->second); } catch (...) { return 3; }
         };
         engineTable["is_third_person"] = []() { return g_ThirdPerson; };
+        // engine.set_hud_visible(on) / engine.is_hud_visible(): the HUD, crosshair and hand (F1)
+        engineTable["set_hud_visible"] = [](bool on) { g_HudHidden = !on; };
+        // engine.set_block_name_display(on): the name of the block pointed at, and of the held
+        //   item after switching (on by default). engine.get_block_description(name) -> "Oak Log"
+        engineTable["set_block_name_display"] = [](bool on) { g_ShowBlockNames = on; };
+        engineTable["get_block_description"] = [](const std::string& name) -> std::string {
+            auto& reg = BlockRegistry::getInstance();
+            const uint8_t id = reg.getBlockId(name);
+            return id == 0 ? std::string() : blockDisplayName(reg.getBlock(id));
+        };
+        engineTable["is_hud_visible"] = []() { return !g_HudHidden; };
+        // engine.set_player_look(yaw, pitch): where the player looks, in degrees (yaw -90 = north,
+        //   -Z; 0 = east, +X; pitch 90 = straight up). engine.get_player_look() -> yaw, pitch
+        engineTable["set_player_look"] = [](float yaw, float pitch) {
+            if (!g_PlayerInstance || !std::isfinite(yaw) || !std::isfinite(pitch)) return false;
+            g_PlayerInstance->yaw = yaw;
+            // (closer to straight up or down than this, the view maths runs out of precision and nothing draws)
+            g_PlayerInstance->pitch = std::clamp(pitch, -89.9f, 89.9f);
+            return true;
+        };
+        engineTable["get_player_look"] = []() -> std::tuple<float, float> {
+            if (!g_PlayerInstance) return { -90.0f, 0.0f };
+            return { g_PlayerInstance->yaw, g_PlayerInstance->pitch };
+        };
+        // engine.get_camera_mode() -> "first", "back" or "front"; engine.set_camera_mode(mode) (F5 cycles them)
+        engineTable["get_camera_mode"] = []() -> std::string {
+            return !g_ThirdPerson ? "first" : (g_ThirdPersonFront ? "front" : "back");
+        };
+        engineTable["set_camera_mode"] = [](const std::string& mode) {
+            if (mode == "first")      { g_ThirdPerson = false; g_ThirdPersonFront = false; }
+            else if (mode == "back")  { g_ThirdPerson = true;  g_ThirdPersonFront = false; }
+            else if (mode == "front") { g_ThirdPerson = true;  g_ThirdPersonFront = true; }
+            else return false;
+            return true;
+        };
 
         engineTable["set_block"] = [](int x, int y, int z, const std::string& blockName) {
             if (g_WorldInstance) {
@@ -4908,6 +5725,13 @@ int main(int argc, char** argv) {
         // ---- First-person hand (FirstPerson.h) ----
         // engine.set_first_person_hand(on): show the held block / arm in first person (default on)
         engineTable["set_first_person_hand"] = [](bool on) { g_FirstPerson.enabled = on; };
+        // engine.set_third_person_item(on [, right_bone [, left_bone]]): show what's held in the
+        // player model's hand in F5 (default on), and which bone is the hand (its bottom end)
+        engineTable["set_third_person_item"] = [](bool on, sol::optional<std::string> r, sol::optional<std::string> l) {
+            g_FirstPerson.showInThirdPerson = on;
+            if (r) g_FirstPerson.rightHandBones.insert(g_FirstPerson.rightHandBones.begin(), *r);
+            if (l) g_FirstPerson.leftHandBones.insert(g_FirstPerson.leftHandBones.begin(), *l);
+        };
         // engine.set_first_person_arm({ right = "bone", left = "bone", color = { r, g, b } }):
         // which bone of g_PlayerModel is the arm shown when the hand is empty (with everything
         // attached to it), and the colour of the plain arm used if the model has none
@@ -5185,6 +6009,8 @@ int main(int argc, char** argv) {
             t["item"] = !b.inventoryImage.empty();
             t["has_sounds"] = !b.soundFootstep.name.empty() || !b.soundDig.name.empty() ||
                               !b.soundDug.name.empty() || !b.soundPlace.name.empty();
+            t["description"] = blockDisplayName(b);
+            t["full_name"] = blockFullName(b);
             return t;
         };
 
@@ -5294,6 +6120,7 @@ int main(int argc, char** argv) {
 
         engineTable["quit_to_menu"] = [window, &lua]() {
             g_SettingsInGame = false;
+            g_HudHidden = false;   // (F1 is for the world you were in: the next one shows the HUD)
             // Save, then unload the world so the next one starts clean (blocks still falling
             // land first, so none is lost in the air)
             if (g_CurrentGameState == GameState::PLAYING) {
@@ -5317,6 +6144,7 @@ int main(int argc, char** argv) {
             if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
             g_ModStorage.clear();       // (so does mod storage - the next world loads its own)
             g_ThirdPerson = false;
+            g_ThirdPersonFront = false;
             g_Paused = false;
             g_Inventory.setCreativeOpen(false);
             g_CurrentGameState = wasOnline ? GameState::MULTIPLAYER : GameState::MENU;
@@ -5343,6 +6171,9 @@ int main(int argc, char** argv) {
                 e["name"] = w.name;
                 e["seed"] = w.seed;
                 if (!w.gameMode.empty()) e["game_mode"] = w.gameMode;
+                e["played"] = playedAgo(w.lastPlayed);   // "2 hours ago"
+                std::error_code tec;
+                e["has_thumbnail"] = fs::exists(savesRoot() / w.name / "thumbnail.png", tec);
                 t[idx++] = e;
             }
             return t;
@@ -5369,13 +6200,23 @@ int main(int argc, char** argv) {
         };
         // engine.play_world(name) -> true, or false + error message
         engineTable["play_world"] = [window](const std::string& name) {
-            if (!selectedGameIsLoaded()) {
-                return std::make_tuple(false, std::string("Restart the game to play worlds for this game."));
+            // The target: a world folder directly in saves/ ...
+            if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos ||
+                name.find('\\') != std::string::npos || name.find(':') != std::string::npos) {
+                return std::make_tuple(false, std::string("Invalid world name."));
+            }
+            // ... of the game selected on the title screen, which must be installed. It doesn't
+            // have to be the game that's loaded now: beginLoadingWorld reloads the mods for it
+            // (the world's game and its mods) first. openActiveWorld checks the loaded game again
+            // before the save is restored.
+            if (!gameInstalled(g_ActiveGameFolder)) {
+                return std::make_tuple(false, "The selected game ('" + g_ActiveGameFolder + "') isn't installed.");
             }
             WorldMeta meta;
-            std::string why;
-            if (readWorldMeta(savesRoot() / name / "world.dat", meta) && !worldBelongsToLoadedGame(meta, &why)) {
-                return std::make_tuple(false, why);
+            if (readWorldMeta(savesRoot() / name / "world.dat", meta) && !meta.game.empty() &&
+                meta.game != g_ActiveGameFolder) {
+                return std::make_tuple(false, "This world was made with '" + meta.game + "', but '" +
+                                              g_ActiveGameFolder + "' is selected.");
             }
             g_ActiveWorldName = name;
             beginLoadingWorld(window);
@@ -5400,6 +6241,34 @@ int main(int argc, char** argv) {
             t["can_play"] = selectedGameIsLoaded();
             return t;
         };
+        // engine.get_update_info() -> { enabled, checked, available, required, current, commit, latest,
+        //   min_supported, download, notes, error }: is there a newer BlockSmith (UpdateCheck.h)
+        engineTable["get_update_info"] = [&lua]() {
+            sol::table t = lua.create_table();
+            t["enabled"] = g_Updates && g_Updates->enabled();
+            t["current"] = std::string(BLOCKSMITH_VERSION);
+            t["commit"] = std::string(BLOCKSMITH_COMMIT);
+            if (g_Updates) {
+                const update::Info& u = g_Updates->info();
+                t["checked"] = u.checked;
+                t["available"] = u.available;
+                t["required"] = u.required;
+                t["latest"] = u.latest;
+                t["min_supported"] = u.minSupported;
+                t["download"] = u.download;
+                t["notes"] = u.notes;
+                t["error"] = u.error;
+            }
+            return t;
+        };
+        // engine.open_update_page() -> true if the browser was asked to open the new version's
+        //   download page (only on the title-screen pages, and only the checked https link from
+        //   the version file: UpdateCheck.h)
+        engineTable["open_update_page"] = []() {
+            if (g_CurrentGameState == GameState::PLAYING || g_CurrentGameState == GameState::LOADING) return false;
+            if (!g_Updates || g_Updates->info().download.empty()) return false;
+            return weblink::open(g_Updates->info().download);
+        };
         engineTable["save_world"] = []() {
             if (g_CurrentGameState == GameState::PLAYING) saveCurrentWorld();
         };
@@ -5414,6 +6283,7 @@ int main(int argc, char** argv) {
                 sol::table e = lua.create_table();
                 e["name"] = s.name;
                 e["address"] = s.address;
+                e["pinned"] = s.pinned;
                 t[i++] = e;
             }
             return t;
@@ -5425,7 +6295,8 @@ int main(int argc, char** argv) {
                 sol::optional<sol::table> e = list[i];
                 if (!e) continue;
                 servers.push_back({e->get_or<std::string>("name", "Server"),
-                                   e->get_or<std::string>("address", "")});
+                                   e->get_or<std::string>("address", ""),
+                                   e->get_or("pinned", false)});
             }
             saveServers(servers);
         };
@@ -5455,6 +6326,7 @@ int main(int argc, char** argv) {
                 return std::make_tuple(false, std::string("Restart the game with this game selected to join its servers."));
             }
             if (g_Server.running()) g_Server.stop();
+            g_HudHidden = false;   // joining a server: the HUD shows (F1 was for the last world)
             std::string error;
             g_NetError.clear();
             const int view = g_WorldInstance ? g_WorldInstance->renderDistance() : 8;
@@ -5530,6 +6402,9 @@ int main(int argc, char** argv) {
             };
             g_Server.onHarvest = [](const std::string& name, const std::string& item, const glm::ivec3& pos) {
                 g_ServerApi.harvest(name, item, pos);
+            };
+            g_Server.onModMessage = [](const std::string& name, const std::string& channel, const std::string& data) {
+                g_ServerApi.modMessage(name, channel, data);
             };
             g_Server.onDropItem = [](const std::string&, const std::string& item, int count, const glm::vec3& at, const GameServer::DropInfo& how) {
                 if (BlockRegistry::getInstance().getBlockId(item) == 0) return;
@@ -5656,6 +6531,20 @@ int main(int argc, char** argv) {
             t["game_installed"] = installed;
             t["same_game"] = st->game.empty() || st->game == g_LoadedGameFolder;
             t["compatible"] = st->compatible;
+            // Which BlockSmith the server runs, and how it compares with this game: "newer" (an
+            // update is available for you), "older" (the server is behind), "same", or "" (an older
+            // server that doesn't say)
+            t["engine_version"] = st->engineVersion;
+            t["engine_commit"] = st->engineCommit;
+            {
+                update::Version sv, mine;
+                std::string cmp;
+                if (update::parseVersion(st->engineVersion, sv) && update::parseVersion(BLOCKSMITH_VERSION, mine)) {
+                    const int c = update::compare(sv, mine);
+                    cmp = c > 0 ? "newer" : (c < 0 ? "older" : "same");
+                }
+                t["engine_compare"] = cmp;
+            }
             t["error"] = st->error;
             sol::table names = lua.create_table();
             for (size_t i = 0; i < st->names.size(); ++i) names[i + 1] = st->names[i];
@@ -5833,6 +6722,24 @@ int main(int argc, char** argv) {
             t["players"] = list;
             return t;
         };
+        // engine.send_to_server(channel, data) -> true if sent: a message for the server's mods
+        // (their on_mod_message(name, channel, data)). In singleplayer, or when hosting, this
+        // game is the server: its own on_mod_message gets it (next frame), with your name.
+        // data is text (numbers become text); at most 4 KB; a flood is dropped by the server.
+        engineTable["send_to_server"] = [](const std::string& channel, sol::object data) {
+            std::string text;
+            if (data.get_type() == sol::type::string) text = data.as<std::string>();
+            else if (data.get_type() == sol::type::number) {
+                char buf[40];
+                std::snprintf(buf, sizeof(buf), "%.14g", data.as<double>());
+                text = buf;
+            } else if (data.valid() && data.get_type() != sol::type::lua_nil) return false;
+            if (!net::validModChannel(channel) || text.size() > net::kMaxModMessageFromPlayer) return false;
+            if (g_Client.active()) return g_Client.sendModMessage(channel, text);
+            if (g_ModToOwnServer.size() >= 4096) return false;
+            g_ModToOwnServer.push_back({ channel, text });
+            return true;
+        };
         // engine.send_chat(text) -> sends a chat message to everyone (multiplayer only). True if sent.
         engineTable["send_chat"] = [](const std::string& text) {
             if (g_Server.running()) { g_Server.sendChat(text); return true; }
@@ -5948,7 +6855,78 @@ int main(int argc, char** argv) {
         };
         engineTable["get_texture_pack"] = []() { return g_ActiveTexturePack; };
         engineTable["open_texture_packs_folder"] = []() { openTexturePacksFolder(); };
-        // engine.set_mod_enabled(id, on) -> true, or false + reason. Applies on the next start.
+        // ---- Which mods a world runs (world list > Mods) ----
+        // engine.get_world_mods(world) -> { game = "...", mods = { { id, title, description,
+        //     source = "Game"|"Global", required, enabled, default, choice }, ... } }
+        //   Game mods are always on. For mods/ folder mods: `default` = on for the game (Mods
+        //   screen), `choice` = the world's own (true / false, nil = follows the game),
+        //   `enabled` = what the world runs. `loaded` = running right now.
+        engineTable["get_world_mods"] = [&lua](const std::string& worldName) -> sol::object {
+            if (!validFolderName(worldName)) return sol::make_object(lua, sol::lua_nil);
+            const std::string game = worldGame(worldName);
+            const auto defaults = loadGameModDefaults(game);
+            const auto choices = loadWorldModChoices(worldName);
+            sol::table t = lua.create_table();
+            sol::table list = lua.create_table();
+            int i = 1;
+            // the ones a world can switch first, then the game's own
+            for (const auto& id : installedGlobalModIds()) {
+                sol::table e = lua.create_table();
+                std::string title = id, description;
+                const fs::path folder = globalModsFolder() / id;
+                std::error_code ec;
+                if (fs::is_directory(folder, ec)) {
+                    auto conf = readConfFile(folder / "mod.conf");
+                    if (!conf["title"].empty()) title = conf["title"];
+                    else if (!conf["name"].empty()) title = conf["name"];
+                    description = conf["description"];
+                }
+                const bool required = modIsRequired(folder, id);
+                const auto d = defaults.find(id);
+                const auto c = choices.find(id);
+                e["id"] = id; e["title"] = title; e["description"] = description;
+                e["source"] = "Global"; e["required"] = required;
+                e["default"] = required || (d != defaults.end() && d->second);
+                if (c != choices.end() && !required) e["choice"] = c->second;
+                e["enabled"] = globalModOn(game, worldName, id, &defaults, &choices);
+                e["loaded"] = g_LoadedGlobalMods.count(id) > 0 && game == g_LoadedGameFolder;
+                list[i++] = e;
+            }
+            for (const auto& m : listModsForGame(game)) {
+                if (m.source != "Game") continue;
+                sol::table e = lua.create_table();
+                e["id"] = m.id; e["title"] = m.title; e["description"] = m.description;
+                e["source"] = "Game"; e["required"] = true; e["enabled"] = true; e["default"] = true;
+                e["loaded"] = (game == g_LoadedGameFolder);
+                list[i++] = e;
+            }
+            t["game"] = game;
+            t["mods"] = list;
+            return t;
+        };
+        // engine.set_world_mod(world, id, on) -> true, or false + reason. on = true / false, or
+        //   nil to follow the game's default again. Used the next time the world is opened.
+        engineTable["set_world_mod"] = [](const std::string& worldName, const std::string& id, sol::optional<bool> on) {
+            if (!validFolderName(worldName)) return std::make_tuple(false, std::string("Invalid world name."));
+            std::error_code ec;
+            if (!fs::is_directory(savesRoot() / worldName, ec)) return std::make_tuple(false, std::string("No such world."));
+            if (!validModId(id)) return std::make_tuple(false, std::string("Invalid mod name."));
+            if (!fs::exists(globalModsFolder() / id, ec)) return std::make_tuple(false, std::string("Mod not found."));
+            if (modIsRequired(globalModsFolder() / id, id)) {
+                return std::make_tuple(false, std::string("This mod is required and always runs."));
+            }
+            auto choices = loadWorldModChoices(worldName);
+            if (on) choices[id] = *on; else choices.erase(id);
+            if (!writeOnOffFile(worldModsFile(worldName), choices,
+                                "# Mods from the mods/ folder this world runs (true) or doesn't (false). Mods not\n"
+                                "# listed follow the game's choice (the Mods screen). The game's own mods always run.\n")) {
+                return std::make_tuple(false, std::string("Could not save the world's mod list."));
+            }
+            return std::make_tuple(true, std::string());
+        };
+
+        // engine.set_mod_enabled(id, on) -> true, or false + reason: on by default for the selected
+        //   game's worlds (a world's own choice wins). Applies when a world is opened.
         engineTable["set_mod_enabled"] = [](const std::string& id, bool on) {
             std::string error;
             if (id.rfind("client:", 0) == 0) {   // a client mod (clientmods/mods.conf)
@@ -5972,6 +6950,18 @@ int main(int argc, char** argv) {
         // Player settings (key bindings, FOV, ...) from settings.txt
         loadSettings();
 
+        // update_check = false in settings.txt turns the new-version check off; update_url points
+        // it at another version file (it must be allowed like any remote content)
+        if (!g_Updates) {
+            const auto on = g_Settings.find("update_check");
+            const bool enabled = on == g_Settings.end() || (on->second != "false" && on->second != "0");
+            const auto url = g_Settings.find("update_url");
+            g_Updates = std::make_unique<update::Checker>(
+                settingsFile().parent_path() / "cache" / "update",
+                (url != g_Settings.end() && !url->second.empty()) ? url->second : std::string(update::kDefaultUrl),
+                remotePolicyFromSettings(), enabled);
+        }
+
         // Every player always has a name (used in chat and multiplayer)
         g_ChatSystem->setPlayerName(ensurePlayerName());
         g_ChatSystem->registerCommand("name", "[new name]", "Show or change your player name.");
@@ -5993,6 +6983,9 @@ int main(int argc, char** argv) {
         buildTextureIndex();   // pictures anywhere in the game / mods can be used by name
         std::vector<fs::path> modFiles;
         std::set<std::string> initFolders;
+        // The mods/ folder mods this session runs: the game's defaults, or the world's own choice
+        const std::set<std::string> sessionGlobalMods = resolveGlobalMods(g_ActiveGameFolder, g_SessionWorld);
+        g_LoadedGlobalMods = sessionGlobalMods;
 
         std::set<std::string> seenModRoots;   // the same folder reached by two paths is only loaded once
         for (const auto& searchPath : modSearchPaths) {
@@ -6022,11 +7015,13 @@ int main(int argc, char** argv) {
                     const std::string modId = (relEc || rel.empty()) ? "" : rel.begin()->string();
                     if (modId == "clientmods") continue;   // mods/clientmods/: the player's client mods, not game mods
                     if (!modId.empty()) {
-                        const bool on = modIsEnabled(resolvedPath, modId);
+                        // On for this game and the world being opened (Luanti-style world mods)
+                        const bool on = sessionGlobalMods.count(modId) > 0;
                         g_ModEnabledAtStartup[modId] = on;
                         if (!on) {
                             if (reportedDisabled.insert(modId).second) {
-                                std::cout << "[Mod] Skipping disabled mod: " << modId << std::endl;
+                                std::cout << "[Mod] Not loading " << modId << " (off for "
+                                          << (g_SessionWorld.empty() ? "this game" : "world '" + g_SessionWorld + "'") << ")" << std::endl;
                             }
                             continue;
                         }
@@ -6145,6 +7140,10 @@ int main(int argc, char** argv) {
             auto editSound = [](const glm::ivec3& pos, uint8_t oldId, uint8_t newId) {
                 FluidRegistry::get().ensureFresh();
                 if (FluidRegistry::get().forBlock(oldId) || FluidRegistry::get().forBlock(newId)) return;
+                // someone else broke it: its bits fly too
+                if (newId == 0 && oldId != 0 && g_Particles) {
+                    g_Particles->spawnBreakParticles(glm::vec3(pos), oldId, static_cast<float>(blockParticleLayer(oldId)));
+                }
                 const glm::vec3 at = glm::vec3(pos) + glm::vec3(0.5f);
                 if (newId == 0) playBlockSound(oldId, "dug", at);
                 else playBlockSound(newId, "place", at);
@@ -6175,6 +7174,7 @@ int main(int argc, char** argv) {
         }
 
         // lua_api.txt: everything modders can use in this build (see writeApiReference)
+        reportMissingTextures();
         writeApiReference(lua);
         engineTable["write_api_reference"] = [&lua]() { return writeApiReference(lua); };
 
@@ -6245,7 +7245,9 @@ int main(int argc, char** argv) {
         glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
 
         Player player;
-        ParticleSystem particles;   // block-break particles (needs the GL context, so created here)
+        ParticleSystem particles;   // particles (ParticleSystem.h; needs the GL context, so created here)
+        g_Particles = &particles;
+        struct ParticlesGone { ~ParticlesGone() { g_Particles = nullptr; } } particlesGone;
         PlayerAvatars playerAvatars;   // other players in multiplayer
         player.position = glm::vec3(8.0f, 100.0f, 8.0f);
 
@@ -6328,6 +7330,14 @@ int main(int argc, char** argv) {
                         // Singleplayer -> world selection screen (world_select.lua)
                         g_CurrentGameState = GameState::WORLD_SELECT;
                         callLuaUI(ctx->lua, "on_world_select_opened");
+                    } else if (actionResult == "update") {
+                        // The new version's download page, in the player's own browser (they clicked
+                        // it). Only an https GitHub page or the version file's own site gets here
+                        // (UpdateCheck.h), and WebLink opens only a plain, safe address.
+                        if (g_Updates && !g_Updates->info().download.empty() &&
+                            !weblink::open(g_Updates->info().download)) {
+                            std::cerr << "[Update] Couldn't open " << g_Updates->info().download << std::endl;
+                        }
                     } else if (actionResult == "multiplayer") {
                         // Multiplayer -> server list (multiplayer.lua)
                         g_CurrentGameState = GameState::MULTIPLAYER;
@@ -6401,7 +7411,20 @@ int main(int argc, char** argv) {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);   // (read again each frame)
         };
 
+        // A new session made for a world: open it now that its mods are loaded
+        if (g_Reload.pending) {
+            const std::string target = g_Reload.world;
+            g_Reload = ReloadRequest{};
+            if (!target.empty()) {
+                g_ActiveWorldName = target;
+                beginLoadingWorld(window);
+            }
+        }
+
+        // A reload asked for during the session: one more frame (the loading screen), then go
+        int reloadFrames = 0;
         while (!glfwWindowShouldClose(window)) {
+            if (g_Reload.pending && reloadFrames++ >= 1) break;
             float currentFrameTime = static_cast<float>(glfwGetTime());
             float deltaTime = currentFrameTime - lastFrameTime;
             lastFrameTime = currentFrameTime;
@@ -6445,6 +7468,28 @@ int main(int argc, char** argv) {
                         auto r = fn(k, value);
                         if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_shared_changed: " << err.what() << std::endl; }
                     }
+                }
+            }
+
+            // Mod messages: from the server (or this game's own server side) to on_server_message,
+            // and from this game's own mods to on_mod_message when it is the server itself
+            {
+                std::vector<LocalModMessage> toGame, toServer;
+                toGame.swap(g_ModToOwnGame);
+                toServer.swap(g_ModToOwnServer);
+                if (g_Client.state() == GameClient::State::Joined) {
+                    for (auto& m : g_Client.takeModMessages()) toGame.push_back({ std::move(m.channel), std::move(m.data) });
+                }
+                if (!toGame.empty()) {
+                    sol::protected_function fn = lua["on_server_message"];
+                    for (const auto& m : toGame) {
+                        if (!fn.valid()) break;
+                        auto r = fn(m.channel, m.data);
+                        if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_server_message: " << err.what() << std::endl; }
+                    }
+                }
+                if (!g_Client.active()) {
+                    for (const auto& m : toServer) g_ServerApi.modMessage(playerName(), m.channel, m.data);
                 }
             }
 
@@ -6622,6 +7667,7 @@ int main(int argc, char** argv) {
                         world.reset();
                         g_ModelInstances.clear();
                         g_ThirdPerson = false;
+                        g_ThirdPersonFront = false;
                         g_Paused = false;
                         g_SettingsInGame = false;
                         g_Inventory.setCreativeOpen(false);
@@ -6633,7 +7679,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (g_CurrentGameState == GameState::LOADING) {
+            if (g_CurrentGameState == GameState::LOADING && !g_Reload.pending) {
                 if (g_PendingWorldOpen) {
                     g_PendingWorldOpen = false;
                     if (!openActiveWorld(world, player)) {
@@ -6728,6 +7774,74 @@ int main(int argc, char** argv) {
                                 playBlockSound(ground, "footstep", player.position, sneaking ? 0.3f : 0.6f);
                                 stepDistance = 0.0f;
                             }
+                            // Particles, Minecraft's way: a puff of the ground's bits on landing (more
+                            // the harder the fall), and a trail of them while sprinting
+                            const int groundLayer = blockParticleLayer(ground);
+                            if (!wasGrounded && fallSpeed > 6.0f) {
+                                particles.spawnFootParticles(player.position, ground, static_cast<float>(groundLayer),
+                                                             std::min(60, static_cast<int>((fallSpeed - 5.0f) * 5.0f)),
+                                                             std::min(3.0f, fallSpeed * 0.12f));
+                            }
+                            static float sprintOwed = 0.0f;
+                            const float speedNow = deltaTime > 0.0f ? glm::length(moved) / deltaTime : 0.0f;
+                            if ((g_LastMoveKeys & MoveInput::Sprint) != 0 && speedNow > 4.0f && !sneaking) {
+                                for (sprintOwed += deltaTime * 20.0f; sprintOwed >= 1.0f; sprintOwed -= 1.0f) {
+                                    particles.spawnFootParticles(player.position, ground, static_cast<float>(groundLayer), 1, 0.6f);
+                                }
+                            }
+                        }
+                    }
+                    // Water: a splash when you drop in, bubbles while your head is under
+                    {
+                        static bool feetWasWet = false;
+                        static float bubbleOwed = 0.0f;
+                        auto wetAt = [&](const glm::vec3& p) {
+                            const uint8_t id = world.getBlockAt(glm::ivec3(glm::floor(p)));
+                            return id != 0 && isWaterBlockName(BlockRegistry::getInstance().getBlock(id).name);
+                        };
+                        const bool feetWet = wetAt(player.position + glm::vec3(0.0f, 0.1f, 0.0f));
+                        if (feetWet && !feetWasWet && fallSpeed > 3.0f) {
+                            // the surface: up from the feet while it's water
+                            glm::vec3 top = player.position;
+                            for (int i = 0; i < 4 && wetAt(top + glm::vec3(0.0f, 1.0f, 0.0f)); ++i) top.y += 1.0f;
+                            top.y = std::floor(top.y) + 0.95f;
+                            const int splash = particleSprite("splash");
+                            if (splash >= 0) {
+                                ParticleSpec sp;
+                                sp.frames = { splash };
+                                sp.pos = top;
+                                sp.vel = glm::vec3(0.0f, 3.2f, 0.0f);          // a spray up, falling back
+                                sp.acc = glm::vec3(0.0f, -14.0f, 0.0f);
+                                sp.life = 0.6f; sp.size = 0.12f;
+                                sp.collide = false;
+                                particles.burst(sp, std::min(60, static_cast<int>(fallSpeed * 4.0f)), glm::vec3(0.5f, 0.0f, 0.5f),
+                                                glm::vec3(1.6f, 1.4f, 1.6f));
+                            }
+                            const int bubble = particleSprite("bubble");
+                            if (bubble >= 0) {
+                                ParticleSpec b;
+                                b.frames = { bubble };
+                                b.pos = player.position + glm::vec3(0.0f, 0.5f, 0.0f);
+                                b.acc = glm::vec3(0.0f, 3.0f, 0.0f);
+                                b.drag = 2.0f; b.life = 0.8f; b.size = 0.08f; b.collide = false;
+                                particles.burst(b, 16, glm::vec3(0.4f, 0.4f, 0.4f), glm::vec3(0.8f, 0.5f, 0.8f));
+                            }
+                        }
+                        feetWasWet = feetWet;
+                        if (wetAt(player.position + glm::vec3(0.0f, 1.62f, 0.0f))) {
+                            const int bubble = particleSprite("bubble");
+                            for (bubbleOwed += deltaTime * 2.5f; bubbleOwed >= 1.0f && bubble >= 0; bubbleOwed -= 1.0f) {
+                                ParticleSpec b;
+                                b.frames = { bubble };
+                                const float yawR = glm::radians(player.yaw);
+                                b.pos = player.position + glm::vec3(std::cos(yawR) * 0.3f, 1.5f, std::sin(yawR) * 0.3f);
+                                b.vel = glm::vec3(particles.randomRange(-0.2f, 0.2f), 0.6f, particles.randomRange(-0.2f, 0.2f));
+                                b.acc = glm::vec3(0.0f, 1.5f, 0.0f);
+                                b.drag = 1.5f; b.life = particles.randomRange(0.8f, 1.6f); b.size = 0.07f; b.collide = false;
+                                particles.spawn(b);
+                            }
+                        } else {
+                            bubbleOwed = 0.0f;
                         }
                     }
                     // Online: tell the server exactly what we just did, so it can do the same
@@ -6902,12 +8016,7 @@ int main(int argc, char** argv) {
 
                 auto& reg = BlockRegistry::getInstance();
                 auto spawnBreakParticles = [&](const glm::ivec3& pos, uint8_t id) {
-                    const auto& prop = reg.getBlock(id);
-                    int particleLayer = -1;   // the block's side texture (or any face it has)
-                    for (int f : { 4, 0, 2, 1, 5, 3 }) {
-                        if (prop.faces[f].baseLayer >= 0) { particleLayer = prop.faces[f].baseLayer; break; }
-                    }
-                    particles.spawnBreakParticles(glm::vec3(pos), id, static_cast<float>(particleLayer));
+                    particles.spawnBreakParticles(glm::vec3(pos), id, static_cast<float>(blockParticleLayer(id)));
                 };
                 const uint8_t heldId = g_Hotbar->getActiveBlockId();
                 const BlockProperty* held = heldId != 0 ? &reg.getBlock(heldId) : nullptr;
@@ -7013,8 +8122,14 @@ int main(int argc, char** argv) {
                                     g_Dig.particleTimer -= deltaTime;
                                     if (g_Dig.particleTimer <= 0.0f && g_Dig.progress < 1.0f) {
                                         g_Dig.particleTimer = 0.25f;
-                                        spawnBreakParticles(hitPos, targetBlockId);
                                         playBlockSound(targetBlockId, "dig", glm::vec3(hitPos) + glm::vec3(0.5f), 0.5f);
+                                    }
+                                    // Minecraft: chips off the face being hit, every tick of digging
+                                    static float chipOwed = 0.0f;
+                                    chipOwed += deltaTime * 20.0f;
+                                    for (; chipOwed >= 1.0f; chipOwed -= 1.0f) {
+                                        particles.spawnDigParticles(glm::vec3(hitPos), glm::vec3(rayResult.faceNormal), targetBlockId,
+                                                                    static_cast<float>(blockParticleLayer(targetBlockId)));
                                     }
                                     if (g_Dig.progress >= 1.0f) {
                                         survivalDig(hitPos, targetBlockId);
@@ -7187,7 +8302,8 @@ int main(int argc, char** argv) {
             glm::mat4 proj = glm::perspective(glm::radians(g_FieldOfView), aspectRatio, 0.1f, 500.0f);
             glm::mat4 view = player.getViewMatrix();
 
-            // Third-person camera (F5): behind the player, pulled in so it never goes through blocks
+            // Third-person camera (F5): behind the player (or in front, looking back at them), pulled
+            // in so it never goes through blocks
             if (g_ThirdPerson && g_CurrentGameState == GameState::PLAYING) {
                 const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
                 const glm::vec3 front = glm::normalize(glm::vec3(
@@ -7195,9 +8311,12 @@ int main(int argc, char** argv) {
                     sin(glm::radians(player.pitch)),
                     sin(glm::radians(player.yaw)) * cos(glm::radians(player.pitch))));
 
+                // eye -> camera. In front the pitch is mirrored: looking down lifts the camera
+                // above the player (instead of into the ground under them)
+                const glm::vec3 away = g_ThirdPersonFront ? glm::vec3(front.x, -front.y, front.z) : -front;
                 float dist = 4.0f;
                 for (float d = 0.25f; d <= 4.0f; d += 0.25f) {
-                    const glm::vec3 p = eye - front * d;
+                    const glm::vec3 p = eye + away * d;
                     const uint8_t id = world.getBlockAt(glm::ivec3(static_cast<int>(std::floor(p.x)),
                                                                    static_cast<int>(std::floor(p.y)),
                                                                    static_cast<int>(std::floor(p.z))));
@@ -7206,7 +8325,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                view = glm::lookAt(eye - front * dist, eye, glm::vec3(0.0f, 1.0f, 0.0f));
+                view = glm::lookAt(eye + away * dist, eye, glm::vec3(0.0f, 1.0f, 0.0f));
             }
 
             glm::vec3 sunDir = g_LightingSystem->getSunDirection();
@@ -7444,11 +8563,14 @@ int main(int argc, char** argv) {
                                 vx.lightSky = lv[0]; vx.lightR = lv[1]; vx.lightG = lv[2]; vx.lightB = lv[3];
                                 return vx;
                             };
-                            const Vertex a = mk(-0.5f, 0.0f, 0, 1, 1.0f), b = mk(0.5f, 0.0f, 1, 1, 1.0f),
+                            Vertex a = mk(-0.5f, 0.0f, 0, 1, 1.0f), b = mk(0.5f, 0.0f, 1, 1, 1.0f),
                                          cc = mk(0.5f, 1.0f, 1, 0, 1.0f), d = mk(-0.5f, 1.0f, 0, 0, 1.0f);
-                            verts = { a, b, cc, a, cc, d };
                             Vertex a2 = a, b2 = b, c2 = cc, d2 = d;
-                            for (Vertex* vv : { &a2, &b2, &c2, &d2 }) vv->faceShading = 0.8f;
+                            // the two sides a hair apart: on the same plane they fought over which
+                            // one shows, and spinning items flickered
+                            for (Vertex* vv : { &a, &b, &cc, &d }) vv->posZ = 0.01f;
+                            for (Vertex* vv : { &a2, &b2, &c2, &d2 }) { vv->faceShading = 0.8f; vv->posZ = -0.01f; }
+                            verts = { a, b, cc, a, cc, d };
                             verts.insert(verts.end(), { b2, a2, d2, b2, d2, c2 });
                             const float bob = std::sin(now * 2.5f + static_cast<float>(v.id)) * 0.05f;
                             model = glm::translate(glm::mat4(1.0f), v.pos + glm::vec3(0.0f, 0.08f + bob, 0.0f));
@@ -7499,8 +8621,11 @@ int main(int argc, char** argv) {
                 if (!otherPlayers.empty()) playerAvatars.render(otherPlayers, shaderProgram, view, proj);
 
                 // Block-break particles (same shader as the world, so they get fog and lighting)
-                if (!g_Paused) particles.update(deltaTime);
-                particles.render(view, proj, shaderProgram, g_TextureArrayID);
+                if (!g_Paused) {
+                    runAmbientEffects(world, player.position, deltaTime);   // torches smoking, lava popping...
+                    particles.update(deltaTime, &world, player.position);
+                }
+                particles.render(view, proj, shaderProgram, g_TextureArrayID, &world);
 
                 g_Clouds->update(deltaTime);
                 if (!skyHidden) {
@@ -7519,7 +8644,8 @@ int main(int argc, char** argv) {
                 glUniform1f(glGetUniformLocation(modelShaderProgram, "u_WeatherLight"), g_Weather.worldLight());
 
                 glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), player.position);
-                modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw + 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                // Models face -Z; turn that to where the player looks (yaw 0 = +X), so F5 shows its back
+                modelMatrix = glm::rotate(modelMatrix, glm::radians(-player.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 
                 // Player model: only in third person (in first person the camera is inside its head)
                 {
@@ -7527,15 +8653,28 @@ int main(int argc, char** argv) {
                     glUniform3f(glGetUniformLocation(modelShaderProgram, "u_LocalLight"), lit.r, lit.g, lit.b);
                 }
                 if (g_ThirdPerson) {
+                    // Why there's no body to see is said once (in the console), not left a mystery
+                    static std::string s_PlayerModelWarned;
+                    std::string problem;
                     try {
                         sol::object modelObj = lua["g_PlayerModel"];
                         if (modelObj.is<std::shared_ptr<AnimatedModel>>()) {
                             auto model = modelObj.as<std::shared_ptr<AnimatedModel>>();
-                            if (model) {
-                                model->draw(modelShaderProgram, modelMatrix);
-                            }
+                            if (!model) problem = "g_PlayerModel is empty";
+                            else if (!model->loaded) problem = "g_PlayerModel did not load (see the [Model] lines above)";
+                            else model->draw(modelShaderProgram, modelMatrix);
+                        } else {
+                            problem = (modelObj.get_type() == sol::type::lua_nil)
+                                ? "g_PlayerModel is nil - no mod loaded a player model (the player mod's models/player_model.json missing?)"
+                                : "g_PlayerModel is not a model from engine.load_model";
                         }
-                    } catch (...) {}
+                    } catch (const std::exception& e) {
+                        problem = std::string("drawing it failed: ") + e.what();
+                    }
+                    if (!problem.empty() && problem != s_PlayerModelWarned) {
+                        std::cout << "[Player] Third person: no player model to draw: " << problem << std::endl;
+                        s_PlayerModelWarned = problem;
+                    }
                 }
 
                 // Models placed from Lua with engine.add_model (mobs etc.)
@@ -7561,8 +8700,37 @@ int main(int argc, char** argv) {
                     for (const EntityView& v : entityViews) {
                         present.insert(v.id);
                         EntityLook& look = g_EntityLooks[v.id];
-                        if (look.seen && v.hurtCount != look.hurtCount) look.hurtUntil = now + 0.35;
+                        if (look.seen && v.hurtCount != look.hurtCount) {
+                            look.hurtUntil = now + 0.35;
+                            // Minecraft's hit sparks: a burst of crit stars around its middle
+                            const int crit = particleSprite("crit");
+                            if (crit >= 0) {
+                                ParticleSpec c;
+                                c.frames = { crit };
+                                c.pos = v.pos + glm::vec3(0.0f, v.height * 0.6f, 0.0f);
+                                c.acc = glm::vec3(0.0f, -6.0f, 0.0f);
+                                c.drag = 3.0f; c.life = 0.75f; c.size = 0.2f; c.sizeEnd = 0.06f;
+                                c.color = glm::vec3(0.9f, 0.9f, 0.95f);
+                                c.glow = true;
+                                // each one starts just outside its body and flies outwards, so they burst
+                                // all round it (inside the body they'd be hidden by the model)
+                                const glm::vec3 centre = c.pos;
+                                for (int k = 0; k < 18; ++k) {
+                                    const float ang = particles.random01() * 6.2831853f;
+                                    const float up = particles.randomRange(-0.6f, 0.9f);
+                                    const glm::vec3 dir = glm::normalize(glm::vec3(std::cos(ang), up, std::sin(ang)));
+                                    ParticleSpec q = c;
+                                    q.pos = centre + glm::vec3(dir.x * (v.width * 0.55f + 0.1f), dir.y * v.height * 0.45f,
+                                                               dir.z * (v.width * 0.55f + 0.1f));
+                                    q.vel = dir * particles.randomRange(1.5f, 3.5f) + glm::vec3(0.0f, 0.6f, 0.0f);
+                                    q.life *= particles.randomRange(0.7f, 1.2f);
+                                    particles.spawn(q);
+                                }
+                            }
+                        }
                         look.hurtCount = v.hurtCount;
+                        look.pos = v.pos; look.width = v.width; look.height = v.height;
+                        look.item = v.type == EntityManager::kItemType;
                         if (!look.seen || v.anim != look.anim) { look.anim = v.anim; look.animStart = now; }
                         look.seen = true;
                         auto vis = g_EntityVisuals.find(v.type);
@@ -7570,12 +8738,11 @@ int main(int argc, char** argv) {
                         AnimatedModel& model = *vis->second.model;
                         model.resetPose();
                         if (!v.anim.empty() && vis->second.anims) {
-                            for (const auto& a : vis->second.anims->animations) {
-                                if (!a || a->name != v.anim) continue;
+                            // the full name ("animation.cow.walk") or the short one ("walk"), like everywhere else
+                            if (const auto a = vis->second.anims->get(v.anim)) {
                                 float t = static_cast<float>((now - look.animStart) * v.animSpeed);
                                 if (a->length > 0.0f) t = v.animLoop ? std::fmod(std::max(t, 0.0f), a->length) : std::min(t, a->length);
                                 a->apply(model, t);
-                                break;
                             }
                         }
                         // light where it stands (sunlight in caves is dark; torches light it)
@@ -7591,7 +8758,28 @@ int main(int argc, char** argv) {
                     glUniform3f(localLight, 1.0f, 1.0f, 1.0f);
                     glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
                     for (auto it = g_EntityLooks.begin(); it != g_EntityLooks.end();) {
-                        if (present.count(it->first)) ++it; else it = g_EntityLooks.erase(it);
+                        if (present.count(it->first)) { ++it; continue; }
+                        // A mob gone from near you died (or a mod took it away): Minecraft's white "poof".
+                        // (Its last hit is never seen - it's removed the moment it dies; mobs that
+                        // despawn or leave your range do it far away, where nothing shows.)
+                        const EntityLook& gone = it->second;
+                        if (!gone.item && gone.seen && glm::distance(gone.pos, player.position) < 24.0f) {
+                            std::vector<int> smoke;
+                            for (int f = 0; f < 8; ++f) { const int l = particleSprite(("smoke_" + std::to_string(f)).c_str()); if (l >= 0) smoke.push_back(l); }
+                            if (!smoke.empty()) {
+                                ParticleSpec pf;
+                                pf.frames = smoke;
+                                pf.pos = gone.pos + glm::vec3(0.0f, gone.height * 0.5f, 0.0f);
+                                pf.vel = glm::vec3(0.0f, 0.4f, 0.0f);
+                                pf.acc = glm::vec3(0.0f, 0.3f, 0.0f);
+                                pf.drag = 3.0f; pf.life = 0.9f; pf.size = 0.32f; pf.sizeEnd = 0.2f;
+                                pf.color = glm::vec3(0.95f);
+                                pf.collide = false;
+                                particles.burst(pf, 20, glm::vec3(gone.width * 0.5f, gone.height * 0.45f, gone.width * 0.5f),
+                                                glm::vec3(1.2f, 0.8f, 1.2f));
+                            }
+                        }
+                        it = g_EntityLooks.erase(it);
                     }
                 }
 
@@ -7765,6 +8953,19 @@ int main(int argc, char** argv) {
                 if (blend < 0.5f) g_Weather.drawBolts(view, proj, eyePos);
                 g_Weather.drawFlash();
 
+                // The world's thumbnail: this frame's picture, before the hand and HUD go on it
+                if (!g_ThumbnailChecked && glfwGetTime() - g_WorldOpenedAt > 6.0 && !g_ActiveWorldName.empty()) {
+                    g_ThumbnailChecked = true;
+                    std::error_code tec;
+                    if (!fs::exists(savesRoot() / g_ActiveWorldName / "thumbnail.png", tec)) g_ThumbnailWanted = true;
+                }
+                if (!g_Paused && glfwGetTime() - g_LastThumbnailAt > 300.0) g_ThumbnailWanted = true;
+                if (g_ThumbnailWanted) {
+                    g_ThumbnailWanted = false;
+                    g_LastThumbnailAt = glfwGetTime();
+                    if (g_Client.state() != GameClient::State::Joined) saveWorldThumbnail(width, height);
+                }
+
                 // ---------------- First-person hand (FirstPerson.h) ----------------
                 {
                     // Walking speed for the bob; "on the ground" by vertical speed, as the grounded
@@ -7783,16 +8984,25 @@ int main(int argc, char** argv) {
                     const uint16_t here = world.getLightAt(glm::ivec3(glm::floor(eyePos)));
                     const glm::vec4 handLight(light::sky(here) / 15.0f, light::red(here) / 15.0f,
                                               light::green(here) / 15.0f, light::blue(here) / 15.0f);
-                    if (!g_ThirdPerson) {
+                    if (!g_ThirdPerson && !g_HudHidden) {
                         g_FirstPerson.render(shaderProgram, modelShaderProgram, g_TextureArrayID, width, height,
                                              handLight, fpModel, settingInt("main_hand", 0) == 1);
+                    } else if (fpModel) {
+                        // F5: what's held, in the player model's hand (placed as the model is drawn)
+                        glm::mat4 modelWorld = glm::translate(glm::mat4(1.0f), player.position);
+                        modelWorld = glm::rotate(modelWorld, glm::radians(-player.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                        g_FirstPerson.renderThirdPerson(shaderProgram, g_TextureArrayID, view, proj, handLight,
+                                                        fpModel, modelWorld, settingInt("main_hand", 0) == 1);
                     }
                 }
 
                 // ---------------- HUD ----------------
                 glDisable(GL_DEPTH_TEST);
+                // F1 hides all of this (the crosshair, hotbar and HUDs), like Minecraft
+                if (!g_HudHidden) {
                 glUseProgram(uiProgram);
-                if (isCursorDisabled && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
+                // (no crosshair when the camera faces the player: it would point at nothing)
+                if (isCursorDisabled && !g_ThirdPersonFront && (!g_ChatSystem || !g_ChatSystem->isOpen)) {
                     glBindVertexArray(crosshairVAO);
                     glLineWidth(2.0f);
                     glDrawArrays(GL_LINES, 0, 4);
@@ -7859,6 +9069,36 @@ int main(int argc, char** argv) {
                                                 static_cast<float>(height), uiProgram, texturedUIProgram);
                     glDisable(GL_DEPTH_TEST);
                 }
+
+                // The held item's name above the hotbar for a moment after switching, like Minecraft
+                if (g_ShowBlockNames && g_FontRenderer && !g_Paused && !g_Inventory.isCreativeOpen() && !g_LuaInventoryOpen) {
+                    const Dimensions2D screen{width, height};
+                    const glm::vec2 sc = uiTextScale(1.0f, screen);
+                    auto& names = BlockRegistry::getInstance();
+                    auto shadowed = [&](const std::string& t, float x, float y, glm::vec2 s, glm::vec4 c) {
+                        g_FontRenderer->renderText(fontProgram, t, x + 2.0f, y + 2.0f, s.x, s.y, glm::vec4(0.1f, 0.1f, 0.1f, c.a * 0.85f), screen);
+                        g_FontRenderer->renderText(fontProgram, t, x, y, s.x, s.y, c, screen);
+                    };
+                    glUseProgram(fontProgram);
+                    if (g_Hotbar) {
+                        const uint8_t held = g_Hotbar->getActiveBlockId();
+                        if (held != g_HeldNameFor || g_Hotbar->activeSlot != g_HeldNameSlot) {
+                            g_HeldNameFor = held;
+                            g_HeldNameSlot = g_Hotbar->activeSlot;
+                            g_HeldNameSince = glfwGetTime();
+                        }
+                        const double age = glfwGetTime() - g_HeldNameSince;
+                        if (held != 0 && age < 2.0) {
+                            const float alpha = static_cast<float>(std::min(1.0, (2.0 - age) / 0.5));
+                            float hx = 0, hy = 0, hw = 0, hh = 0;
+                            hotbarScreenRect(*g_Hotbar, static_cast<float>(width), static_cast<float>(height), hx, hy, hw, hh);
+                            const std::string t = blockDisplayName(names.getBlock(held));
+                            const float tw = g_FontRenderer->textWidth(t, sc.x, screen);
+                            shadowed(t, std::round((width - tw) * 0.5f), std::round(hy - 14.0f), sc, glm::vec4(1.0f, 1.0f, 1.0f, alpha));
+                        }
+                    }
+                }
+                }   // !g_HudHidden
 
                 // 2. Creative inventory (drawn by inventory.lua)
                 g_Inventory.renderCreativeInventory(window, lua, static_cast<float>(width), static_cast<float>(height), uiProgram, texturedUIProgram);
@@ -8053,11 +9293,13 @@ int main(int argc, char** argv) {
                 drawLoadingScreen(uiProgram, fontProgram, g_LoadingProgress, width, height);
             } else if (g_CurrentGameState == GameState::WORLD_SELECT) {
                 resetUIRenderState();
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_world_select",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
             } else if (g_CurrentGameState == GameState::MULTIPLAYER) {
                 resetUIRenderState();
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_multiplayer",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
@@ -8073,6 +9315,8 @@ int main(int argc, char** argv) {
                                             uiProgram, texturedUIProgram);
             } else if (g_CurrentGameState == GameState::SETTINGS) {
                 resetUIRenderState();
+                // From the title screen: over the game's panorama, turning behind it
+                if (g_MainMenu && g_MainMenu->renderBackdrop(width, height)) resetUIRenderState();
                 g_Inventory.renderLuaScreen(window, lua, "render_settings",
                                             static_cast<float>(width), static_cast<float>(height),
                                             uiProgram, texturedUIProgram);
@@ -8098,6 +9342,24 @@ int main(int argc, char** argv) {
                 static std::string current;
                 static std::map<std::string, GLFWcursor*> cursors;
                 std::string want = uidraw::takeCursorRequest();
+                // (the new-version check: asked in the background; the title screen shows it)
+                if (g_Updates) {
+                    g_Updates->update(glfwGetTime());
+                    if (g_Updates->takeNews()) {
+                        const std::string line = g_Updates->summary();
+                        // one line (the full details: the server's "update" command / the Lua info)
+                        if (!line.empty()) std::cout << "[Update] " << line
+                                                     << (g_Updates->info().checked ? "" : " (" + g_Updates->url() + ")") << std::endl;
+                    }
+                    if (g_MainMenu) {
+                        const update::Info& u = g_Updates->info();
+                        std::string notice;
+                        if (u.required) notice = "Update required: " + u.latest;
+                        else if (u.available) notice = "Update available: " + u.latest;
+                        if (!notice.empty() && !u.download.empty()) notice += " - click to download";
+                        g_MainMenu->setUpdateNotice(notice, u.required);
+                    }
+                }
                 if (glfwGetInputMode(window, GLFW_CURSOR) != GLFW_CURSOR_NORMAL || want == "arrow") want.clear();
                 if (want != current) {
                     current = want;
@@ -8141,8 +9403,23 @@ int main(int argc, char** argv) {
         for (auto& [addr, t] : g_ServerIcons) if (t.tex) glDeleteTextures(1, &t.tex);
         g_ServerIcons.clear();
 
+        // Everything still holding the session's Lua functions lets go while the Lua state exists
+        g_BlockMods = BlockModifiers{};
+        g_EntityLua = EntityLua{};
+        g_Entities = EntityManager{};
+        g_ServerApi = ServerLuaApi{};
+        g_AmbientEffects.clear();
+        g_AmbientByBlock.clear();
+        g_AmbientResolvedFor = 0;
+        g_Lua = nullptr;
+
         g_Audio.shutdown();
-        // (the window and the objects drawing with OpenGL go at the end of this block: GlShutdown)
+        // (the objects drawing with OpenGL go at the end of this block: GlShutdown)
+        }   // end of the session: its Lua state, world and renderers are gone now
+
+        if (!g_Reload.pending || glfwWindowShouldClose(window)) break;
+        resetForReload();
+        }   // for (;;): the next session, with the mods of the world being opened
     } catch (const std::exception& e) {
         std::cerr << "\n[CRITICAL EXCEPTION]: " << e.what() << std::endl;
         system("pause");

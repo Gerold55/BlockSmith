@@ -10,7 +10,7 @@
 --   default_sounds.material(name) -> "stone" | ... | nil        - what this mod thinks a block is
 --   default_sounds.rules  - { { pattern, set }, ... } checked in order; add your own first
 
-sounds = default_sounds or {}
+default_sounds = default_sounds or {}
 
 local function set(kind, gains)
     gains = gains or {}

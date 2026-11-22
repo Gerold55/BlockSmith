@@ -136,7 +136,7 @@ engine.register_item_use(EMPTY, function(pointed)
 end)
 
 -- Water's bucket comes with this mod; fluids registered earlier with a `bucket` field too
-buckets.register("water", "water_bucket", "water_bucket.png")
+buckets.register("water", "water_bucket", "bucket_water.png")
 for _, f in ipairs(engine.list_fluids()) do
     if f.bucket and not by_fluid[f.name] then
         buckets.register(f.name, f.bucket, f.bucket_image, f.mod_path)

@@ -14,6 +14,13 @@ using json = nlohmann::json;
 namespace {
 
 // Euler angles in degrees, applied X first, then Y, then Z.
+// Bedrock rotations -> the engine's. Blockbench reads a Bedrock rotation (x, y, z) as (-x, -y, z)
+// in its own space; the engine draws Bedrock models mirrored left-right back to what Blockbench
+// shows (AnimatedModel::draw), which turns that into (-x, y, -z) here. With it, every pose,
+// animation and rest rotation looks exactly as it does in Blockbench: a leg at -60 on X swings
+// forward, a knee at +X bends back, a head at +X looks down.
+glm::vec3 bedrockToEngine(const glm::vec3& deg) { return glm::vec3(-deg.x, deg.y, -deg.z); }
+
 glm::mat4 eulerMatrix(const glm::vec3& deg) {
     glm::mat4 m(1.0f);
     m = glm::rotate(m, glm::radians(deg.z), glm::vec3(0, 0, 1));
@@ -95,7 +102,7 @@ glm::mat4 Bone::getLocalTransform() const {
     glm::mat4 m(1.0f);
     m = glm::translate(m, restPosition + position + pivot);   // file's rest position + animation offset
     m *= glm::mat4_cast(restRotation);
-    m *= eulerMatrix(rotation);
+    m *= eulerMatrix(bedrock ? bedrockToEngine(rotation) : rotation);
     m = glm::scale(m, scale * animScale);
     m = glm::translate(m, -pivot);
     return m;
@@ -141,10 +148,20 @@ void AnimatedModel::draw(GLuint shaderProgram, const glm::mat4& worldTransform) 
     if (texLoc >= 0) glUniform1i(texLoc, 0);
 
     const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
-    const glm::mat4 root = glm::scale(worldTransform, glm::vec3(scale));
+    glm::mat4 root = glm::scale(worldTransform, glm::vec3(scale));
+    // Bedrock / Blockbench models store X mirrored (Blockbench flips it back when it shows them):
+    // without flipping it here too, the whole model came out as its mirror image - the right
+    // arm on the left, turns and tilts the wrong way round. Mirroring flips which way the
+    // triangles wind, so the front-face rule is swapped while drawing.
+    const bool mirror = !isB3D;
+    if (mirror) {
+        root = glm::scale(root, glm::vec3(-1.0f, 1.0f, 1.0f));
+        glFrontFace(GL_CW);
+    }
     for (const auto& rootBone : rootBones) {
         drawBoneRecursive(rootBone, modelLoc, root);
     }
+    if (mirror) glFrontFace(GL_CCW);
 }
 
 // ===========================================================================
@@ -228,7 +245,7 @@ void appendCube(const json& cube, float texW, float texH, bool boneMirror, std::
     glm::vec3 cubePivot(0.0f);
     const bool rotated = cube.contains("rotation");
     if (rotated) {
-        rot = eulerMatrix(vec3Of(cube, "rotation", glm::vec3(0.0f)));
+        rot = eulerMatrix(bedrockToEngine(vec3Of(cube, "rotation", glm::vec3(0.0f))));
         cubePivot = vec3Of(cube, "pivot", origin + size * 0.5f) / 16.0f;
     }
 
@@ -302,12 +319,18 @@ void AnimatedModel::loadFromJson(const std::string& filepath) {
             auto bone = std::make_shared<Bone>();
             bone->name = bData.value("name", "bone_" + std::to_string(boneMap.size()));
             bone->pivot = vec3Of(bData, "pivot", glm::vec3(0.0f)) / 16.0f;
-            bone->restRotation = glm::quat_cast(eulerMatrix(vec3Of(bData, "rotation", glm::vec3(0.0f))));
+            bone->restRotation = glm::quat_cast(eulerMatrix(bedrockToEngine(vec3Of(bData, "rotation", glm::vec3(0.0f)))));
+            bone->bedrock = true;
 
             if (bData.contains("cubes")) {
                 std::vector<ModelVertex> verts;
                 const bool boneMirror = bData.value("mirror", false);
                 for (const auto& cube : bData["cubes"]) appendCube(cube, texW, texH, boneMirror, verts);
+                for (const ModelVertex& v : verts) {
+                    bone->boundsMin = bone->hasBounds ? glm::min(bone->boundsMin, v.position) : v.position;
+                    bone->boundsMax = bone->hasBounds ? glm::max(bone->boundsMax, v.position) : v.position;
+                    bone->hasBounds = true;
+                }
                 if (!verts.empty()) {
                     bone->meshes.push_back(std::make_shared<Mesh>(verts));
                     bone->mesh = bone->meshes.front();
@@ -562,6 +585,29 @@ bool AnimatedModel::hierarchyIsAcyclic(std::string* cycleBone) const {
 bool AnimatedModel::hierarchyOk() const {
     if (m_hierarchyState == 0) m_hierarchyState = hierarchyIsAcyclic(&m_cycleBone) ? 1 : 2;
     return m_hierarchyState == 1;
+}
+
+// The matrix of `target` below `bone` (whose parent's matrix is `parent`), or false if it isn't there
+static bool findBoneMatrix(const std::shared_ptr<Bone>& bone, const Bone* target, const glm::mat4& parent,
+                           glm::mat4& out, int depth) {
+    if (!bone || depth > 256) return false;
+    const glm::mat4 m = parent * bone->getLocalTransform();
+    if (bone.get() == target) { out = m; return true; }
+    for (const auto& child : bone->children)
+        if (findBoneMatrix(child, target, m, out, depth + 1)) return true;
+    return false;
+}
+
+bool AnimatedModel::boneMatrix(const std::string& name, const glm::mat4& world, glm::mat4& out) const {
+    if (!loaded || !hierarchyOk()) return false;
+    const auto it = boneMap.find(name);
+    if (it == boneMap.end()) return false;
+    // The same root as draw(): the model's scale, and Bedrock models' mirror on X
+    glm::mat4 root = glm::scale(world, glm::vec3(scale));
+    if (!isB3D) root = glm::scale(root, glm::vec3(-1.0f, 1.0f, 1.0f));
+    for (const auto& r : rootBones)
+        if (findBoneMatrix(r, it->second.get(), root, out, 0)) return true;
+    return false;
 }
 
 bool AnimatedModel::drawBone(GLuint shaderProgram, const std::string& name, const glm::mat4& world) {
