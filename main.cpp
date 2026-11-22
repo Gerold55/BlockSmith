@@ -4043,6 +4043,7 @@ void resetForReload() {
     // Settings mods change, back to the engine's own
     g_FootstepDistance = 1.3f;
     g_FlyAllowed = true;
+    g_MoveKeyMask = 0xFF;   // every movement control back (a disabled mod may have frozen some: set_player_controls)
     g_PlaceRepeatSeconds = 0.2f;
     g_LuaInventoryOpen = false;
     g_FirstPerson = FirstPersonView{};

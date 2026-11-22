@@ -176,6 +176,100 @@ std::string describeAddress(void* addr) {
     }
     return s.str();
 }
+
+// The frames with their exact names: this program's frames looked up by addr2line (Linux) or
+// atos (macOS) - the names dladdr gives are only the nearest exported symbol, often wrong
+// (code put inline, functions not exported). Run once per place a warning comes from.
+// ok = false when the tool isn't there (then the frames have dladdr's names).
+std::vector<std::string> exactFrames(void* const* frames, int n, bool& ok) {
+    std::vector<std::string> out;
+    for (int i = 0; i < n; ++i) out.push_back(describeAddress(frames[i]));
+    ok = false;
+    Dl_info self{};
+    if (!dladdr(reinterpret_cast<void*>(&init), &self) || !self.dli_fbase || !self.dli_fname) return out;
+    std::error_code ec;
+#if defined(__APPLE__)
+    std::string exe = fs::absolute(self.dli_fname, ec).string();
+#else
+    std::string exe = fs::read_symlink("/proc/self/exe", ec).string();
+    if (exe.empty()) exe = fs::absolute(self.dli_fname, ec).string();
+#endif
+    if (exe.empty() || exe.find('\'') != std::string::npos) return out;
+    std::vector<int> mine;   // which frames are this program's
+    std::ostringstream cmd;
+#if defined(__APPLE__)
+    cmd << "atos -o '" << exe << "' -l 0x" << std::hex << reinterpret_cast<uintptr_t>(self.dli_fbase);
+#else
+    cmd << "addr2line -a -f -i -C -e '" << exe << "'";   // (-i -a: each address, then its inline chain)
+#endif
+    for (int i = 0; i < n; ++i) {
+        Dl_info info{};
+        if (!dladdr(frames[i], &info) || info.dli_fbase != self.dli_fbase) continue;
+        // (a return address points after the call: one byte back is the call itself)
+        const uintptr_t a = reinterpret_cast<uintptr_t>(frames[i]) - 1;
+#if defined(__APPLE__)
+        cmd << " 0x" << std::hex << a;
+#else
+        cmd << " 0x" << std::hex << (a - reinterpret_cast<uintptr_t>(self.dli_fbase));
+#endif
+        mine.push_back(i);
+    }
+    if (mine.empty()) return out;
+    cmd << " 2>/dev/null";
+    FILE* p = popen(cmd.str().c_str(), "r");
+    if (!p) return out;
+    std::vector<std::string> lines;
+    char buf[4096];
+    while (std::fgets(buf, sizeof(buf), p)) {
+        std::string l = buf;
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        lines.push_back(l);
+    }
+    pclose(p);
+    const std::string mod = fs::path(exe).filename().string();
+    auto where = [&](int i) {
+        std::ostringstream m;
+        m << "  (" << mod << "+0x" << std::hex
+          << (reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(self.dli_fbase)) << ")";
+        return m.str();
+    };
+#if defined(__APPLE__)
+    // "function (in BlockSmithServer) (File.cpp:123)" or "function (in BlockSmithServer) + 45"
+    if (lines.size() != mine.size()) return out;
+    for (size_t k = 0; k < mine.size(); ++k) {
+        const std::string& l = lines[k];
+        const size_t in = l.find(" (in ");
+        if (in == std::string::npos || l.rfind("0x", 0) == 0) continue;   // (atos couldn't name it)
+        std::string text = l.substr(0, in) + where(mine[k]);
+        const size_t open = l.rfind(" (");
+        if (open != std::string::npos && open > in && l.back() == ')') text += "  " + l.substr(open + 2, l.size() - open - 3);
+        out[mine[k]] = text;
+    }
+#else
+    // each address: "0x...", then function / "path/File.cpp:123" pairs, innermost inline code
+    // first - the last pair is the real function and the line in it ("??:?" without debug info)
+    std::vector<std::pair<std::string, std::string>> last;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].rfind("0x", 0) == 0) { last.push_back({ "??", "??" }); continue; }
+        if (last.empty() || i + 1 >= lines.size()) return out;
+        last.back() = { lines[i], lines[i + 1] };
+        ++i;
+    }
+    if (last.size() != mine.size()) return out;
+    for (size_t k = 0; k < mine.size(); ++k) {
+        const std::string& fn = last[k].first;
+        std::string loc = last[k].second;
+        if (fn == "??") continue;
+        const size_t disc = loc.find(" (discriminator");
+        if (disc != std::string::npos) loc.erase(disc);
+        std::string text = fn + where(mine[k]);
+        if (loc.rfind("??", 0) != 0) text += "  " + fs::path(loc).filename().string();
+        out[mine[k]] = text;
+    }
+#endif
+    ok = true;
+    return out;
+}
 #endif
 
 }  // namespace
@@ -199,6 +293,18 @@ thread_local double t_lastLuaError = -100.0;
 std::string shortFrame(const std::string& f) {
     const size_t sep = f.find("  (");
     std::string name = f.substr(0, sep);
+    for (const char* junk : { "(anonymous namespace)::", "`anonymous namespace'::" }) {
+        for (size_t at; (at = name.find(junk)) != std::string::npos;) name.erase(at, std::strlen(junk));
+    }
+    for (size_t at; (at = name.find("{lambda")) != std::string::npos;) {   // GCC / Clang: {lambda(int)#1}
+        int d = 0; size_t e = at;
+        for (; e < name.size(); ++e) { if (name[e] == '{') ++d; else if (name[e] == '}' && --d == 0) break; }
+        name.replace(at, e - at + 1, "(lambda)");
+    }
+    for (const char* junk : { "::_FUN", "::operator()" }) {
+        const size_t at = name.rfind(junk);
+        if (at != std::string::npos && at + std::strlen(junk) == name.size()) name.erase(at);
+    }
     std::string rest = sep == std::string::npos ? "" : f.substr(sep + 2);
     const size_t plus = name.rfind("+0x");
     if (plus != std::string::npos) name.erase(plus);
@@ -208,11 +314,12 @@ std::string shortFrame(const std::string& f) {
         if (name.compare(i, 8, "<lambda_") == 0 && depth == 0) { n += "(lambda)"; }
         if (name[i] == '<' && !(i >= 8 && name.compare(i - 8, 8, "operator") == 0)) { ++depth; continue; }
         if (name[i] == '>' && depth > 0) { --depth; continue; }
-        if (name[i] == '(' && depth == 0 && name.compare(i, 8, "(lambda)") != 0 &&
-            name.compare(i, 11, "(anonymous ") != 0) { ++depth; continue; }   // (the parameter list)
+        if (name[i] == '(' && (depth > 0 || (name.compare(i, 8, "(lambda)") != 0 &&
+            name.compare(i, 11, "(anonymous ") != 0))) { ++depth; continue; }   // (the parameter list)
         if (name[i] == ')' && depth > 0) { --depth; continue; }
         if (depth == 0) n += name[i];
     }
+    if (n == "_FUN" || n.empty()) n = "(lambda)";
     if (n.size() > 90) n = n.substr(0, 87) + "...";
     const size_t close = rest.find(')');
     std::string module = close == std::string::npos ? rest : rest.substr(0, close + 1);
@@ -224,7 +331,11 @@ std::string shortFrame(const std::string& f) {
 
 // Frames of Lua itself / sol (where the engine was called from a mod): the trace stops there
 bool luaFrame(const std::string& f) {
-    if (f.rfind("sol::", 0) == 0) return true;
+    // (the name without its parameters or template arguments: those mention sol:: in engine
+    // functions that take Lua values too)
+    const std::string sf = shortFrame(f);
+    const std::string name = sf.substr(0, sf.find("  "));
+    if (name.rfind("sol::", 0) == 0 || name.find(" sol::") != std::string::npos) return true;
     static const char* mods[] = { "(lua", "(liblua", "(Lua" };
     for (const char* m : mods) if (f.find(m) != std::string::npos) return true;
     return false;
@@ -233,7 +344,8 @@ bool luaFrame(const std::string& f) {
 // The system's own frames (thread start, C runtime, exception unwinding): left out
 bool systemFrame(const std::string& f) {
     static const char* s[] = { "ntdll", "KERNEL32", "KERNELBASE", "VCRUNTIME", "ucrtbase", "libc.so", "libsystem_",
-                               "__scrt_common_main", "_CxxFrameHandler", "start_thread", "__libc_start", "libstdc++" };
+                               "__scrt_common_main", "_CxxFrameHandler", "start_thread", "__libc_start", "libstdc++",
+                               "_start  (", "dyld" };
     for (const char* x : s) if (f.find(x) != std::string::npos) return true;
     return false;
 }
@@ -291,10 +403,34 @@ private:
         std::string resolve;
         std::vector<std::string> frames;
         bool fromLua = false;
-        for (const auto& f : stackTraceResolved(2, 40, resolve)) {
+#ifdef _WIN32
+        const std::vector<std::string> stack = stackTrace(1, 40);   // (DbgHelp: exact names already)
+#else
+        // The same place again (other text, same call site): nothing more to show
+        void* raw[48];
+        const int rawN = backtrace(raw, 48);
+        {
+            static std::set<std::string> rawSites;
+            std::ostringstream key;
+            for (int i = 0; i < rawN && i < 12; ++i) key << raw[i] << ",";
+            if (!rawSites.insert(key.str()).second) { m_out->pubsync(); return; }
+        }
+        bool exact = false;
+        const std::vector<std::string> stack = exactFrames(raw, rawN, exact);
+        if (!exact) stackTraceResolved(0, 40, resolve);   // (no addr2line / atos here: say how to get them)
+#endif
+        for (const auto& f : stack) {
             if (boring(f) || systemFrame(f)) continue;
             if (luaFrame(f)) { if (!frames.empty()) { fromLua = true; break; } continue; }
-            frames.push_back(shortFrame(f));
+            std::string sf = shortFrame(f);
+            if (sf.find("Diagnostics.cpp") != std::string::npos) continue;   // (this trace itself)
+#ifndef _WIN32
+            // (without addr2line / atos the names are dladdr's guesses: the misleading ones,
+            // "std::basic_string" for code put inline, are left out; the command gives them all)
+            if (!exact && (sf.rfind("std::", 0) == 0 || sf.rfind("??", 0) == 0)) continue;
+            if (!frames.empty() && sf.substr(0, sf.find("  ")) == frames.back().substr(0, frames.back().find("  "))) continue;
+#endif
+            frames.push_back(sf);
             if (frames.size() >= 6) break;
         }
         // Several warnings from the same place (one per missing texture...): the trace once
@@ -307,7 +443,7 @@ private:
         for (size_t i = 0; i < frames.size(); ++i) t << (i ? "\n    |    < " : "") << frames[i];
         if (fromLua) t << "\n    |    < (called from a mod's Lua)";
         t << "\n";
-        (void)resolve;   // (the full stack and its addr2line command: crash reports)
+        if (!resolve.empty()) t << "    |    exact names: " << resolve << "\n";   // (Linux / macOS)
         const std::string s = t.str();
         m_out->sputn(s.data(), static_cast<std::streamsize>(s.size()));
         m_out->pubsync();

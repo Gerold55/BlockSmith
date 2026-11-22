@@ -8,4 +8,5 @@ lan_server_id = ccbce16ecf0815f00cea0408a0413933
 main_hand = 0
 player_name = Gerold55
 render_distance = 13
+server_id.miniontoby.host.ircnow.org:30000 = 1566390fe513515fcba6cd07a81f5863
 vsync = 1
