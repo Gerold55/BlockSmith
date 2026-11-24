@@ -124,7 +124,7 @@ local LABELS = {
     light_quality   = "Lighting",
     bloom           = "Bloom",
     filmic          = "Filmic Look",
-    artnet          = "Art-Net input",
+    udp_input       = "Network input (client mods)",
     volume_master   = "Master Volume",
     volume_music    = "Music",
     volume_effects  = "Blocks & Effects",
@@ -311,8 +311,8 @@ local function entries()
         end
     elseif state.tab == "video" then
         section("Display")
-        local lighting = { light_quality = true, bloom = true, filmic = true, artnet = true }
-        for _, s in ipairs(state.video) do if s.id ~= "main_hand" and not lighting[s.id] then row(s) end end
+        local lighting = { light_quality = true, bloom = true, filmic = true }
+        for _, s in ipairs(state.video) do if s.id ~= "main_hand" and s.id ~= "udp_input" and not lighting[s.id] then row(s) end end
         local any = false
         for _, s in ipairs(state.video) do
             if lighting[s.id] then
@@ -322,6 +322,9 @@ local function entries()
         end
         for _, s in ipairs(state.video) do
             if s.id == "main_hand" then section("Hand"); row(s) end
+        end
+        for _, s in ipairs(state.video) do
+            if s.id == "udp_input" then section("Client mods"); row(s) end
         end
     elseif state.tab == "sound" then
         section("Volume")

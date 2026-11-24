@@ -56,7 +56,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "BlockStateLua.h"
 #include "VoxelVolume.h"
 #include "Spotlights.h"
-#include "ArtNet.h"
+#include "UdpInput.h"
 #include "GpuCheck.h"
 #include "Bloom.h"
 #include "SunShafts.h"
@@ -3132,8 +3132,8 @@ const VideoSetting kVideoSettings[] = {
     { "brightness",       0, 100, 5 },   // 0 = moody, 50 = the game's own, 100 = bright (Minecraft's gamma)
     { "light_quality",    0,   2, 1 },   // traced lighting (shadows of lamps and spotlights): 0 off, 1 low, 2 high
     { "bloom",            0,   1, 1 },   // bright things glow
-    { "filmic",           0,   1, 1 },
-    { "artnet",           0,   2, 1 },   // Art-Net (DMX) input: 0 off, 1 this computer only, 2 the network   // filmic exposure for Lighting Low/High (a film curve; the eye adjusts)
+    { "filmic",           0,   1, 1 },   // filmic exposure for Lighting Low/High (a film curve; the eye adjusts)
+    { "udp_input",        0,   2, 1 },   // network input for client mods: 0 off, 1 this computer only, 2 the network
     { "volume_master",    0, 100, 5 },
     { "volume_music",     0, 100, 5 },
     { "volume_effects",   0, 100, 5 },
@@ -3143,6 +3143,23 @@ const VideoSetting kVideoSettings[] = {
 const VideoSetting* findVideoSetting(const std::string& id) {
     for (const auto& s : kVideoSettings) if (id == s.id) return &s;
     return nullptr;
+}
+
+// The ports client mods may listen on (settings.txt: udp_ports = 6454, 6455 - the player's list)
+std::set<int> udpInputPorts() {
+    std::set<int> out;
+    const auto it = g_Settings.find("udp_ports");
+    const std::string list = it == g_Settings.end() ? std::string("6454") : it->second;
+    std::string cur;
+    for (char c : list + ",") {
+        if (c >= '0' && c <= '9') cur += c;
+        else if (!cur.empty()) {
+            const int p = std::atoi(cur.c_str());
+            if (p >= 1 && p <= 65535) out.insert(p);
+            cur.clear();
+        }
+    }
+    return out;
 }
 
 int currentVideoSetting(const std::string& id) {
@@ -3155,7 +3172,7 @@ int currentVideoSetting(const std::string& id) {
     // (Off unless the player chose a level: the standard look by default, the realistic one opt-in)
     if (id == "light_quality") return std::clamp(settingInt(id, 0), 0, g_GpuCaps.maxLightQuality);
     if (id == "bloom") return g_GpuCaps.bloom ? std::clamp(settingInt(id, 0), 0, 1) : 0;
-    if (id == "artnet") return std::clamp(settingInt(id, 0), 0, 2);
+    if (id == "udp_input") return std::clamp(settingInt(id, 0), 0, 2);
     if (id == "filmic") return g_GpuCaps.maxLightQuality > 0 ? std::clamp(settingInt(id, 1), 0, 1) : 0;
     if (id == "volume_music") return settingInt(id, 60);
     if (id.rfind("volume_", 0) == 0) return settingInt(id, 100);
@@ -3170,7 +3187,7 @@ void applyVideoSetting(const std::string& id, int value) {
     else if (id == "light_quality") g_LightQuality = std::clamp(value, 0, g_GpuCaps.maxLightQuality);
     else if (id == "bloom") g_BloomOn = value != 0 && g_GpuCaps.bloom;
     else if (id == "filmic") g_FilmicOn = value != 0;
-    else if (id == "artnet") g_ArtNet.setMode(static_cast<ArtNetInput::Mode>(std::clamp(value, 0, 2)), settingInt("artnet_port", 6454));
+    else if (id == "udp_input") g_UdpInput.setMode(static_cast<UdpInput::Mode>(std::clamp(value, 0, 2)), udpInputPorts());
     else if (id.rfind("volume_", 0) == 0) g_Audio.setVolume(id.substr(7), value / 100.0f);   // master, music...
 }
 
@@ -3180,8 +3197,8 @@ bool setVideoSetting(const std::string& id, int value, std::string& error) {
     value = std::clamp(value, s->minV, s->maxV);
     // Lighting and bloom are the player's own choice: only a click in their Settings changes them.
     // A game's or server's mods (which run in the player's game too) can't switch them on.
-    // (Art-Net opens a network port: the player's choice only, too)
-    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "artnet") && !g_PlayerSettingsClick) {
+    // (network input opens a port: the player's choice only, too)
+    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "udp_input") && !g_PlayerSettingsClick) {
         error = "Only the player can change this, in Settings";
         return false;
     }
@@ -5731,63 +5748,6 @@ int main(int argc, char** argv) {
             lightsTable["remove"] = [](int id) { return g_Spotlights.remove(id); };
             lightsTable["list"] = []() { return sol::as_table(g_Spotlights.ids()); };
             lightsTable["clear"] = []() { for (int id : g_Spotlights.ids()) g_Spotlights.remove(id); };
-            // ---- dmx.*: Art-Net input (ArtNet.h), read only. The player turns it on in Settings.
-            //   dmx.status() -> { mode = "off"|"local"|"network", listening, port, packets, error }
-            //   dmx.get(universe, channel) -> 0..255 (channel 1..512; 0 if nothing has come)
-            //   dmx.read(universe, first, count) -> { values }  (a fixture's channels in one go)
-            //   dmx.frame(universe) -> how many packets have come for it (changes when new data comes)
-            //   dmx.age(universe) -> seconds since the last packet (nil: never)
-            //   dmx.universes() -> { { universe, frames, age, source }, ... }
-            {
-                sol::table dmxTable = lua.create_named_table("dmx");
-                dmxTable["status"] = [&lua]() {
-                    sol::table t = lua.create_table();
-                    const auto m = g_ArtNet.mode();
-                    t["mode"] = std::string(m == ArtNetInput::Mode::Off ? "off" : m == ArtNetInput::Mode::Local ? "local" : "network");
-                    t["listening"] = g_ArtNet.listening();
-                    t["port"] = g_ArtNet.port();
-                    t["packets"] = static_cast<double>(g_ArtNet.packets());
-                    if (!g_ArtNet.lastError().empty()) t["error"] = g_ArtNet.lastError();
-                    return t;
-                };
-                dmxTable["get"] = [](int universe, int channel) {
-                    const auto* u = g_ArtNet.universe(universe);
-                    if (!u || channel < 1 || channel > 512) return 0;
-                    return static_cast<int>(u->data[static_cast<size_t>(channel - 1)]);
-                };
-                dmxTable["read"] = [&lua](int universe, int first, int count) {
-                    sol::table t = lua.create_table();
-                    const auto* u = g_ArtNet.universe(universe);
-                    count = std::clamp(count, 0, 512);
-                    for (int i = 0; i < count; ++i) {
-                        const int ch = first + i;
-                        t[i + 1] = (u && ch >= 1 && ch <= 512) ? static_cast<int>(u->data[static_cast<size_t>(ch - 1)]) : 0;
-                    }
-                    return t;
-                };
-                dmxTable["frame"] = [](int universe) {
-                    const auto* u = g_ArtNet.universe(universe);
-                    return u ? static_cast<double>(u->frames) : 0.0;
-                };
-                dmxTable["age"] = [](int universe) -> sol::optional<double> {
-                    const auto* u = g_ArtNet.universe(universe);
-                    if (!u || u->lastTime < 0.0) return sol::nullopt;
-                    return glfwGetTime() - u->lastTime;
-                };
-                dmxTable["universes"] = [&lua]() {
-                    sol::table t = lua.create_table();
-                    int i = 1;
-                    for (const auto& [addr, u] : g_ArtNet.universes()) {
-                        sol::table e = lua.create_table();
-                        e["universe"] = addr;
-                        e["frames"] = static_cast<double>(u.frames);
-                        e["age"] = glfwGetTime() - u.lastTime;
-                        e["source"] = u.source;
-                        t[i++] = e;
-                    }
-                    return t;
-                };
-            }
             lightsTable["set_haze"] = [colorFrom](float amount, sol::optional<sol::object> color) {
                 g_Spotlights.haze = std::clamp(amount, 0.0f, 4.0f);
                 if (color) g_Spotlights.hazeColor = colorFrom(*color, g_Spotlights.hazeColor);
@@ -6986,7 +6946,7 @@ int main(int argc, char** argv) {
                 e["step"] = s.step;
                 // Choices shown as buttons; ones this graphics card can't take are greyed out
                 // (disabled) with the reason (GpuCheck.h)
-                if (std::string(s.id) == "artnet") {
+                if (std::string(s.id) == "udp_input") {
                     sol::table opts = lua.create_table();
                     const char* names[3] = { "Off", "This computer", "Network" };
                     for (int v = 0; v < 3; ++v) {
@@ -6996,9 +6956,9 @@ int main(int argc, char** argv) {
                         opts[v + 1] = o;
                     }
                     e["options"] = opts;
-                    std::string note = "DMX from lighting software or a console, for mods like Stage Lights. "
-                                       "This computer: software on this PC. Network: a desk or another PC.";
-                    if (!g_ArtNet.lastError().empty()) note = "Art-Net input couldn't start: " + g_ArtNet.lastError();
+                    std::string note = "Lets your client mods receive data from other programs, such as Art-Net from "
+                                       "lighting software. This computer: programs on this PC. Network: other devices.";
+                    if (!g_UdpInput.lastError().empty()) note = "Network input: " + g_UdpInput.lastError();
                     e["note"] = note;
                 }
                 if (std::string(s.id) == "filmic") {
@@ -8068,6 +8028,15 @@ int main(int argc, char** argv) {
             clientMods.showChat = [](const std::string& text, float r, float g, float b) {
                 if (g_ChatSystem) g_ChatSystem->addMessage(text, glm::vec3(r, g, b));
             };
+            // client.send_to_server: the same road as engine.send_to_server (the server's mods get
+            // it in on_mod_message, from this player; singleplayer: this game's own mods)
+            clientMods.sendToServer = [](const std::string& channel, const std::string& text) {
+                if (!net::validModChannel(channel) || text.size() > net::kMaxModMessageFromPlayer) return false;
+                if (g_Client.active()) return g_Client.sendModMessage(channel, text);
+                if (g_ModToOwnServer.size() >= 4096) return false;
+                g_ModToOwnServer.push_back({ channel, text });
+                return true;
+            };
             clientMods.init(lua, folder.string());
             addClientModWorldApi(clientMods);
             clientMods.load();
@@ -8555,7 +8524,7 @@ int main(int argc, char** argv) {
             // on_update(dt): errors are printed (once until the message changes), never hidden
             {
                 static std::string lastUpdateError;
-                g_ArtNet.poll(glfwGetTime());           // (DMX that arrived: before mods read it)
+                g_UdpInput.poll();                      // (network input that arrived: before client mods read it)
                 sol::protected_function onUpdate = lua["on_update"];
                 if (onUpdate.valid()) {
                     sol::protected_function_result r = onUpdate(deltaTime);

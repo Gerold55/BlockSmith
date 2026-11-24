@@ -84,6 +84,9 @@ public:
 
     // Shows a line in chat (set by main.cpp)
     std::function<void(const std::string&, float, float, float)> showChat;
+    // client.send_to_server(channel, data): to the server's mods (or this game's own, in
+    // singleplayer), like engine.send_to_server. Set by the game.
+    std::function<bool(const std::string&, const std::string&)> sendToServer;
 
     ~ClientMods();
 

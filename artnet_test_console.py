@@ -1,9 +1,9 @@
-# Art-Net test console: sends DMX to the game so you can try Stage Lights without lighting software.
+# Art-Net test console: sends DMX to the game so you can try Art-Net without lighting software.
 #   python tools/artnet_test_console.py [seconds]
-# Turn on Settings > Video > Art-Net input (This computer), auto-patch from universe 0 on the
-# Lighting Desk, press Take DMX control. 4 moving heads (1, 13, 25, 37) sweep red with a star
-# gobo; 2 washes (49, 57) light green.
-# A stand-in lighting console: sends Art-Net (ArtDmx) to the game, universe 0, ~30 times a second
+# In the game: Settings > Video > Network input = This computer, and the Art-Net client mod
+# (clientmods/artnet) switched on. Universe 0: channels 1-48 four 12-channel moving heads
+# (pan, pan fine, tilt, tilt fine, dimmer, strobe, red, green, blue, zoom, gobo, gobo spin)
+# sweeping in red with a gobo; 49-64 two 8-channel washes in green.
 import socket, struct, time, math, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 seq = 0

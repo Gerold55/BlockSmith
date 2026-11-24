@@ -9,6 +9,8 @@
 //                  client_mods_players = true      may they see where other players are?
 //                  client_mods_block_range = 64    how far from the player they can read blocks
 //                                                  (0 = any distance)
+//                  client_mods_messages = true     may they send messages to the server's mods
+//                                                  (client.send_to_server)?
 
 #include <cctype>
 #include <cstdlib>
@@ -21,6 +23,7 @@ struct ClientModRules {
     bool chat = false;       // may send chat messages (and so commands) for the player
     bool players = true;     // may read other players' names and positions
     int blockRange = 64;     // blocks further than this from the player can't be read (0 = no limit)
+    bool messages = true;    // may send messages to the server's mods (which check them, as any player's)
 
     static constexpr const char* kSharedKey = "engine:client_mods";
 
@@ -36,7 +39,7 @@ struct ClientModRules {
     std::string encode() const {
         std::ostringstream o;
         o << "allowed=" << (allowed ? 1 : 0) << ";chat=" << (chat ? 1 : 0) << ";players=" << (players ? 1 : 0)
-          << ";range=" << blockRange;
+          << ";range=" << blockRange << ";msg=" << (messages ? 1 : 0);
         return o.str();
     }
 
@@ -54,6 +57,7 @@ struct ClientModRules {
             else if (k == "chat") r.chat = n != 0;
             else if (k == "players") r.players = n != 0;
             else if (k == "range") r.blockRange = n < 0 ? 0 : n;
+            else if (k == "msg") r.messages = n != 0;
         }
         return r;
     }
@@ -75,6 +79,7 @@ struct ClientModRules {
         flag(prefix, r.allowed);
         flag(prefix + "_chat", r.chat);
         flag(prefix + "_players", r.players);
+        flag(prefix + "_messages", r.messages);
         const auto it = kv.find(prefix + "_block_range");
         if (it != kv.end() && !it->second.empty()) {
             const int n = std::atoi(it->second.c_str());

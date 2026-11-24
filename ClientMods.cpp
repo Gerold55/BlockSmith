@@ -1,5 +1,6 @@
 // Client mods: see ClientMods.h
 #include "ClientMods.h"
+#include "UdpInput.h"
 #include "Diagnostics.h"
 #include "ModOrder.h"
 #include "SafeReplace.h"
@@ -293,7 +294,71 @@ void ClientMods::init(sol::state& gameLua, const std::string& folder) {
         t["chat"] = m_rules.chat;
         t["players"] = m_rules.players;
         t["block_range"] = m_rules.blockRange;
+        t["messages"] = m_rules.messages;
         return t;
+    };
+    // client.send_to_server(channel, data) -> true if sent: a message to the server's mods (they
+    // get it in on_mod_message, from this player, and check it like anything a player's game
+    // sends). Only if the server allows it (client_mods_messages).
+    client["send_to_server"] = [this](const std::string& channel, sol::object data) -> std::tuple<bool, sol::object> {
+        sol::state_view lv(*m_lua);
+        auto no = [&](const char* why) { return std::make_tuple(false, sol::make_object(lv, std::string(why))); };
+        if (!m_rules.messages) return no("this server doesn't let client mods send messages");
+        std::string text;
+        if (data.get_type() == sol::type::string) text = data.as<std::string>();
+        else if (data.get_type() == sol::type::number) text = std::to_string(data.as<double>());
+        else return no("data must be text");
+        if (!sendToServer || !sendToServer(channel, text)) return no("not sent (a bad channel name, too long, or not in a world)");
+        return std::make_tuple(true, sol::make_object(lv, sol::lua_nil));
+    };
+
+    // Network input (UdpInput.h): only if the player turned it on in Settings, only on the ports
+    // they allow. Packets are data (strings of bytes); nothing in them is ever run.
+    //   client.udp_status() -> { mode = "off"|"local"|"network", ports = { allowed }, listening = { ports }, received }
+    //   client.udp_listen(port) -> true, or false + why
+    //   client.udp_receive(port [, max]) -> { { data, from, port, time }, ... } (since the last call)
+    //   client.udp_reply(port, address, to_port, data) -> true, or false + why (only to who just sent here)
+    client["udp_status"] = [](sol::this_state ts) {
+        sol::state_view lv(ts);
+        sol::table t = lv.create_table();
+        const auto m = g_UdpInput.mode();
+        t["mode"] = std::string(m == UdpInput::Mode::Off ? "off" : m == UdpInput::Mode::Local ? "local" : "network");
+        sol::table ports = lv.create_table();
+        int i = 1;
+        for (int p : g_UdpInput.allowedPorts()) ports[i++] = p;
+        t["ports"] = ports;
+        sol::table lis = lv.create_table();
+        i = 1;
+        for (int p : g_UdpInput.listeningPorts()) lis[i++] = p;
+        t["listening"] = lis;
+        t["received"] = static_cast<double>(g_UdpInput.received());
+        if (!g_UdpInput.lastError().empty()) t["error"] = g_UdpInput.lastError();
+        return t;
+    };
+    client["udp_listen"] = [](int port, sol::this_state ts) -> std::tuple<bool, sol::object> {
+        std::string why;
+        if (g_UdpInput.listen(port, why)) return std::make_tuple(true, sol::make_object(ts, sol::lua_nil));
+        return std::make_tuple(false, sol::make_object(ts, why));
+    };
+    client["udp_receive"] = [](int port, sol::optional<int> max, sol::this_state ts) {
+        sol::state_view lv(ts);
+        sol::table t = lv.create_table();
+        int i = 1;
+        for (auto& p : g_UdpInput.take(port, static_cast<size_t>(std::clamp(max.value_or(256), 1, 256)))) {
+            sol::table e = lv.create_table();
+            e["data"] = p.data;
+            e["from"] = p.from;
+            e["port"] = p.fromPort;
+            e["time"] = p.time;
+            t[i++] = e;
+        }
+        return t;
+    };
+    client["udp_reply"] = [](int port, const std::string& to, int toPort, const std::string& data,
+                              sol::this_state ts) -> std::tuple<bool, sol::object> {
+        std::string why;
+        if (g_UdpInput.reply(port, to, toPort, data, why)) return std::make_tuple(true, sol::make_object(ts, sol::lua_nil));
+        return std::make_tuple(false, sol::make_object(ts, why));
     };
     client["display_chat_message"] = [this](const std::string& text, sol::optional<float> r,
                                              sol::optional<float> g, sol::optional<float> b) {
@@ -388,6 +453,7 @@ void ClientMods::init(sol::state& gameLua, const std::string& folder) {
 }
 
 void ClientMods::load() {
+    g_UdpInput.closeAll();          // (client mods loading again: they ask for their ports again)
     if (!m_lua) return;
     sol::state& L = *m_lua;
     {

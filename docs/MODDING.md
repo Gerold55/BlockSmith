@@ -58,7 +58,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [C22. A minigame HUD: timers, scoreboards and titles](#c22-a-minigame-hud-timers-scoreboards-and-titles)
    - [C23. A new dimension with a portal](#c23-a-new-dimension-with-a-portal)
    - [C24. Signs that greet players](#c24-signs-that-greet-players)
-   - [C25. A stage lighting rig (the `stage_lights` mod)](#c25-a-stage-lighting-rig-the-stage_lights-mod)
+   - [C25. A spotlight run from a lighting console (Art-Net)](#c25-a-spotlight-run-from-a-lighting-console-art-net)
 3. [Part 3: Reference](#part-3-reference)
    - [Function index](#function-index): every function and hook, A to Z per table
    - [1. Folders](#1-folders)
@@ -447,7 +447,7 @@ Open **Mods** on the title screen, find *hello* (marked *Client mod*), press **E
 - **A sandbox.** There's no `io`, no `os.execute` and no `require`. `client.dofile("file.lua")` loads files from the mod's own folder, while it loads. Saved data goes through `client.get_mod_storage()`.
 - **Mistakes are contained.** If a callback errors, that callback stops, a red line in chat says which mod and why, and everything else carries on.
 
-**The server decides.** Servers set four rules in `server.conf`, and your game keeps to them while you play there:
+**The server decides.** Servers set five rules in `server.conf`, and your game keeps to them while you play there:
 
 | Rule | Default | Meaning |
 |---|---|---|
@@ -455,6 +455,7 @@ Open **Mods** on the title screen, find *hello* (marked *Client mod*), press **E
 | `client_mods_chat` | `false` | they may send chat messages and commands for you (`client.send_chat_message`) |
 | `client_mods_players` | `true` | they may see other players' names and positions (`client.get_players`) |
 | `client_mods_block_range` | `64` | how far from you they can read blocks; 0 = any distance |
+| `client_mods_messages` | `true` | they may send messages to the server's mods (`client.send_to_server`), which check them like anything from a player's game |
 
 In singleplayer there are no limits. A LAN host has no limits either, and the friends who join get the host's `lan_client_mods...` settings (no limits unless changed). `client.get_rules()` tells your mod what's allowed right now. Plan for `nil`: when a block is out of range, `client.get_block` returns nil.
 
@@ -1683,80 +1684,101 @@ end
 - Players place the sign item on the ground or on a wall, and write on it in the screen that opens. Right-clicking a sign edits the side they're looking at; right-clicking with the blue ink colours that side.
 - `engine.get_block_text(x, y, z)` reads any sign: a shop mod can read prices from signs, a minigame can use them as buttons.
 
+## C25. A spotlight run from a lighting console (Art-Net)
+
+A light in the game run from real lighting control (QLC+, grandMA onPC, MagicQ, a desk with an Art-Net node), the same for every player on a server. Three pieces work together:
+
+1. **The player's lighting software** sends Art-Net (DMX over the network) to their own game.
+2. **A client mod** in that player's game receives it ([network input](#network-input)) and passes the channels on to the server's mods with [`client.send_to_server`](#fn-client-send_to_server).
+3. **The game mod**, where the world runs, checks who sent it and drives the spotlight in every player's game.
+
+Game and server mods never touch the network: only the player's own client mod receives anything, and only after the player turned **Network input** on in Settings.
+
+**The client mod** (`clientmods/my_artnet/init.lua`): reads Art-Net's DMX packets on port 6454 and sends universe 0's first six channels, when they change.
+
+```lua
+local PORT = 6454
+local listening = false
+local last_sent = ""
+
+client.register_on_join(function()
+    local why
+    listening, why = client.udp_listen(PORT)
+    if not listening then client.display_chat_message("Art-Net: " .. tostring(why)) end
+end)
+
+client.register_on_update(function(dt)
+    if not listening then return end
+    for _, p in ipairs(client.udp_receive(PORT)) do
+        local d = p.data
+        -- ArtDmx: "Art-Net\0", opcode 0x5000 (little-endian), ..., universe at 15-16,
+        -- length at 17-18 (big-endian), the channels from byte 19
+        if #d >= 24 and d:sub(1, 8) == "Art-Net\0" and d:byte(9) == 0x00 and d:byte(10) == 0x50 then
+            local universe = d:byte(15) | ((d:byte(16) & 0x7F) << 8)
+            if universe == 0 then
+                local v = { d:byte(19, 24) }               -- channels 1-6
+                local text = table.concat(v, ",")
+                if text ~= last_sent then
+                    last_sent = text
+                    client.send_to_server("mylights:dmx", text)
+                end
+            end
+        end
+    end
+end)
+```
+
+**The game mod**: where the world runs, it decides whose DMX to believe and passes it to every player's game; every game sets its spotlight from it.
+
+```lua
+-- where the world runs: one player at a time runs the lights (here: operators)
+local prev_msg = on_mod_message
+function on_mod_message(name, channel, data, ...)
+    if channel == "mylights:dmx" then
+        if not engine.is_player_operator(name) then return end
+        local v = {}
+        for n in tostring(data):gmatch("%d+") do v[#v + 1] = math.min(255, tonumber(n)) end
+        if #v == 6 then engine.send_to_all("mylights:look", table.concat(v, ",")) end
+        return
+    end
+    if prev_msg then return prev_msg(name, channel, data, ...) end
+end
+
+-- every player's game: the spotlight
+local spot
+local prev_srv = on_server_message
+function on_server_message(channel, data, ...)
+    if channel == "mylights:look" and lights then
+        local v = {}
+        for n in tostring(data):gmatch("%d+") do v[#v + 1] = tonumber(n) end
+        spot = spot or lights.add_spot{ x = 0.5, y = 80, z = 0.5, angle = 20, range = 40 }
+        lights.set(spot, {
+            pan = (v[1] / 255 - 0.5) * 540,        -- 540 degrees across the channel
+            tilt = -90 + v[2] / 255 * 180,         -- straight down .. straight up
+            dimmer = v[3] / 255,
+            color = { v[4] / 255, v[5] / 255, v[6] / 255 },
+        })
+        return
+    end
+    if prev_srv then return prev_srv(channel, data, ...) end
+end
+```
+
+In singleplayer it all happens in your own game: `client.send_to_server` reaches your world's `on_mod_message`, and `engine.send_to_all` your own `on_server_message`.
+
+**Going further:**
+- **Fine channels.** Consoles send pan and tilt as two channels each (coarse and fine) for smooth movement: `(coarse * 256 + fine) / 65535` gives 0..1.
+- **Being found.** Consoles discover nodes with ArtPoll packets (opcode `0x2000`). A client mod can answer with an ArtPollReply through [`client.udp_reply`](#fn-client-udp_reply), so the game shows up in the console's node list (on "Network").
+- **Limits.** A player's game may send 20 messages a second (4 KB each): about 15 a second, only when something changed, leaves room. Smooth movement between updates in each game (move a little toward the newest pan and tilt every frame).
+- **Trust.** What a player's game sends is a claim: decide where the world runs who may run the lights (an operator, whoever took control at a desk), and check every value.
+- **The patch.** Keep which universe and address each light reads with the world ([`engine.set_storage`](#fn-engine-set_storage)) and share it ([`engine.set_shared`](#fn-engine-set_shared)), so the client mod can send just those channels.
+- **Setting up the software:** on the same PC, send its Art-Net output to 127.0.0.1 and choose **This computer**; if the software also listens for Art-Net on that address, switch its input off, or both programs fight over the port. From a desk or another PC: **Network**, and send to this PC's address or broadcast (2.255.255.255 or 10.255.255.255).
+
+---
+
 # Part 3: Reference
 
 Every function, grouped by what it's for. Each section is complete on its own, so you can jump straight in from the index.
-
-## C25. A stage lighting rig (the `stage_lights` mod)
-
-The **`stage_lights`** mod (in `mods/stage_lights/`) is a complete lighting rig built on [spotlights](#spotlights): fixtures you place, aim and program, and a desk that runs the show. Switch it on for your game or world on the **Mods** screen. It works in singleplayer, on LAN and on servers, and everyone sees the same show.
-
-**Playing with it.** In the creative inventory's **Stage Lights** tab:
-
-| block | |
-|---|---|
-| Moving Head | a spot with a gobo (star, dots, rings, spokes, leaves, bars), beam 4°–40° |
-| Wash Light | a wide, soft flood of colour, 15°–90° |
-| Beam Light | a narrow, intense shaft that shows far through haze, 1°–12° |
-| Lighting Desk | runs the show |
-
-- **Placing a fixture:** hung under a block (air below it) it points down; on the floor it points up. Either way it turns toward you.
-- **Right-click a fixture** to set it up:
-  - colour (12 presets or red/green/blue), dimmer, brightness, beam width, soft edge, reach, how much the beam shows in haze, strobe, shadows;
-  - pan and tilt, with **Aim at me** (stand where the light should land and press it);
-  - a **program** that moves it in time: Still, Sweep, Circle, Wave, Fan, Chase, Pulse, Rainbow, Strobe, with speed and size;
-  - its **group** (1–8), whether it **follows the desk**, a gobo and gobo spin;
-  - **Copy** / **Paste** to set up a row of lights alike.
-- **Right-click the desk** to run the show:
-  - master dimmer, **Blackout**, haze (and its colour), tempo in BPM, with **Tap** to tap it in;
-  - for each group: on/off, a program and a colour that replace its fixtures' own (fixtures that don't follow the desk keep theirs). Chases and fans run across a group in order (by x, then z).
-  - **Scenes 1–8:** Store saves every fixture and the desk; Scene recalls it.
-- **`/stage`** (operators): `blackout`, `on`, `master <0-100>`, `haze <0-200>`, `bpm <30-240>`, `list`.
-
-**Running it from a console (Art-Net / DMX).** The fixtures can be patched and driven by real lighting software or a desk:
-1. Turn on **Art-Net input** in Settings (This computer, or Network for a desk or another PC; see [Art-Net](#art-net)).
-2. Patch: give each fixture a universe and address in its screen, or press **Auto-patch all** on the desk: every fixture one after another from address 1, by group, then across the stage.
-3. On the desk, press **Take DMX control**. Your game reads the patched channels and sends them to the world's owner, which sends them to every player: everyone sees what the console does. One player has control at a time; **Release DMX** gives it back to the fixtures' own programs.
-
-While DMX is in control, a fixture's programs and its group's program step aside; the desk's master and blackout still count. If the console pauses, fixtures hold their last look (like real DMX gear) until control is released.
-
-| fixture | channels |
-|---|---|
-| Moving Head (12) | pan, pan fine, tilt, tilt fine, dimmer, strobe, red, green, blue, zoom, gobo, gobo spin |
-| Wash Light (8) | pan, tilt, dimmer, strobe, red, green, blue, zoom |
-| Beam Light (9) | pan, pan fine, tilt, tilt fine, dimmer, strobe, red, green, blue |
-
-Pan covers 540° around the direction the fixture faces (its own pan setting is the middle); tilt goes from straight down (0) to straight up (255). Strobe: 0–9 off, then 1 to 20 flashes a second. Gobo: 0–9 open, then each 10 values the next gobo (star, dots, rings, spokes, leaves, bars). Gobo spin: 128 still, lower one way, higher the other. Zoom covers the fixture's beam widths.
-
-**How it works (to learn from or copy).**
-- **Where the world runs** (singleplayer, the LAN host, the server) keeps every fixture's settings, saves them with the world (`engine.set_storage`), and shares each one with [`engine.set_shared`](#fn-engine-set_shared), so players who join later get them too.
-- **Every player's game** turns the shared settings into spotlights with `lights.add_spot` / `lights.set`, and moves them each frame by their program. A show clock, shared every few seconds, keeps programs in time on every screen.
-- **The screens** send changes to where the world runs with [`engine.send_to_server`](#fn-engine-send_to_server); it checks them before they count: only known settings, each within its range; players in creative mode or operators; within 48 blocks. The change is shown at once to the player making it, and to everyone once it's accepted.
-
-**From another mod** (where the world runs):
-
-```lua
--- build a rig from code: a row of moving heads under a truss
-for i = 0, 5 do
-    stage_lights.place(x + i * 3, y + 8, z, "stage_lights:moving_head",
-        { group = 1, color = { 1, 0.2, 0.1 }, tilt = -55, program = "sweep", gobo = "star" })
-end
-stage_lights.set_show({ haze = 0.9, bpm = 128, groups = { [1] = { program = "rainbow" } } })
-stage_lights.set(x, y + 8, z, { dimmer = 0.5 })      -- change one; stage_lights.get(x, y, z) reads it
-```
-
-| function | |
-|---|---|
-| `stage_lights.place(x, y, z, type, fields [, dim])` | puts a fixture there, with any settings (below) |
-| `stage_lights.get(x, y, z [, dim])` / `stage_lights.set(x, y, z, fields [, dim])` | a fixture's settings |
-| `stage_lights.set_show(fields)` | the desk: `master`, `blackout`, `haze`, `haze_color` (1–12), `bpm`, `groups = { [n] = { program, color, on } }` |
-| `stage_lights.fixtures()`, `stage_lights.show()` | in every player's game: the fixtures it knows about (each with its `key`) and the desk |
-| `stage_lights.register_fixture(name, def)` | a new kind of fixture: `description`, `lens` (picture), `angle`, `softness`, `range`, `beam`, `intensity`, `gobos`, `zoom = { min, max }` |
-| `stage_lights.register_dmx_profile(name, { channels, names, decode })` | a fixture type's DMX channels: `decode(values, settings)` returns what they set (`pan`, `tilt`, `dimmer`, `strobe`, `color`, `angle`, `gobo`, `gobo_spin`) |
-| `stage_lights.dmx_status()` | this game's Art-Net input ([`dmx.status()`](#fn-dmx-status) plus `universes`) |
-| `stage_lights.register_program(id, label, fn)` | a new program: `fn(o, beat, phase, i, n, size)` changes `o.pan`, `o.tilt`, `o.dimmer`, `o.color`, `o.strobe` (beat: beats since the show started; i of n: its place in its group) |
-
-Fixture settings: `color` `{r, g, b}` (0–1), `dimmer` (0–1), `intensity`, `angle`, `softness`, `range`, `beam`, `strobe`, `pan`, `tilt`, `gobo`, `gobo_spin`, `shadows`, `group` (1–8), `program`, `speed`, `size`, `follow`, `dmx_universe`, `dmx_address` (0 = not patched). Players see shadows and beams that stop at walls with Lighting on Low or High; with Lighting Off the lights still shine, without shadows.
 
 ## Function index
 
@@ -2735,8 +2757,7 @@ lights.set_haze(0.6)                  -- how much beams show in the air
 - `lights.aim(id, x, y, z)` turns it toward a point. `lights.remove(id)`, `lights.list()` (the ids), `lights.clear()`.
 - <a id="fn-lights-set_haze"></a><a id="fn-lights-get_haze"></a>`lights.set_haze(amount [, color])`: haze in the air (0 = none, default 0.35, up to 4), which is what makes beams visible. `lights.get_haze()` returns amount, colour.
 - Up to **16** spotlights are drawn at once: the brightest ones near the camera. Add as many as you like; the far and dim ones wait their turn.
-- Spotlights belong to the player's game (like `sky.add_light`). A mod that runs in every player's game, like a stage mod, shows the same lights to everyone.
-- **A complete lighting rig** to use or learn from: the `stage_lights` mod ([C25](#c25-a-stage-lighting-rig-the-stage_lights-mod)): fixtures you place and program, a desk, scenes, and the same show for every player.
+- Spotlights belong to the player's game (like `sky.add_light`). A mod that runs in every player's game shows the same lights to everyone: keep the lights' settings where the world runs and share them ([`engine.set_shared`](#fn-engine-set_shared)), so every game makes the same ones.
 
 <a id="traced-lighting"></a>### Traced lighting: shadows, sunlight through leaves, sun shafts
 
@@ -2769,37 +2790,6 @@ With **Lighting** on Low or High (the player's choice, in Settings), light finds
 - `sky.get_bloom()` returns on (the player has it on), strength, threshold.
 - It only changes how bloom looks for players who turned it on. It never turns it on.
 
-<a id="art-net"></a>### Art-Net: DMX from lighting software and consoles
-
-Lights in the game can be run from real lighting control: QLC+, grandMA onPC, Chamsys MagicQ, Lightkey, Onyx, or a desk with an Art-Net output. The game reads **Art-Net** (DMX over the network) and mods read the channels. The `stage_lights` mod uses it to let a console drive its fixtures ([C25](#c25-a-stage-lighting-rig-the-stage_lights-mod)).
-
-**Turning it on (the player).** Settings > Video > **Art-Net input**:
-
-| choice | |
-|---|---|
-| Off (the default) | nothing is received |
-| This computer | listens on 127.0.0.1 only: lighting software on the same PC |
-| Network | listens on every network card: a desk, a node or another PC. It also answers Art-Net polls, so consoles list the game as a node called "BlockSmith" (universes 0-3). The system may ask to let the game through the firewall. |
-
-It uses UDP port 6454, the Art-Net port (`artnet_port` in settings.txt changes it). Like Lighting and Bloom, only the player can change it: mods and servers can't open a network port on a player's computer.
-
-**Reading it from a mod** (each player's game; the channels are only ever numbers):
-
-| function | |
-|---|---|
-| <a id="fn-dmx-get"></a>`dmx.get(universe, channel)` | 0–255, channel 1–512 (0 if nothing has come) |
-| <a id="fn-dmx-read"></a>`dmx.read(universe, first, count)` | `{ values }`: a fixture's channels in one go |
-| <a id="fn-dmx-frame"></a>`dmx.frame(universe)` | how many packets have come for it: it changes when new data comes |
-| <a id="fn-dmx-age"></a>`dmx.age(universe)` | seconds since its last packet, or `nil` (never) |
-| <a id="fn-dmx-universes"></a>`dmx.universes()` | `{ { universe, frames, age, source }, ... }` |
-| <a id="fn-dmx-status"></a>`dmx.status()` | `{ mode = "off" \| "local" \| "network", listening, port, packets, error }` |
-
-`universe` is the Art-Net port address (0–32767: net × 256 + sub-net × 16 + universe); most software calls the first one universe 0 (some call it 1: then it's 0 here). Only one game receives a console's DMX: to show the same lights to everyone on a server, send what you read to the server (see how `stage_lights` does it).
-
-**Setting up the software:**
-- **On the same PC:** set its Art-Net output to send to 127.0.0.1 and choose This computer. If the software also listens for Art-Net input on that address, switch its input off, or both programs fight over the port.
-- **From another PC or a desk:** choose Network, and send to this PC's address, or broadcast (2.255.255.255 or 10.255.255.255).
-
 <a id="lighting-quality"></a>### Lighting quality and the graphics card check
 
 Players choose in **Settings > Video > Lighting**:
@@ -2810,7 +2800,6 @@ Players choose in **Settings > Video > Lighting**:
 | Lighting: Low | the realistic light above (the player turns it on): traced shadows for spotlights, point lights, the sun and moon (shorter rays), sky light that's less in corners, sun spots through leaves, caustics and glints on water; beams stop at walls |
 | Lighting: High | longer rays, shadows inside beams, sun shafts, light beams in water, and water that reflects the world |
 | Filmic Look: Off / On | how Low and High light is brought to the screen (above) |
-| Art-Net input: Off / This computer / Network | DMX from lighting software or a console, for mods to read ([Art-Net](#art-net)) |
 | Bloom: Off / On | the glow above |
 
 <a id="fn-lights-get_quality"></a>**Protecting players' computers.** When the game starts, it checks the graphics card:
@@ -4338,11 +4327,33 @@ Scripts in `clientmods/<name>/init.lua` that run only in the player's own game. 
 - <a id="fn-client-get_hotbar_slot"></a>`client.get_hotbar_slot(i)` returns name, count; <a id="fn-client-get_active_slot"></a>`client.get_active_slot()`; <a id="fn-client-get_hotbar_size"></a>`client.get_hotbar_size()`.
 - <a id="fn-client-get_time"></a>`client.get_time()` returns the time of day (0–1, as `sky.get_time`). <a id="fn-client-key_name"></a>`client.key_name(code)` returns a key's name.
 - <a id="fn-client-get_players"></a>`client.get_players()` returns other players `{ name, x, y, z, yaw }`. It's empty if the server doesn't allow it.
-- <a id="fn-client-get_server_info"></a>`client.get_server_info()` returns `{ mode, address, world }`. <a id="fn-client-get_rules"></a>`client.get_rules()` returns `{ allowed, chat, players, block_range }`.
+- <a id="fn-client-get_server_info"></a>`client.get_server_info()` returns `{ mode, address, world }`. <a id="fn-client-get_rules"></a>`client.get_rules()` returns `{ allowed, chat, players, block_range, messages }`.
 
 **Chat:**
 - <a id="fn-client-display_chat_message"></a>`client.display_chat_message(text [, r, g, b])` shows a line in your own chat (nobody else sees it).
 - <a id="fn-client-send_chat_message"></a>`client.send_chat_message(text)` sends chat, or a `/command`, as if you typed it. It returns false when the server doesn't allow it.
+
+**Talking to the server's mods:**
+- <a id="fn-client-send_to_server"></a>`client.send_to_server(channel, data)` → `true`, or `false, why`: a message to the server's mods, like [`engine.send_to_server`](#fn-engine-send_to_server) from a game mod. They get it in [`on_mod_message`](#fn-hooks-on_mod_message), from this player, and check it like anything else a player's game sends. The same channel names and limits (4 KB, 20 a second); only if the server allows it (`client_mods_messages`). In singleplayer it reaches your own world's mods.
+
+<a id="network-input"></a>**Network input** (data from other programs: lighting software's Art-Net, a stream deck, a sensor...). Off until the player turns it on in **Settings > Video > Network input**:
+
+| choice | |
+|---|---|
+| Off (the default) | nothing can be received |
+| This computer | only from programs on the same PC (127.0.0.1) |
+| Network | from any network card: other devices and PCs. The system may ask to let the game through the firewall. |
+
+Only on the ports the player allows: `udp_ports = 6454` in `settings.txt` (comma-separated; 6454, Art-Net's, unless changed). Up to 4 at once. Mods can't turn it on, choose other ports, or reach the network any other way, and game mods and servers have no network input at all.
+
+| function | |
+|---|---|
+| <a id="fn-client-udp_listen"></a>`client.udp_listen(port)` | starts receiving UDP packets on that port: `true`, or `false, why` (off, a port the player doesn't allow, in use by another program) |
+| <a id="fn-client-udp_receive"></a>`client.udp_receive(port [, max])` | the packets that came since the last call, oldest first: `{ { data, from, port, time }, ... }`. `data` is the packet's bytes as a string (read it with `string.byte`); `from` and `port` are the sender's address and port. At most 256 are kept per port; older ones are dropped if nobody reads them. |
+| <a id="fn-client-udp_reply"></a>`client.udp_reply(port, address, to_port, data)` | sends a packet back, for protocols that answer "who's there?": only to an address that sent this port a packet in the last 10 seconds, at most 1472 bytes and 20 a second. `true`, or `false, why`. |
+| <a id="fn-client-udp_status"></a>`client.udp_status()` | `{ mode = "off" \| "local" \| "network", ports = { allowed }, listening = { ports }, received, error }` |
+
+Packets are only ever data: nothing in them is run.
 
 **Your mod:**
 - <a id="fn-client-get_mod_storage"></a>`client.get_mod_storage()`, called while your mod loads, returns storage kept between sessions: `s:get(key)`, `s:set(key, value)` (nil removes), `s:get_string`, `s:get_int`, `s:get_float`, `s:get_keys()`. Values are text.
@@ -4357,6 +4368,7 @@ client_mods = true                 # false: players' client mods don't run here
 client_mods_chat = false           # may they send chat and commands for the player?
 client_mods_players = true         # may they see other players?
 client_mods_block_range = 64       # how far they can read blocks (0 = any distance)
+client_mods_messages = true        # may they send messages to this server's mods (client.send_to_server)?
 ```
 For a LAN game, the host's `settings.txt` can set the same keys with `lan_` in front (`lan_client_mods_chat = false`...). A game mod running on the server can also change the rules with `engine.set_shared("engine:client_mods", "allowed=1;chat=0;players=1;range=32")`.
 

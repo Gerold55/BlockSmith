@@ -148,7 +148,7 @@ add_executable(BlockSmith
     GpuCheck.cpp
     Bloom.cpp
     SunShafts.cpp
-    ArtNet.cpp
+    UdpInput.cpp
     Model.h
     ChatSystem.cpp
     WebLink.cpp
