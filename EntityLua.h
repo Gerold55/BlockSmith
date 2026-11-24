@@ -18,6 +18,7 @@
 #include <sol/sol.hpp>
 #include "Entities.h"
 #include "World.h"
+#include "Dimensions.h"
 #include "LuaSandbox.h"
 #include <cmath>
 #include <functional>
@@ -36,6 +37,11 @@ struct EntityLuaHost {
     std::function<bool()> isAuthority = [] { return true; };
     // Every player in the world: name and feet position
     std::function<std::vector<std::pair<std::string, glm::vec3>>()> players;
+    // Dimensions (Dimensions.h): every player with the dimension they're in, and the world of a
+    // dimension if it's loaded. With these, each dimension's entities move in their own world
+    // near their own players; without, everything is in `world`.
+    std::function<std::vector<std::tuple<std::string, glm::vec3, std::string>>()> playerPlaces;
+    std::function<const World*(const std::string& dimension)> worldFor;
     std::function<void(const std::string& name, float amount, const std::string& reason)> damagePlayer;
     // Puts items in a player's inventory; false = no room (the item stays on the ground)
     std::function<bool(const std::string& name, const std::string& item, int count)> giveItem;
@@ -61,6 +67,8 @@ E._defs = {}
 
 -- Where it is, and moving it
 function M:get_pos() return E._pos(self.id) end
+function M:get_dimension() return E._dimension(self.id) end
+function M:set_dimension(dim, x, y, z) return E._set_dimension(self.id, dim, x, y, z) end
 function M:set_pos(x, y, z) E._set_pos(self.id, x, y, z) end
 function M:get_velocity() return E._vel(self.id) end
 function M:set_velocity(x, y, z) E._set_vel(self.id, x, y, z) end
@@ -360,9 +368,24 @@ public:
             const glm::vec3 c(x, y, z);
             for (const auto& [id, e] : mgr->all()) {
                 if (e.removed || (!name.empty() && e.type != name)) continue;
+                if (e.dimension != dims::current()) continue;   // (only the dimension this code runs in)
                 if (glm::distance(e.pos, c) <= r) out.push_back(id);
             }
             return sol::as_table(out);
+        };
+        // Dimensions: which one it's in, and moving it to another (at x, y, z there)
+        E["_dimension"] = [mgr](uint32_t id) -> std::string {
+            const Entity* e = mgr->get(id);
+            return (!e || e->dimension.empty()) ? std::string(dims::kOverworld) : e->dimension;
+        };
+        E["_set_dimension"] = [mgr](uint32_t id, const std::string& dim, float x, float y, float z) {
+            Entity* e = mgr->get(id);
+            if (!e || !dims::Registry::get().has(dim) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+            e->dimension = dim == dims::kOverworld ? std::string() : dim;
+            e->pos = {x, y, z};
+            e->vel = glm::vec3(0.0f);
+            ++e->version;   // (players' games: it left theirs, or appears in theirs)
+            return true;
         };
         E["_players"] = [self]() {
             sol::state_view L(*self->m_lua);
@@ -386,7 +409,8 @@ public:
         };
 
         // entities.register_spawn{ name, on = {blocks}, min_light, max_light, min_y, max_y,
-        //   chance, group = n or {min, max}, max_nearby, when = "day"|"night"|"any", sky = true }
+        //   chance, group = n or {min, max}, max_nearby, when = "day"|"night"|"any", sky = true,
+        //   dimensions = { "overworld", ... } or "*" (default: the overworld) }
         E["register_spawn"] = [mgr](sol::table def) {
             SpawnRule r;
             r.type = def.get_or("name", std::string());
@@ -407,6 +431,19 @@ public:
             }
             r.groupMin = std::clamp(r.groupMin, 1, 16);
             r.groupMax = std::clamp(r.groupMax, r.groupMin, 16);
+            // dimensions = { "overworld", "mymod:depths" } or "*" (every one); default: the overworld
+            sol::object ds = def["dimensions"];
+            if (ds.is<std::string>()) {
+                const std::string d = ds.as<std::string>();
+                r.dimensions = { d == dims::kOverworld ? std::string() : d };
+            } else if (ds.is<sol::table>()) {
+                r.dimensions.clear();
+                for (const auto& kv : ds.as<sol::table>()) {
+                    if (!kv.second.is<std::string>()) continue;
+                    const std::string d = kv.second.as<std::string>();
+                    r.dimensions.push_back(d == dims::kOverworld ? std::string() : d);
+                }
+            }
             r.maxNearby = std::clamp(def.get_or("max_nearby", r.maxNearby), 1, 100);
             r.when = def.get_or("when", r.when);
             r.needsSky = def.get_or("sky", r.needsSky);
@@ -427,23 +464,45 @@ public:
     // ---- The authority, every tick ----
     void step(float dt) {
         if (!m_lua || !m_host.manager || !m_host.world || !authority()) return;
-        EntityManager& mgr = *m_host.manager;
+        // Each dimension on its own: its entities, in its world, near its players. A dimension
+        // that isn't loaded (nobody there) waits, frozen, like Minecraft's unloaded chunks.
+        std::map<std::string, std::vector<std::pair<std::string, glm::vec3>>> byDim;
+        if (m_host.playerPlaces && m_host.worldFor) {
+            for (auto& [name, pos, dim] : m_host.playerPlaces()) byDim[dim == "overworld" ? std::string() : dim].push_back({name, pos});
+            byDim[std::string()];   // (the overworld always: despawning, items with nobody near)
+            for (auto& [dim, players] : byDim) {
+                const World* w = m_host.worldFor(dim);
+                if (!w) continue;
+                dims::InDimension here(dim);
+                m_host.manager->onlyDimension(&dim);
+                stepIn(dt, *w, players);
+                m_host.manager->onlyDimension(nullptr);
+            }
+            return;
+        }
         std::vector<std::pair<std::string, glm::vec3>> players;
         if (m_host.players) players = m_host.players();
+        stepIn(dt, *m_host.world, players);
+    }
+
+private:
+    void stepIn(float dt, const World& world, const std::vector<std::pair<std::string, glm::vec3>>& players) {
+        EntityManager& mgr = *m_host.manager;
         std::vector<glm::vec3> positions;
         for (const auto& p : players) positions.push_back(p.second);
+        const World* stepWorld = &world;
 
-        mgr.step(dt, *m_host.world, positions);
+        mgr.step(dt, world, positions);
         forgetRemoved();
 
         // Each mob's own on_step (not the ones frozen far away)
         std::vector<uint32_t> ids;
         ids.reserve(mgr.all().size());
         for (const auto& [id, e] : mgr.all()) {
-            if (e.removed) continue;
+            if (e.removed || e.dimension != dims::current()) continue;
             float nearest = 1e9f;
             for (const auto& p : positions) nearest = std::min(nearest, glm::distance(p, e.pos));
-            if (nearest <= EntityManager::kActiveRange && m_host.world->isLoaded(glm::ivec3(glm::floor(e.pos)))) ids.push_back(id);
+            if (nearest <= EntityManager::kActiveRange && stepWorld->isLoaded(glm::ivec3(glm::floor(e.pos)))) ids.push_back(id);
         }
         for (uint32_t id : ids) {
             if (!mgr.get(id)) continue;
@@ -461,13 +520,15 @@ public:
         // Natural spawning
         const bool day = m_host.isDay ? m_host.isDay() : true;
         auto light = m_host.lightLevel ? m_host.lightLevel : std::function<int(int, int, int)>([](int, int, int) { return 15; });
-        for (uint32_t id : mgr.trySpawning(dt, *m_host.world, positions, light, day,
+        for (uint32_t id : mgr.trySpawning(dt, world, positions, light, day,
                                            m_host.spawningEnabled ? m_host.spawningEnabled() : true,
                                            m_host.skyVisible)) {
             activate(id, sol::lua_nil);
         }
         forgetRemoved();
     }
+
+public:
 
     // A player hit it (left click). `from` = where they are (for knockback)
     void punch(uint32_t id, const std::string& player, const glm::vec3& from, const std::string& item) {

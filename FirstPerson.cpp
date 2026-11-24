@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX   // (windows.h's min/max macros would break std::max and glm::max)
+#endif
+#include "BlockShape.h"
 #include "FirstPerson.h"
 #include "Block.h"
 #include "Model.h"
@@ -27,7 +31,6 @@ void cubeFace(int f, float out[4][3]) {
     }
 }
 constexpr float kShade[6] = { 0.8f, 0.8f, 1.0f, 0.5f, 0.7f, 0.7f };
-constexpr float kUV[4][2] = { {0, 1}, {1, 1}, {1, 0}, {0, 0} };
 
 Vertex vert(float x, float y, float z, float u, float v, const glm::vec3& tint, float base, float overlay,
             bool tintBase, bool tintOverlay, float shade) {
@@ -136,7 +139,15 @@ void FirstPersonView::buildMesh(uint8_t id) {
             for (Vertex& v : back) { v.faceShading = 0.8f; v.posZ = -kSideGap; }
             pushQuad(verts, back);
         } else {
-            // A block: a little cube with its own textures
+            // A block: a little cube with its own textures - or a slab / stairs in its shape
+            // (BlockShape.h: a bottom slab, stairs going up away from you), the pictures lined
+            // up as in the world
+            shape::Box bs[shape::kMaxBoxes];
+            auto none = [](int, int, int, uint8_t&, uint8_t&) { return false; };
+            int nb = 1;
+            bs[0] = { glm::vec3(0.0f), glm::vec3(1.0f) };
+            if (shape::isPartial(p)) nb = shape::boxes(p, 1, none, bs);
+            for (int bi = 0; bi < nb; ++bi)
             for (int f = 0; f < 6; ++f) {
                 int tf = f;
                 if (p.faces[tf].baseLayer < 0) for (int g : { 2, 4, 0, 1, 5, 3 }) if (p.faces[g].baseLayer >= 0) { tf = g; break; }
@@ -145,7 +156,9 @@ void FirstPersonView::buildMesh(uint8_t id) {
                 cubeFace(f, c);
                 Vertex q[4];
                 for (int i = 0; i < 4; ++i) {
-                    q[i] = vert(c[i][0] - 0.5f, c[i][1] - 0.5f, c[i][2] - 0.5f, kUV[i][0], kUV[i][1], p.defaultTint,
+                    const glm::vec3 pt = bs[bi].mn + glm::vec3(c[i][0], c[i][1], c[i][2]) * (bs[bi].mx - bs[bi].mn);
+                    const glm::vec2 uv = shape::faceUV(f, pt);
+                    q[i] = vert(pt.x - 0.5f, pt.y - 0.5f, pt.z - 0.5f, uv.x, uv.y, p.defaultTint,
                                 static_cast<float>(fd.baseLayer), static_cast<float>(fd.overlayLayer),
                                 fd.tintBase, fd.tintOverlay, kShade[f]);
                 }

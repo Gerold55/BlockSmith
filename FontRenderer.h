@@ -55,6 +55,12 @@ public:
     // The resolution the scales are relative to (scale 1 = the font's size at this size)
     Dimensions2D baseSize() const { return baseResolution; }
 
+    // For text drawn anywhere else (in the world, on signs): each letter of `text` as a quad in
+    // font pixels (baseline at y = 0, y downwards) with its place in the atlas. Returns the width.
+    struct GlyphQuad { float x0, y0, x1, y1, s0, t0, s1, t1; };
+    float layout(std::string_view text, std::vector<GlyphQuad>& out) const;
+    GLuint atlasTexture() const { return fontTextureID; }
+
 private:
     std::vector<float> generateFontVertices(float x, float y, float scaleX, float scaleY,
                                             Dimensions2D resolution, std::string_view text) const;

@@ -48,10 +48,17 @@ void Player::update(float deltaTime, const World& world, GLFWwindow* window, sol
     // The movement itself lives in stepMovement (PlayerMovement.cpp) so the multiplayer
     // server can run exactly the same code.
     MoveState state{position, velocity, isGrounded};
-    stepMovement(state, readMoveInput(window, yaw, pitch), deltaTime, world);
+    const MoveInput input = readMoveInput(window, yaw, pitch);
+    stepMovement(state, input, deltaTime, world);
     position = state.position;
     velocity = state.velocity;
     isGrounded = state.grounded;
+    // Sneaking lowers the eyes (not while flying: there Sneak means going down). Eased over
+    // about a tenth of a second, so the camera dips instead of jumping.
+    const bool sneaking = (input.keys & MoveInput::Sneak) != 0 && !g_Flying;
+    const float target = sneaking ? kSneakingEyeHeight : kStandingEyeHeight;
+    eyeHeight += (target - eyeHeight) * std::min(1.0f, deltaTime * 14.0f);
+    if (std::fabs(target - eyeHeight) < 0.001f) eyeHeight = target;
 }
 
 // Keys mods allow (engine.set_player_controls): hunger can stop sprinting, death can stop
@@ -103,7 +110,7 @@ void updateFlight(GLFWwindow* window, bool canFly, bool grounded) {
 }
 
 glm::mat4 Player::getViewMatrix() const {
-    glm::vec3 cameraPos = position + glm::vec3(0.0f, 1.62f, 0.0f);
+    glm::vec3 cameraPos = eyePosition();
     glm::vec3 front(
         cos(glm::radians(yaw)) * cos(glm::radians(pitch)),
         sin(glm::radians(pitch)),

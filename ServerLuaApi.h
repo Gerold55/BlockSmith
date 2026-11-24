@@ -25,9 +25,12 @@
 
 #include "LuaSandbox.h"
 #include "Net.h"
+#include "Dimensions.h"
 #include "Block.h"
 #include <glm/glm.hpp>
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -41,6 +44,7 @@ class ServerLuaApi {
 public:
     struct PlayerInfo {
         std::string name;
+        std::string dimension;        // "" = the overworld
         glm::vec3 pos{0.0f};
         std::string mode;
         bool op = false;
@@ -57,6 +61,12 @@ public:
     std::function<bool(PlayerInfo&)> localPlayer;
     std::function<void(const std::string&, const glm::vec3&)> localMessage;
     std::function<void(const glm::vec3&)> localTeleport;
+    // Dimensions: send a player to a dimension (the owner moves the local player, or asks the
+    // server); make sure a dimension's world is loaded (dimensions.run_in)
+    std::function<bool(const std::string& name, const std::string& dimension, const glm::vec3& pos)> changeDimension;
+    std::function<bool(const std::string& dimension)> loadDimension;
+    // Loads (or generates) the chunks within `radius` blocks of x, z in a dimension, now
+    std::function<bool(const std::string& dimension, int x, int z, int radius)> loadArea;
     // A mod message for the local player's own game (its on_server_message). Returns whether
     // it was accepted (false: its queue is full, and the message is dropped).
     std::function<bool(const std::string& channel, const std::string& data)> localModMessage;
@@ -113,6 +123,36 @@ public:
     // A joined player used `item` on the block at pos (C_HARVEST): on_player_harvest
     void harvest(const std::string& name, const std::string& item, const glm::ivec3& pos) {
         call("on_player_harvest", [](sol::protected_function_result&) {}, name, item, pos.x, pos.y, pos.z);
+    }
+    // A player wrote on a block (a sign): can_edit_text(name, x, y, z, side, lines) -> false[,
+    // reason] refuses, a table of lines replaces theirs, nothing allows it
+    bool canEditText(const std::string& name, const glm::ivec3& pos, int side, std::vector<std::string>& lines,
+                     std::string& refusal) {
+        bool ok = true;
+        sol::table t = lua->create_table();
+        for (size_t i = 0; i < lines.size(); ++i) t[i + 1] = lines[i];
+        call("can_edit_text", [&](sol::protected_function_result& r) {
+            if (r.return_count() < 1) return;
+            const sol::object v = r.get<sol::object>(0);
+            if (v.get_type() == sol::type::boolean && !v.as<bool>()) {
+                ok = false;
+                if (r.return_count() >= 2 && r.get<sol::object>(1).get_type() == sol::type::string) refusal = r.get<std::string>(1);
+            } else if (v.get_type() == sol::type::table) {
+                sol::table nt = v.as<sol::table>();
+                lines.clear();
+                for (size_t i = 1; i <= BlockText::kMaxLines && i <= nt.size(); ++i) {
+                    sol::object l = nt[i];
+                    lines.push_back(l.get_type() == sol::type::string ? l.as<std::string>().substr(0, BlockText::kMaxLineBytes) : std::string());
+                }
+            }
+        }, name, pos.x, pos.y, pos.z, std::string(side == 1 ? "back" : "front"), t);
+        return ok;
+    }
+    // A player is now in another dimension: on_player_change_dimension(name, from, to)
+    void dimensionChanged(const std::string& name, const std::string& from, const std::string& to) {
+        dims::InDimension here(to);
+        call("on_player_change_dimension", [](sol::protected_function_result&) {}, name,
+             from.empty() ? std::string(dims::kOverworld) : from, to.empty() ? std::string(dims::kOverworld) : to);
     }
     // A player's game sent its server's mods a message (engine.send_to_server)
     void modMessage(const std::string& name, const std::string& channel, const std::string& data) {
@@ -201,6 +241,54 @@ public:
             if (server && server->running()) n += server->sendModMessageToAll(channel, text);
             return n;
         };
+        // engine.get_player_dimension(name) -> "overworld" | "mod:name", or nil if they aren't online
+        engine["get_player_dimension"] = [this](const std::string& name, sol::this_state ts) -> sol::object {
+            sol::state_view lv(ts);
+            PlayerInfo p;
+            if (!findPlayer(name, p)) return sol::make_object(lv, sol::lua_nil);
+            return sol::make_object(lv, p.dimension.empty() ? std::string(dims::kOverworld) : p.dimension);
+        };
+        // engine.set_player_dimension(name, dimension [, x, y, z]) -> true: they're now in that
+        // dimension at x, y, z (its world is loaded first; no position: its `spawn`).
+        // on_player_change_dimension runs.
+        engine["set_player_dimension"] = [this](const std::string& name, const std::string& dimension,
+                                                sol::optional<float> x, sol::optional<float> y, sol::optional<float> z) {
+            if (!dims::Registry::get().has(dimension) || !changeDimension) return false;
+            glm::vec3 at = dims::Registry::get().type(dimension).spawn;
+            if (x && y && z) at = glm::vec3(*x, *y, *z);
+            if (!std::isfinite(at.x) || !std::isfinite(at.y) || !std::isfinite(at.z)) return false;
+            return changeDimension(name, dimension, at);
+        };
+        {
+            sol::table dimensions = (*lua)["dimensions"].get_or_create<sol::table>();
+            // dimensions.current() -> the dimension this code runs in ("overworld" or "mod:name"):
+            // where the player, block or entity that started it is
+            dimensions["current"] = []() {
+                return dims::current().empty() ? std::string(dims::kOverworld) : dims::current();
+            };
+            // dimensions.load_area(dimension, x, z [, radius]) -> true: the chunks within radius
+            // blocks (default 16, at most 64) of x, z are there now - loaded from disk or generated
+            // - so blocks there can be read and changed straight away (building a portal there)
+            dimensions["load_area"] = [this](const std::string& dimension, float x, float z, sol::optional<int> radius) {
+                if (!dims::Registry::get().has(dimension) || !loadArea) return false;
+                if (!std::isfinite(x) || !std::isfinite(z)) return false;
+                return loadArea(dimension, static_cast<int>(std::floor(x)), static_cast<int>(std::floor(z)),
+                                std::clamp(radius.value_or(16), 0, 64));
+            };
+            // dimensions.run_in(dimension, fn, ...) -> fn's first result: runs fn with world
+            // functions (engine.set_block, get_block...) acting in that dimension (loaded first)
+            dimensions["run_in"] = [this](const std::string& dimension, sol::protected_function fn,
+                                          sol::variadic_args args, sol::this_state ts) -> sol::object {
+                sol::state_view lv(ts);
+                if (!dims::Registry::get().has(dimension)) throw std::runtime_error("dimensions.run_in: no dimension '" + dimension + "'");
+                if (loadDimension && !loadDimension(dimension)) return sol::make_object(lv, sol::lua_nil);
+                dims::InDimension here(dimension);
+                auto r = fn(args);
+                if (!r.valid()) { sol::error err = r; throw std::runtime_error(err.what()); }
+                if (r.return_count() < 1) return sol::make_object(lv, sol::lua_nil);
+                return r.get<sol::object>(0);
+            };
+        }
         engine["kick_player"] = [this](const std::string& name, sol::optional<std::string> reason) {
             if (!server || !server->running()) return false;
             const auto names = server->playerNames();
@@ -290,10 +378,12 @@ private:
         PlayerInfo local;
         if (localPlayer && localPlayer(local)) out.push_back(local);
         if (server && server->running()) {
-            for (const auto& [name, pos] : server->playerPositions()) {
+            for (const auto& place : server->playerPlaces()) {
+                const std::string& name = place.name;
                 PlayerInfo p;
                 p.name = name;
-                p.pos = pos;
+                p.pos = place.pos;
+                p.dimension = place.dimension;
                 p.mode = server->playerMode(name);
                 if (p.mode.empty()) p.mode = server->defaultMode();
                 p.op = isOperator && isOperator(name);
@@ -310,6 +400,7 @@ private:
         sol::table t = lv.create_table();
         t["name"] = p.name;
         t["x"] = p.pos.x; t["y"] = p.pos.y; t["z"] = p.pos.z;
+        t["dimension"] = p.dimension.empty() ? std::string(dims::kOverworld) : p.dimension;
         t["mode"] = p.mode;
         t["operator"] = p.op;
         return t;

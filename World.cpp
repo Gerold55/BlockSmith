@@ -39,6 +39,9 @@ constexpr uint32_t kTintMagic    = 0x544E4954;  // "TINT"
 // Terrain info: u16 terrain version, u8 built (see ChunkData). Written before the colours, so
 // older builds (which read the colours to the end of the file) simply stop at it.
 constexpr uint32_t kTerrainMagic = 0x52524554;  // "TERR"
+// Block text (signs...): u16 count, then each: u8 x, u8 y, u8 z, u8 flags (1 waxed), and front
+// then back: u8 r g b, u8 glowing, u8 lines, { u16 length, bytes }. Before the colours.
+constexpr uint32_t kTextMagic    = 0x54584554;  // "TEXT"
 constexpr int      kChunkCells   = CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_WIDTH;
 
 // Neighbor slots match ChunkData::neighbors:
@@ -134,7 +137,7 @@ World::World() : m_fluids(std::make_unique<FluidSimulator>(*this)) {
     std::random_device rd;
     m_seed = rd() ^ static_cast<uint32_t>(
                  std::chrono::system_clock::now().time_since_epoch().count());
-    std::cout << "[World] Initialized with random seed: " << m_seed << std::endl;
+    // (a placeholder: the world being opened or created sets its real seed, and says it)
 }
 
 World::~World() = default;
@@ -244,6 +247,13 @@ void World::setRenderDistance(int chunks) {
 
 void World::ensureLuaSeeded(sol::state& lua) {
     if (m_luaSeeded) return;
+    if (!m_dimension.empty()) {
+        // Another dimension: its generator gets the seed with each chunk, and its terrain
+        // version is the one its dimensions.register gave (the overworld's hooks aren't its own)
+        m_terrainVersion = static_cast<uint16_t>(std::clamp(m_dimType.terrainVersion, 0, 65535));
+        m_luaSeeded = true;
+        return;
+    }
     CaveGenerator::setSeed(m_seed);
     if (m_generator) CaveGenerator::prepare();   // before the threads carve caves
     // The world generator's terrain version (its global terrain_version, if it has one)
@@ -333,7 +343,7 @@ void World::loadQueuedChunks(sol::state& lua) {
         const bool generationHeld = !m_fatalError.empty() || Clock::now() < m_genHoldUntil;
         auto generate = [&](const ChunkCoord& c) {
             if (!generationHeld && m_generating.size() < maxInFlight) {
-                m_generator->request(c.first, c.second, m_resetCount, m_seed);
+                m_generator->request(c.first, c.second, m_resetCount, m_seed, m_dimension, m_dimType.caves);
                 m_generating.insert(c);
             } else {
                 notYet.push_back(c);
@@ -420,7 +430,7 @@ void World::loadQueuedChunks(sol::state& lua) {
 
 // Finished chunks from the generator's threads: keep the ones still needed.
 void World::collectGenerated() {
-    for (auto& r : m_generator->takeFinished()) {
+    for (auto& r : m_generator->takeFinished(m_dimension)) {
         const ChunkCoord c{r.cx, r.cz};
         if (r.epoch != m_resetCount) continue;          // from before a reset (another world)
         m_generating.erase(c);
@@ -435,7 +445,7 @@ void World::collectGenerated() {
     }
     // Requests for places nobody is near any more: drop them if they haven't started
     for (auto it = m_generating.begin(); it != m_generating.end();) {
-        if (!wantedChunk(*it) && m_generator->cancel(it->first, it->second)) it = m_generating.erase(it);
+        if (!wantedChunk(*it) && m_generator->cancel(it->first, it->second, m_dimension)) it = m_generating.erase(it);
         else ++it;
     }
 }
@@ -450,7 +460,7 @@ void World::noteSeedFailure(const std::string& error) {
     if (m_seedFailures >= kMaxSeedAttempts) {
         m_fatalError = "The world generator failed (set_world_seed): " + error;
         std::cerr << "[World] " << m_fatalError << " - giving up after " << m_seedFailures << " attempts" << std::endl;
-        if (m_generator) m_generator->clearQueue();
+        if (m_generator) m_generator->clearQueue(m_dimension);
         return;
     }
     const int shift = std::min(m_seedFailures - 1, 4);          // 0.5 s, 1 s, 2 s, 4 s, 8 s
@@ -569,7 +579,7 @@ bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
     // 2. Otherwise generate it (Lua mapgen, or the C++ fallback).
     if (!fromDisk) {
         chunk = std::make_shared<ChunkData>();   // fresh, in case a broken file half-filled it
-        generateNewChunk(*chunk, chunkX, chunkZ, &lua, m_seed);
+        generateNewChunk(*chunk, chunkX, chunkZ, &lua, m_seed, m_dimension, m_dimType.caves);
     } else {
         computeBiomeTint(*chunk, chunkX, chunkZ, &lua);   // saved before biome colours
     }
@@ -630,21 +640,38 @@ void World::computeBiomeTint(ChunkData& chunk, int cx, int cz, sol::state* lua) 
     }
 }
 
-void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed) {
+void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed,
+                             const std::string& dimension, bool caves) {
     sol::protected_function genFunc;
-    if (lua) genFunc = (*lua)["generate_chunk"];
-    if (lua && genFunc.valid()) {
-        auto result = genFunc(&chunk, cx, cz);
-        if (!result.valid()) {
-            sol::error err = result;
-            std::cerr << "[Mapgen Error]: " << err.what() << std::endl;
+    if (dimension.empty() || dimension == "overworld") {
+        if (lua) genFunc = (*lua)["generate_chunk"];
+        if (lua && genFunc.valid()) {
+            auto result = genFunc(&chunk, cx, cz);
+            if (!result.valid()) {
+                sol::error err = result;
+                std::cerr << "[Mapgen Error]: " << err.what() << std::endl;
+            }
+        } else {
+            generateFallbackTerrain(chunk, cx, cz, static_cast<float>(seed % 100000) * 0.001f);
         }
-    } else {
-        generateFallbackTerrain(chunk, cx, cz, static_cast<float>(seed % 100000) * 0.001f);
+    } else if (lua) {
+        // Another dimension: the generator its mod gave dimensions.register (kept by name in
+        // _dimension_generators in every Lua state). None: the chunk stays empty (a void).
+        sol::object gens = (*lua)["_dimension_generators"];
+        if (gens.get_type() == sol::type::table) {
+            sol::protected_function fn = gens.as<sol::table>()[dimension];
+            if (fn.valid()) {
+                auto result = fn(&chunk, cx, cz, seed);
+                if (!result.valid()) {
+                    sol::error err = result;
+                    std::cerr << "[Mapgen Error] (" << dimension << "): " << err.what() << std::endl;
+                }
+            }
+        }
     }
     // Carve caves into the new terrain (seeded, so the same seed gives the same caves).
     // Saved chunks skip this - their caves are already in the file.
-    CaveGenerator::carveChunk(chunk, cx, cz);
+    if (caves) CaveGenerator::carveChunk(chunk, cx, cz);
     computeBiomeTint(chunk, cx, cz, lua);
 }
 
@@ -660,11 +687,12 @@ void World::reset() {
     m_unloaded.clear();
     m_justLoaded.clear();
     m_generating.clear();   // results still on their way carry the old reset count: ignored
-    if (m_generator) m_generator->clearQueue();
+    if (m_generator) m_generator->clearQueue(m_dimension);
     ++m_resetCount;
     m_remote = false;
     m_recordChanges = false;
     m_changes.clear();
+    m_textChanges.clear();
     m_extraCenters.clear();
     m_fluids->clear();
     m_modified.clear();
@@ -802,6 +830,34 @@ std::vector<uint8_t> World::encodeChunk(const ChunkData& chunk) {
         put32(out, kTerrainMagic);
         put16(out, chunk.terrainVersion);
         out.push_back(chunk.built ? 1 : 0);
+    }
+
+    // Block text (signs)
+    if (!chunk.allTexts().empty()) {
+        put32(out, kTextMagic);
+        put16(out, static_cast<uint16_t>(std::min<size_t>(chunk.allTexts().size(), 0xFFFF)));
+        size_t n = 0;
+        for (const auto& [key, t] : chunk.allTexts()) {
+            if (++n > 0xFFFF) break;
+            int x, y, z;
+            ChunkData::textPos(key, x, y, z);
+            out.push_back(static_cast<uint8_t>(x)); out.push_back(static_cast<uint8_t>(y)); out.push_back(static_cast<uint8_t>(z));
+            out.push_back(t.waxed ? 1 : 0);
+            for (const BlockTextSide* side : { &t.front, &t.back }) {
+                out.push_back(static_cast<uint8_t>(side->color >> 16));
+                out.push_back(static_cast<uint8_t>(side->color >> 8));
+                out.push_back(static_cast<uint8_t>(side->color));
+                out.push_back(side->glowing ? 1 : 0);
+                const size_t lines = std::min(side->lines.size(), BlockText::kMaxLines);
+                out.push_back(static_cast<uint8_t>(lines));
+                for (size_t i = 0; i < lines; ++i) {
+                    const std::string& l = side->lines[i];
+                    const size_t len = std::min(l.size(), BlockText::kMaxLineBytes);
+                    put16(out, static_cast<uint16_t>(len));
+                    out.insert(out.end(), l.begin(), l.begin() + static_cast<std::ptrdiff_t>(len));
+                }
+            }
+        }
     }
 
     // Biome colours (if this chunk has them)
@@ -950,6 +1006,38 @@ bool World::decodeChunk(const std::vector<uint8_t>& d, ChunkData& chunk) {
         chunk.built = d[p + 6] != 0;
         chunk.terrainKnown = true;
         p += 7;
+    }
+    // Block text (signs), if saved - read carefully: a damaged section just ends it
+    if (cell == kChunkCells && p + 6 <= d.size() && get32(d, p) == kTextMagic) {
+        p += 4;
+        const uint16_t count = get16(d, p);
+        p += 2;
+        bool ok = true;
+        for (uint16_t i = 0; i < count && ok; ++i) {
+            if (p + 4 > d.size()) { ok = false; break; }
+            const int x = d[p], y = d[p + 1], z = d[p + 2];
+            BlockText t;
+            t.waxed = (d[p + 3] & 1) != 0;
+            p += 4;
+            for (BlockTextSide* side : { &t.front, &t.back }) {
+                if (p + 5 > d.size()) { ok = false; break; }
+                side->color = (static_cast<uint32_t>(d[p]) << 16) | (static_cast<uint32_t>(d[p + 1]) << 8) | d[p + 2];
+                side->glowing = d[p + 3] != 0;
+                const int lines = d[p + 4];
+                p += 5;
+                for (int l = 0; l < lines; ++l) {
+                    if (p + 2 > d.size()) { ok = false; break; }
+                    const uint16_t len = get16(d, p);
+                    p += 2;
+                    if (p + len > d.size()) { ok = false; break; }
+                    if (static_cast<size_t>(l) < BlockText::kMaxLines)
+                        side->lines.emplace_back(reinterpret_cast<const char*>(d.data() + p), std::min<size_t>(len, BlockText::kMaxLineBytes));
+                    p += len;
+                }
+            }
+            if (ok && x < CHUNK_WIDTH && z < CHUNK_WIDTH && y < CHUNK_HEIGHT) chunk.setText(x, y, z, t);
+        }
+        if (!ok) p = d.size();
     }
     // Biome colours, if saved
     if (cell == kChunkCells && p + 4 <= d.size() && get32(d, p) == kTintMagic) {
@@ -1190,6 +1278,7 @@ void World::setMetadataAt(const glm::ivec3& loc, uint8_t meta) {
                        positiveMod(loc.z, CHUNK_WIDTH), meta);
     markBlockChanged(loc);
     markModified(loc);
+    noteFluidChange(loc);    // (a slab or stairs may have been waterlogged or drained)
     recordChange(loc);
 }
 
@@ -1200,6 +1289,43 @@ void World::setMetadataAt(const glm::ivec3& loc, uint8_t meta) {
 void World::recordChange(const glm::ivec3& loc) {
     if (!m_recordChanges && !m_remote) return;
     m_changes.push_back(BlockChange{loc, getBlockAt(loc), getMetadataAt(loc)});
+}
+
+const BlockText* World::getBlockTextAt(const glm::ivec3& loc) const {
+    const ChunkData* c = chunkAt(loc);
+    if (!c) return nullptr;
+    return c->getText(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
+}
+
+bool World::setBlockTextAt(const glm::ivec3& loc, const BlockText& text) {
+    ChunkData* c = chunkAt(loc);
+    if (!c || loc.y < 0 || loc.y >= CHUNK_HEIGHT) return false;
+    BlockText t = text;   // (kept within the limits)
+    for (BlockTextSide* side : { &t.front, &t.back }) {
+        if (side->lines.size() > BlockText::kMaxLines) side->lines.resize(BlockText::kMaxLines);
+        for (auto& l : side->lines) if (l.size() > BlockText::kMaxLineBytes) l.resize(BlockText::kMaxLineBytes);
+        side->color &= 0xFFFFFF;
+    }
+    c->setText(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH), t);
+    if (!m_remote) markModified(loc);
+    if (m_recordChanges) m_textChanges.push_back(loc);
+    return true;
+}
+
+bool World::clearBlockTextAt(const glm::ivec3& loc) {
+    ChunkData* c = chunkAt(loc);
+    if (!c || !getBlockTextAt(loc)) return false;
+    c->clearText(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
+    if (!m_remote) markModified(loc);
+    if (m_recordChanges) m_textChanges.push_back(loc);
+    return true;
+}
+
+void World::applyNetworkText(const glm::ivec3& loc, const BlockText* text) {
+    ChunkData* c = chunkAt(loc);
+    if (!c) return;
+    if (text) c->setText(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH), *text);
+    else c->clearText(positiveMod(loc.x, CHUNK_WIDTH), loc.y, positiveMod(loc.z, CHUNK_WIDTH));
 }
 
 std::vector<World::BlockChange> World::takeBlockChanges() {
@@ -1305,11 +1431,24 @@ int World::groundHeightAt(int x, int z) const {
 // Light (Light.h)
 // ---------------------------------------------------------------------------
 
+void World::setDimension(const std::string& nameIn) {
+    const std::string name = nameIn == dims::kOverworld ? std::string() : nameIn;
+    m_dimension = name;
+    m_dimType = dims::Registry::get().type(name.empty() ? std::string(dims::kOverworld) : name);
+    m_luaSeeded = false;   // (its own terrain version, worked out again before chunks load)
+    if (name.empty()) { m_dimType = DimensionType(); m_dimType.name = dims::kOverworld; }
+    if (m_light) {
+        m_light->setSkylight(m_dimType.hasSkylight);
+        for (auto& entry : chunks) lightChunkAdded(*entry.second);   // (normally none: set before loading)
+    }
+}
+
 void World::setLighting(bool on) {
     if (on == m_lightingOn) return;
     m_lightingOn = on;
     if (!on) { m_light.reset(); return; }
     m_light = std::make_unique<LightEngine>();
+    m_light->setSkylight(m_dimType.hasSkylight);
     for (auto& entry : chunks) lightChunkAdded(*entry.second);   // chunks already here
     for (auto& entry : chunks) markDirty(entry.first.first, entry.first.second);
 }

@@ -266,6 +266,20 @@ float FontRenderer::textWidth(std::string_view text, float scaleX, Dimensions2D 
     return rx * scaleWidth;
 }
 
+float FontRenderer::layout(std::string_view text, std::vector<GlyphQuad>& out) const {
+    out.clear();
+    if (fontTextureID == 0) return 0.0f;
+    float rx = 0.0f, ry = 0.0f;
+    for (size_t i = 0; i < text.size();) {
+        const int glyph = nextGlyph(text, i);
+        if (glyph < 0) continue;
+        stbtt_aligned_quad q;
+        stbtt_GetBakedQuad(const_cast<stbtt_bakedchar*>(cdata), atlasWidth, atlasHeight, glyph, &rx, &ry, &q, 1);
+        out.push_back({ q.x0, q.y0, q.x1, q.y1, q.s0, q.t0, q.s1, q.t1 });
+    }
+    return rx;
+}
+
 float FontRenderer::capHeight(float scaleY, Dimensions2D resolution) const {
     if (this->baseResolution.height <= 0 || fontTextureID == 0) return 0.0f;
     const float scaleHeight = scaleY * static_cast<float>(resolution.height)

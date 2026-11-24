@@ -181,6 +181,7 @@ void BlockModifiers::update(float dt, World& world, const std::vector<glm::vec3>
     if (!m_lua || world.isRemote()) return;
     World::NaturalChanges nature;   // ABMs, LBMs and random ticks: nature, not building
     resolve();
+    select(world.dimension());      // this dimension's timers, scan and LBM record
 
     // ---- LBMs: chunks that just arrived ----
     for (const auto& [c, fromDisk] : world.takeLoadedChunks()) runLBMs(world, c, fromDisk);
@@ -355,7 +356,68 @@ void BlockModifiers::saveWorld(const std::string& worldDir) const {
     if (ec) { fs::remove(fs::path(worldDir) / "lbm_done.txt", ec); fs::rename(tmp, fs::path(worldDir) / "lbm_done.txt", ec); }
 }
 
+void BlockModifiers::select(const std::string& dimension) {
+    if (dimension == m_currentDim) return;
+    WorldState& out = m_otherWorlds[m_currentDim];
+    out.timers.clear();
+    for (const auto& a : m_abms) out.timers.push_back(a.timer);
+    out.tickCarry = m_tickCarry;
+    out.scanChunks = std::move(m_scanChunks);
+    out.scanNext = m_scanNext;
+    out.scanDue = std::move(m_scanDue);
+    out.lbmDone = std::move(m_lbmDone);
+    out.lbmDirty = m_lbmDirty;
+    out.started = true;
+    WorldState in = std::move(m_otherWorlds[dimension]);
+    m_otherWorlds.erase(dimension);
+    for (size_t i = 0; i < m_abms.size(); ++i) {
+        m_abms[i].timer = (in.started && i < in.timers.size()) ? in.timers[i]
+                        : static_cast<float>(random() % 1000) / 1000.0f * m_abms[i].interval;
+    }
+    m_tickCarry = in.tickCarry;
+    m_scanChunks = std::move(in.scanChunks);
+    m_scanNext = in.started ? in.scanNext : 0;
+    m_scanDue = std::move(in.scanDue);
+    for (auto& v : m_byBlock) v.clear();   // (rebuilt when the next scan starts)
+    if (m_scanNext < m_scanChunks.size()) { m_scanChunks.clear(); m_scanNext = 0; }   // a fresh scan for it
+    m_lbmDone = std::move(in.lbmDone);
+    m_lbmDirty = in.lbmDirty;
+    m_currentDim = dimension;
+}
+
+void BlockModifiers::loadDimension(const std::string& dimension, const std::string& dir) {
+    select(dimension);
+    m_lbmDone.clear();
+    m_lbmDirty = false;
+    std::ifstream f(fs::path(dir) / "lbm_done.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        auto& done = m_lbmDone[line.substr(0, tab)];
+        std::stringstream ss(line.substr(tab + 1));
+        std::string item;
+        while (std::getline(ss, item, ';')) {
+            int cx = 0, cz = 0;
+            if (std::sscanf(item.c_str(), "%d,%d", &cx, &cz) == 2) done.insert({cx, cz});
+        }
+    }
+}
+
+void BlockModifiers::saveDimension(const std::string& dimension, const std::string& dir) {
+    select(dimension);
+    saveWorld(dir);
+}
+
+void BlockModifiers::forgetDimension(const std::string& dimension) {
+    if (dimension == m_currentDim) select(std::string());
+    if (!dimension.empty()) m_otherWorlds.erase(dimension);
+}
+
 void BlockModifiers::clearWorld() {
+    m_otherWorlds.clear();
+    m_currentDim.clear();
     m_lbmDone.clear();
     m_lbmDirty = false;
     m_scanChunks.clear();

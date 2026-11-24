@@ -267,7 +267,8 @@ void WeatherEffects::drawPrecipitation(const glm::mat4& view, const glm::mat4& p
 void WeatherEffects::drawSkyTint() {
     if (m_skyTint.a <= 0.001f || m_overlayProgram == 0) return;
     glUseProgram(m_overlayProgram);
-    glUniform4fv(glGetUniformLocation(m_overlayProgram, "u_Color"), 1, glm::value_ptr(m_skyTint));
+    const glm::vec4 tint = drawnSkyTint();
+    glUniform4fv(glGetUniformLocation(m_overlayProgram, "u_Color"), 1, glm::value_ptr(tint));
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);

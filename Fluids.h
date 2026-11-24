@@ -55,6 +55,7 @@ struct FluidCell {
     bool source = false;
     bool falling = false;
     int level = 0;                     // 0 for sources, 1..spread for flowing
+    bool held = false;                 // a source held in a waterlogged slab/stairs (BlockShape.h)
     explicit operator bool() const { return fluid != nullptr; }
 };
 

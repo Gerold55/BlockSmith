@@ -1,4 +1,5 @@
 #pragma once
+#include "Dimensions.h"
 // Multiplayer networking (ENet, UDP).
 //
 //  GameServer - runs inside the host's game ("Host Game" in the pause menu). The host's
@@ -32,12 +33,14 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 8;   // 7: the server decides each player's game mode
+constexpr uint32_t kProtocolVersion  = 10;   // 7: the server decides each player's game mode
                                             // 8: passwords by per-server challenge-response (Auth.h)
+                                            // 9: dimensions (S_DIMENSION, S_PLAYER_DIM), mod messages
+                                            // 10: block text (signs: C/S_BLOCK_TEXT, chunks' TEXT section)
 // The oldest server protocol this game can still play on. A newer game may join an older server
 // (it speaks the older protocol), never the other way round. Raise it when support for an old
 // protocol is dropped.
-constexpr uint32_t kMinProtocolVersion = 8;
+constexpr uint32_t kMinProtocolVersion = 10;   // (a game without dimensions would be shown the wrong world)
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -67,6 +70,7 @@ struct PlayerView {
         float yaw, pitch;
     };
     std::string name;
+    std::string dimension;        // which dimension they're in ("" = the overworld)
     glm::vec3 position{0.0f};     // where to draw them this frame
     float yaw = 0.0f, pitch = 0.0f;
     std::deque<Snapshot> snapshots;   // oldest first
@@ -276,6 +280,35 @@ public:
     std::function<void(const std::string& name, const std::string& channel, const std::string& text)> onModMessage;
     bool sendModMessage(const std::string& name, const std::string& channel, const std::string& text);
     int sendModMessageToAll(const std::string& channel, const std::string& text);   // -> how many got it
+
+    // Dimensions (Dimensions.h). The world's dimensions are shared by everyone on it; each
+    // player is in one of them. The owner gives the world of a dimension ("" = the overworld;
+    // nullptr: no such dimension) and every loaded one (for their changes and load centres).
+    // Without these, everything is the world given to start().
+    std::function<World*(const std::string& dimension)> worldFor;
+    std::function<void(const std::function<void(const std::string& dimension, World& world)>&)> forEachWorld;
+    // Which dimension a player was in last time (dedicated server: saved with them)
+    std::function<std::string(const std::string& name)> dimensionFor;
+    // A player moved to another dimension (setPlayerDimension): from, to ("" = the overworld)
+    std::function<void(const std::string& name, const std::string& from, const std::string& to)> onDimensionChange;
+    std::string playerDimension(const std::string& name) const;   // "" = the overworld (or not online)
+
+    // Block text (signs). A player wrote `lines` on one side (0 front, 1 back) of the block at pos:
+    // checked (online, within reach, a block that holds text, not waxed, then canEditText - the
+    // mods' can_edit_text, which may refuse with a reason or change the lines), then set in their
+    // dimension's world; everyone with that chunk gets it. `why`: what to tell them ("" = nothing).
+    bool editBlockText(const std::string& name, const glm::ivec3& pos, int side, std::vector<std::string> lines,
+                       std::string* why = nullptr);
+    std::function<bool(const std::string& name, const glm::ivec3& pos, int side, std::vector<std::string>& lines,
+                       std::string& refusal)> canEditText;
+    std::function<void(const std::string& name, const glm::ivec3& pos, int side)> onTextEdit;
+    // Sends a joined player to `dimension` at pos: their game drops its chunks and gets that
+    // dimension's. False: not online, or no such dimension.
+    bool setPlayerDimension(const std::string& name, const std::string& dimension, const glm::vec3& pos);
+    // The host's own player (hosting from the game) is in this dimension
+    void setHostDimension(const std::string& dimension);
+    struct Place { std::string name, dimension; glm::vec3 pos; };
+    std::vector<Place> playerPlaces() const;
     // Changes a block for a joined player with the same checks as their own edits: loaded,
     // within reach (+ slack, at most 4), undiggable blocks only in creative, then canEdit (spawn
     // protection, can_edit_block). True = changed (onPlayerEdit is called; everyone sees it).
@@ -343,7 +376,12 @@ private:
         double entityActWindow = 0.0;     // (hits / right-clicks / drops: at most 10 / 30 a second)
         int entityActs = 0, drops = 0;
         double modTokens = net::kModMessageBurst, modRefillAt = 0.0;   // (mod messages: flood limit)
+        std::string dimension;            // which dimension they're in ("" = the overworld)
     };
+    World& worldOf(const Client& c) const;
+    World& worldByDim(const std::string& dimension) const;
+    void sendDimension(Client& c);
+    std::string m_hostDimension;
     void sendEntities();
     EntityManager* m_entityManager = nullptr;
     float m_entityTimer = 0.0f;
@@ -364,8 +402,9 @@ private:
     void sendMode(Client& c);
 
     void streamChunks(Client& c);
-    void sendBlockChanges(const std::vector<World::BlockChange>& changes);
-    void sendFallingStarts(const std::vector<World::FallingStart>& starts);
+    void sendBlockChanges(const std::vector<World::BlockChange>& changes, const std::string& dimension);
+    void sendTextChanges(const World& world, const std::vector<glm::ivec3>& changes, const std::string& dimension);
+    void sendFallingStarts(const std::vector<World::FallingStart>& starts, const std::string& dimension);
     void sendPositions();
     void broadcastChat(const std::string& text, const glm::vec3& color);
 
@@ -508,8 +547,21 @@ public:
     // Mod messages (see GameServer::onModMessage): to the server's mods, and what its mods sent
     // us since the last call, oldest first
     bool sendModMessage(const std::string& channel, const std::string& text);
+    // We wrote on a block (a sign): the server decides (GameServer::editBlockText)
+    bool sendBlockText(const glm::ivec3& pos, int side, const std::vector<std::string>& lines);
+    bool takeTextArrived() { const bool a = m_textArrived; m_textArrived = false; return a; }
     struct ModMessage { std::string channel, data; };
     std::vector<ModMessage> takeModMessages() { std::vector<ModMessage> out; out.swap(m_modMessages); return out; }
+    // The dimension the server has us in ("" = the overworld) and its rules; true once each time
+    // it changes, with where we are now (the game moves the player there and redraws the sky)
+    const std::string& dimension() const { return m_dimension; }
+    const DimensionType& dimensionType() const { return m_dimType; }
+    bool takeDimensionChange(glm::vec3& pos) {
+        if (!m_dimensionChanged) return false;
+        m_dimensionChanged = false;
+        pos = m_dimensionPos;
+        return true;
+    }
 
     // A block changed by the server (another player, water...): for break/place sounds
     std::function<void(const glm::ivec3& pos, uint8_t oldId, uint8_t newId)> onBlockChanged;
@@ -522,6 +574,11 @@ private:
     std::vector<std::string> m_sharedChanges;
     std::vector<Action> m_actions;
     std::vector<ModMessage> m_modMessages;
+    bool m_textArrived = false;
+    std::string m_dimension;
+    DimensionType m_dimType;
+    glm::vec3 m_dimensionPos{0.0f};
+    bool m_dimensionChanged = false;
     std::string m_completeText, m_completeAsked;   // what the last answer / question was for
     std::vector<std::string> m_completeList;
     bool m_completeHave = false, m_completeArrived = false;

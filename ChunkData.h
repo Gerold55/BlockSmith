@@ -3,9 +3,27 @@
 // and (later) the server and networking. The client builds a ChunkMesh from it to draw it.
 
 #include <cstdint>
+#include <map>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include "Types.h"
+
+// Text kept with a block (signs, labels, books on a lectern...): a front and a back side, each
+// with its lines, colour and glow, and whether it's locked against editing ("waxed"). Saved with
+// the chunk and sent to players with it; it goes when the block there changes.
+struct BlockTextSide {
+    std::vector<std::string> lines;
+    uint32_t color = 0x000000;    // 0xRRGGBB
+    bool glowing = false;         // drawn at full brightness, with an outline
+    bool empty() const { for (const auto& l : lines) if (!l.empty()) return false; return true; }
+};
+struct BlockText {
+    BlockTextSide front, back;
+    bool waxed = false;           // nobody can edit it any more (a mod may still change it)
+    static constexpr size_t kMaxLines = 8;
+    static constexpr size_t kMaxLineBytes = 96;
+};
 
 class ChunkData {
 public:
@@ -58,6 +76,18 @@ public:
     // a chunk that isn't loaded (or has no light): open sky, so borders never go black
     uint16_t getLight(int x, int y, int z) const;
 
+    // ---- Block text (BlockText above), by local position ----
+    static uint32_t textKey(int x, int y, int z) { return (static_cast<uint32_t>(y) << 8) | (static_cast<uint32_t>(z) << 4) | static_cast<uint32_t>(x); }
+    static void textPos(uint32_t key, int& x, int& y, int& z) { x = key & 15; z = (key >> 4) & 15; y = static_cast<int>(key >> 8); }
+    const BlockText* getText(int x, int y, int z) const {
+        if (!inside(x, y, z) || texts.empty()) return nullptr;
+        const auto it = texts.find(textKey(x, y, z));
+        return it == texts.end() ? nullptr : &it->second;
+    }
+    void setText(int x, int y, int z, const BlockText& t) { if (inside(x, y, z)) texts[textKey(x, y, z)] = t; }
+    void clearText(int x, int y, int z) { if (inside(x, y, z) && !texts.empty()) texts.erase(textKey(x, y, z)); }
+    const std::map<uint32_t, BlockText>& allTexts() const { return texts; }
+
     // Neighbour slots: 0 = +X, 1 = -X, 4 = +Z, 5 = -Z (2/3 unused). Managed by World.
     ChunkData* neighbors[6];
     // This chunk's coordinates (set by World when it's added)
@@ -75,4 +105,5 @@ private:
     uint32_t tint[kTintChannels][CHUNK_WIDTH][CHUNK_WIDTH] = {};
     bool tintSet[kTintChannels] = {};
     std::vector<uint16_t> light;   // empty = no light kept
+    std::map<uint32_t, BlockText> texts;   // (by textKey)
 };

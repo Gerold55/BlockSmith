@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX   // (windows.h's min/max macros would break std::max and glm::max)
+#endif
+#include "BlockShape.h"
 #include "Hotbar.h"
 #include "Block.h"
 
@@ -309,11 +313,6 @@ const float kFaceVerts[6][18] = {
     { 0.5f,-0.5f, 0.5f,  0.5f,-0.5f,-0.5f,  0.5f, 0.5f,-0.5f,   0.5f, 0.5f,-0.5f,  0.5f, 0.5f, 0.5f,  0.5f,-0.5f, 0.5f }
 };
 
-const float kTexCoords[12] = {
-    0.0f, 0.0f,  1.0f, 0.0f,  1.0f, 1.0f,
-    1.0f, 1.0f,  0.0f, 1.0f,  0.0f, 0.0f
-};
-
 // Indexed by kFaceVerts order: -Z, +Z, +Y, -Y, -X, +X
 // Visible faces after rotation: +Y (top), +Z (left), +X (right) - same as the creative inventory
 const float kFaceShading[6] = { 0.6f, 0.8f, 1.0f, 0.5f, 0.8f, 0.6f };
@@ -387,6 +386,16 @@ void appendIcon(std::vector<float>& out, uint8_t blockId, float cx, float cy, fl
     xf = glm::rotate(xf, glm::radians(-45.0f), glm::vec3(0, 1, 0));
     xf = glm::scale(xf, glm::vec3(scale));
 
+    // Slabs and stairs: their boxes (BlockShape.h), the base first and the step after it, so
+    // without a depth buffer the step still ends up in front. A slab shows as a bottom slab,
+    // stairs with the step at the back (the profile on the left face).
+    shape::Box boxes[shape::kMaxBoxes];
+    auto none = [](int, int, int, uint8_t&, uint8_t&) { return false; };
+    int boxCount = 1;
+    boxes[0] = { glm::vec3(0.0f), glm::vec3(1.0f) };
+    if (shape::isPartial(prop)) boxCount = shape::boxes(prop, 0, none, boxes);
+
+    for (int bi = 0; bi < boxCount; ++bi)
     for (int face = 0; face < 6; ++face) {
         const FaceDefinition& fd = prop.faces[kFaceToProp[face]];
         if (fd.baseLayer < 0) continue;
@@ -404,11 +413,21 @@ void appendIcon(std::vector<float>& out, uint8_t blockId, float cx, float cy, fl
 
         const float layer = static_cast<float>(fd.baseLayer);
         const float overlay = fd.overlayLayer >= 0 ? static_cast<float>(fd.overlayLayer) : -1.0f;
+        // Which axis the texture's u and v run along on this face (from its first corners), so
+        // a smaller box shows just its part of the picture
+        const glm::vec3 c0(kFaceVerts[face][0], kFaceVerts[face][1], kFaceVerts[face][2]);
+        const glm::vec3 c1(kFaceVerts[face][3], kFaceVerts[face][4], kFaceVerts[face][5]);
+        const glm::vec3 c2(kFaceVerts[face][6], kFaceVerts[face][7], kFaceVerts[face][8]);
+        int ua = 0, va = 0;
+        for (int k = 0; k < 3; ++k) { if (c0[k] != c1[k]) ua = k; if (c1[k] != c2[k]) va = k; }
+        const glm::vec3 bmn = boxes[bi].mn - glm::vec3(0.5f), bmx = boxes[bi].mx - glm::vec3(0.5f);
 
         for (int v = 0; v < 6; ++v) {
-            const glm::vec4 p = xf * glm::vec4(kFaceVerts[face][v * 3 + 0],
-                                               kFaceVerts[face][v * 3 + 1],
-                                               kFaceVerts[face][v * 3 + 2], 1.0f);
+            const glm::vec3 unit(kFaceVerts[face][v * 3 + 0], kFaceVerts[face][v * 3 + 1], kFaceVerts[face][v * 3 + 2]);
+            const glm::vec3 pos = bmn + (unit + glm::vec3(0.5f)) * (bmx - bmn);
+            const float tu = (pos[ua] - c0[ua]) / (c1[ua] - c0[ua]);
+            const float tv = (pos[va] - c1[va]) / (c2[va] - c1[va]);
+            const glm::vec4 p = xf * glm::vec4(pos, 1.0f);
             // Screen Y points down, so flip Y to keep the cube's top on top.
             out.push_back(cx + p.x);
             out.push_back(cy - p.y);
@@ -417,10 +436,9 @@ void appendIcon(std::vector<float>& out, uint8_t blockId, float cx, float cy, fl
             out.push_back(tint.r);
             out.push_back(tint.g);
             out.push_back(tint.b);
-
             // Flip V so side textures are the right way up
-            out.push_back(kTexCoords[v * 2 + 0]);
-            out.push_back(1.0f - kTexCoords[v * 2 + 1]);
+            out.push_back(tu);
+            out.push_back(1.0f - tv);
 
             out.push_back(layer);
             out.push_back(overlay);

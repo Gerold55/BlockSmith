@@ -1,4 +1,5 @@
 #pragma once
+#include "Dimensions.h"
 // The world's block data: loading, generating, saving and unloading chunks, water flow
 // and block access. No graphics - WorldRenderer draws it on the client, so a server can
 // run a World without a window.
@@ -153,13 +154,23 @@ public:
     // Applies a block the server says changed (not queued as a local edit).
     void applyNetworkBlock(const glm::ivec3& loc, uint8_t id, uint8_t meta);
 
+    // Block text (signs: ChunkData.h's BlockText). nullptr = none, or not loaded. Setting it (or
+    // clearing it) is saved with the chunk; while recording changes (hosting, the server) the
+    // position also goes into takeTextChanges() for the players who have that chunk.
+    const BlockText* getBlockTextAt(const glm::ivec3& loc) const;
+    bool setBlockTextAt(const glm::ivec3& loc, const BlockText& text);
+    bool clearBlockTextAt(const glm::ivec3& loc);
+    std::vector<glm::ivec3> takeTextChanges() { std::vector<glm::ivec3> out; out.swap(m_textChanges); return out; }
+    // A joined game: the server's text for a block (nullptr: it has none)
+    void applyNetworkText(const glm::ivec3& loc, const BlockText* text);
+
     // Hosting: also keep chunks loaded around these points (other players), each with its
     // own radius in chunks. Cleared by passing an empty list.
     struct LoadCenter { glm::vec3 pos; int radius; };
     void setExtraLoadCenters(const std::vector<LoadCenter>& centers);
 
     // When on (hosting) or remote, every block/metadata change is queued here.
-    void setRecordChanges(bool on) { m_recordChanges = on; if (!on) m_changes.clear(); }
+    void setRecordChanges(bool on) { m_recordChanges = on; if (!on) { m_changes.clear(); m_textChanges.clear(); } }
     std::vector<BlockChange> takeBlockChanges();
 
     // Background world generation (the dedicated server uses this): new chunks are made on
@@ -170,7 +181,17 @@ public:
 
     // Makes a brand-new chunk: the Lua world generator (generate_chunk) if `lua` has one,
     // else the built-in terrain, then caves. Safe to call from any thread with its own lua.
-    static void generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed);
+    // `dimension`: "" (the overworld: generate_chunk) or a registered dimension (its generator,
+    // from dimensions.register; none = an empty chunk). caves: run the engine's cave carver.
+    static void generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed,
+                                 const std::string& dimension = std::string(), bool caves = true);
+
+    // Which dimension this world is (Dimensions.h): "" = the overworld. Set before chunks load
+    // (it decides the generator, the save folder's meaning, sunlight and caves).
+    void setDimension(const std::string& name);
+    const std::string& dimension() const { return m_dimension; }   // "" = the overworld
+    std::string dimensionName() const { return m_dimension.empty() ? std::string("overworld") : m_dimension; }
+    const DimensionType& dimensionType() const { return m_dimType; }
     // Biome colours for a chunk from Lua's get_grass_color / get_foliage_color (see World.cpp)
     static void computeBiomeTint(ChunkData& chunk, int cx, int cz, sol::state* lua);
 
@@ -290,6 +311,7 @@ private:
     bool m_remote = false;
     bool m_recordChanges = false;
     std::vector<BlockChange> m_changes;
+    std::vector<glm::ivec3> m_textChanges;
     struct CenterChunk { ChunkCoord chunk; int radius; };
     std::vector<CenterChunk> m_extraCenters;
 
@@ -304,6 +326,8 @@ private:
     // Light
     bool m_lightingOn = false;
     std::unique_ptr<LightEngine> m_light;
+    std::string m_dimension;      // "" = the overworld
+    DimensionType m_dimType;
     void lightChunkAdded(ChunkData& chunk);
     void lightBlockChanged(const glm::ivec3& loc, uint8_t oldId);
 

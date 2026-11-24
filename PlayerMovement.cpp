@@ -3,6 +3,7 @@
 #include "Block.h"
 #include "Fluids.h"
 #include "DoorShape.h"
+#include "BlockShape.h"
 #include <cmath>
 
 // Moved here from Player::update unchanged, so singleplayer movement feels exactly the same.
@@ -92,7 +93,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
             velocity.y = -3.0f;             // swim down
         }
     } else {
-        float gravity = -22.0f;
+        float gravity = -22.0f * world.dimensionType().gravity;   // (a dimension's own gravity)
         if (!grounded) {
             velocity.y += gravity * deltaTime;
         }
@@ -109,24 +110,10 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
     float halfWidth = playerWidth / 2.0f;
     float skin = 0.02f;
 
-    // A block's collision box in world coordinates (false = you can walk through it). Most
-    // blocks are a full cube; doors are their thin panel (DoorShape.h), wherever it is now.
-    auto& registry = BlockRegistry::getInstance();
-    auto solidBox = [&](int x, int y, int z, glm::vec3& mn, glm::vec3& mx) {
-        const uint8_t blockId = world.getBlockAt({x, y, z});
-        if (blockId == 0 || isFluidBlock(blockId)) return false;
-        const auto& prop = registry.getBlock(blockId);
-        if (!prop.isWalkable) return false;
-        const glm::vec3 cell(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-        if (prop.pattern == "door") {
-            door::box(world.getMetadataAt({x, y, z}), mn, mx);
-            mn += cell;
-            mx += cell;
-        } else {
-            mn = cell;
-            mx = cell + glm::vec3(1.0f);
-        }
-        return true;
+    // A block's collision boxes in world coordinates (none = you can walk through it). Most
+    // blocks are a full cube; doors their thin panel, slabs and stairs their parts (BlockShape.h).
+    auto solidBoxes = [&](int x, int y, int z, shape::Box out[shape::kMaxBoxes]) {
+        return shape::worldBoxes(world, x, y, z, isFluidBlock, out);
     };
 
     // --- Sneaking: don't walk off edges (Minecraft). On the ground, any horizontal move that
@@ -140,9 +127,12 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
         const int y = static_cast<int>(std::floor(yb));
         for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
             for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
-                glm::vec3 mn, mx;
-                if (!solidBox(x, y, z, mn, mx)) continue;
+                shape::Box bs[shape::kMaxBoxes];
+                const int nb = solidBoxes(x, y, z, bs);
+                for (int bi = 0; bi < nb; ++bi) {
+                const glm::vec3 mn = bs[bi].mn, mx = bs[bi].mx;
                 if (x0 < mx.x && x1 > mn.x && z0 < mx.z && z1 > mn.z && yb < mx.y && yb >= mn.y - 0.001f) return true;
+                }
             }
         }
         return false;
@@ -192,8 +182,10 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
         for (int x = static_cast<int>(std::floor(lo[0])); x <= static_cast<int>(std::floor(hi[0])); ++x) {
             for (int y = static_cast<int>(std::floor(lo[1])); y <= static_cast<int>(std::floor(hi[1])); ++y) {
                 for (int z = static_cast<int>(std::floor(lo[2])); z <= static_cast<int>(std::floor(hi[2])); ++z) {
-                    glm::vec3 mn, mx;
-                    if (!solidBox(x, y, z, mn, mx)) continue;
+                    shape::Box bs[shape::kMaxBoxes];
+                    const int nb = solidBoxes(x, y, z, bs);
+                    for (int bi = 0; bi < nb; ++bi) {
+                    const glm::vec3 mn = bs[bi].mn, mx = bs[bi].mx;
                     // Must overlap the box on the two other axes (same tests as below)
                     bool across = true;
                     for (int k = 0; k < 3 && across; ++k) {
@@ -214,83 +206,120 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                         const float stop = std::min(0.0f, mx[axis] + gap - boxLo[axis]);
                         if (stop > allowed) { allowed = stop; hit = true; }
                     }
+                    }
                 }
             }
         }
         return allowed;
     };
 
-    // --- X Axis Collision & Move ---
-    // The direction of this move is kept until the overlap check below has used it: the check
-    // pushes out against the direction of travel, and must still do so after the sweep hit
-    // something. Velocity is cleared only once both are done.
-    float dirX = velocity.x;
-    bool stopX = false;
-    {
-        bool hit = false;
-        position.x += sweepAxis(0, velocity.x * deltaTime, hit);
-        stopX = hit;
-    }
-    {
-        const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
-        const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
-        const float z0 = position.z - halfWidth + skin, z1 = position.z + halfWidth - skin;
-        for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
-            for (int y = static_cast<int>(std::floor(y0)); y <= static_cast<int>(std::floor(y1)); ++y) {
-                for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
-                    glm::vec3 mn, mx;
-                    if (!solidBox(x, y, z, mn, mx)) continue;
-                    if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
-                    if (dirX > 0.0f) {
-                        position.x = mn.x - halfWidth - 0.001f;
-                        dirX = 0.0f;
-                        stopX = true;
-                    } else if (dirX < 0.0f) {
-                        position.x = mx.x + halfWidth + 0.001f;
-                        dirX = 0.0f;
-                        stopX = true;
+    // --- Horizontal moves (x, then z). stopX / stopZ: something was in the way ---
+    bool stopX = false, stopZ = false;
+    auto moveHorizontal = [&]() {
+        // --- X Axis Collision & Move ---
+        // The direction of this move is kept until the overlap check below has used it: the check
+        // pushes out against the direction of travel, and must still do so after the sweep hit
+        // something. Velocity is cleared only once both are done.
+        float dirX = velocity.x;
+        stopX = false;
+        {
+            bool hit = false;
+            position.x += sweepAxis(0, velocity.x * deltaTime, hit);
+            stopX = hit;
+        }
+        {
+            const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
+            const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
+            const float z0 = position.z - halfWidth + skin, z1 = position.z + halfWidth - skin;
+            for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
+                for (int y = static_cast<int>(std::floor(y0)); y <= static_cast<int>(std::floor(y1)); ++y) {
+                    for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
+                        shape::Box bs[shape::kMaxBoxes];
+                        const int nb = solidBoxes(x, y, z, bs);
+                        for (int bi = 0; bi < nb; ++bi) {
+                        const glm::vec3 mn = bs[bi].mn, mx = bs[bi].mx;
+                        if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
+                        if (dirX > 0.0f) {
+                            position.x = mn.x - halfWidth - 0.001f;
+                            dirX = 0.0f;
+                            stopX = true;
+                        } else if (dirX < 0.0f) {
+                            position.x = mx.x + halfWidth + 0.001f;
+                            dirX = 0.0f;
+                            stopX = true;
+                        }
+                        }
                     }
                 }
             }
         }
-    }
-    if (stopX) velocity.x = 0.0f;
+        if (stopX) velocity.x = 0.0f;
 
-    // --- Z Axis Collision & Move ---
-    // The direction of this move is kept until the overlap check below has used it: the check
-    // pushes out against the direction of travel, and must still do so after the sweep hit
-    // something. Velocity is cleared only once both are done.
-    float dirZ = velocity.z;
-    bool stopZ = false;
-    {
-        bool hit = false;
-        position.z += sweepAxis(2, velocity.z * deltaTime, hit);
-        stopZ = hit;
-    }
-    {
-        const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
-        const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
-        const float z0 = position.z - halfWidth + skin, z1 = position.z + halfWidth - skin;
-        for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
-            for (int y = static_cast<int>(std::floor(y0)); y <= static_cast<int>(std::floor(y1)); ++y) {
-                for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
-                    glm::vec3 mn, mx;
-                    if (!solidBox(x, y, z, mn, mx)) continue;
-                    if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
-                    if (dirZ > 0.0f) {
-                        position.z = mn.z - halfWidth - 0.001f;
-                        dirZ = 0.0f;
-                        stopZ = true;
-                    } else if (dirZ < 0.0f) {
-                        position.z = mx.z + halfWidth + 0.001f;
-                        dirZ = 0.0f;
-                        stopZ = true;
+        // --- Z Axis Collision & Move ---
+        // The direction of this move is kept until the overlap check below has used it: the check
+        // pushes out against the direction of travel, and must still do so after the sweep hit
+        // something. Velocity is cleared only once both are done.
+        float dirZ = velocity.z;
+        stopZ = false;
+        {
+            bool hit = false;
+            position.z += sweepAxis(2, velocity.z * deltaTime, hit);
+            stopZ = hit;
+        }
+        {
+            const float x0 = position.x - halfWidth + skin, x1 = position.x + halfWidth - skin;
+            const float y0 = position.y + skin, y1 = position.y + playerHeight - skin;
+            const float z0 = position.z - halfWidth + skin, z1 = position.z + halfWidth - skin;
+            for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
+                for (int y = static_cast<int>(std::floor(y0)); y <= static_cast<int>(std::floor(y1)); ++y) {
+                    for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
+                        shape::Box bs[shape::kMaxBoxes];
+                        const int nb = solidBoxes(x, y, z, bs);
+                        for (int bi = 0; bi < nb; ++bi) {
+                        const glm::vec3 mn = bs[bi].mn, mx = bs[bi].mx;
+                        if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 > mn.y && z0 < mx.z && z1 > mn.z)) continue;
+                        if (dirZ > 0.0f) {
+                            position.z = mn.z - halfWidth - 0.001f;
+                            dirZ = 0.0f;
+                            stopZ = true;
+                        } else if (dirZ < 0.0f) {
+                            position.z = mx.z + halfWidth + 0.001f;
+                            dirZ = 0.0f;
+                            stopZ = true;
+                        }
+                        }
                     }
                 }
             }
         }
+        if (stopZ) velocity.z = 0.0f;
+    };
+
+    // Stepping up (up to 0.6 of a block): on the ground and walked into something low - a
+    // slab, a stair, a path's edge - the move is tried again lifted by up to a step, then set
+    // down on whatever is there. Kept only if it got further than the move along the ground.
+    const glm::vec3 startPos = position, startVel = velocity;
+    moveHorizontal();
+    if (grounded && !flying && (stopX || stopZ)) {
+        constexpr float kStepHeight = 0.6f;
+        const glm::vec3 flatPos = position, flatVel = velocity;
+        const bool flatStopX = stopX, flatStopZ = stopZ;
+        position = startPos;
+        velocity = startVel;
+        bool hit = false;
+        const float up = sweepAxis(1, kStepHeight, hit);
+        position.y += up;
+        moveHorizontal();
+        position.y += sweepAxis(1, -up, hit);              // down onto the step
+        auto flatDist = [&](const glm::vec3& p) { return glm::length(glm::vec2(p.x - startPos.x, p.z - startPos.z)); };
+        const bool better = up > 0.01f && flatDist(position) > flatDist(flatPos) + 0.001f && position.y > startPos.y + 0.01f;
+        if (!better) {
+            position = flatPos;
+            velocity = flatVel;
+            stopX = flatStopX;
+            stopZ = flatStopZ;
+        }
     }
-    if (stopZ) velocity.z = 0.0f;
 
     // --- Y Axis Collision & Move ---
     grounded = false;
@@ -311,8 +340,10 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
         for (int x = static_cast<int>(std::floor(x0)); x <= static_cast<int>(std::floor(x1)); ++x) {
             for (int y = static_cast<int>(std::floor(y0)); y <= static_cast<int>(std::floor(y1)); ++y) {
                 for (int z = static_cast<int>(std::floor(z0)); z <= static_cast<int>(std::floor(z1)); ++z) {
-                    glm::vec3 mn, mx;
-                    if (!solidBox(x, y, z, mn, mx)) continue;
+                    shape::Box bs[shape::kMaxBoxes];
+                    const int nb = solidBoxes(x, y, z, bs);
+                    for (int bi = 0; bi < nb; ++bi) {
+                    const glm::vec3 mn = bs[bi].mn, mx = bs[bi].mx;
                     if (!(x0 < mx.x && x1 > mn.x && y0 < mx.y && y1 >= mn.y && z0 < mx.z && z1 > mn.z)) continue;
                     if (dirY < 0.0f) {
                         position.y = mx.y;
@@ -323,6 +354,7 @@ void stepMovement(MoveState& state, const MoveInput& input, float deltaTime, con
                         position.y = mn.y - playerHeight;
                         dirY = 0.0f;
                         stopY = true;
+                    }
                     }
                 }
             }

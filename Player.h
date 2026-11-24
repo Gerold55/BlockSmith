@@ -34,6 +34,12 @@ public:
     float jumpForce = 8.5f;
 
     bool isGrounded = false;
+    // How high the eyes (the camera) are above the feet: 1.62 standing, lower while sneaking
+    // (eased, so the camera dips smoothly). Everything looking from the player's eyes uses it.
+    float eyeHeight = kStandingEyeHeight;
+    static constexpr float kStandingEyeHeight = 1.62f;
+    static constexpr float kSneakingEyeHeight = 1.27f;
+    glm::vec3 eyePosition() const { return position + glm::vec3(0.0f, eyeHeight, 0.0f); }
     bool isPaused = false;
     bool escapePressedLastFrame = false;
     bool firstMouse = true;

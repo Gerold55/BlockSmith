@@ -59,9 +59,18 @@ struct BlockProperty {
     bool isCutout = false;   // Alpha-tested (leaves, plants): opaque pass, shader discards transparent texels
     bool isWalkable = true;
     bool isSelectable = true;
+    bool holdsText = false;   // players may write on it (signs): `text = true`, or a sign pattern
     bool hasGravity = false; // Enabled for falling blocks like sand and gravel
     bool in_creative = true; // Controls whether the block appears in the creative inventory menu
     std::string pattern = "cube"; // Controls rendering style (e.g. "cube", "plantlike", "door", "custom_model")
+    // register_block's `rotation` (BlockShape.h): 0 none, 3 "axis" (logs: upright or lying along
+    // X or Z). Kept in the block's metadata; set when it's placed.
+    uint8_t rotation = 0;
+    // Stairs join into corners with the stairs around them; `stairs_connect = false` stops it
+    bool stairsConnect = true;
+    // Slabs and stairs can hold water (Minecraft's waterlogging, BlockShape.h): register_block's
+    // `waterloggable = false` stops it
+    bool waterloggable = true;
 
     // --- Survival digging (used when the game isn't in creative mode) ---
     float hardness = -2.0f;       // seconds to dig by hand; 0 = instant, -1 = unbreakable,

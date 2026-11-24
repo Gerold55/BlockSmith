@@ -212,7 +212,7 @@ void LightEngine::blockChanged(ChunkData& chunk, int x, int y, int z) {
                 m_add.push_back(Node{c, static_cast<int16_t>(nx), static_cast<int16_t>(ny), static_cast<int16_t>(nz)});
             }
         }
-        if (y == CHUNK_HEIGHT - 1) {   // the top of the world is open sky
+        if (m_sky && y == CHUNK_HEIGHT - 1) {   // the top of the world is open sky
             chunk.setLocalLight(x, y, z, withChannel(chunk.getLocalLight(x, y, z), 0, std::max(0, 15 - bl.absorb)));
             m_add.push_back(Node{&chunk, static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<int16_t>(z)});
         }
@@ -230,7 +230,7 @@ void LightEngine::chunkAdded(ChunkData& chunk) {
     int surface[CHUNK_WIDTH][CHUNK_WIDTH];
     for (int x = 0; x < CHUNK_WIDTH; ++x) {
         for (int z = 0; z < CHUNK_WIDTH; ++z) {
-            int s = 15;
+            int s = m_sky ? 15 : 0;   // (no skylight: the columns start dark)
             surface[x][z] = -1;
             for (int y = CHUNK_HEIGHT - 1; y >= 0; --y) {
                 const BlockLight& bl = blockLight(chunk.getLocalBlock(x, y, z));

@@ -39,9 +39,15 @@ local function swap_one(pointed, item)
     return true
 end
 
+-- Every registered fluid. (engine.list_fluids can give nothing - e.g. in the world generator's
+-- own copy of the mods, where only world generation works - so that's an empty list.)
+local function fluid_list()
+    return (engine.list_fluids and engine.list_fluids()) or {}
+end
+
 -- The block a fluid's source is (from engine.list_fluids), or nil if it doesn't exist (yet)
 local function source_block_of(fluid_name)
-    for _, f in ipairs(engine.list_fluids()) do
+    for _, f in ipairs(fluid_list()) do
         if f.name == fluid_name then
             if engine.get_block_id(f.source) ~= 0 then return f.source end
             return nil
@@ -69,8 +75,28 @@ local function find_image(image, dir)
     return image
 end
 
+-- Slabs and stairs hold water (waterlogging): a water bucket on one fills it,
+-- an empty bucket on a waterlogged one takes the water back. True if it did.
+local function waterlog(pointed, fluid_name)
+    local u = pointed.under
+    if not u or not engine.can_waterlog or pointed.fluid then return false end
+    if not engine.can_waterlog(u.x, u.y, u.z) then return false end
+    if fluid_name == "water" then
+        if engine.is_waterlogged(u.x, u.y, u.z) then return false end
+        if swap_one(pointed, EMPTY) then engine.set_waterlogged(u.x, u.y, u.z, true) end
+        return true
+    elseif fluid_name == nil then
+        if not engine.is_waterlogged(u.x, u.y, u.z) then return false end
+        local item = by_fluid["water"]
+        if item and swap_one(pointed, item) then engine.set_waterlogged(u.x, u.y, u.z, false) end
+        return true
+    end
+    return false
+end
+
 local function pour(fluid_name)
     return function(pointed)
+        if waterlog(pointed, fluid_name) then return true end
         -- Where: the fluid being looked at, the plant/fluid block itself, or the space in
         -- front of the block face
         local t = nil
@@ -125,6 +151,7 @@ engine.register_block(EMPTY, 1.0, 1.0, 1.0, empty_image, nil, {
 })
 
 engine.register_item_use(EMPTY, function(pointed)
+    if waterlog(pointed, nil) then return true end
     local f = pointed.fluid
     if not f or not f.source then return true end   -- nothing to scoop (never place the bucket)
     local item = by_fluid[f.name]
@@ -137,7 +164,7 @@ end)
 
 -- Water's bucket comes with this mod; fluids registered earlier with a `bucket` field too
 buckets.register("water", "water_bucket", "bucket_water.png")
-for _, f in ipairs(engine.list_fluids()) do
+for _, f in ipairs(fluid_list()) do
     if f.bucket and not by_fluid[f.name] then
         buckets.register(f.name, f.bucket, f.bucket_image, f.mod_path)
     end

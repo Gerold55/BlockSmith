@@ -29,54 +29,16 @@ in vec3 FragPos;
 uniform float u_SunPosY; // ranges from -1.0 (midnight) to +1.0 (noon)
 uniform float u_StarDensity;    // 0..1: chance that a sky cell has a star
 uniform float u_StarBrightness; // 0 = no stars, 1 = normal
+uniform vec3 u_SunDir;          // toward the sun
+uniform float u_SkyBrightness;  // 1 = as is (Lighting Low/High: a little deeper)
+uniform float u_SkyHalo;        // the soft glow around the sun (0 = none)
 
+)" BLOCKSMITH_SKY_GLSL R"(
 void main() {
     vec3 normalizedDir = normalize(FragPos);
     float y = normalizedDir.y;
-
-    // Authentic Minecraft-inspired palette
-    vec3 dayZenith    = vec3(0.32f, 0.52f, 0.90f);
-    vec3 dayHorizon   = vec3(0.58f, 0.74f, 0.94f);
-    
-    vec3 sunsetZenith   = vec3(0.12f, 0.15f, 0.32f);
-    vec3 sunsetHorizon  = vec3(0.92f, 0.48f, 0.22f); // Vibrant orange-red sunset glow
-    vec3 sunsetTransition = vec3(0.55f, 0.22f, 0.35f); // Deep purplish twilight band
-
-    vec3 nightZenith  = vec3(0.01f, 0.012f, 0.035f);
-    vec3 nightHorizon = vec3(0.03f, 0.04f, 0.09f);
-
-    vec3 topColor;
-    vec3 horizonColor;
-
     float sunFactor = clamp(u_SunPosY, -1.0f, 1.0f);
-
-    // Blending based on Sun height position
-    if (sunFactor > 0.0f) {
-        // Day to Sunset blend
-        float t = clamp(sunFactor * 2.0f - 1.0f, 0.0f, 1.0f); // 0 at horizon/sunset, 1 at noon
-        topColor     = mix(sunsetZenith, dayZenith, t);
-        horizonColor = mix(sunsetHorizon, dayHorizon, t);
-    } else {
-        // Sunset to Night blend
-        float t = clamp((-sunFactor) * 2.0f, 0.0f, 1.0f); // 0 at sunset, 1 at midnight
-        topColor     = mix(sunsetZenith, nightZenith, t);
-        horizonColor = mix(sunsetHorizon, nightHorizon, t);
-    }
-
-    // Minecraft vertical gradient curve (smoother zenith falloff)
-    float altitude = clamp(y, 0.0f, 1.0f);
-    vec3 skyColor = mix(horizonColor, topColor, pow(altitude, 0.55f));
-
-    // Add a warm/cool horizon haze band around y = 0 mimicking atmospheric scattering
-    float horizonGlow = exp(-abs(y) * 4.0f);
-    if (sunFactor > -0.3f && sunFactor < 0.3f) {
-        // Enhance sunset band intensity when the sun is near the horizon
-        float sunsetIntensity = 1.0f - abs(sunFactor) * 3.33f;
-        skyColor += sunsetTransition * horizonGlow * max(0.0f, sunsetIntensity);
-    } else {
-        // General ambient horizon brightness lift
-        skyColor += horizonColor * horizonGlow * 0.25f;
-    }
+    vec3 skyColor = blocksmithSky(normalizedDir, normalize(u_SunDir), u_SkyHalo);
 
     // Stars: one possible star per cell of a fixed grid on the sky sphere. Each star is a small
     // soft dot of a fixed size, so it stays put and steady when the camera moves or turns
@@ -100,11 +62,12 @@ void main() {
         }
     }
 
-    // Pitch black below the horizon plane
-    if (y < 0.0f) {
-        skyColor = mix(skyColor, nightHorizon, clamp(-y * 2.0f, 0.0f, 1.0f));
-    }
 
+    // (dimmer and a touch richer in colour, for Lighting Low/High)
+    if (u_SkyBrightness < 0.999f) {
+        float l = dot(skyColor, vec3(0.299f, 0.587f, 0.114f));
+        skyColor = max(mix(vec3(l), skyColor, 1.0f + (1.0f - u_SkyBrightness) * 1.2f), vec3(0.0f)) * u_SkyBrightness;
+    }
     FragColor = vec4(skyColor, 1.0f);
 }
 )";
@@ -163,8 +126,17 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection, float su
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
     glUniform1f(glGetUniformLocation(shaderProgram, "u_SunPosY"), sunPosY);
+    {
+        glm::vec3 sd = sunDirection;
+        if (glm::dot(sd, sd) < 1e-6f) sd = glm::vec3(0.0f, sunPosY, 0.0f);
+        sd.y = sunPosY;            // (the height always matches the time given)
+        if (glm::dot(sd, sd) < 1e-6f) sd = glm::vec3(1.0f, 0.0f, 0.0f);
+        glUniform3f(glGetUniformLocation(shaderProgram, "u_SunDir"), sd.x, sd.y, sd.z);
+    }
     glUniform1f(glGetUniformLocation(shaderProgram, "u_StarDensity"), starDensity);
     glUniform1f(glGetUniformLocation(shaderProgram, "u_StarBrightness"), starBrightness);
+    glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyBrightness"), brightness);
+    glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyHalo"), sunHalo);
 
     glBindVertexArray(VAO);
     glDrawArrays(GL_TRIANGLES, 0, 36);

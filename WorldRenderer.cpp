@@ -134,6 +134,7 @@ void WorldRenderer::rebuildMeshes(const World& world, const glm::vec3& playerPos
         if (!mesh) mesh = std::make_unique<ChunkMesh>();
         mesh->generateMeshData(*data);
         m_needsUpload.insert(c);
+        m_meshed.push_back(c);
         if (elapsedMs(start) >= m_meshBudgetMs) break;
     }
 }
@@ -184,7 +185,13 @@ void WorldRenderer::drawOpaque(GLuint shaderProgram, std::vector<Visible>& list)
     }
 }
 
-// Transparent pass farthest-first, blended, not writing depth (list sorted nearest-first)
+// Transparent pass farthest-first, blended, not writing depth (list sorted nearest-first).
+// Faces turned away are culled: the faces inside a chunk aren't sorted, so without it a block's
+// far side (an ice block's bottom, lit from below) could be drawn after its near side and cover
+// it - ice came out dark, with bright strips where the near face showed past the far one.
+// Liquids are meshed with both sides (ChunkMesh), so their surface still shows from underwater.
+// Liquids go first (every chunk), then the other see-through blocks: the faces aren't sorted by
+// depth, so water drawn after the ice on top of it covered the ice in lines and patches.
 void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visible>& list) const {
     const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
     const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
@@ -192,19 +199,40 @@ void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visi
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+    GLint frontWas = GL_CCW, cullModeWas = GL_BACK;
+    glGetIntegerv(GL_FRONT_FACE, &frontWas);
+    glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
+    glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
+    glFrontFace(GL_CCW);
+    glCullFace(GL_BACK);
+    for (auto it = list.rbegin(); it != list.rend(); ++it) {
+        if (it->mesh->liquidVertexCount > 0 && it->mesh->liquidVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, it->origin, it->fade);
+            it->mesh->drawLiquid();
+        }
+    }
     for (auto it = list.rbegin(); it != list.rend(); ++it) {
         if (it->mesh->transparentVertexCount > 0 && it->mesh->transparentVAO != 0) {
             setChunkUniforms(modelLoc, fadeLoc, it->origin, it->fade);
             it->mesh->drawTransparent();
         }
     }
+    if (!cullWas) glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(frontWas));
+    glCullFace(static_cast<GLenum>(cullModeWas));
     glDepthMask(GL_TRUE);
 }
 
-// Tinting glass (BlockProperty::tintView): after everything behind it is drawn, its faces again
-// with multiply blending - the shader's u_TintPass gives each pixel the glass's colour as a
-// filter (white where it's clear) - so the world, water, mobs and sky seen through it take its
-// colour, at any time of day. Several panes in a row multiply, like real glass.
+// Tinting glass (BlockProperty::tintView): its faces drawn with multiply blending - the shader's
+// u_TintPass gives each pixel the glass's colour as a filter (white where it's clear) - so the
+// world, mobs and sky seen through it take its colour, at any time of day. Several blocks in a
+// row multiply, like real glass.
+//  - Only the faces turned toward you filter (back faces culled): light passes through a block
+//    once, not once at the face it enters and again at the one it leaves. With both, ice and
+//    tinted glass came out twice as dark, and darker still in stripes where faces overlapped.
+//  - Drawn before the see-through blocks themselves (renderTransparent), so the glass's own
+//    surface (and the water under ice) isn't darkened by its own filter.
 void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& list) const {
     bool any = false;
     for (const auto& v : list) if (v.mesh->tintVertexCount > 0) { any = true; break; }
@@ -216,6 +244,13 @@ void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& l
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_DST_COLOR, GL_ZERO);              // result = what's there x the glass colour
+    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+    GLint frontWas = GL_CCW, cullModeWas = GL_BACK;
+    glGetIntegerv(GL_FRONT_FACE, &frontWas);
+    glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
+    glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
+    glFrontFace(GL_CCW);
+    glCullFace(GL_BACK);
     if (tintLoc >= 0) glUniform1i(tintLoc, 1);
     for (const auto& v : list) {
         if (v.mesh->tintVertexCount > 0 && v.mesh->tintVAO != 0) {
@@ -224,14 +259,17 @@ void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& l
         }
     }
     if (tintLoc >= 0) glUniform1i(tintLoc, 0);
+    if (!cullWas) glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(frontWas));
+    glCullFace(static_cast<GLenum>(cullModeWas));
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_TRUE);
 }
 
 void WorldRenderer::drawList(GLuint shaderProgram, std::vector<Visible>& list) const {
     drawOpaque(shaderProgram, list);
+    drawTint(shaderProgram, list);          // (before the glass itself: see drawTint)
     drawTransparent(shaderProgram, list);
-    drawTint(shaderProgram, list);
 }
 
 void WorldRenderer::collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list) {
@@ -240,7 +278,7 @@ void WorldRenderer::collectVisible(const glm::mat4& viewProj, const glm::vec3& e
     list.reserve(m_meshes.size());
     for (const auto& entry : m_meshes) {
         ChunkMesh* mesh = entry.second.get();
-        if (mesh->opaqueVertexCount == 0 && mesh->transparentVertexCount == 0) continue;
+        if (mesh->opaqueVertexCount == 0 && mesh->transparentVertexCount == 0 && mesh->liquidVertexCount == 0) continue;
 
         const glm::vec3 boxMin = originOf(entry.first);
         const glm::vec3 boxMax = boxMin + glm::vec3(static_cast<float>(CHUNK_WIDTH),
@@ -265,8 +303,8 @@ void WorldRenderer::renderOpaque(GLuint shaderProgram, const glm::mat4& viewProj
 }
 
 void WorldRenderer::renderTransparent(GLuint shaderProgram) {
+    drawTint(shaderProgram, m_visible);     // (before the glass itself: see drawTint)
     drawTransparent(shaderProgram, m_visible);
-    drawTint(shaderProgram, m_visible);
     m_visible.clear();     // (meshes may be thrown away before the next frame)
 }
 

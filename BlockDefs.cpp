@@ -205,8 +205,22 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         block.isCutout      = props.get_or("cutout", false);
         block.isWalkable    = props.get_or("walkable", (name != "air" && name != "water" && name != "flowing_water" && name != "short_grass" && name != "flower_red"));
         block.isSelectable  = props.get_or("selectable", (name != "water" && name != "flowing_water" && name != "air" && name != "short_grass" && name != "flower_red"));
+        {
+            const std::string pat = props.get_or("pattern", std::string("cube"));
+            block.holdsText = props.get_or("text", pat == "sign" || pat == "wall_sign");
+        }
         block.hasGravity    = props.get_or("gravity", false);
         block.pattern       = props.get_or("pattern", std::string("cube"));
+        {
+            // rotation = "axis" (BlockShape.h): a log, lying along the face it's put against
+            const std::string rot = props.get_or("rotation", std::string());
+            block.rotation = rot == "axis" ? 3 : 0;
+            block.waterloggable = props.get_or("waterloggable", true);
+            block.stairsConnect = props.get_or("stairs_connect", true);
+            if (!rot.empty() && block.rotation == 0)
+                std::cerr << "[Block] " << name << ": rotation \"" << rot << "\" isn't known (only \"axis\", for logs; "
+                          << "slabs and stairs turn by their pattern)" << std::endl;
+        }
         shouldTint          = props.get_or("tint", shouldTint);
         // in_creative = false hides the block from the creative inventory (it still exists in the world)
         block.in_creative   = props.get_or("in_creative", true);

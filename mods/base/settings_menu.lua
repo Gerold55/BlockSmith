@@ -121,6 +121,10 @@ local LABELS = {
     vsync           = "VSync",
     main_hand       = "Main Hand",
     brightness      = "Brightness",
+    light_quality   = "Lighting",
+    bloom           = "Bloom",
+    filmic          = "Filmic Look",
+    artnet          = "Art-Net input",
     volume_master   = "Master Volume",
     volume_music    = "Music",
     volume_effects  = "Blocks & Effects",
@@ -307,7 +311,15 @@ local function entries()
         end
     elseif state.tab == "video" then
         section("Display")
-        for _, s in ipairs(state.video) do if s.id ~= "main_hand" then row(s) end end
+        local lighting = { light_quality = true, bloom = true, filmic = true, artnet = true }
+        for _, s in ipairs(state.video) do if s.id ~= "main_hand" and not lighting[s.id] then row(s) end end
+        local any = false
+        for _, s in ipairs(state.video) do
+            if lighting[s.id] then
+                if not any then section("Lighting"); any = true end
+                row(s)
+            end
+        end
         for _, s in ipairs(state.video) do
             if s.id == "main_hand" then section("Hand"); row(s) end
         end
@@ -444,6 +456,14 @@ local function widget(L, item, ry, rh)
         return { kind = "segments", x = right - 2 * w, y = cy, w = 2 * w, h = ch, seg = w,
                  options = { { "Left", 1 }, { "Right", 0 } } }
     end
+    -- Choices the engine lists (lighting, bloom): buttons; ones this computer can't run are
+    -- greyed out (opt[3]) and say why when clicked
+    if item.options then
+        local w = 46 * S
+        local opts = {}
+        for i, o in ipairs(item.options) do opts[i] = { o.label, o.value, o.disabled } end
+        return { kind = "segments", x = right - #opts * w, y = cy, w = #opts * w, h = ch, seg = w, options = opts }
+    end
     local valueW = 46 * S
     local w = Theme.slider_w * S
     return { kind = "slider", x = right - valueW - w, y = cy, w = w, h = ch, valueX = right - valueW + 8 * S, valueW = valueW - 8 * S }
@@ -496,6 +516,7 @@ local function draw_list(L, mx, my)
     local S, fs = L.S, L.fs
     local shown, list, maxScroll = visible(L)
     local counts = key_counts()
+    state.hover_note = nil            -- (set again below while over a row with a note)
     local _, _, left_down = ui.get_mouse()
 
     for _, v in ipairs(shown) do
@@ -542,11 +563,14 @@ local function draw_list(L, mx, my)
                 for i, opt in ipairs(wdg.options) do
                     local sx = wdg.x + (i - 1) * wdg.seg
                     local sel = item.value == opt[2]
+                    local off = opt[3]                       -- not available on this computer
                     if sel then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, C.accent)
-                    elseif inside(mx, my, sx, wdg.y, wdg.seg, wdg.h) then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, { 1, 1, 1, 0.08 }) end
+                    elseif not off and inside(mx, my, sx, wdg.y, wdg.seg, wdg.h) then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, { 1, 1, 1, 0.08 }) end
                     text_mid(opt[1], sx + (wdg.seg - text_width(opt[1], fs * 0.85)) / 2, wdg.y, wdg.h, fs * 0.85,
-                             sel and C.accent_text or C.text, false, S)
+                             sel and C.accent_text or (off and C.disabled or C.text), false, S)
                 end
+                -- why some choices are greyed out, next to them
+                if item.note and inside(mx, my, L.listX, ry, L.listW, rh) then state.hover_note = item.note end
             elseif wdg.kind == "slider" then
                 -- dragging: follow the mouse while the button is held
                 if state.dragging == item.id then
@@ -666,6 +690,7 @@ function render_settings(W, H)
     -- Status line: what to do now, or what went wrong
     local note, color = nil, C.detail
     if state.message then note, color = state.message, C.error
+    elseif state.hover_note then note, color = state.hover_note, C.detail
     elseif state.waiting then note, color = "Press a key or mouse button for this control. Escape cancels.", C.waiting
     elseif state.editing then note, color = "Type, then press Enter. Escape cancels.", C.waiting
     elseif state.tab == "server" then note = "Description colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} starts a 2nd line"
@@ -732,6 +757,10 @@ function handle_settings_click(mx, my, W, H)
                 return true
             elseif hit and w.kind == "segments" then
                 local i = clamp(math.floor((mx - w.x) / w.seg) + 1, 1, #w.options)
+                if w.options[i][3] then                  -- greyed out: say why instead
+                    state.message = item.note or "Not available on this computer"
+                    return true
+                end
                 local ok, err = set_value(item, w.options[i][2])
                 if ok == false then state.message = err end
                 refresh()

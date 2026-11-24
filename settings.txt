@@ -1,13 +1,17 @@
 # Game settings. Edited from the Settings screen.
+artnet = 0
+bloom = 1
 brightness = 50
 client_mods = 
+filmic = 1
 firewall_ok_game = 1
 fov = 70
 key_forward = 87
 lan_server_id = ccbce16ecf0815f00cea0408a0413933
+light_quality = 1
 main_hand = 0
 player_name = Gerold55
-render_distance = 13
+render_distance = 10
 server_id.miniontoby.host.ircnow.org:30000 = 1566390fe513515fcba6cd07a81f5863
 server_max_players = 50
 vsync = 1

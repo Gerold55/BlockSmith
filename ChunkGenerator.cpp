@@ -45,9 +45,17 @@ ChunkGenerator::~ChunkGenerator() {
 void ChunkGenerator::request(int cx, int cz, unsigned epoch) { request(cx, cz, epoch, m_seed); }
 
 void ChunkGenerator::request(int cx, int cz, unsigned epoch, uint32_t seed) {
+    request(cx, cz, epoch, seed, std::string(), true);
+}
+
+void ChunkGenerator::request(int cx, int cz, unsigned epoch, uint32_t seed, const std::string& dimension, bool caves) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_jobs.push_back({cx, cz, epoch, seed});
+        Job j;
+        j.cx = cx; j.cz = cz; j.epoch = epoch; j.seed = seed;
+        j.dimension = dimension == "overworld" ? std::string() : dimension;
+        j.caves = caves;
+        m_jobs.push_back(std::move(j));
     }
     m_wake.notify_one();
 }
@@ -55,6 +63,13 @@ void ChunkGenerator::request(int cx, int cz, unsigned epoch, uint32_t seed) {
 void ChunkGenerator::clearQueue() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_jobs.clear();
+}
+
+void ChunkGenerator::clearQueue(const std::string& dimensionIn) {
+    const std::string dimension = dimensionIn == "overworld" ? std::string() : dimensionIn;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_jobs.erase(std::remove_if(m_jobs.begin(), m_jobs.end(), [&](const Job& j) { return j.dimension == dimension; }),
+                 m_jobs.end());
 }
 
 bool ChunkGenerator::cancel(int cx, int cz) {
@@ -68,12 +83,43 @@ bool ChunkGenerator::cancel(int cx, int cz) {
     return false;
 }
 
+bool ChunkGenerator::cancel(int cx, int cz, const std::string& dimensionIn) {
+    const std::string dimension = dimensionIn == "overworld" ? std::string() : dimensionIn;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto it = m_jobs.begin(); it != m_jobs.end(); ++it) {
+        if (it->cx == cx && it->cz == cz && it->dimension == dimension) {
+            m_jobs.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<ChunkGenerator::Result> ChunkGenerator::takeFinished(const std::string& dimensionIn) {
+    const std::string dimension = dimensionIn == "overworld" ? std::string() : dimensionIn;
+    std::vector<Result> out;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto keep = std::stable_partition(m_done.begin(), m_done.end(),
+                                          [&](const Result& r) { return r.dimension != dimension; });
+        out.assign(std::make_move_iterator(keep), std::make_move_iterator(m_done.end()));
+        m_done.erase(keep, m_done.end());
+    }
+    updateRate();
+    return out;
+}
+
 std::vector<ChunkGenerator::Result> ChunkGenerator::takeFinished() {
     std::vector<Result> out;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         out.swap(m_done);
     }
+    updateRate();
+    return out;
+}
+
+void ChunkGenerator::updateRate() {
     // Rate for 'tps'
     const auto now = std::chrono::steady_clock::now();
     const double span = std::chrono::duration<double>(now - m_rateWindow).count();
@@ -81,7 +127,6 @@ std::vector<ChunkGenerator::Result> ChunkGenerator::takeFinished() {
         m_rate = m_generatedThisWindow.exchange(0) / span;
         m_rateWindow = now;
     }
-    return out;
 }
 
 size_t ChunkGenerator::queuedCount() const {
@@ -118,7 +163,7 @@ void ChunkGenerator::workerLoop(int index) {
         }
         if (generatorLost) {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_done.push_back({job.cx, job.cz, job.epoch, nullptr,
+            m_done.push_back({job.cx, job.cz, job.dimension, job.epoch, nullptr,
                               "the world generator couldn't be restarted after set_world_seed failed: " + lastSeedError});
             continue;
         }
@@ -169,7 +214,7 @@ void ChunkGenerator::workerLoop(int index) {
                 }
                 if (!lua) generatorLost = true;   // no Lua to retry with: every job fails from now on
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_done.push_back({job.cx, job.cz, job.epoch, nullptr, error});
+                m_done.push_back({job.cx, job.cz, job.dimension, job.epoch, nullptr, error});
                 continue;
             }
             seeded = true;                     // only now: set_world_seed really ran with it
@@ -177,9 +222,9 @@ void ChunkGenerator::workerLoop(int index) {
             reportedFailure = false;
         }
         auto chunk = std::make_shared<ChunkData>();
-        World::generateNewChunk(*chunk, job.cx, job.cz, lua.get(), job.seed);
+        World::generateNewChunk(*chunk, job.cx, job.cz, lua.get(), job.seed, job.dimension, job.caves);
         ++m_generatedThisWindow;
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_done.push_back({job.cx, job.cz, job.epoch, std::move(chunk), std::string()});
+        m_done.push_back({job.cx, job.cz, job.dimension, job.epoch, std::move(chunk), std::string()});
     }
 }

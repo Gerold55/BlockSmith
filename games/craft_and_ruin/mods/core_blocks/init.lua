@@ -51,6 +51,7 @@ engine.register_block("log_oak", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_oak_log_top.png",
     sides  = "textures/cw_oak_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Oak Log",
     transparent = false,
     walkable = true,
@@ -73,6 +74,7 @@ engine.register_block("log_birch", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_birch_log_top.png",
     sides  = "textures/cw_birch_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Birch Log",
     transparent = false,
     walkable = true,
@@ -341,3 +343,5 @@ dofile(g_CurrentModPath .. "/leafdecay.lua")
 dofile(g_CurrentModPath .. "/particles.lua")
 -- Biome blocks: spruce, jungle and acacia trees, snow and ice, terracotta and red sand
 dofile(g_CurrentModPath .. "/biome_blocks.lua")
+-- Slabs, stairs and signs
+dofile(g_CurrentModPath .. "/building_blocks.lua")

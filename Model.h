@@ -1,5 +1,6 @@
 #pragma once
-// 3D models for entities: Bedrock-style .json geometry and Blitz3D .b3d meshes (the
+// 3D models for entities: Bedrock-style .json geometry, Blockbench project files (.bbmodel: the
+// file Blockbench saves, with its textures and animations inside) and Blitz3D .b3d meshes (the
 // format Luanti mods use). Bones can be posed from Lua with set_rotation / set_position.
 
 #include <glad/glad.h>
@@ -28,6 +29,7 @@ public:
     GLuint VAO = 0;
     GLuint VBO = 0;
     int vertexCount = 0;
+    int textureIndex = 0;   // which of the model's textures (AnimatedModel::textures); 0 = the main one
 };
 
 struct Bone {
@@ -58,11 +60,25 @@ struct Bone {
     glm::mat4 getLocalTransform() const;
 };
 
+// A picture a model uses. .bbmodel files list theirs (usually embedded in the file); `name` is
+// the file name to look for when it isn't embedded.
+struct ModelTexture {
+    std::string name;
+    GLuint id = 0;          // 0 = not loaded (yet): the model's main texture is used instead
+    bool owned = false;     // made from the file's embedded picture: deleted with the model
+};
+
 class AnimatedModel {
 public:
+    AnimatedModel() = default;
+    ~AnimatedModel();
+    AnimatedModel(const AnimatedModel&) = delete;
+    AnimatedModel& operator=(const AnimatedModel&) = delete;
+
     void loadFromFile(const std::string& filepath);
     void loadFromJson(const std::string& filepath);
     void loadFromB3D(const std::string& filepath);
+    void loadFromBBModel(const std::string& filepath);
 
     std::shared_ptr<Bone> getBone(const std::string& name);
     void draw(GLuint shaderProgram, const glm::mat4& worldTransform) const;
@@ -70,8 +86,13 @@ public:
     bool loaded = false;
     bool isB3D = false;
     float scale = 1.0f;          // b3d models use 10 units per block, so they default to 0.1
-    GLuint texture = 0;          // 0 = plain white
-    std::string textureHint;     // texture file named inside the model (b3d TEXS chunk)
+    GLuint texture = 0;          // 0 = plain white. The main texture: meshes using texture 0
+    std::string textureHint;     // texture file named inside the model (b3d TEXS chunk, a .bbmodel's
+                                 // first texture when it isn't embedded)
+    // A .bbmodel's textures, in the file's order (texture 0 is also `texture`, unless load_model
+    // was given another). Faces using one that couldn't be loaded use the main texture.
+    std::vector<ModelTexture> textures;
+    GLuint textureFor(int index) const;
 
     std::map<std::string, std::shared_ptr<Bone>> boneMap;
     std::vector<std::shared_ptr<Bone>> rootBones;
@@ -109,7 +130,9 @@ private:
 struct AnimKey {
     float time = 0.0f;
     glm::vec3 pre{0.0f}, post{0.0f};   // value arriving at / leaving this key (usually the same)
-    int lerp = 0;                      // 0 linear, 1 catmullrom, 2 step
+    int lerp = 0;                      // 0 linear, 1 catmullrom, 2 step, 3 bezier (Blockbench)
+    // Bezier handles (per axis), relative to the key: time in seconds, value in the channel's units
+    glm::vec3 leftTime{-0.1f}, leftValue{0.0f}, rightTime{0.1f}, rightValue{0.0f};
 };
 
 struct AnimChannel {
@@ -138,7 +161,8 @@ public:
 
 class AnimationSet {
 public:
-    bool loadFromFile(const std::string& path);   // false (and a console message) on failure
+    // .animation.json, or the animations saved in a .bbmodel. False (and a console message) on failure
+    bool loadFromFile(const std::string& path);
     std::shared_ptr<ModelAnimation> get(const std::string& name) const;   // "" = the first one
     std::vector<std::string> names() const;
 

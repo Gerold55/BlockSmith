@@ -38,6 +38,8 @@ public:
     float areaReadyProgress(const World& world, const glm::vec3& pos, int radius) const;
 
     // Time per frame spent building meshes / uploading them, in milliseconds.
+    // Chunks meshed (their blocks changed, or they loaded) since the last call (VoxelVolume)
+    std::vector<ChunkCoord> takeMeshedChunks() { std::vector<ChunkCoord> out; out.swap(m_meshed); return out; }
     void setMeshBudgetMs(float ms) { m_meshBudgetMs = ms; }
     void setUploadBudgetMs(float ms) { m_uploadBudgetMs = ms; }
 
@@ -49,6 +51,7 @@ public:
     size_t meshCount() const { return m_meshes.size(); }
 
 private:
+    std::vector<ChunkCoord> m_meshed;
     using Clock = std::chrono::steady_clock;
 
     struct Visible {

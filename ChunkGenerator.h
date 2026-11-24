@@ -30,6 +30,7 @@ public:
 
     struct Result {
         int cx, cz;
+        std::string dimension;             // which dimension's chunk ("" = the overworld)
         unsigned epoch;                    // World::resetCount() when requested
         std::shared_ptr<ChunkData> chunk;  // nullptr: the job failed - nothing was generated
         // Why it failed: the world generator's set_world_seed raised this Lua error (or its Lua
@@ -49,11 +50,19 @@ public:
     // re-seeds its Lua when it changes). Defaults to the seed given to the constructor.
     void request(int cx, int cz, unsigned epoch);
     void request(int cx, int cz, unsigned epoch, uint32_t seed);
-    // Drops every request that hasn't started (switching or leaving a world).
+    // A chunk of one dimension (Dimensions.h): "" or "overworld" = the overworld. `caves`: the
+    // engine's cave carver runs on it (that dimension type's caves).
+    void request(int cx, int cz, unsigned epoch, uint32_t seed, const std::string& dimension, bool caves);
+    // Drops every request that hasn't started (switching or leaving a world). With a dimension:
+    // only that dimension's (the others' worlds are still waiting for theirs).
     void clearQueue();
+    void clearQueue(const std::string& dimension);
     // Removes a request that hasn't started yet (the player moved away). False if already running.
     bool cancel(int cx, int cz);
+    bool cancel(int cx, int cz, const std::string& dimension);
+    // Finished chunks: all of them, or one dimension's (the others' stay until their world asks)
     std::vector<Result> takeFinished();
+    std::vector<Result> takeFinished(const std::string& dimension);
 
     int threadCount() const { return static_cast<int>(m_threads.size()); }
     size_t queuedCount() const;
@@ -68,7 +77,8 @@ private:
     std::vector<std::thread> m_threads;
     mutable std::mutex m_mutex;
     std::condition_variable m_wake;
-    struct Job { int cx, cz; unsigned epoch; uint32_t seed; };
+    struct Job { int cx, cz; unsigned epoch; uint32_t seed; std::string dimension; bool caves = true; };
+    void updateRate();
     std::deque<Job> m_jobs;
     std::vector<Result> m_done;
     bool m_stop = false;

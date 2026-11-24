@@ -49,6 +49,19 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "Block.h"
 #include "ChunkData.h"
 #include "WorldRenderer.h"
+#include "DimensionsLua.h"
+#include "SignShape.h"
+#include "SignText.h"
+#include "BlockTextLua.h"
+#include "BlockStateLua.h"
+#include "VoxelVolume.h"
+#include "Spotlights.h"
+#include "ArtNet.h"
+#include "GpuCheck.h"
+#include "Bloom.h"
+#include "SunShafts.h"
+#include "SceneCopy.h"
+#include "DimensionWorlds.h"
 #include "Net.h"
 #include "BlockDefs.h"
 #include "PlayerMovement.h"
@@ -135,6 +148,25 @@ Hotbar* g_Hotbar = nullptr;
 FontRenderer* g_FontRenderer = nullptr;
 ChatSystem* g_ChatSystem = nullptr;
 LightingSystem* g_LightingSystem = nullptr;
+// Light traced through the blocks around the camera (VoxelVolume.h) and mods' spotlights
+// (Spotlights.h: lights.add_spot...)
+VoxelVolume g_Voxels;
+Spotlights g_Spotlights;
+// What the graphics card can take (GpuCheck.h, at startup) and the lighting the player chose:
+// quality 0 off (no traced shadows), 1 low, 2 high; bloom on/off (Bloom.h)
+GpuCaps g_GpuCaps;
+// True only while the Settings screen handles the player's own mouse click: lighting and bloom
+// are the player's choice, never a mod's or a server's (setVideoSetting refuses them otherwise)
+bool g_PlayerSettingsClick = false;
+int g_LightQuality = 0;
+bool g_BloomOn = false;
+bool g_FilmicOn = true;          // filmic exposure for Lighting Low/High (Settings; the player's choice)
+SceneCopy g_SceneCopy;           // the frame before water is drawn: water reflections (High)
+float g_BloomStrength = 0.6f, g_BloomThreshold = 0.75f;   // (a game can tune them: sky.set_bloom)
+Bloom g_Bloom;
+// Sun shafts in the air (SunShafts.h; lighting quality High), and how strong a game wants them
+SunShafts g_SunShafts;
+float g_SunShaftStrength = 0.5f;
 Skybox* g_Skybox = nullptr;
 Clouds* g_Clouds = nullptr;
 WeatherEffects g_Weather;   // rain/snow/sky tint/flashes - decided in Lua (mods/weather)
@@ -292,6 +324,14 @@ std::vector<std::string> g_SharedChanged;   // keys to report to on_shared_chang
 struct LocalModMessage { std::string channel, data; };
 std::vector<LocalModMessage> g_ModToOwnGame, g_ModToOwnServer;
 World* g_WorldInstance = nullptr;
+// Dimensions (Dimensions.h). The world on screen (g_WorldInstance) is the dimension this game's
+// player is in; when hosting, other dimensions with guests in them run in the background here.
+DimensionWorlds g_DimWorlds;
+std::string g_WorldDir;           // the open world's folder (its dimensions are inside it)
+bool g_DimensionSwitched = false; // the main loop throws the old dimension's meshes away
+// The world mods' world functions act on: the dimension the code runs in (dims::current() - the
+// player, block or entity it's about), which may be a background one when hosting
+World* apiWorld();
 float g_PlaceRepeatSeconds = 0.2f;   // holding right-click places again this often (0 = off)
 FirstPersonView g_FirstPerson;        // the hand / held block in first person (FirstPerson.h)
 
@@ -377,12 +417,27 @@ bool dropItemInWorld(const std::string& item, int count, const glm::vec3& pos, c
     return false;
 }
 
-// What to draw and click this frame: ours, or the server's
+// The other players in this game's dimension (the ones elsewhere aren't seen, like Minecraft;
+// they're still in the player list)
+const net::PlayerMap& playersHere() {
+    const net::PlayerMap& all = g_Server.running() ? g_Server.players() : g_Client.players();
+    const std::string mine = g_WorldInstance ? g_WorldInstance->dimension() : std::string();
+    bool same = true;
+    for (const auto& [id, v] : all) if (v.dimension != mine) { same = false; break; }
+    if (same) return all;
+    static net::PlayerMap here;
+    here.clear();
+    for (const auto& [id, v] : all) if (v.dimension == mine) here.emplace(id, v);
+    return here;
+}
+
+// What to draw and click this frame: ours, or the server's (only this dimension's)
 std::vector<EntityView> currentEntityViews() {
     std::vector<EntityView> out;
     if (entitiesHere()) {
         out.reserve(g_Entities.all().size());
-        for (const auto& [id, e] : g_Entities.all()) if (!e.removed) out.push_back(g_Entities.view(e));
+        const std::string mine = g_WorldInstance ? g_WorldInstance->dimension() : std::string();
+        for (const auto& [id, e] : g_Entities.all()) if (!e.removed && e.dimension == mine) out.push_back(g_Entities.view(e));
     } else {
         out.reserve(g_Client.entities().size());
         for (const auto& [id, v] : g_Client.entities()) out.push_back(v);
@@ -628,6 +683,7 @@ struct WorldMeta {
     std::vector<std::pair<std::string, int>> hotbar;   // block name ("" = empty), count
     std::string game;                                  // games/<folder> this world belongs to ("" = older save)
     std::string timeLine;                              // "time=<days> <speed>" (DayTime.h), "" = new
+    std::string dimension;                             // where the player is ("" = the overworld)
 };
 
 bool readWorldMeta(const fs::path& file, WorldMeta& meta) {
@@ -655,6 +711,9 @@ bool readWorldMeta(const fs::path& file, WorldMeta& meta) {
             meta.game = line.substr(eq + 1);
         } else if (key == "time") {
             meta.timeLine = line;
+        } else if (key == "dimension") {
+            meta.dimension = line.substr(eq + 1);
+            if (!dims::validName(meta.dimension) || meta.dimension == dims::kOverworld) meta.dimension.clear();
         } else if (key.rfind("hotbar", 0) == 0) {
             const int idx = std::atoi(key.c_str() + 6);
             std::string name;
@@ -688,6 +747,8 @@ bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, c
         if (player) {
             out << "player=" << player->position.x << " " << player->position.y << " " << player->position.z << "\n";
             out << "look=" << player->yaw << " " << player->pitch << "\n";
+            // the dimension they're in (the overworld isn't written: older games read the file too)
+            if (g_WorldInstance && !g_WorldInstance->dimension().empty()) out << "dimension=" << g_WorldInstance->dimension() << "\n";
         }
         // The time of day: only for the world being played (a new world starts in the morning)
         if (g_LightingSystem && withHotbar) out << g_LightingSystem->clock.saveLine() << "\n";
@@ -711,22 +772,85 @@ bool writeWorldMeta(const fs::path& file, uint32_t seed, const Player* player, c
 // Writes changed chunks + world.dat for the world that is currently open.
 void saveCurrentWorld() {
     World* w = g_WorldInstance;
-    if (!w || w->saveDirectory().empty()) return;
+    if (!w || w->saveDirectory().empty() || g_WorldDir.empty()) return;
 
-    const int written = w->saveAll();
-    g_BlockMods.saveWorld(w->saveDirectory());
-    if (entitiesHere() && !g_Entities.save(w->saveDirectory(), [](Entity& e) { g_EntityLua.saveData(e); })) {
+    // Every dimension's chunks (the one we're in, and any running in the background)
+    const int written = w->saveAll() + g_DimWorlds.saveAll();
+    g_BlockMods.saveDimension(w->dimension(), w->saveDirectory());
+    g_DimWorlds.forEach([](const std::string& d, World& dw) { g_BlockMods.saveDimension(d, dw.saveDirectory()); });
+    // (the world's own files are in its folder, whichever dimension we're in)
+    if (entitiesHere() && !g_Entities.save(g_WorldDir, [](Entity& e) { g_EntityLua.saveData(e); })) {
         std::cerr << "[Save] Could not save entities.txt" << std::endl;
     }
     {
-        std::ofstream f(fs::path(w->saveDirectory()) / "mod_storage.txt");
+        std::ofstream f(fs::path(g_WorldDir) / "mod_storage.txt");
         for (const auto& [k, v] : g_ModStorage) f << escapeStorage(k) << '\t' << escapeStorage(v) << '\n';
         g_ModStorageDirty = false;
     }
-    const bool metaOk = writeWorldMeta(fs::path(w->saveDirectory()) / "world.dat", w->seed(),
+    const bool metaOk = writeWorldMeta(fs::path(g_WorldDir) / "world.dat", w->seed(),
                                        g_PlayerInstance, g_LoadedGameFolder);
     std::cout << "[Save] Saved '" << g_ActiveWorldName << "' (" << written << " changed chunks"
               << (metaOk ? "" : ", world.dat FAILED") << ")" << std::endl;
+}
+
+// This game's own player goes to another dimension (singleplayer, or the host): the dimension
+// it leaves is saved (and keeps running in the background while guests are there), the one it
+// goes to is loaded into the world on screen. Like Minecraft's, the trip shows a short wait
+// while the new dimension's chunks arrive. False: joined to someone else's server (that server
+// decides), or no such dimension.
+World* apiWorld() {
+    if (!g_WorldInstance) return nullptr;
+    const std::string& d = dims::current();
+    if (d == g_WorldInstance->dimension() || g_Client.active()) return g_WorldInstance;   // (joined: only ours)
+    if (World* w = g_DimWorlds.get(d)) return w;
+    return g_WorldInstance;
+}
+
+extern GameServer g_Server;
+extern ServerLuaApi g_ServerApi;
+std::string playerName();
+bool changeLocalDimension(const std::string& toIn, const glm::vec3& pos) {
+    World* w = g_WorldInstance;
+    if (!w || !g_PlayerInstance || g_Client.active()) return false;
+    const std::string to = DimensionWorlds::norm(toIn);
+    if (!to.empty() && !dims::Registry::get().has(to)) return false;
+    if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) return false;
+    const std::string from = w->dimension();
+    g_PlayerInstance->velocity = glm::vec3(0.0f);
+    if (to == from) { g_PlayerInstance->position = pos; return true; }
+
+    // 1. The dimension we leave: everything changed in it goes to disk
+    w->saveAll();
+    if (!g_WorldDir.empty()) g_BlockMods.saveDimension(from, w->saveDirectory());
+    // 2. The one we go to: if it was running in the background (guests there), it's saved and
+    //    taken over by the world on screen (which reads those chunks back from disk)
+    if (World* bg = g_DimWorlds.find(to); bg && bg != w) g_DimWorlds.unload(to);
+    // 3. The world on screen becomes that dimension
+    w->reset();
+    w->setDimension(to);
+    if (!g_WorldDir.empty()) {
+        std::error_code ec;
+        const fs::path dir = fs::path(g_WorldDir) / dims::folderOf(to);
+        fs::create_directories(dir / "chunks", ec);
+        w->setSaveDirectory(dir.string());
+        g_BlockMods.loadDimension(to, dir.string());
+    }
+    if (g_Server.running()) w->setRecordChanges(true);
+    // 4. Guests still in the dimension we left: it runs on in the background for them
+    if (g_Server.running()) {
+        for (const auto& p : g_Server.playerPlaces()) {
+            if (p.dimension == from) { g_DimWorlds.get(from); break; }
+        }
+    }
+    g_PlayerInstance->position = pos;
+    g_Dig = DigState{};
+    dims::currentRef() = to;
+    g_DimensionSwitched = true;
+    if (g_Server.running()) g_Server.setHostDimension(to);
+    std::cout << "[Dimension] " << playerName() << ": " << (from.empty() ? std::string(dims::kOverworld) : from)
+              << " -> " << (to.empty() ? std::string(dims::kOverworld) : to) << std::endl;
+    g_ServerApi.dimensionChanged(playerName(), from, to);
+    return true;
 }
 
 // Can this world be played with the game that is currently loaded?
@@ -921,7 +1045,24 @@ bool openActiveWorld(World& world, Player& player) {
         }
     }
     g_Dig = DigState{};
-    world.setSaveDirectory(dir.string());
+    g_DimWorlds.unloadAll();
+    g_WorldDir = dir.string();
+    g_DimWorlds.primary = &world;
+    g_DimWorlds.worldDir = g_WorldDir;
+    // The dimension the player was in (one no longer registered: back to the overworld spawn)
+    std::string dimension = meta.dimension;
+    if (!dimension.empty() && !dims::Registry::get().has(dimension)) {
+        std::cout << "[World] The dimension '" << dimension << "' isn't there any more: back to the overworld" << std::endl;
+        dimension.clear();
+        meta.hasPlayer = false;
+    }
+    world.setDimension(dimension);
+    dims::currentRef() = dimension;
+    if (dimension.empty()) world.setSaveDirectory(dir.string());
+    else {
+        fs::create_directories(dir / dims::folderOf(dimension) / "chunks", ec);
+        world.setSaveDirectory((dir / dims::folderOf(dimension)).string());
+    }
     world.setSeed(existing ? meta.seed : randomSeed());
 
     // The time of day carries on where it was (a new world: morning)
@@ -955,6 +1096,7 @@ bool openActiveWorld(World& world, Player& player) {
 
     // Which chunks the once-only LBMs have already been through
     g_BlockMods.loadWorld(dir.string());
+    if (!dimension.empty()) g_BlockMods.loadDimension(dimension, world.saveDirectory());
 
     // Its mobs and dropped items (their mods' on_spawn gets what on_save gave them)
     g_EntityLua.reset();
@@ -1995,7 +2137,37 @@ std::string resolveAssetPath(const std::string& path, const std::string& subfold
         std::error_code ec;
         if (!p.empty() && fs::is_regular_file(p, ec)) return p;
     }
+    // Asked for after loading (a command, a timer): by then the "current mod" is whichever loaded
+    // last, so every mod's folder is looked in, as for pictures
+    for (const std::string& folder : g_ModFolders) {
+        for (const std::string& p : { folder + "/" + path, folder + "/" + subfolder + "/" + file }) {
+            std::error_code ec;
+            if (fs::is_regular_file(p, ec)) return p;
+        }
+    }
     return "";
+}
+
+// A model's pictures: `explicitTex` (load_model's texture / an entity's "texture") or the one the
+// file names as its main texture, then any other picture a .bbmodel lists but doesn't hold inside
+// (looked for by its file name, like the main one). Embedded ones are already loaded.
+void loadModelTextures(AnimatedModel& model, const std::string& explicitTex) {
+    const std::string tex = explicitTex.empty() ? model.textureHint : explicitTex;
+    if (!tex.empty()) {
+        const std::string texPath = resolveAssetPath(tex, "textures");
+        model.texture = loadStandardTexture(texPath.empty() ? tex : texPath);
+    }
+    for (size_t i = 1; i < model.textures.size(); ++i) {
+        ModelTexture& t = model.textures[i];
+        if (t.id || t.name.empty()) continue;
+        const std::string texPath = resolveAssetPath(t.name, "textures");
+        if (texPath.empty()) {
+            std::cerr << "[Model] Texture " << t.name << " isn't in the model file or the mod's folder: "
+                      << "its faces use the main texture" << std::endl;
+            continue;
+        }
+        t.id = loadStandardTexture(texPath);
+    }
 }
 
 struct ModelInstance {
@@ -2327,6 +2499,8 @@ local hooks = {
     { "on_server_stop",           "()  the server is stopping (in the game: you stopped hosting)" },
     { "on_use_hoe",               "(x, y, z, block) -> true if used  right-click with a hoe (tool_type \"hoe\")" },
     { "on_use_scythe",            "(x, y, z, block) -> true if it reaped (else it digs)  left-click with a scythe" },
+    { "on_dimension_change",      "(to, from)  this game's player is now in another dimension (\"overworld\" or \"mod:name\")" },
+    { "on_player_change_dimension", "(name, from, to)  a player went to another dimension (where the world runs)" },
     { "on_mod_message",           "(name, channel, data)  a player's game sent the server's mods a message (engine.send_to_server)" },
     { "on_server_message",        "(channel, data)  the server's mods sent this game a message (engine.send_to_player / send_to_all)" },
     { "on_player_harvest",        "(name, item, x, y, z)  a joined player's engine.request_harvest (the scythe): the server decides" },
@@ -2525,6 +2699,7 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     world["set_caves_enabled"] = [](sol::variadic_args) {};   // the main thread's setting wins
     world["set_cave_settings"] = [](sol::variadic_args) {};   // same
     world["get_cave_settings"] = [](sol::this_state ts) { return caveSettingsTable(ts); };
+    dims::installLua(*lua);   // (before the noop tables: dimensions.register is real here)
     lua->script(kWorkerNoopLua);
     for (const auto& file : modFiles) {
         (*lua)["g_CurrentModPath"] = file.parent_path().string();
@@ -2922,6 +3097,31 @@ void resetKeybinds() {
     saveSettings();
 }
 
+// OpenGL errors explained by the graphics driver itself (KHR_debug, where the driver has it):
+// which call failed and why, in the log as "[GL] ...". Only errors (and the first few of each),
+// so it costs nothing in a normal frame. Loaded by hand: the GL loader here doesn't include it.
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+typedef void (APIENTRY* GLDebugProcBS)(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
+                                       const GLchar* message, const void* userParam);
+typedef void (APIENTRY* GLDebugMessageCallbackBS)(GLDebugProcBS callback, const void* userParam);
+static void APIENTRY glErrorReport(GLenum, GLenum type, GLuint id, GLenum, GLsizei, const GLchar* message, const void*) {
+    if (type != 0x824C /* GL_DEBUG_TYPE_ERROR */) return;
+    static std::map<GLuint, int> seen;
+    if (++seen[id] > 3 || seen.size() > 40) return;          // (the first few of each kind)
+    std::cerr << "[GL] " << message << std::endl;
+}
+static void installGLErrorReporting() {
+    auto cb = reinterpret_cast<GLDebugMessageCallbackBS>(glfwGetProcAddress("glDebugMessageCallback"));
+    if (!cb) cb = reinterpret_cast<GLDebugMessageCallbackBS>(glfwGetProcAddress("glDebugMessageCallbackARB"));
+    if (!cb) return;
+    glEnable(0x92E0);   // GL_DEBUG_OUTPUT
+    glEnable(0x8242);   // GL_DEBUG_OUTPUT_SYNCHRONOUS: reported during the call that failed
+    cb(glErrorReport, nullptr);
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
 // Video settings: value limits, current value, and applying them.
 struct VideoSetting { const char* id; int minV, maxV, step; };
 const VideoSetting kVideoSettings[] = {
@@ -2930,6 +3130,10 @@ const VideoSetting kVideoSettings[] = {
     { "vsync",            0,   1, 1 },
     { "main_hand",        0,   1, 1 },   // 0 = right, 1 = left (left-handed players)
     { "brightness",       0, 100, 5 },   // 0 = moody, 50 = the game's own, 100 = bright (Minecraft's gamma)
+    { "light_quality",    0,   2, 1 },   // traced lighting (shadows of lamps and spotlights): 0 off, 1 low, 2 high
+    { "bloom",            0,   1, 1 },   // bright things glow
+    { "filmic",           0,   1, 1 },
+    { "artnet",           0,   2, 1 },   // Art-Net (DMX) input: 0 off, 1 this computer only, 2 the network   // filmic exposure for Lighting Low/High (a film curve; the eye adjusts)
     { "volume_master",    0, 100, 5 },
     { "volume_music",     0, 100, 5 },
     { "volume_effects",   0, 100, 5 },
@@ -2947,6 +3151,12 @@ int currentVideoSetting(const std::string& id) {
     if (id == "vsync") return settingInt(id, 1);
     if (id == "main_hand") return settingInt(id, 0);
     if (id == "brightness") return settingInt(id, 50);
+    // (never more than this graphics card can take: GpuCheck.h)
+    // (Off unless the player chose a level: the standard look by default, the realistic one opt-in)
+    if (id == "light_quality") return std::clamp(settingInt(id, 0), 0, g_GpuCaps.maxLightQuality);
+    if (id == "bloom") return g_GpuCaps.bloom ? std::clamp(settingInt(id, 0), 0, 1) : 0;
+    if (id == "artnet") return std::clamp(settingInt(id, 0), 0, 2);
+    if (id == "filmic") return g_GpuCaps.maxLightQuality > 0 ? std::clamp(settingInt(id, 1), 0, 1) : 0;
     if (id == "volume_music") return settingInt(id, 60);
     if (id.rfind("volume_", 0) == 0) return settingInt(id, 100);
     return 0;
@@ -2957,6 +3167,10 @@ void applyVideoSetting(const std::string& id, int value) {
     else if (id == "render_distance") { if (g_WorldInstance) g_WorldInstance->setRenderDistance(value); }
     else if (id == "vsync") glfwSwapInterval(value ? 1 : 0);
     else if (id == "brightness") g_LightSettings.playerBrightness = std::clamp(value, 0, 100) / 100.0f;
+    else if (id == "light_quality") g_LightQuality = std::clamp(value, 0, g_GpuCaps.maxLightQuality);
+    else if (id == "bloom") g_BloomOn = value != 0 && g_GpuCaps.bloom;
+    else if (id == "filmic") g_FilmicOn = value != 0;
+    else if (id == "artnet") g_ArtNet.setMode(static_cast<ArtNetInput::Mode>(std::clamp(value, 0, 2)), settingInt("artnet_port", 6454));
     else if (id.rfind("volume_", 0) == 0) g_Audio.setVolume(id.substr(7), value / 100.0f);   // master, music...
 }
 
@@ -2964,6 +3178,26 @@ bool setVideoSetting(const std::string& id, int value, std::string& error) {
     const VideoSetting* s = findVideoSetting(id);
     if (!s) { error = "Unknown setting."; return false; }
     value = std::clamp(value, s->minV, s->maxV);
+    // Lighting and bloom are the player's own choice: only a click in their Settings changes them.
+    // A game's or server's mods (which run in the player's game too) can't switch them on.
+    // (Art-Net opens a network port: the player's choice only, too)
+    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "artnet") && !g_PlayerSettingsClick) {
+        error = "Only the player can change this, in Settings";
+        return false;
+    }
+    // What the graphics card can't take is refused, whoever asks (GpuCheck.h)
+    if (id == "light_quality" && value > g_GpuCaps.maxLightQuality) {
+        error = g_GpuCaps.lightReason.empty() ? "Not available on this graphics card" : g_GpuCaps.lightReason;
+        return false;
+    }
+    if (id == "filmic" && value != 0 && g_GpuCaps.maxLightQuality <= 0) {
+        error = "Works with Lighting Low or High, which this graphics card can't run";
+        return false;
+    }
+    if (id == "bloom" && value != 0 && !g_GpuCaps.bloom) {
+        error = g_GpuCaps.bloomReason.empty() ? "Not available on this graphics card" : g_GpuCaps.bloomReason;
+        return false;
+    }
     g_Settings[id] = std::to_string(value);
     saveSettings();
     applyVideoSetting(id, value);
@@ -3089,7 +3323,7 @@ void addClientModWorldApi(ClientMods& cm) {
         sol::state_view lv(ts);
         sol::table list = lv.create_table();
         if (!mods->rules().players) return list;
-        const net::PlayerMap& others = g_Server.running() ? g_Server.players() : g_Client.players();
+        const net::PlayerMap& others = playersHere();
         int i = 1;
         for (const auto& [id, v] : others) {
             sol::table e = lv.create_table();
@@ -3175,6 +3409,21 @@ bool isWaterBlockName(const std::string& name) {
 
 // engine.register_item_use(item, fn): what right-clicking with an item does (buckets etc.)
 std::unordered_map<std::string, sol::protected_function> g_ItemUseHandlers;
+
+// A player broke the block at pos: air - or, for a waterlogged slab or stairs, the water it
+// held (a source) (BlockShape.h)
+void clearBrokenBlock(World& world, const glm::ivec3& pos) {
+    const uint8_t id = world.getBlockAt(pos);
+    if (id != 0 && shape::isWaterlogged(BlockRegistry::getInstance().getBlock(id), world.getMetadataAt(pos))) {
+        FluidRegistry::get().ensureFresh();
+        const FluidDef* water = FluidRegistry::get().byName("water");
+        if (water && water->sourceId != 0) {
+            world.setBlockWithMetaAt(pos, water->sourceId, 0);
+            return;
+        }
+    }
+    world.setBlockAt(pos, 0);
+}
 
 // Is the block at p a full source of any fluid (water, lava, modded fluids)?
 bool isFluidSourceAt(const World& world, const glm::ivec3& p) {
@@ -3579,6 +3828,50 @@ uniform float u_MinLight;         // the darkest anything gets (sky.set_min_ligh
 uniform float u_Brightness;       // 0 = moody, 1 = bright (sky.set_brightness, like Minecraft's slider)
 uniform float u_BlockLightScale;  // how strong block light is (sky.set_block_light_strength)
 uniform float u_Gamma;            // the player's Brightness slider above "Default": 0..1 lift of the final light
+uniform vec3  u_CameraPos;        // (spotlights: which way a face looks)
+uniform int   u_TraceSteps;       // shadow rays' longest walk through the blocks (lighting quality)
+uniform int   u_SunSteps;         // the sun's shadow rays (0 = the sun isn't traced)
+uniform vec3  u_MoonDir;          // toward the moon
+uniform float u_MoonShadow;       // how much the moon's shadows show (0 = none: day, new moon, rain)
+uniform int   u_Filmic;           // 1 = filmic exposure (Settings: the eye adjusts, a film curve)
+uniform float u_SkyFog;           // 0..1: how much fog takes the colour of the sky behind it
+uniform float u_CamWaterDepth;    // how deep the camera is under water (blocks; 0 = not under)
+uniform float u_SkyBrightness;    // the sky's brightness (Skybox::brightness): fog matches it
+uniform float u_SkyHalo;          // the sky's glow around the sun (0 = the standard look)
+uniform vec4  u_WeatherTint;      // the weather's tint over the sky (rgb, how much): fog and reflections get it too
+uniform int   u_SSR;              // 1 = water reflects the world (lighting High)
+uniform sampler2D u_SceneColor;   // the frame before water was drawn (SceneCopy.h)
+uniform sampler2D u_SceneDepth;
+uniform mat4  u_ViewProj;
+)" BLOCKSMITH_VOXEL_TRACE_GLSL BLOCKSMITH_SPOT_GLSL BLOCKSMITH_SKY_GLSL R"(
+
+// How much of the sky a face sees past the blocks around it (a few blocks out): crevices,
+// corners and the ground under overhangs get less. With the mesher's own corner shading, this
+// gives the soft contact darkening real light has.
+float voxAO(vec3 p, vec3 n) {
+    vec3 t1 = abs(n.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t2 = cross(n, t1);
+    vec3 o = p + n * 0.5;
+    float occ = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        float a = float(i) * 0.785398;
+        vec3 dir = t1 * cos(a) + t2 * sin(a);
+        occ += min(voxOpacity(ivec3(floor(o + n * 0.4 + dir * 1.4))), 1.0) * 0.6;
+        occ += min(voxOpacity(ivec3(floor(o + n * 1.5 + dir * 2.2))), 1.0) * 0.4;
+    }
+    occ += min(voxOpacity(ivec3(floor(o + n * 2.0))), 1.0) * 0.8;
+    return 1.0 - 0.55 * clamp(occ / 8.8, 0.0, 1.0);
+}
+
+// Under water (Lighting Low/High): how much daylight is left in the water around the camera.
+// Water swallows light: dimmer the deeper you are, and much darker when the sun is low.
+float underwaterLight() {
+    float dl = smoothstep(-0.15, 0.35, normalize(u_SunDir).y) * clamp(u_WeatherLight, 0.3, 1.0);
+    return mix(0.12, 0.62, dl) * exp(-u_CamWaterDepth * 0.08);
+}
+
+// Depth buffer value -> distance (the projection's near 0.1, far 500)
+float ssrLinZ(float d) { return 100.0 / (500.1 - (d * 2.0 - 1.0) * 499.9); }
 
 // Light level (0..1) -> brightness: Minecraft's curve (each level ~20% dimmer), lifted by u_Brightness
 float lightCurve(float l) {
@@ -3591,8 +3884,29 @@ float lightCurve(float l) {
     return mix(v, lifted, u_Brightness);
 }
 
+// The rippling net of light the sun makes on things under water (caustics): tiles every 4
+// blocks, slowly moving with time
+float waterCaustic(vec2 p, float t) {
+    p = mod(p * 1.5707963, 6.2831853) - 250.0;
+    vec2 i = p;
+    float c = 1.0;
+    const float inten = 0.005;
+    for (int n = 0; n < 4; n++) {
+        float tt = t * 0.45 * (1.0 - (3.5 / float(n + 1)));
+        i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0 / length(vec2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
+    }
+    c /= 4.0;
+    c = 1.17 - pow(c, 1.4);
+    return clamp(pow(abs(c), 8.0), 0.0, 2.0);
+}
+
 void main() {
     vec4 finalColor = vec4(TintColor, 1.0);
+    // The surface's true direction (before anything can skip a pixel: screen-space slopes need
+    // every pixel of the 2x2 block). Water uses it below to flow the right way.
+    vec3 surfN = cross(dFdx(WorldPos), dFdy(WorldPos));
+    surfN = dot(surfN, surfN) > 1e-12 ? normalize(surfN) : vec3(0.0, 1.0, 0.0);
 
     if (u_Unlit == 0 && u_IsGUI == 0 && u_ChunkFade < 1.0) {
         float threshold = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
@@ -3603,8 +3917,23 @@ void main() {
         vec2 animatedUV = TexCoord;
 
         if (TintColor.b > TintColor.r && TintColor.b > TintColor.g && BaseLayer > 0.0 && u_IsGUI == 0) {
+            // Water moves the way water goes. (Texture v runs down a block's sides, and along +z
+            // on its top; the pattern moves the way the coordinate it's sampled at moves back.)
+            vec3 n = surfN.y < 0.0 ? -surfN : surfN;          // (the surface's upward side)
+            if (abs(n.y) < 0.5) {
+                // a side or a waterfall: down
+                animatedUV.y -= u_Time * 0.6f;
+            } else {
+                // the top: downhill where the water slopes (flowing water), otherwise still.
+                // Snapped to 8 directions at one speed, so both halves of a block's surface
+                // (which can tilt a little differently) move together - no seam between them.
+                vec2 slope = n.xz;
+                if (length(slope) > 0.05) {
+                    float a = round(atan(slope.y, slope.x) / 0.7853982) * 0.7853982;
+                    animatedUV -= vec2(cos(a), sin(a)) * u_Time * 0.45f;
+                }
+            }
             animatedUV.x += sin(u_Time * 1.2f + WorldPos.z * 0.5f) * 0.02f;
-            animatedUV.y += u_Time * 0.08f;
         }
 
         vec4 baseTex = texture(textureArray, vec3(animatedUV, BaseLayer));
@@ -3627,24 +3956,148 @@ void main() {
         return;
     }
 
-    vec3 dayLightColor = vec3(1.0f, 0.98f, 0.92f);
-    vec3 sunsetLightColor = vec3(1.0f, 0.62f, 0.32f);
-    vec3 nightLightColor = vec3(0.35f, 0.5f, 0.75f);
-
-    vec3 currentSunLightColor = mix(sunsetLightColor, dayLightColor, clamp(u_SunDir.y + 0.15f, 0.0f, 1.0f));
-    if (u_SunDir.y < 0.0f) {
-        currentSunLightColor = mix(sunsetLightColor, nightLightColor, clamp(-u_SunDir.y * 2.0f, 0.0f, 1.0f));
+    // The face's direction, from how the position changes across the screen (flat faces), turned
+    // toward the camera: for spotlights and shadows traced through the blocks (VoxelVolume.h)
+    vec3 faceN = normalize(cross(dFdx(WorldPos), dFdy(WorldPos)));
+    if (dot(faceN, u_CameraPos - WorldPos) < 0.0) faceN = -faceN;
+    // Block faces are all along the axes: snapped to the nearest one. (Far away a face is only a
+    // pixel or two, and the screen-space estimate wobbles there: unsnapped, distant sunlit faces
+    // could come out turned away from the sun and drawn dark.)
+    {
+        vec3 an = abs(faceN);
+        faceN = (an.x > an.y && an.x > an.z) ? vec3(sign(faceN.x), 0.0, 0.0)
+              : (an.y > an.z) ? vec3(0.0, sign(faceN.y), 0.0) : vec3(0.0, 0.0, sign(faceN.z));
     }
 
+    // The light from the sky through the day: warm white by day, a warm glow (not an orange
+    // wash: the sky and fog carry the sunset's colour) around sunset, blue moonlight at night
+    vec3 dayLightColor = vec3(1.0f, 0.97f, 0.90f);
+    vec3 sunsetLightColor = vec3(1.0f, 0.80f, 0.62f);
+    vec3 nightLightColor = vec3(0.58f, 0.66f, 0.92f);
+
+    vec3 currentSunLightColor = mix(sunsetLightColor, dayLightColor, smoothstep(-0.05f, 0.35f, u_SunDir.y));
+    if (u_SunDir.y < 0.0f) {
+        currentSunLightColor = mix(sunsetLightColor, nightLightColor, smoothstep(0.0f, 0.25f, -u_SunDir.y));
+    }
+
+    // ---- Lighting Low / High: light worked out the way it really behaves (simply) ----
+    // Each surface gets: sunlight (if it faces the sun and a ray to the sun gets through the
+    // blocks), the sky's light (bluish, less in corners and under overhangs), a little light
+    // bounced off the ground, moonlight at night, and torches - added up as real amounts of light
+    // (in linear colour, brighter than the screen can show), then brought to the screen like a
+    // camera does: filmic exposure (Settings), or a plain one.
+    bool realistic = u_Unlit == 0 && u_SunSteps > 0 && u_VoxEnabled == 1 && u_VoxelLight == 1;
+    vec3 albedoW = finalColor.rgb;        // what lamps and spotlights multiply
+    vec3 blkLight = vec3(0.0);            // (torch light here, for the night colour fade)
     vec3 shadedColor;
-    if (u_Unlit == 1) {
+    if (realistic) {
+        vec4 L = VoxelLight;
+        vec3 albedo = pow(max(finalColor.rgb, vec3(0.0)), vec3(2.2));
+        albedoW = albedo;
+        // the mesher's fixed per-side shading taken back out (the sun does that now), its corner
+        // darkening kept
+        float faceConst = abs(faceN.y) > 0.5 ? (faceN.y > 0.0 ? 1.0 : 0.5) : (abs(faceN.x) > 0.5 ? 0.8 : 0.7);
+        float vao = clamp(LightIntensity / faceConst, 0.0, 1.0);
+        // what this face belongs to: leaves (light shines through them), plants (lit like the
+        // ground they stand on, whichever way their crossed panels face)
+        float selfO = voxOpacity(ivec3(floor(WorldPos - faceN * 0.02)));
+        bool leaf = abs(selfO - 0.50196) < 0.002;
+        // (the water's surface seen from below has air behind it: that's water, not a plant)
+        bool waterFace = voxIsWater(ivec3(floor(WorldPos + faceN * 0.02))) || voxIsWater(ivec3(floor(WorldPos - faceN * 0.02)));
+        bool plant = selfO < 0.01 && !waterFace;
+        vec3 n = plant ? vec3(0.0, 1.0, 0.0) : faceN;
+        float ao = vao * ((plant || !voxColumnReady(ivec3(floor(WorldPos)))) ? 1.0 : voxAO(WorldPos, faceN));
+        vec3 sd = normalize(u_SunDir);
+        float sunUp = smoothstep(-0.02, 0.10, sd.y);
+        float dayAmt = smoothstep(-0.18, 0.25, sd.y);
+        float sky = lightCurve(L.x);                       // open to the sky here (0 deep underground)
+        float near_ = 1.0 - smoothstep(44.0, 58.0, length(WorldPos - u_CameraPos));
+        // (blocks here not traced yet - just joined, or just came into range: lit like far-off
+        // land until they are, instead of flashing bright and then darkening)
+        bool ready = voxColumnReady(ivec3(floor(WorldPos)));
+        if (!ready) near_ = 0.0;
+        float clearSky = clamp(u_WeatherLight, 0.0, 1.0);
+        clearSky = clearSky * clearSky * clearSky;         // (clouds and rain: hardly any direct sun)
+
+        // Sunlight: warm, strong; orange and weaker when low
+        float ndl = dot(n, sd);
+        float wrap = leaf ? clamp(ndl * 0.6 + 0.4, 0.0, 1.0) : max(ndl, 0.0);
+        float sunVis = 0.0;
+        if (wrap > 0.0 && sunUp > 0.0) {
+            float T = 1.0;
+            if (near_ > 0.0) {
+                g_VoxSoftFoliage = leaf ? 1.0 : 0.0;
+                T = voxTransmittance(WorldPos + n * 0.05, WorldPos + sd * 90.0, u_SunSteps);
+                g_VoxSoftFoliage = 0.0;
+            }
+            // (past the traced blocks, and to keep caves dark: open sky means sunlit)
+            sunVis = mix(smoothstep(0.55, 0.95, sky), T * smoothstep(0.15, 0.55, sky), near_);
+        }
+        vec3 sunTint = mix(vec3(1.0, 0.55, 0.28), vec3(1.0, 0.94, 0.84), smoothstep(0.02, 0.4, sd.y));
+        vec3 sunLight = sunTint * 3.3 * sunUp * clearSky;
+        vec3 direct = sunLight * wrap * sunVis * mix(1.0, vao, 0.35);
+
+        // The sky's light: blue by day, dusky at sunset, dim blue at night; grey in bad weather
+        vec3 skyCol = mix(vec3(0.035, 0.045, 0.085),
+                          mix(vec3(0.42, 0.36, 0.40), vec3(0.36, 0.42, 0.55), smoothstep(0.05, 0.4, sd.y)), dayAmt);
+        skyCol = mix(vec3(dot(skyCol, vec3(0.333))), skyCol, clearSky * 0.7 + 0.3) * mix(0.55, 1.0, u_WeatherLight);
+        float hemi = 0.62 + 0.38 * n.y;                    // tops see the whole sky, sides half
+        vec3 ambient = skyCol * hemi * sky * ao;
+        // sunlight bounced off the ground onto sides and undersides
+        vec3 bounce = sunLight * 0.10 * sky * (0.5 - 0.5 * n.y) * ao * vec3(1.0, 0.92, 0.8);
+
+        // Moonlight, with soft shadows (u_MoonShadow)
+        vec3 moon = vec3(0.0);
+        vec3 md = normalize(u_MoonDir);
+        float moonUp = smoothstep(0.0, 0.2, md.y) * (1.0 - dayAmt);
+        if (moonUp > 0.0) {
+            float mdl = max(dot(n, md), 0.0);
+            float mv = 1.0;
+            if (u_MoonShadow > 0.0 && near_ > 0.0 && mdl > 0.0)
+                mv = mix(1.0, voxTransmittance(WorldPos + n * 0.05, WorldPos + md * 90.0, u_SunSteps / 2), u_MoonShadow * near_);
+            moon = vec3(0.06, 0.075, 0.13) * mdl * mv * moonUp * smoothstep(0.3, 0.8, sky) * clamp(u_WeatherLight, 0.0, 1.0);
+        }
+
+        // Torches and other block light (they flicker a little)
+        vec3 blk = vec3(lightCurve(L.y), lightCurve(L.z), lightCurve(L.w)) * u_BlockLightScale;
+        blk *= 1.0 + 0.025 * (sin(u_Time * 9.1) + sin(u_Time * 13.7 + 1.3)) * 0.5;
+        vec3 blockL = blk * blk * 1.8 * mix(1.0, ao, 0.6);
+        blkLight = blk;
+
+        // Under water: bluer and dimmer with depth; the surface's ripples focus the sun into a
+        // moving net of light (caustics)
+        float wd = voxWaterDepth(WorldPos + faceN * 0.05);
+        if (wd > 0.0) {
+            vec2 q = WorldPos.xz + sd.xz / max(sd.y, 0.25) * wd;
+            float c = waterCaustic(q, u_Time) * 0.6 + waterCaustic(q * 0.7 + 1.3, u_Time * 0.8) * 0.4;
+            vec3 absorb = exp(-wd * vec3(0.10, 0.04, 0.03));
+            direct *= absorb * (0.7 + c * 1.8 * exp(-wd * 0.12));
+            ambient *= absorb;
+        }
+
+        float minL = mix(u_MinLight, max(u_MinLight, 0.08), u_Gamma);
+        shadedColor = albedo * (direct + ambient + bounce + moon + blockL + vec3(minL * minL * 0.5 + 0.002));
+    } else if (u_Unlit == 1) {
         shadedColor = finalColor.rgb * LightIntensity * currentSunLightColor;
     } else {
         vec4 L = (u_VoxelLight == 1) ? VoxelLight : u_FallbackLight;
         // Sunlight follows the time of day and the weather (sky.set_light); block light doesn't
-        float daylight = clamp(u_SunDir.y * 0.6f + 0.4f, 0.28f, 1.0f);
+        // How much daylight: a smooth curve, so it dims gradually through sunset (about 55% just
+        // after the sun sets) down to a moody but readable night
+        float daylight = mix(0.40f, 1.0f, smoothstep(-0.22f, 0.32f, u_SunDir.y));
         vec3 sunPart = lightCurve(L.x) * daylight * currentSunLightColor * u_WeatherLight;
+        // In daylight, faces turned toward the sun are a little brighter and warmer, faces turned
+        // away a little cooler: you can tell where the sun is, even without traced shadows
+        {
+            float faceSun = dot(faceN, normalize(u_SunDir));
+            float dayAmt = smoothstep(0.0f, 0.25f, u_SunDir.y) * clamp(L.x * 1.5f, 0.0f, 1.0f);
+            sunPart *= 1.0f + dayAmt * (faceSun > 0.0f ? 0.08f : 0.06f) * faceSun;
+            sunPart *= mix(vec3(1.0f), faceSun > 0.0f ? vec3(1.03f, 1.0f, 0.95f) : vec3(0.96f, 0.98f, 1.04f),
+                           dayAmt * abs(faceSun));
+        }
         vec3 blockPart = vec3(lightCurve(L.y), lightCurve(L.z), lightCurve(L.w)) * u_BlockLightScale;
+        // Flames are alive: block light flickers very slightly
+        blockPart *= 1.0f + 0.025f * (sin(u_Time * 9.1f) + sin(u_Time * 13.7f + 1.3f)) * 0.5f;
         // Screen blend: torches still show at dusk, and coloured lights mix
         vec3 lightAmount = vec3(1.0f) - (vec3(1.0f) - sunPart) * (vec3(1.0f) - min(blockPart, vec3(1.0f)));
         // The player's brightness (gamma), as in Minecraft: on the FINAL light, so dark caves
@@ -3663,10 +4116,148 @@ void main() {
         if(dist < u_PointLights[i].radius) {
             float attenuation = 1.0f - (dist / u_PointLights[i].radius);
             attenuation = attenuation * attenuation;
+            // blocks in between cast shadows (traced through the blocks around the camera)
+            attenuation *= voxTransmittance(WorldPos + faceN * 0.02, u_PointLights[i].position, u_TraceSteps / 2);
             pointLightContribution += u_PointLights[i].color * u_PointLights[i].intensity * attenuation;
         }
     }
-    shadedColor += finalColor.rgb * pointLightContribution;
+    shadedColor += albedoW * pointLightContribution;
+
+    // Spotlights (Spotlights.h): cone, gobo and traced shadows
+    if (u_Unlit == 0 && u_NumSpots > 0) {
+        vec3 spot = vec3(0.0);
+        for (int i = 0; i < u_NumSpots && i < 16; ++i) spot += spotLightAt(WorldPos, faceN, i, u_TraceSteps);
+        shadedColor += albedoW * spot;
+    }
+
+    // Realistic light onto the screen
+    if (realistic) {
+        float dayAmt = smoothstep(-0.18, 0.25, normalize(u_SunDir).y);
+        // How open to the sky the camera is (u_FallbackLight.x: the sky light where it is): in
+        // caves and closed rooms the exposure is set for torchlight, whatever the time of day
+        float camSky = smoothstep(0.15, 0.7, u_FallbackLight.x);
+        vec3 c;
+        if (u_Filmic == 1) {
+            // Filmic: the eye adjusts (more exposure at night, so moonlit land stays readable),
+            // and a film curve: deep shadows, bright highlights that roll off softly
+            float exposure = mix(0.65, mix(1.5, 0.30, dayAmt), camSky);
+            vec3 x = shadedColor * exposure;
+            c = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+        } else {
+            // Plain: a gentle curve, flatter and closer to the standard look
+            float exposure = mix(0.8, mix(1.25, 0.47, dayAmt), camSky);
+            c = vec3(1.0) - exp(-shadedColor * exposure);
+        }
+        c = pow(c, vec3(1.0 / 2.2));
+        // (the curve takes a little colour out of bright parts: a touch back)
+        float lum = dot(c, vec3(0.299, 0.587, 0.114));
+        c = clamp(mix(vec3(lum), c, 1.12), 0.0, 1.0);
+        // At night, out in the open, colours fade toward a cool blue-grey, as they do for the
+        // eye by moonlight (torchlit places keep their colour)
+        float nightSee = (1.0 - dayAmt) * camSky * (1.0 - smoothstep(0.0, 0.25, max(max(blkLight.r, blkLight.g), blkLight.b)));
+        c = mix(c, lum * vec3(0.78, 0.9, 1.15), 0.6 * nightSee);
+        vec3 inv = vec3(1.0) - c;
+        shadedColor = mix(c, vec3(1.0) - inv * inv * inv, u_Gamma * 0.6);   // (the Brightness slider)
+    }
+
+    // The water's surface (lighting quality Low/High): it reflects the sky more the flatter you
+    // look across it, and small moving waves catch the sun (or the moon) in bright glints
+    if (u_Unlit == 0 && u_SunSteps > 0 && u_VoxEnabled == 1 && u_VoxelLight == 1 && abs(faceN.y) > 0.9) {
+        ivec3 wc = ivec3(floor(WorldPos - faceN * 0.05));
+        if (voxIsWater(wc) && !voxIsWater(wc + ivec3(0, 1, 0))) {
+            vec3 V = normalize(u_CameraPos - WorldPos);
+            vec2 wp = WorldPos.xz;
+            float t = u_Time;
+            vec3 n = normalize(vec3(0.05 * cos(wp.x * 1.7 + t * 1.3) + 0.035 * cos((wp.x + wp.y) * 2.9 + t * 1.9) +
+                                    0.02 * cos(wp.x * 5.3 - wp.y * 1.1 + t * 2.7),
+                                    1.0,
+                                    0.05 * sin(wp.y * 1.9 + t * 1.1) + 0.035 * sin((wp.x - wp.y) * 3.3 + t * 2.3) +
+                                    0.02 * sin(wp.y * 4.7 + wp.x * 1.3 + t * 2.9)));
+            float near_ = 1.0 - smoothstep(44.0, 58.0, length(WorldPos - u_CameraPos));
+            if (faceN.y > 0.0) {
+                float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
+                vec3 R = reflect(-V, n);
+                vec3 sd = normalize(u_SunDir);
+                // what it reflects: the sky in that direction, or (High) the world, found by
+                // following the reflected ray across the picture drawn so far
+                vec3 refl = blocksmithSky(normalize(vec3(R.x, max(R.y, 0.02), R.z)), sd, u_SkyHalo) * clamp(u_WeatherLight, 0.3, 1.0);
+                if (u_WeatherTint.a > 0.0) refl = mix(refl, u_WeatherTint.rgb, u_WeatherTint.a);
+                if (u_SSR == 1) {
+                    vec3 pos = WorldPos, prev = WorldPos;
+                    float stepL = 0.3;
+                    for (int i = 0; i < 32; ++i) {
+                        prev = pos;
+                        pos += R * stepL;
+                        stepL *= 1.15;
+                        vec4 cp = u_ViewProj * vec4(pos, 1.0);
+                        if (cp.w <= 0.01) break;
+                        vec3 ndc = cp.xyz / cp.w;
+                        vec2 suv = ndc.xy * 0.5 + 0.5;
+                        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+                        float sdp = texture(u_SceneDepth, suv).r;
+                        if (sdp >= 0.99999) continue;                 // (sky there)
+                        float rz = ssrLinZ(ndc.z * 0.5 + 0.5), sz = ssrLinZ(sdp);
+                        if (rz > sz + 0.02 && rz - sz < stepL + 1.0) {
+                            vec3 a = prev, b = pos;                   // narrow it down
+                            for (int j = 0; j < 5; ++j) {
+                                vec3 m = (a + b) * 0.5;
+                                vec4 c2 = u_ViewProj * vec4(m, 1.0);
+                                vec3 n2 = c2.xyz / c2.w;
+                                if (ssrLinZ(n2.z * 0.5 + 0.5) > ssrLinZ(texture(u_SceneDepth, n2.xy * 0.5 + 0.5).r)) b = m;
+                                else a = m;
+                            }
+                            vec4 c3 = u_ViewProj * vec4(b, 1.0);
+                            vec2 huv = c3.xy / c3.w * 0.5 + 0.5;
+                            vec2 e = smoothstep(vec2(0.0), vec2(0.08), huv) * (vec2(1.0) - smoothstep(vec2(0.92), vec2(1.0), huv));
+                            refl = mix(refl, texture(u_SceneColor, huv).rgb, e.x * e.y);
+                            break;
+                        }
+                    }
+                }
+                shadedColor = mix(shadedColor, refl, fres * 0.85);
+                finalColor.a = mix(finalColor.a, 1.0, fres * 0.7);
+                float sunUp = smoothstep(0.0, 0.15, sd.y);
+                if (sunUp > 0.0 && dot(R, sd) > 0.9) {
+                    float vis = voxTransmittance(WorldPos + vec3(0.0, 0.05, 0.0), WorldPos + sd * 90.0, u_SunSteps);
+                    float rs = max(dot(R, sd), 0.0);
+                    float spec = pow(rs, 400.0) * 5.0 + pow(rs, 40.0) * 0.35;
+                    shadedColor += currentSunLightColor * spec * vis * sunUp * near_ * u_WeatherLight;
+                    finalColor.a = max(finalColor.a, min(1.0, spec * vis));
+                }
+                vec3 md = normalize(u_MoonDir);
+                if (u_MoonShadow > 0.0 && md.y > 0.0 && dot(R, md) > 0.95) {
+                    float rs = max(dot(R, md), 0.0);
+                    shadedColor += vec3(0.6, 0.7, 0.9) * pow(rs, 300.0) * 1.5 * u_MoonShadow * near_;
+                }
+            } else {
+                // From under the water: the whole surface overhead is see-through (the sky and
+                // anything above show through it, tinted by the water) and shimmers all over
+                // with the light coming down through the moving waves - the same everywhere,
+                // no window or edge
+                vec3 sd = normalize(u_SunDir);
+                float cosUp = clamp(-V.y, 0.0, 1.0);            // 1 = looking straight up at it
+                float camDepth = max(u_CamWaterDepth, 0.0);
+                float clarity = exp(-camDepth * 0.12);          // (deeper: more water in the way)
+                vec3 below = u_FogColor * underwaterLight();
+                float daylight_ = smoothstep(-0.1, 0.3, sd.y) * clamp(u_WeatherLight, 0.3, 1.0);
+                // two layers of moving caustics, and sparkles where the waves catch the light
+                // (a fine net of light, softened so it reads from a distance, over rolling bands
+                // where the waves tilt toward the light)
+                float sh1 = sqrt(clamp(waterCaustic(WorldPos.xz * 1.6, u_Time * 1.2), 0.0, 1.0));
+                float sh2 = sqrt(clamp(waterCaustic(WorldPos.xz * 2.7 + 3.7, u_Time * 0.9), 0.0, 1.0));
+                float waves = clamp(0.5 + 5.0 * (n.x * 0.8 + n.z * 0.6), 0.0, 1.0);
+                float shimmer = clamp(sh1 * 0.45 + sh2 * 0.25 + waves * 0.45, 0.0, 1.2);
+                float sparkle = pow(clamp(sh1 * sh2 * waves * 1.6, 0.0, 1.0), 2.0);
+                vec3 lightCol = mix(below, vec3(0.8, 0.93, 1.0), 0.45) * (0.45 + 0.55 * daylight_);
+                shadedColor = lightCol * (0.4 + 1.2 * shimmer) + vec3(0.9, 0.97, 1.0) * sparkle * 1.2 * daylight_ * near_;
+                // see-through all over; only a little more solid looking across it, and more the
+                // deeper you are
+                float a = mix(0.42, 0.62, 1.0 - cosUp);
+                a = mix(a, 0.85, 1.0 - clarity);
+                finalColor.a = clamp(a + 0.22 * (shimmer - 0.4) + 0.3 * sparkle, 0.3, 0.92);
+            }
+        }
+    }
 
     if (u_Unlit == 0) {
         shadedColor *= mix(vec3(1.0f), u_UnderwaterTint, u_UnderwaterAmount);
@@ -3691,7 +4282,32 @@ void main() {
         return;
     }
 
-    vec3 finalRgb = mix(u_FogColor, shadedColor, fogFactor);
+    // A light grade: a touch richer colour and a gentle contrast curve (before the fog, which
+    // keeps its own colour)
+    if (u_Unlit == 0 && !realistic) {
+        float lum = dot(shadedColor, vec3(0.299f, 0.587f, 0.114f));
+        shadedColor = max(mix(vec3(lum), shadedColor, 1.08f), vec3(0.0f));
+        vec3 c = clamp(shadedColor, 0.0f, 1.0f);
+        shadedColor = mix(shadedColor, c * c * (3.0f - 2.0f * c), 0.15f);
+    }
+    // The fog takes the colour of the sky behind it (so far-off land melts into the sunset
+    // instead of a grey wall with a hard edge against the sky)
+    vec3 fogC = u_FogColor;
+    // under water, the water around you is only as bright as the light that reaches it
+    if (realistic && u_CamWaterDepth > 0.0) fogC *= underwaterLight();
+    if (u_SkyFog > 0.0 && fogFactor < 1.0) {
+        vec3 vd = normalize(WorldPos - u_CameraPos);
+        vec3 sk = blocksmithSky(normalize(vec3(vd.x, max(vd.y, 0.0) * 0.6 + 0.01, vd.z)), normalize(u_SunDir), u_SkyHalo);
+        if (u_SkyBrightness < 0.999) {
+            float l = dot(sk, vec3(0.299, 0.587, 0.114));
+            sk = max(mix(vec3(l), sk, 1.0 + (1.0 - u_SkyBrightness) * 1.2), vec3(0.0)) * u_SkyBrightness;
+        }
+        fogC = mix(u_FogColor, sk, u_SkyFog);
+    }
+    // Clouds, rain and storms grey the sky over (sky.set_sky_tint): the fog the same, so distant
+    // land fades into the same dark grey instead of bright blue under a storm
+    if (u_WeatherTint.a > 0.0) fogC = mix(fogC, u_WeatherTint.rgb, u_WeatherTint.a);
+    vec3 finalRgb = mix(fogC, shadedColor, fogFactor);
     FragColorOut = vec4(finalRgb, finalColor.a);
 }
 )";
@@ -4017,6 +4633,12 @@ void drawLoadingScreen(GLuint uiProgram, GLuint fontProgram, float progress, int
 void resetForReload() {
     std::cout << "[Mods] Reloading for '" << g_Reload.world << "' (game " << g_Reload.game << ")" << std::endl;
     ++g_SessionGeneration;
+    g_Spotlights.clear();                // (mods' spotlights go with the mods)
+    g_BloomStrength = 0.6f;              // (and a game's bloom tuning)
+    g_SunShaftStrength = 0.5f;
+    g_BloomThreshold = 0.75f;
+    g_Voxels.clear();
+    VoxelVolume::invalidateOpacity();
 
     // Blocks, fluids and what's worked out from them
     resetBlockDefinitions();   // the registry, and ids start from 1 again
@@ -4055,6 +4677,7 @@ void resetForReload() {
     // Settings mods change, back to the engine's own
     g_FootstepDistance = 1.3f;
     g_FlyAllowed = true;
+    dims::Registry::get().clear();   // the next mods register their dimensions again
     g_MoveKeyMask = 0xFF;   // every movement control back (a disabled mod may have frozen some: set_player_controls)
     g_PlaceRepeatSeconds = 0.2f;
     g_LuaInventoryOpen = false;
@@ -4132,6 +4755,7 @@ int main(int argc, char** argv) {
             std::cerr << "[Error] Failed to initialize GLAD\n";
             return -1;
         }
+        installGLErrorReporting();
 
         // The window and its OpenGL context last the whole run - through every mod reload below
         struct WindowShutdown {
@@ -4478,6 +5102,16 @@ int main(int argc, char** argv) {
             GLuint shader = glCreateShader(type);
             glShaderSource(shader, 1, &src, NULL);
             glCompileShader(shader);
+            // A shader this graphics driver won't take: say so (otherwise whatever it draws
+            // just doesn't show, with no clue why)
+            GLint ok = 0;
+            glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+            if (!ok) {
+                char log[2048];
+                glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+                std::cerr << "[Shader] " << (type == GL_VERTEX_SHADER ? "vertex" : "fragment")
+                          << " shader failed on this graphics driver:\n" << log << std::endl;
+            }
             return shader;
         };
 
@@ -4748,7 +5382,7 @@ int main(int argc, char** argv) {
             "is_loaded", [](const AnimatedModel& m) { return m.loaded; }
         );
 
-        // ---- Animations (Bedrock / Blockbench .animation.json) ----
+        // ---- Animations (Bedrock / Blockbench .animation.json, or the ones saved in a .bbmodel) ----
         // local anims = engine.load_animations("player.animation.json")   (mod folder or its models/)
         // local walk = anims:get("animation.player.walk")   (or the short "walk", or nil/"" = the first)
         // walk:apply(model, time [, weight])   pose the model at `time` seconds; weight 0..1 blends
@@ -4992,6 +5626,185 @@ int main(int argc, char** argv) {
                 radius.value_or(cur.radius), intensity.value_or(cur.intensity));
         };
         skyTable["remove_light"] = [](int id) { if (g_LightingSystem) g_LightingSystem->removePointLight(id); };
+        // sky.set_bloom(strength [, threshold]): how much bright things glow (default 0.6) and how
+        // bright they must be (0..1, default 0.75) - when the player has Bloom on (Settings).
+        // sky.get_bloom() -> on, strength, threshold
+        skyTable["set_bloom"] = [](float strength, sol::optional<float> threshold) {
+            g_BloomStrength = std::clamp(strength, 0.0f, 2.0f);
+            if (threshold) g_BloomThreshold = std::clamp(*threshold, 0.0f, 0.99f);
+        };
+        // sky.set_sun_shafts(strength): how much the air glows where sunlight gets through
+        // (0 = none, default 0.5, up to 2) - when the player's lighting quality is High
+        skyTable["set_sun_shafts"] = [](float strength) { g_SunShaftStrength = std::clamp(strength, 0.0f, 2.0f); };
+        skyTable["get_bloom"] = []() {
+            return std::make_tuple(g_BloomOn && g_GpuCaps.bloom, g_BloomStrength, g_BloomThreshold);
+        };
+
+        // ---- Spotlights (Spotlights.h): stage lights with beams, gobos and traced shadows ----
+        // lights.add_spot{ x, y, z, pan, tilt, color, dimmer, intensity, angle, softness, range,
+        //                  beam, strobe, gobo, gobo_rotation, gobo_spin, shadows } -> id
+        // lights.set(id, { ...any of those... }), lights.get(id) -> table, lights.aim(id, x, y, z),
+        // lights.remove(id), lights.list() -> ids, lights.clear(), lights.set_haze(amount [, color]),
+        // lights.get_haze() -> amount, color
+        {
+            sol::table lightsTable = lua.create_named_table("lights");
+            auto colorFrom = [](const sol::object& o, glm::vec3 fallback) {
+                if (o.get_type() == sol::type::string) {
+                    std::string h = o.as<std::string>();
+                    if (!h.empty() && h[0] == '#') h.erase(0, 1);
+                    unsigned v = 0;
+                    if (h.size() == 6 && std::sscanf(h.c_str(), "%6x", &v) == 1)
+                        return glm::vec3(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f);
+                } else if (o.get_type() == sol::type::table) {
+                    sol::table t = o.as<sol::table>();
+                    glm::vec3 c(t.get_or(1, fallback.r), t.get_or(2, fallback.g), t.get_or(3, fallback.b));
+                    if (c.r > 1.0f || c.g > 1.0f || c.b > 1.0f) c /= 255.0f;   // 0..255 works too
+                    return glm::clamp(c, glm::vec3(0.0f), glm::vec3(1.0f));
+                }
+                return fallback;
+            };
+            auto apply = [colorFrom](SpotLight& s, const sol::table& t) {
+                auto num = [&](const char* k, float& v) { sol::object o = t[k]; if (o.get_type() == sol::type::number) v = o.as<float>(); };
+                num("x", s.position.x); num("y", s.position.y); num("z", s.position.z);
+                num("pan", s.pan); num("tilt", s.tilt);
+                num("dimmer", s.dimmer); num("intensity", s.intensity);
+                num("angle", s.angle); num("softness", s.softness); num("range", s.range);
+                num("beam", s.beam); num("strobe", s.strobe);
+                num("gobo_rotation", s.goboRotation); num("gobo_spin", s.goboSpin);
+                s.color = colorFrom(t["color"], s.color);
+                sol::object sh = t["shadows"];
+                if (sh.get_type() == sol::type::boolean) s.shadows = sh.as<bool>();
+                sol::object g = t["gobo"];
+                if (g.get_type() == sol::type::string) {
+                    const std::string name = g.as<std::string>();
+                    s.gobo = name.empty() ? -1 : loadTextureToLayer(name);   // a picture: white lets light through
+                } else if (g.get_type() == sol::type::boolean && !g.as<bool>()) {
+                    s.gobo = -1;
+                }
+                s.dimmer = std::clamp(s.dimmer, 0.0f, 1.0f);
+                s.intensity = std::max(0.0f, s.intensity);
+                s.angle = std::clamp(s.angle, 1.0f, 170.0f);
+                s.softness = std::clamp(s.softness, 0.0f, 1.0f);
+                s.range = std::clamp(s.range, 0.0f, 256.0f);
+                s.beam = std::max(0.0f, s.beam);
+                s.strobe = std::clamp(s.strobe, 0.0f, 30.0f);
+                s.tilt = std::clamp(s.tilt, -90.0f, 90.0f);
+            };
+            lightsTable["add_spot"] = [apply](sol::table t) {
+                SpotLight s;
+                apply(s, t);
+                return g_Spotlights.add(s);
+            };
+            lightsTable["set"] = [apply](int id, sol::table t) {
+                SpotLight* s = g_Spotlights.get(id);
+                if (!s) return false;
+                apply(*s, t);
+                return true;
+            };
+            lightsTable["get"] = [](int id, sol::this_state ts) -> sol::object {
+                sol::state_view lv(ts);
+                SpotLight* s = g_Spotlights.get(id);
+                if (!s) return sol::make_object(lv, sol::lua_nil);
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "#%02x%02x%02x", static_cast<int>(s->color.r * 255 + 0.5f),
+                              static_cast<int>(s->color.g * 255 + 0.5f), static_cast<int>(s->color.b * 255 + 0.5f));
+                sol::table t = lv.create_table();
+                t["x"] = s->position.x; t["y"] = s->position.y; t["z"] = s->position.z;
+                t["pan"] = s->pan; t["tilt"] = s->tilt; t["color"] = std::string(hex);
+                t["dimmer"] = s->dimmer; t["intensity"] = s->intensity; t["angle"] = s->angle;
+                t["softness"] = s->softness; t["range"] = s->range; t["beam"] = s->beam; t["strobe"] = s->strobe;
+                t["gobo_rotation"] = s->goboRotation; t["gobo_spin"] = s->goboSpin; t["shadows"] = s->shadows;
+                t["has_gobo"] = s->gobo >= 0;
+                return sol::make_object(lv, t);
+            };
+            // lights.aim(id, x, y, z): pan and tilt to point at that spot
+            lightsTable["aim"] = [](int id, float x, float y, float z) {
+                SpotLight* s = g_Spotlights.get(id);
+                if (!s) return false;
+                const glm::vec3 d = glm::vec3(x, y, z) - s->position;
+                const float flat = std::sqrt(d.x * d.x + d.z * d.z);
+                if (flat < 1e-4f && std::fabs(d.y) < 1e-4f) return false;
+                s->pan = glm::degrees(std::atan2(d.x, -d.z));
+                s->tilt = glm::degrees(std::atan2(d.y, flat));
+                return true;
+            };
+            lightsTable["remove"] = [](int id) { return g_Spotlights.remove(id); };
+            lightsTable["list"] = []() { return sol::as_table(g_Spotlights.ids()); };
+            lightsTable["clear"] = []() { for (int id : g_Spotlights.ids()) g_Spotlights.remove(id); };
+            // ---- dmx.*: Art-Net input (ArtNet.h), read only. The player turns it on in Settings.
+            //   dmx.status() -> { mode = "off"|"local"|"network", listening, port, packets, error }
+            //   dmx.get(universe, channel) -> 0..255 (channel 1..512; 0 if nothing has come)
+            //   dmx.read(universe, first, count) -> { values }  (a fixture's channels in one go)
+            //   dmx.frame(universe) -> how many packets have come for it (changes when new data comes)
+            //   dmx.age(universe) -> seconds since the last packet (nil: never)
+            //   dmx.universes() -> { { universe, frames, age, source }, ... }
+            {
+                sol::table dmxTable = lua.create_named_table("dmx");
+                dmxTable["status"] = [&lua]() {
+                    sol::table t = lua.create_table();
+                    const auto m = g_ArtNet.mode();
+                    t["mode"] = std::string(m == ArtNetInput::Mode::Off ? "off" : m == ArtNetInput::Mode::Local ? "local" : "network");
+                    t["listening"] = g_ArtNet.listening();
+                    t["port"] = g_ArtNet.port();
+                    t["packets"] = static_cast<double>(g_ArtNet.packets());
+                    if (!g_ArtNet.lastError().empty()) t["error"] = g_ArtNet.lastError();
+                    return t;
+                };
+                dmxTable["get"] = [](int universe, int channel) {
+                    const auto* u = g_ArtNet.universe(universe);
+                    if (!u || channel < 1 || channel > 512) return 0;
+                    return static_cast<int>(u->data[static_cast<size_t>(channel - 1)]);
+                };
+                dmxTable["read"] = [&lua](int universe, int first, int count) {
+                    sol::table t = lua.create_table();
+                    const auto* u = g_ArtNet.universe(universe);
+                    count = std::clamp(count, 0, 512);
+                    for (int i = 0; i < count; ++i) {
+                        const int ch = first + i;
+                        t[i + 1] = (u && ch >= 1 && ch <= 512) ? static_cast<int>(u->data[static_cast<size_t>(ch - 1)]) : 0;
+                    }
+                    return t;
+                };
+                dmxTable["frame"] = [](int universe) {
+                    const auto* u = g_ArtNet.universe(universe);
+                    return u ? static_cast<double>(u->frames) : 0.0;
+                };
+                dmxTable["age"] = [](int universe) -> sol::optional<double> {
+                    const auto* u = g_ArtNet.universe(universe);
+                    if (!u || u->lastTime < 0.0) return sol::nullopt;
+                    return glfwGetTime() - u->lastTime;
+                };
+                dmxTable["universes"] = [&lua]() {
+                    sol::table t = lua.create_table();
+                    int i = 1;
+                    for (const auto& [addr, u] : g_ArtNet.universes()) {
+                        sol::table e = lua.create_table();
+                        e["universe"] = addr;
+                        e["frames"] = static_cast<double>(u.frames);
+                        e["age"] = glfwGetTime() - u.lastTime;
+                        e["source"] = u.source;
+                        t[i++] = e;
+                    }
+                    return t;
+                };
+            }
+            lightsTable["set_haze"] = [colorFrom](float amount, sol::optional<sol::object> color) {
+                g_Spotlights.haze = std::clamp(amount, 0.0f, 4.0f);
+                if (color) g_Spotlights.hazeColor = colorFrom(*color, g_Spotlights.hazeColor);
+            };
+            // lights.get_quality() -> "off" | "low" | "high": the player's lighting setting (traced
+            // shadows), so a mod can go easy on lights where it's off
+            lightsTable["get_quality"] = []() {
+                return std::string(g_LightQuality >= 2 ? "high" : g_LightQuality == 1 ? "low" : "off");
+            };
+            lightsTable["get_haze"] = []() {
+                char hex[8];
+                const glm::vec3 c = g_Spotlights.hazeColor;
+                std::snprintf(hex, sizeof(hex), "#%02x%02x%02x", static_cast<int>(c.r * 255 + 0.5f),
+                              static_cast<int>(c.g * 255 + 0.5f), static_cast<int>(c.b * 255 + 0.5f));
+                return std::make_tuple(g_Spotlights.haze, std::string(hex));
+            };
+        }
 
         // ---- Block light look (Light.h) ----
         // sky.set_min_light(v): the darkest anything gets, 0..1 (default 0.02; 0 = pitch black caves)
@@ -5285,9 +6098,9 @@ int main(int argc, char** argv) {
         // x, y, z: the block's bottom corner (y has a fraction while it falls)
         sol::state_view lv(ts);
         sol::table out = lv.create_table();
-        if (g_WorldInstance) {
+        if (apiWorld()) {
             int i = 1;
-            for (const auto& f : g_WorldInstance->fallingBlocks()) {
+            for (const auto& f : apiWorld()->fallingBlocks()) {
                 sol::table t = lv.create_table();
                 t["name"] = BlockRegistry::getInstance().getBlock(f.id).name;
                 t["x"] = f.pos.x; t["y"] = f.pos.y; t["z"] = f.pos.z;
@@ -5348,6 +6161,7 @@ int main(int argc, char** argv) {
         menuTable["set_active_game"] = [](std::string folderName) { g_ActiveGameFolder = folderName; };
 
         auto engineTable = lua.create_named_table("engine");
+        dims::installLua(lua);   // dimensions.register / get / list (DimensionsLua.h)
         // Server-side events and player functions (ServerLuaApi.h): in singleplayer and when
         // hosting a LAN game, the same as on the dedicated server
         g_ServerApi.lua = &lua;
@@ -5362,7 +6176,32 @@ int main(int argc, char** argv) {
             p.pos = g_PlayerInstance->position;
             p.mode = g_Creative ? "creative" : "survival";
             p.op = true;
+            p.dimension = g_WorldInstance->dimension();
             return true;
+        };
+        // Dimensions: this game's player moves here; anyone else asks the server we're hosting
+        g_ServerApi.changeDimension = [](const std::string& name, const std::string& d, const glm::vec3& pos) {
+            if (name == playerName() && !g_Client.active()) return changeLocalDimension(d, pos);
+            return g_Server.running() && g_Server.setPlayerDimension(name, d, pos);
+        };
+        g_ServerApi.loadArea = [&lua](const std::string& d, int x, int z, int radius) {
+            if (g_Client.active()) return false;   // (joined: the server's world, not ours to load)
+            World* w = g_DimWorlds.get(d);
+            if (!w) return false;
+            g_DimWorlds.touch(d);
+            const int r = (radius + CHUNK_WIDTH - 1) / CHUNK_WIDTH;
+            const int ccx = static_cast<int>(std::floor(x / static_cast<float>(CHUNK_WIDTH)));
+            const int ccz = static_cast<int>(std::floor(z / static_cast<float>(CHUNK_WIDTH)));
+            bool ok = true;
+            for (int cx = ccx - r; cx <= ccx + r; ++cx)
+                for (int cz = ccz - r; cz <= ccz + r; ++cz)
+                    if (!w->chunkData({cx, cz})) ok = w->loadChunk(cx, cz, lua) && ok;
+            return ok;
+        };
+        g_ServerApi.loadDimension = [](const std::string& d) {
+            World* w = g_DimWorlds.get(d);
+            if (w) g_DimWorlds.touch(d);
+            return w != nullptr;
         };
         g_ServerApi.localMessage = [](const std::string& text, const glm::vec3& color) {
             if (g_ChatSystem) g_ChatSystem->addMessage(text, color);
@@ -5383,6 +6222,29 @@ int main(int argc, char** argv) {
             t["hosting"] = g_Server.running();
         };
         g_ServerApi.addFunctions(engineTable);
+        // Block text (signs): reading and setting where the world runs; this game's player's own
+        // edits go to the server when joined, else through the same checks here
+        blockstate::install(engineTable, []() { return apiWorld(); });   // BlockStateLua.h
+        blocktext::install(engineTable, []() { return apiWorld(); }, []() { return !g_Client.active(); },
+            [](const glm::ivec3& pos, int side, const std::vector<std::string>& linesIn) {
+                if (g_Client.state() == GameClient::State::Joined) return g_Client.sendBlockText(pos, side, linesIn);
+                if (g_Client.active()) return false;
+                World* w = apiWorld();
+                if (!w) return false;
+                const uint8_t id = w->getBlockAt(pos);
+                if (id == 0 || !BlockRegistry::getInstance().getBlock(id).holdsText) return false;
+                const BlockText* old = w->getBlockTextAt(pos);
+                if (old && old->waxed) return false;
+                std::vector<std::string> lines = linesIn;
+                std::string refusal;
+                if (!g_ServerApi.canEditText(playerName(), pos, side, lines, refusal)) {
+                    if (!refusal.empty() && g_ChatSystem) g_ChatSystem->addMessage(refusal, glm::vec3(1.0f, 0.55f, 0.55f));
+                    return false;
+                }
+                BlockText t = old ? *old : BlockText();
+                (side == 1 ? t.back : t.front).lines = lines;
+                return w->setBlockTextAt(pos, t);
+            });
         engineTable["register_block"] = &registerBlockFromLua;
         engineTable["get_block_id"] = &getBlockIdLua;
         engineTable["set_fov"] = [](float fov) { g_FieldOfView = fov; };
@@ -5392,8 +6254,9 @@ int main(int argc, char** argv) {
         engineTable["set_moon_texture"] = [](std::string path) { if (g_LightingSystem) g_LightingSystem->setMoonTexture(path); };
 
         // engine.load_model(path [, texture [, scale]])
-        //   path    - .json (Bedrock geometry) or .b3d (Luanti mesh), found in the mod's folder or models/
-        //   texture - image for the model; defaults to the one named inside a .b3d
+        //   path    - .json (Bedrock geometry), .bbmodel (a Blockbench project, textures and all) or
+        //             .b3d (Luanti mesh), found in the mod's folder or models/
+        //   texture - image for the model; defaults to the one inside a .bbmodel / named inside a .b3d
         //   scale   - size multiplier; .b3d models default to 0.1 (10 units = 1 block)
         engineTable["load_model"] = [](std::string path, sol::optional<std::string> texture, sol::optional<float> scale) {
             auto model = std::make_shared<AnimatedModel>();
@@ -5404,12 +6267,7 @@ int main(int argc, char** argv) {
                 return model;
             }
             model->loadFromFile(resolved);
-
-            const std::string tex = texture.value_or(model->textureHint);
-            if (!tex.empty()) {
-                const std::string texPath = resolveAssetPath(tex, "textures");
-                model->texture = loadStandardTexture(texPath.empty() ? tex : texPath);
-            }
+            loadModelTextures(*model, texture.value_or(""));
             if (scale.has_value()) model->scale = scale.value();
             return model;
         };
@@ -5494,6 +6352,15 @@ int main(int argc, char** argv) {
                 if (g_Server.running()) for (const auto& p : g_Server.playerPositions()) out.push_back(p);
                 return out;
             };
+            // Dimensions: each player with where they are, and each loaded dimension's world
+            host.playerPlaces = [] {
+                std::vector<std::tuple<std::string, glm::vec3, std::string>> out;
+                if (g_PlayerInstance && g_WorldInstance && g_CurrentGameState == GameState::PLAYING)
+                    out.emplace_back(playerName(), g_PlayerInstance->position, g_WorldInstance->dimension());
+                if (g_Server.running()) for (const auto& p : g_Server.playerPlaces()) out.emplace_back(p.name, p.pos, p.dimension);
+                return out;
+            };
+            host.worldFor = [](const std::string& d) -> const World* { return g_DimWorlds.find(d); };
             // Hurting a player: theirs to decide (the survival mod's on_server_action "damage")
             host.damagePlayer = [&lua](const std::string& name, float amount, const std::string& reason) {
                 char buf[32];
@@ -5513,7 +6380,7 @@ int main(int argc, char** argv) {
                 return g_Server.running() && g_Server.sendAction(name, "give", item, std::to_string(count));
             };
             host.lightLevel = [](int x, int y, int z) {
-                const uint16_t l = g_WorldInstance ? g_WorldInstance->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
+                const uint16_t l = apiWorld() ? apiWorld()->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
                 float day = 1.0f;
                 if (g_LightingSystem) day = std::max(0.0f, std::min(1.0f, g_LightingSystem->getSunDirection().y * 2.0f + 0.5f));
                 const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
@@ -5541,11 +6408,7 @@ int main(int argc, char** argv) {
                     } else {
                         v.model = std::make_shared<AnimatedModel>();
                         v.model->loadFromFile(resolved);
-                        const std::string tex = def.get_or("texture", v.model->textureHint);
-                        if (!tex.empty()) {
-                            const std::string texPath = resolveAssetPath(tex, "textures");
-                            v.model->texture = loadStandardTexture(texPath.empty() ? tex : texPath);
-                        }
+                        loadModelTextures(*v.model, def.get_or("texture", std::string()));
                     }
                 }
                 const std::string animFile = def.get_or("animations", std::string());
@@ -5604,14 +6467,14 @@ int main(int argc, char** argv) {
         };
 
         engineTable["set_block"] = [](int x, int y, int z, const std::string& blockName) {
-            if (g_WorldInstance) {
+            if (apiWorld()) {
                 uint8_t id = BlockRegistry::getInstance().getBlockId(blockName);
-                g_WorldInstance->setBlockAt(glm::ivec3(x, y, z), id);
+                apiWorld()->setBlockAt(glm::ivec3(x, y, z), id);
             }
         };
         engineTable["get_block_name"] = [](int x, int y, int z) -> std::string {
-            if (g_WorldInstance) {
-                uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
+            if (apiWorld()) {
+                uint8_t id = apiWorld()->getBlockAt(glm::ivec3(x, y, z));
                 if (id == 0) return "air";
                 return BlockRegistry::getInstance().getBlock(id).name;
             }
@@ -5620,13 +6483,13 @@ int main(int argc, char** argv) {
         // engine.get_metadata(x, y, z) -> 0..255 (water: flow level in the low 3 bits, 8 = falling)
         // engine.get_light(x, y, z) -> sun, red, green, blue (0..15 each): the light at a block
         engineTable["get_light"] = [](int x, int y, int z) -> std::tuple<int, int, int, int> {
-            const uint16_t l = g_WorldInstance ? g_WorldInstance->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
+            const uint16_t l = apiWorld() ? apiWorld()->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
             return std::make_tuple(light::sky(l), light::red(l), light::green(l), light::blue(l));
         };
         // engine.get_light_level(x, y, z) -> 0..15: how bright it is there right now (the brightest
         // of block light and sunlight, sunlight lower at night) - for mob spawning, plant growth...
         engineTable["get_light_level"] = [](int x, int y, int z) -> int {
-            const uint16_t l = g_WorldInstance ? g_WorldInstance->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
+            const uint16_t l = apiWorld() ? apiWorld()->getLightAt(glm::ivec3(x, y, z)) : ChunkData::kFullSky;
             float day = 1.0f;
             if (g_LightingSystem) day = std::max(0.0f, std::min(1.0f, g_LightingSystem->getSunDirection().y * 2.0f + 0.5f));
             const int skyNow = std::max(0, light::sky(l) - static_cast<int>(std::lround((1.0f - day) * 11.0f)));
@@ -5636,37 +6499,37 @@ int main(int argc, char** argv) {
         // (both on by default). Every chunk is redrawn.
         engineTable["set_smooth_lighting"] = [](bool on) {
             ChunkMesh::smoothLighting = on;
-            if (g_WorldInstance) g_WorldInstance->markAllDirty();
+            if (apiWorld()) apiWorld()->markAllDirty();
         };
         engineTable["set_ambient_occlusion"] = [](bool on) {
             ChunkMesh::ambientOcclusion = on;
-            if (g_WorldInstance) g_WorldInstance->markAllDirty();
+            if (apiWorld()) apiWorld()->markAllDirty();
         };
         engineTable["get_metadata"] = [](int x, int y, int z) -> int {
-            return g_WorldInstance ? g_WorldInstance->getMetadataAt(glm::ivec3(x, y, z)) : 0;
+            return apiWorld() ? apiWorld()->getMetadataAt(glm::ivec3(x, y, z)) : 0;
         };
         // engine.set_block_meta(x, y, z, name, meta): block and metadata in one change
         engineTable["set_block_meta"] = [](int x, int y, int z, const std::string& blockName, int meta) {
-            if (!g_WorldInstance) return;
+            if (!apiWorld()) return;
             const uint8_t id = BlockRegistry::getInstance().getBlockId(blockName);
-            g_WorldInstance->setBlockWithMetaAt(glm::ivec3(x, y, z), id, static_cast<uint8_t>(meta & 0xFF));
+            apiWorld()->setBlockWithMetaAt(glm::ivec3(x, y, z), id, static_cast<uint8_t>(meta & 0xFF));
         };
         // engine.register_fluid, register_fluid_reaction, get_fluid, is_fluid_source,
         // list_fluids (Fluids.cpp)
-        addFluidLuaApi(lua, engineTable, []() { return g_WorldInstance; });
+        addFluidLuaApi(lua, engineTable, []() { return apiWorld(); });
         // engine.is_replaceable(x, y, z): air, a fluid or a plant - room to put something
         // engine.is_opaque(x, y, z) -> true for a solid block light can't pass (stone, dirt...):
         // not air, water, plants, leaves or glass. (Grass under one turns to dirt.)
         engineTable["is_opaque"] = [](int x, int y, int z) {
-            if (!g_WorldInstance) return false;
-            const uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
+            if (!apiWorld()) return false;
+            const uint8_t id = apiWorld()->getBlockAt(glm::ivec3(x, y, z));
             if (id == 0 || FluidRegistry::get().forBlock(id)) return false;
             const auto& b = BlockRegistry::getInstance().getBlock(id);
             return b.isWalkable && !b.isTransparent && !b.isCutout;
         };
         engineTable["is_replaceable"] = [](int x, int y, int z) {
-            if (!g_WorldInstance) return false;
-            const uint8_t id = g_WorldInstance->getBlockAt(glm::ivec3(x, y, z));
+            if (!apiWorld()) return false;
+            const uint8_t id = apiWorld()->getBlockAt(glm::ivec3(x, y, z));
             if (id == 0) return true;
             const auto& prop = BlockRegistry::getInstance().getBlock(id);
             return FluidRegistry::get().forBlock(id) != nullptr || prop.pattern == "plantlike";
@@ -5800,14 +6663,14 @@ int main(int argc, char** argv) {
             t["sneaking"] = (k & MoveInput::Sneak) != 0;
             t["jumping"] = (k & MoveInput::Jump) != 0;
             t["flying"] = g_Flying;
-            if (g_WorldInstance) {
+            if (apiWorld()) {
                 auto fluidAt = [](const glm::vec3& v) -> const FluidDef* {
                     FluidRegistry::get().ensureFresh();
-                    return FluidRegistry::get().forBlock(g_WorldInstance->getBlockAt(glm::ivec3(
+                    return FluidRegistry::get().forBlock(apiWorld()->getBlockAt(glm::ivec3(
                         static_cast<int>(std::floor(v.x)), static_cast<int>(std::floor(v.y)), static_cast<int>(std::floor(v.z)))));
                 };
                 if (const FluidDef* f = fluidAt(p->position + glm::vec3(0.0f, 0.1f, 0.0f))) t["feet_fluid"] = f->name;
-                if (const FluidDef* f = fluidAt(p->position + glm::vec3(0.0f, 1.62f, 0.0f))) t["head_fluid"] = f->name;
+                if (const FluidDef* f = fluidAt(p->eyePosition())) t["head_fluid"] = f->name;
             }
             return t;
         };
@@ -5826,9 +6689,23 @@ int main(int argc, char** argv) {
         };
         // engine.respawn_player(x, y, z): back to a spawn point. When joined, the server
         // moves you to its spawn instead (the coordinates are ignored).
-        engineTable["respawn_player"] = [](sol::optional<float> x, sol::optional<float> y, sol::optional<float> z) {
+        // Like Minecraft, respawning is in the overworld (wherever you died), unless `dimension`
+        // says otherwise (a respawn anchor's): engine.respawn_player(x, y, z [, dimension])
+        engineTable["respawn_player"] = [](sol::optional<float> x, sol::optional<float> y, sol::optional<float> z,
+                                           sol::optional<std::string> dimension) {
             if (g_Client.state() == GameClient::State::Joined) { g_Client.sendCommand("respawn"); return true; }
             if (!g_PlayerInstance || !x || !y || !z) return false;
+            // the dimension: the one given, else where the dimension we died in sends us (its
+            // `respawn`: the overworld by default) - at that dimension's spawn if it isn't the overworld
+            glm::vec3 at(*x, *y, *z);
+            std::string d;
+            if (dimension) d = DimensionWorlds::norm(*dimension);
+            else if (g_WorldInstance) {
+                d = dims::respawnDimension(g_WorldInstance->dimension());
+                if (!d.empty()) at = dims::Registry::get().type(d).spawn;
+            }
+            if (g_WorldInstance && g_WorldInstance->dimension() != d) return changeLocalDimension(d, at);
+            if (!dimension && !d.empty()) { g_PlayerInstance->position = at; g_PlayerInstance->velocity = glm::vec3(0.0f); return true; }
             g_PlayerInstance->position = glm::vec3(*x, *y, *z);
             g_PlayerInstance->velocity = glm::vec3(0.0f);
             return true;
@@ -6016,7 +6893,7 @@ int main(int argc, char** argv) {
 
         // engine.is_outdoors(x, y, z) -> true if nothing is above (rain reaches it)
         engineTable["is_outdoors"] = [](int x, int y, int z) {
-            return g_WorldInstance && g_WorldInstance->hasSkyAbove(glm::ivec3(x, y, z));
+            return apiWorld() && apiWorld()->hasSkyAbove(glm::ivec3(x, y, z));
         };
         // engine.give_item(name [, count]) -> true if it fit: into a slot holding the same item,
         // else the first empty slot
@@ -6107,6 +6984,54 @@ int main(int argc, char** argv) {
                 e["min"] = s.minV;
                 e["max"] = s.maxV;
                 e["step"] = s.step;
+                // Choices shown as buttons; ones this graphics card can't take are greyed out
+                // (disabled) with the reason (GpuCheck.h)
+                if (std::string(s.id) == "artnet") {
+                    sol::table opts = lua.create_table();
+                    const char* names[3] = { "Off", "This computer", "Network" };
+                    for (int v = 0; v < 3; ++v) {
+                        sol::table o = lua.create_table();
+                        o["label"] = std::string(names[v]);
+                        o["value"] = v;
+                        opts[v + 1] = o;
+                    }
+                    e["options"] = opts;
+                    std::string note = "DMX from lighting software or a console, for mods like Stage Lights. "
+                                       "This computer: software on this PC. Network: a desk or another PC.";
+                    if (!g_ArtNet.lastError().empty()) note = "Art-Net input couldn't start: " + g_ArtNet.lastError();
+                    e["note"] = note;
+                }
+                if (std::string(s.id) == "filmic") {
+                    sol::table opts = lua.create_table();
+                    for (int v = 0; v < 2; ++v) {
+                        sol::table o = lua.create_table();
+                        o["label"] = std::string(v ? "On" : "Off");
+                        o["value"] = v;
+                        if (v && g_GpuCaps.maxLightQuality <= 0) o["disabled"] = true;
+                        opts[v + 1] = o;
+                    }
+                    e["options"] = opts;
+                    e["note"] = std::string(g_GpuCaps.maxLightQuality <= 0
+                        ? "Needs Lighting Low or High, which this graphics card can't run"
+                        : "With Lighting Low or High: a film-like curve and exposure that adjusts to day and night");
+                }
+                if (std::string(s.id) == "light_quality" || std::string(s.id) == "bloom") {
+                    const bool isLight = std::string(s.id) == "light_quality";
+                    sol::table opts = lua.create_table();
+                    const char* names[3] = { "Off", isLight ? "Low" : "On", "High" };
+                    const int count = isLight ? 3 : 2;
+                    for (int v = 0; v < count; ++v) {
+                        sol::table o = lua.create_table();
+                        o["label"] = std::string(names[v]);
+                        o["value"] = v;
+                        const bool ok = isLight ? v <= g_GpuCaps.maxLightQuality : (v == 0 || g_GpuCaps.bloom);
+                        if (!ok) o["disabled"] = true;
+                        opts[v + 1] = o;
+                    }
+                    e["options"] = opts;
+                    const std::string& why = isLight ? g_GpuCaps.lightReason : g_GpuCaps.bloomReason;
+                    if (!why.empty()) e["note"] = why;
+                }
                 t[idx++] = e;
             }
             return t;
@@ -6127,6 +7052,8 @@ int main(int argc, char** argv) {
                 if (g_WorldInstance) g_WorldInstance->finishFalling();
                 saveCurrentWorld();
             }
+            g_DimWorlds.unloadAll();          // (the world's other dimensions close with it)
+            dims::currentRef().clear();
             const bool wasOnline = g_Client.active();
             if (g_Client.active()) g_Client.disconnect();
             if (g_Server.running()) { g_ServerApi.serverStopping(); g_ServerApi.flush(); g_Server.stop(); }
@@ -6400,8 +7327,21 @@ int main(int argc, char** argv) {
                 if (kind == 0) g_EntityLua.punch(id, name, at, item);
                 else g_EntityLua.rightClick(id, name, item);
             };
+            // Dimensions: guests may be in any of the world's dimensions (the background ones run here)
+            g_Server.worldFor = [](const std::string& d) { return g_DimWorlds.get(d); };
+            g_Server.forEachWorld = [](const std::function<void(const std::string&, World&)>& fn) {
+                if (g_WorldInstance) fn(g_WorldInstance->dimension(), *g_WorldInstance);
+                g_DimWorlds.forEach(fn);
+            };
+            g_Server.onDimensionChange = [](const std::string& name, const std::string& from, const std::string& to) {
+                g_ServerApi.dimensionChanged(name, from, to);
+            };
             g_Server.onHarvest = [](const std::string& name, const std::string& item, const glm::ivec3& pos) {
                 g_ServerApi.harvest(name, item, pos);
+            };
+            g_Server.canEditText = [](const std::string& name, const glm::ivec3& pos, int side, std::vector<std::string>& lines,
+                                      std::string& refusal) {
+                return g_ServerApi.canEditText(name, pos, side, lines, refusal);
             };
             g_Server.onModMessage = [](const std::string& name, const std::string& channel, const std::string& data) {
                 g_ServerApi.modMessage(name, channel, data);
@@ -6949,6 +7889,18 @@ int main(int argc, char** argv) {
 
         // Player settings (key bindings, FOV, ...) from settings.txt
         loadSettings();
+        // Once a run: what this graphics card can take (Settings greys out the rest)
+        {
+            static bool s_gpuChecked = false;
+            if (!s_gpuChecked) {
+                s_gpuChecked = true;
+                const auto it = g_Settings.find("gpu_check");
+                g_GpuCaps = detectGpuCaps(it != g_Settings.end() && (it->second == "off" || it->second == "false" || it->second == "0"));
+            }
+            g_LightQuality = currentVideoSetting("light_quality");
+            g_BloomOn = currentVideoSetting("bloom") != 0;
+            g_FilmicOn = currentVideoSetting("filmic") != 0;
+        }
 
         // update_check = false in settings.txt turns the new-version check off; update_url points
         // it at another version file (it must be allowed like any remote content)
@@ -7200,6 +8152,17 @@ int main(int argc, char** argv) {
         for (const auto& f : modFiles) if (f.filename() != "init.lua" && !isInsideInitFolder(f)) genModFiles.push_back(f);
         ChunkGenerator chunkGenerator(0, [genModFiles]() { return makeWorldGenLua(genModFiles); }, world.seed(), 2);
         world.setGenerator(&chunkGenerator);
+        // The world's other dimensions use the same generator threads (Dimensions.h)
+        g_DimWorlds.primary = &world;
+        g_DimWorlds.generator = &chunkGenerator;
+        g_DimWorlds.onLoaded = [](const std::string& d, World& w) {
+            if (g_Server.running()) w.setRecordChanges(true);
+            g_BlockMods.loadDimension(d, w.saveDirectory());
+        };
+        g_DimWorlds.onUnloading = [](const std::string& d, World& w) {
+            g_BlockMods.saveDimension(d, w.saveDirectory());
+            g_BlockMods.forgetDimension(d);
+        };
         std::cout << "[World] Generating chunks on " << chunkGenerator.threadCount() << " background thread"
                   << (chunkGenerator.threadCount() == 1 ? "" : "s") << std::endl;
 
@@ -7207,6 +8170,22 @@ int main(int argc, char** argv) {
         glAttachShader(shaderProgram, compileShader(GL_VERTEX_SHADER, vertexShaderSource));
         glAttachShader(shaderProgram, compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource));
         glLinkProgram(shaderProgram);
+        {
+            GLint ok = 0;
+            glGetProgramiv(shaderProgram, GL_LINK_STATUS, &ok);
+            if (!ok) {
+                char log[2048];
+                glGetProgramInfoLog(shaderProgram, sizeof(log), nullptr, log);
+                std::cerr << "[Shader] the world shader failed to link on this graphics driver:\n" << log << std::endl;
+            }
+            // Every texture it reads gets its own unit right away (two kinds of texture on one
+            // unit - as they all are, on 0, until set - and strict drivers refuse every draw)
+            glUseProgram(shaderProgram);
+            glUniform1i(glGetUniformLocation(shaderProgram, "textureArray"), 0);
+            glUniform1i(glGetUniformLocation(shaderProgram, "u_Voxels"), 3);
+            glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneColor"), 5);
+            glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneDepth"), 6);
+        }
         glUseProgram(shaderProgram);
         glUniform1f(glGetUniformLocation(shaderProgram, "u_WeatherLight"), 1.0f);
         glUniform4f(glGetUniformLocation(shaderProgram, "u_FallbackLight"), 1.0f, 0.0f, 0.0f, 0.0f);
@@ -7358,7 +8337,11 @@ int main(int argc, char** argv) {
                         glfwSetWindowShouldClose(win, true);
                     }
                 } else if (settingsOpen()) {
+                    // (the player's own click: the only thing allowed to change their lighting and
+                    // bloom - see setVideoSetting)
+                    g_PlayerSettingsClick = true;
                     callLuaUI(ctx->lua, "handle_settings_click", mx, my, sw, sh);
+                    g_PlayerSettingsClick = false;
                 } else if (g_CurrentGameState == GameState::WORLD_SELECT) {
                     callLuaUI(ctx->lua, "handle_world_select_click", mx, my, sw, sh);
                 } else if (g_CurrentGameState == GameState::MULTIPLAYER) {
@@ -7441,7 +8424,7 @@ int main(int argc, char** argv) {
 
             g_PlayerPosition = player.position;
             {
-                const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+                const glm::vec3 eye = player.eyePosition();
                 const glm::vec3 fwd(std::cos(glm::radians(player.yaw)) * std::cos(glm::radians(player.pitch)),
                                     std::sin(glm::radians(player.pitch)),
                                     std::sin(glm::radians(player.yaw)) * std::cos(glm::radians(player.pitch)));
@@ -7572,6 +8555,7 @@ int main(int argc, char** argv) {
             // on_update(dt): errors are printed (once until the message changes), never hidden
             {
                 static std::string lastUpdateError;
+                g_ArtNet.poll(glfwGetTime());           // (DMX that arrived: before mods read it)
                 sol::protected_function onUpdate = lua["on_update"];
                 if (onUpdate.valid()) {
                     sol::protected_function_result r = onUpdate(deltaTime);
@@ -7592,10 +8576,18 @@ int main(int argc, char** argv) {
                 g_EntityLua.setWorld(g_WorldInstance);
                 g_EntityLua.step(std::min(deltaTime, 0.1f));
                 // ABMs (grass spreading, crops...) near players; LBMs on chunks that just loaded
-                std::vector<glm::vec3> nearPlayers;
-                if (g_PlayerInstance) nearPlayers.push_back(g_PlayerInstance->position);
-                if (g_Server.running()) for (const auto& p : g_Server.playerPositions()) nearPlayers.push_back(p.second);
-                g_BlockMods.update(std::min(deltaTime, 0.25f), *g_WorldInstance, nearPlayers);
+                // (each dimension's own: ours on screen, and the ones guests are in)
+                std::map<std::string, std::vector<glm::vec3>> byDim;
+                if (g_PlayerInstance) byDim[g_WorldInstance->dimension()].push_back(g_PlayerInstance->position);
+                if (g_Server.running()) for (const auto& p : g_Server.playerPlaces()) byDim[p.dimension].push_back(p.pos);
+                g_BlockMods.update(std::min(deltaTime, 0.25f), *g_WorldInstance, byDim[g_WorldInstance->dimension()]);
+                g_DimWorlds.forEach([&](const std::string& d, World& w) {
+                    dims::InDimension here(d);
+                    g_BlockMods.update(std::min(deltaTime, 0.25f), w, byDim[d]);
+                });
+                // the background dimensions load around their players, flow, and unload when empty
+                byDim.erase(g_WorldInstance->dimension());
+                g_DimWorlds.update(lua, std::min(deltaTime, 0.25f), glfwGetTime(), byDim);
             }
 
             int width, height;
@@ -7828,7 +8820,7 @@ int main(int argc, char** argv) {
                             }
                         }
                         feetWasWet = feetWet;
-                        if (wetAt(player.position + glm::vec3(0.0f, 1.62f, 0.0f))) {
+                        if (wetAt(player.eyePosition())) {
                             const int bubble = particleSprite("bubble");
                             for (bubbleOwed += deltaTime * 2.5f; bubbleOwed >= 1.0f && bubble >= 0; bubbleOwed -= 1.0f) {
                                 ParticleSpec b;
@@ -7877,7 +8869,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            glm::vec3 rayOrigin = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+            glm::vec3 rayOrigin = player.eyePosition();
             glm::vec3 rayDir;
             rayDir.x = cos(glm::radians(player.yaw)) * cos(glm::radians(player.pitch));
             rayDir.y = sin(glm::radians(player.pitch));
@@ -8061,18 +9053,20 @@ int main(int argc, char** argv) {
                     }
                     spawnBreakParticles(pos, id);
                     playBlockSound(id, "dug", glm::vec3(pos) + glm::vec3(0.5f));
-                    world.setBlockAt(pos, 0);
+                    clearBrokenBlock(world, pos);
                     blockBroken(pos, block.name, brokenMeta);
                     if (handled) return;
                     if (blockNeedsTool(block) && !rightTool(block)) return;   // stone by hand: nothing
                     const std::string drop = block.dropsSet ? block.drops : block.name;
+                    // a double slab is two slabs
+                    const int dropCount = (shape::isSlab(block) && (brokenMeta & 3) == shape::kSlabDouble) ? 2 : 1;
                     // It pops out as an item to pick up (walk over it), like Minecraft
                     if (!drop.empty()) {
                         const glm::vec3 at = glm::vec3(pos) + glm::vec3(0.5f, 0.25f, 0.5f);
                         if (entitiesHere()) {
-                            if (!g_EntityLua.drop(drop, 1, at)) giveHotbarItem(drop, 1);
+                            if (!g_EntityLua.drop(drop, dropCount, at)) giveHotbarItem(drop, dropCount);
                         } else {
-                            g_Client.sendDropItem(drop, 1, at);
+                            g_Client.sendDropItem(drop, dropCount, at);
                         }
                     }
                 };
@@ -8106,7 +9100,7 @@ int main(int argc, char** argv) {
                                     const uint8_t brokenMeta = world.getMetadataAt(hitPos);
                                     spawnBreakParticles(hitPos, targetBlockId);
                                     playBlockSound(targetBlockId, "dug", glm::vec3(hitPos) + glm::vec3(0.5f));
-                                    world.setBlockAt(hitPos, 0);
+                                    clearBrokenBlock(world, hitPos);
                                     blockBroken(hitPos, targetProp.name, brokenMeta);
                                 }
                             } else {
@@ -8221,7 +9215,8 @@ int main(int argc, char** argv) {
                                 // instead of using it; repeat = from holding the button
                                 sol::protected_function_result res = clickFunc(hitPos.x, hitPos.y, hitPos.z, targetProp.name,
                                                                                activeItemName, sneaking, rightRepeat);
-                                if (res.valid()) handled = res.get<bool>();
+                                // (a hook that returns nothing means "not handled", never a crash)
+                                if (res.valid()) handled = res.get_type() == sol::type::boolean && res.get<bool>();
                             }
                             if (handled) g_FirstPerson.swing();   // opened a door, a workbench...
 
@@ -8241,9 +9236,43 @@ int main(int argc, char** argv) {
                                     // ternary isn't mixing glm::ivec3 and glm::vec3.
                                     const glm::ivec3 hitCell(rayResult.blockPos);
                                     const int farmlandLift = (targetProp.name.find("farmland") != std::string::npos) ? 1 : 0;
-                                    const glm::ivec3 cell = replaceTarget
+                                    glm::ivec3 cell = replaceTarget
                                         ? hitCell + glm::ivec3(0, farmlandLift, 0)
                                         : hitCell + glm::ivec3(glm::round(glm::vec3(rayResult.faceNormal)));
+
+                                    // How it's turned / which half (BlockShape.h), from where the
+                                    // player looks and the spot they clicked
+                                    const BlockProperty& placeProp = BlockRegistry::getInstance().getBlock(selectedBlock);
+                                    const glm::ivec3 clickN = rayResult.faceNormal;
+                                    // the way the player looks, flat: 0 north, 1 east, 2 south, 3 west
+                                    const int lookDir = std::fabs(rayDir.x) > std::fabs(rayDir.z)
+                                        ? (rayDir.x > 0.0f ? 1 : 3) : (rayDir.z > 0.0f ? 2 : 0);
+                                    // the upper half of a block's side was clicked
+                                    const bool upperHalf = clickN.y < 0 ||
+                                        (clickN.y == 0 && rayResult.hitPoint.y - std::floor(rayResult.hitPoint.y) > 0.5f);
+                                    uint8_t placeMeta = 0;
+                                    bool mergeSlab = false;          // a second slab into the same cell: a double slab
+                                    if (shape::isSlab(placeProp)) {
+                                        auto halfAt = [&](const glm::ivec3& c, uint8_t& half) {
+                                            if (world.getBlockAt(c) != selectedBlock) return false;
+                                            half = world.getMetadataAt(c) & 3;
+                                            return half != shape::kSlabDouble;
+                                        };
+                                        uint8_t half = 0;
+                                        if (!replaceTarget && halfAt(hitCell, half) &&
+                                            ((clickN.y > 0 && half == shape::kSlabBottom) || (clickN.y < 0 && half == shape::kSlabTop))) {
+                                            cell = hitCell;                // clicked the open side of a slab
+                                            mergeSlab = true;
+                                        } else if (halfAt(cell, half)) {
+                                            mergeSlab = true;              // into a cell that holds a slab already
+                                        }
+                                        placeMeta = mergeSlab ? shape::kSlabDouble
+                                                  : (clickN.y > 0 ? shape::kSlabBottom : upperHalf ? shape::kSlabTop : shape::kSlabBottom);
+                                    } else if (shape::isStairs(placeProp)) {
+                                        placeMeta = static_cast<uint8_t>(lookDir | (upperHalf && clickN.y <= 0 ? shape::kStairUpsideDown : 0));
+                                    } else if (placeProp.rotation == shape::kRotAxis) {
+                                        placeMeta = clickN.y != 0 ? 0 : clickN.x != 0 ? 1 : 2;      // along the face it went on
+                                    }
 
                                     // Don't place a solid block where the player is standing (or jumping).
                                     // Player box: 0.6 wide, 1.8 tall, feet at player.position.
@@ -8259,7 +9288,7 @@ int main(int argc, char** argv) {
                                     const bool solid = BlockRegistry::getInstance().getBlock(selectedBlock).isWalkable;
                                     // Only into a free space: air, a fluid or a plant (never over a
                                     // door you reached past, or any other block)
-                                    bool cellFree = replaceTarget;
+                                    bool cellFree = replaceTarget || mergeSlab;
                                     if (!cellFree) {
                                         const uint8_t existing = world.getBlockAt(cell);
                                         const auto& ep = BlockRegistry::getInstance().getBlock(existing);
@@ -8267,8 +9296,14 @@ int main(int argc, char** argv) {
                                                 || ep.pattern == "plantlike";
                                     }
 
-                                    if (cellFree && !(solid && overlapsPlayer)) {
-                                        world.setBlockAt(cell, selectedBlock);
+                                    if (cellFree && !(solid && overlapsPlayer && !mergeSlab)) {
+                                        // Into a water source: slabs and stairs hold it (waterlogged)
+                                        if (!mergeSlab && shape::canWaterlog(placeProp, placeMeta)) {
+                                            const FluidCell wc = FluidRegistry::get().cell(world.getBlockAt(cell), world.getMetadataAt(cell));
+                                            if (wc && wc.source && wc.fluid->name == "water") placeMeta |= shape::kWaterlogged;
+                                        }
+                                        if (placeMeta != 0 || mergeSlab) world.setBlockWithMetaAt(cell, selectedBlock, placeMeta);
+                                        else world.setBlockAt(cell, selectedBlock);
                                         g_FirstPerson.swing();
                                         // on_block_placed(x, y, z, block): a player put a block down
                                         {
@@ -8305,7 +9340,7 @@ int main(int argc, char** argv) {
             // Third-person camera (F5): behind the player (or in front, looking back at them), pulled
             // in so it never goes through blocks
             if (g_ThirdPerson && g_CurrentGameState == GameState::PLAYING) {
-                const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+                const glm::vec3 eye = player.eyePosition();
                 const glm::vec3 front = glm::normalize(glm::vec3(
                     cos(glm::radians(player.yaw)) * cos(glm::radians(player.pitch)),
                     sin(glm::radians(player.pitch)),
@@ -8328,10 +9363,24 @@ int main(int argc, char** argv) {
                 view = glm::lookAt(eye + away * dist, eye, glm::vec3(0.0f, 1.0f, 0.0f));
             }
 
+            // The dimension's sky (Dimensions.h): a fixed time of day, and how the sky looks -
+            // "overworld" (sun, moon, stars, clouds), "nether" (only fog), "end" (a dark sky)
+            const DimensionType& dimType = world.dimensionType();
+            {
+                static bool fixedApplied = false;
+                if (dimType.fixedTime >= 0.0) {
+                    g_LightingSystem->customTimeOfDay = static_cast<float>(dimType.fixedTime);
+                    fixedApplied = true;
+                } else if (fixedApplied) {
+                    g_LightingSystem->customTimeOfDay = -1.0f;   // back to the world's clock
+                    fixedApplied = false;
+                }
+            }
+            const bool normalSky = dimType.effects == "overworld";
             glm::vec3 sunDir = g_LightingSystem->getSunDirection();
             int moonPhase = g_LightingSystem->getMoonPhase();
 
-            const glm::vec3 eyePos = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+            const glm::vec3 eyePos = player.eyePosition();
             const float waterDepth = (g_CurrentGameState == GameState::PLAYING)
                 ? underwaterDepth(world, eyePos)
                 : -1.0f;
@@ -8345,7 +9394,9 @@ int main(int argc, char** argv) {
                 else                            g_UnderwaterBlend = glm::max(g_UnderwaterBlend - step, target);
             }
             const float blend      = g_UnderwaterBlend;
-            const bool  skyHidden = blend > 0.5f;
+            // (what a dimension draws overhead: its sky, sun, moon - each can be off)
+            // (under water too: the sky is what's seen through the water's surface overhead)
+            const bool  skyHidden = !(dimType.showSky || dimType.showSun || dimType.showMoon);
 
             const WaterColors water = (blend > 0.0f)
                 ? queryWaterColors(lua, eyePos)
@@ -8363,13 +9414,14 @@ int main(int argc, char** argv) {
             const glm::vec3 underwaterTint = glm::mix(glm::vec3(0.85f, 0.95f, 1.0f), fogHue, 0.75f);
             const float tintAmount = blend * g_Underwater.tintStrength;
 
-            const glm::vec3 skyClear(0.5f, 0.8f, 0.95f);
+            const glm::vec3 skyClear = normalSky ? glm::vec3(0.5f, 0.8f, 0.95f)
+                                     : (dimType.effects == "end" ? dimType.skyColor : dimType.fogColor);
             const glm::vec3 clearCol = glm::mix(skyClear, underwaterFog, blend);
             glClearColor(clearCol.r, clearCol.g, clearCol.b, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             if (g_CurrentGameState == GameState::PLAYING) {
-                const glm::vec3 aboveFog   = fogColorForSun(g_Fog, sunDir.y);
+                const glm::vec3 aboveFog   = normalSky ? fogColorForSun(g_Fog, sunDir.y) : dimType.fogColor;
                 const float loadedEdge     = g_WorldInstance->renderDistanceBlocks();
                 const float aboveEnd       = glm::min(effectiveFogEnd(g_Fog, g_LightingSystem->weatherRainIntensity), loadedEdge - 8.0f);
                 const float aboveStart     = effectiveFogStart(g_Fog, aboveEnd);
@@ -8382,7 +9434,10 @@ int main(int argc, char** argv) {
                 const bool fogOn  = g_Fog.enabled || blend > 0.0f;
 
                 if (!skyHidden) {
-                    g_Skybox->render(view, proj, sunDir.y);
+                    g_Skybox->sunDirection = sunDir;
+                    g_Skybox->brightness = g_LightQuality > 0 ? 0.86f : 1.0f;
+                    g_Skybox->sunHalo = g_LightQuality > 0 ? 1.0f : 0.0f;
+                    if (dimType.showSky) g_Skybox->render(view, proj, sunDir.y);
 
                     glDepthMask(GL_FALSE);
                     glUseProgram(sunProgram);
@@ -8406,7 +9461,7 @@ int main(int argc, char** argv) {
                     }
 
                     glBindVertexArray(sunVAO);
-                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                    if (dimType.showSun) glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
                     glm::vec3 moonDir = -sunDir;
                     glm::vec3 moonWorldPos = player.position + (moonDir * 80.0f);
@@ -8427,13 +9482,13 @@ int main(int argc, char** argv) {
                     } else {
                         glUniform1i(glGetUniformLocation(sunProgram, "u_HasTexture"), 0);
                     }
-                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+                    if (dimType.showMoon) glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
                     glBindVertexArray(0);
                     glDepthMask(GL_TRUE);
 
                     // Weather: greys/darkens the sky, sun and moon (sky.set_sky_tint)
-                    g_Weather.drawSkyTint();
+                    if (dimType.showWeather) g_Weather.drawSkyTint();
                 }
 
                 glUseProgram(shaderProgram);
@@ -8451,6 +9506,22 @@ int main(int argc, char** argv) {
                 glUniform1f(glGetUniformLocation(shaderProgram, "u_FogEnd"), fogEnd);
                 glUniform1f(glGetUniformLocation(shaderProgram, "u_FogDensity"), fogDensity);
                 glUniform3f(glGetUniformLocation(shaderProgram, "u_FogColor"), fogCol.r, fogCol.g, fogCol.b);
+                // Fog takes the sky's colour behind it (where there's a normal sky, not under
+                // water; rain greys it)
+                {
+                    const float rain = glm::clamp(g_LightingSystem->weatherRainIntensity, 0.0f, 1.0f);
+                    // (in bad weather too: the weather's tint below greys both alike)
+                    (void)rain;
+                    const float skyFog = (normalSky && dimType.showSky && blend <= 0.0f) ? 1.0f : 0.0f;
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyFog"), skyFog);
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyBrightness"), g_LightQuality > 0 ? 0.86f : 1.0f);
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyHalo"), g_LightQuality > 0 ? 1.0f : 0.0f);
+                    {
+                        const glm::vec4 tint = (normalSky && dimType.showWeather && blend <= 0.0f) ? g_Weather.drawnSkyTint() : glm::vec4(0.0f);
+                        glUniform4f(glGetUniformLocation(shaderProgram, "u_WeatherTint"), tint.r, tint.g, tint.b, glm::clamp(tint.a, 0.0f, 1.0f));
+                    }
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_CamWaterDepth"), submerged ? waterDepth : 0.0f);
+                }
                 glUniform3f(glGetUniformLocation(shaderProgram, "u_UnderwaterTint"), underwaterTint.r, underwaterTint.g, underwaterTint.b);
                 glUniform1f(glGetUniformLocation(shaderProgram, "u_UnderwaterAmount"), tintAmount);
                 glUniform1f(glGetUniformLocation(shaderProgram, "u_WeatherLight"), g_Weather.worldLight());
@@ -8476,14 +9547,82 @@ int main(int argc, char** argv) {
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_Unlit"), 0);
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_IsGUI"), 0);
 
+                // Another dimension (the server sent us, or we went ourselves): its chunks, not the
+                // old ones' meshes; on_dimension_change(to, from) for this game's mods
+                {
+                    static std::string lastDim;
+                    glm::vec3 to;
+                    if (g_Client.takeDimensionChange(to)) {
+                        player.position = to;
+                        player.velocity = glm::vec3(0.0f);
+                        g_Dig = DigState{};
+                        dims::currentRef() = g_Client.dimension();
+                        g_DimensionSwitched = true;
+                    }
+                    if (g_DimensionSwitched) {
+                        g_DimensionSwitched = false;
+                        worldRenderer.clear();
+                        const std::string now = world.dimension();
+                        if (now != lastDim) {
+                            const std::string from = lastDim;
+                            lastDim = now;
+                            sol::protected_function hook = lua["on_dimension_change"];
+                            if (hook.valid()) {
+                                auto r = hook(now.empty() ? std::string(dims::kOverworld) : now,
+                                              from.empty() ? std::string(dims::kOverworld) : from);
+                                if (!r.valid()) { sol::error err = r; std::cerr << "[Lua] on_dimension_change: " << err.what() << std::endl; }
+                            }
+                        }
+                    }
+                    if (lastDim != world.dimension() && !g_DimensionSwitched) lastDim = world.dimension();
+                }
                 worldRenderer.update(world, player.position);   // pick up changed chunks, mesh, upload
+                // The blocks around the camera for tracing light (VoxelVolume.h), and spotlights
+                {
+                    const glm::vec3 camWorld = glm::vec3(glm::inverse(view)[3]);
+                    // (lighting quality Off: the volume isn't kept up to date and nothing is traced)
+                    const auto meshed = worldRenderer.takeMeshedChunks();
+                    if (g_LightQuality > 0) g_Voxels.update(world, camWorld, meshed);
+                    else if (!meshed.empty()) g_Voxels.clear();   // (filled again when it's turned back on)
+                    g_Voxels.bind(shaderProgram, 3, g_LightQuality > 0);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_TraceSteps"), g_LightQuality >= 2 ? 96 : 48);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SunSteps"),
+                                g_LightQuality >= 2 ? 80 : g_LightQuality == 1 ? 40 : 0);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_Filmic"), g_FilmicOn ? 1 : 0);
+                    // (the reflection samplers live on their own units, even when unused: two
+                    // sampler types may not share a unit)
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneColor"), 5);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneDepth"), 6);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SSR"), 0);
+                    // The moon's soft shadows: at night, with the moon up, by how full it is (phase 0
+                    // full .. 4 new), weaker in rain; none where the dimension has no moon
+                    {
+                        const glm::vec3 sd = g_LightingSystem->getSunDirection();
+                        const glm::vec3 md = g_LightingSystem->getMoonDirection();
+                        const int phase = g_LightingSystem->getMoonPhase();
+                        const float full = 1.0f - static_cast<float>(std::min(phase, 8 - phase)) / 4.0f;
+                        const float night = 1.0f - glm::smoothstep(-0.05f, 0.05f, sd.y);
+                        const float moonUp = glm::smoothstep(0.02f, 0.25f, md.y);
+                        const float rain = glm::clamp(g_LightingSystem->weatherRainIntensity, 0.0f, 1.0f);
+                        const float moonShadow = world.dimensionType().showMoon ? night * moonUp * full * (1.0f - 0.7f * rain) : 0.0f;
+                        glUniform3f(glGetUniformLocation(shaderProgram, "u_MoonDir"), md.x, md.y, md.z);
+                        glUniform1f(glGetUniformLocation(shaderProgram, "u_MoonShadow"), moonShadow);
+                    }
+                    g_Spotlights.tracing = g_LightQuality > 0;
+                    g_Spotlights.beamSamples = g_LightQuality >= 2 ? 40 : 24;
+                    g_Spotlights.beamTraceSteps = g_LightQuality >= 2 ? 48 : 0;
+                    g_Spotlights.upload(shaderProgram, camWorld, static_cast<float>(glfwGetTime()));
+                    glUniform3f(glGetUniformLocation(shaderProgram, "u_CameraPos"), camWorld.x, camWorld.y, camWorld.z);
+                }
                 // Block light: chunks use the light in their vertices; everything else drawn with
                 // this shader afterwards (players, particles) uses the light where the camera is
                 {
                     const uint16_t here = world.getLightAt(glm::ivec3(glm::floor(eyePos)));
                     glUniform4f(glGetUniformLocation(shaderProgram, "u_FallbackLight"), light::sky(here) / 15.0f,
                                 light::red(here) / 15.0f, light::green(here) / 15.0f, light::blue(here) / 15.0f);
-                    glUniform1f(glGetUniformLocation(shaderProgram, "u_MinLight"), g_LightSettings.minLight);
+                    // (a dimension's ambient light: the darkest it gets there)
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_MinLight"),
+                                std::max(g_LightSettings.minLight, world.dimensionType().ambientLight));
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_Brightness"), g_LightSettings.effectiveBrightness());
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_Gamma"), g_LightSettings.gammaLift());
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_BlockLightScale"), g_LightSettings.blockLightScale);
@@ -8493,6 +9632,16 @@ int main(int argc, char** argv) {
                 // mobs, items, players, particles), so whatever is in or behind the water is seen
                 // through it rather than drawn over it
                 worldRenderer.renderOpaque(shaderProgram, proj * view, eyePos);
+
+                // Text on signs (SignText.h), on the boards just drawn
+                if (g_FontRenderer) {
+                    static SignTextRenderer signText;
+                    signText.draw(world, *g_FontRenderer, proj * view, eyePos,
+                                  glm::clamp(sunDir.y * 2.0f + 0.5f, 0.15f, 1.0f));
+                    glUseProgram(shaderProgram);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
+                }
 
                 // Falling blocks (sand, gravel): drawn where they are this frame, as the same
                 // textured cube they are in the world, lit by the light where they are
@@ -8617,7 +9766,7 @@ int main(int argc, char** argv) {
                 glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
 
                 // Other players (multiplayer)
-                const net::PlayerMap& otherPlayers = g_Server.running() ? g_Server.players() : g_Client.players();
+                const net::PlayerMap& otherPlayers = playersHere();
                 if (!otherPlayers.empty()) playerAvatars.render(otherPlayers, shaderProgram, view, proj);
 
                 // Block-break particles (same shader as the world, so they get fog and lighting)
@@ -8628,7 +9777,7 @@ int main(int argc, char** argv) {
                 particles.render(view, proj, shaderProgram, g_TextureArrayID, &world);
 
                 g_Clouds->update(deltaTime);
-                if (!skyHidden) {
+                if (blend <= 0.5f && dimType.showClouds) {   // (a dimension may have none)
                     g_Clouds->render(view, proj, player.position,
                                        static_cast<float>(glfwGetTime()),
                                        sunDir.y,
@@ -8786,7 +9935,21 @@ int main(int argc, char** argv) {
                 // See-through blocks last (water, glass...): everything else is already drawn, so
                 // the half of a cow under the water is seen through it, tinted like the lake bed
                 {
+                    // Water reflections (lighting High): a copy of the picture so far, for the
+                    // water to look things up in
+                    bool ssr = false;
+                    if (g_LightQuality >= 2 && blend <= 0.0f) {
+                        int fbw = 0, fbh = 0;
+                        glfwGetFramebufferSize(window, &fbw, &fbh);
+                        ssr = g_SceneCopy.capture(fbw, fbh);
+                        if (ssr) g_SceneCopy.bind(5, 6);
+                    }
                     glUseProgram(shaderProgram);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SSR"), ssr ? 1 : 0);
+                    {
+                        const glm::mat4 vp = proj * view;
+                        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "u_ViewProj"), 1, GL_FALSE, glm::value_ptr(vp));
+                    }
                     glActiveTexture(GL_TEXTURE0);
                     glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
                     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
@@ -8797,7 +9960,34 @@ int main(int argc, char** argv) {
                     glEnable(GL_DEPTH_TEST);
                     glDepthFunc(GL_LESS);
                     worldRenderer.renderTransparent(shaderProgram);
+                    // Spotlight beams in the air (Spotlights.h), over everything
+                    g_Spotlights.drawBeams(proj * view, glm::vec3(glm::inverse(view)[3]), g_Voxels,
+                                           static_cast<float>(glfwGetTime()), g_TextureArrayID);
+                    // Bloom (Settings; only where the graphics card can take it): bright things glow
+                    // Sun shafts (High): light in the air where the sun gets past leaves and edges
+                    // (under water too: beams of sunlight in the water)
+                    if (g_LightQuality >= 2 && g_SunShaftStrength > 0.0f && sunDir.y > 0.02f &&
+                        dimType.showSun) {
+                        const float up = glm::smoothstep(0.02f, 0.2f, sunDir.y);
+                        const glm::vec3 day(1.0f, 0.98f, 0.92f), sunset(1.0f, 0.62f, 0.32f);
+                        const glm::vec3 sunCol = glm::mix(sunset, day, glm::clamp(sunDir.y + 0.15f, 0.0f, 1.0f));
+                        const float rain = g_LightingSystem ? g_LightingSystem->weatherRainIntensity : 0.0f;
+                        g_SunShafts.apply(width, height, glm::inverse(proj * view), glm::vec3(glm::inverse(view)[3]), sunDir,
+                                          sunCol, g_SunShaftStrength * up * (1.0f - 0.7f * glm::clamp(rain, 0.0f, 1.0f)), g_Voxels);
+                    }
+                    // (fading out through the fog: bright distant fog and sky don't glow)
+                    if (g_BloomOn && g_GpuCaps.bloom) {
+                        const float fadeEnd = fogOn ? (fogExp ? 2.0f / std::max(fogDensity, 1e-4f) : fogEnd) : loadedEdge;
+                        const float fadeStart = fogOn ? (fogExp ? 0.0f : fogStart * 0.6f) : loadedEdge * 0.6f;
+                        // (with the realistic look, sunlit sand and snow are already near white: only
+                        // what's brighter than that - lamps, glints, the sun's edge - glows)
+                        const float thr = g_LightQuality > 0 ? std::max(g_BloomThreshold, 0.88f) : g_BloomThreshold;
+                        const float str = g_LightQuality > 0 ? g_BloomStrength * 0.7f : g_BloomStrength;
+                        g_Bloom.apply(width, height, str, thr, fadeStart, fadeEnd, 0.1f, 500.0f);
+                    }
+                    glUseProgram(shaderProgram);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
+                    glUniform1i(glGetUniformLocation(shaderProgram, "u_SSR"), 0);
                     glEnable(GL_BLEND);
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 }
@@ -8808,8 +9998,20 @@ int main(int argc, char** argv) {
                     glm::vec3 selMin(0.0f), selMax(1.0f);
                     {
                         const uint8_t selId = world.getBlockAt(rayResult.blockPos);
-                        if (selId != 0 && BlockRegistry::getInstance().getBlock(selId).pattern == "door") {
+                        const std::string& selPattern = selId ? BlockRegistry::getInstance().getBlock(selId).pattern : std::string();
+                        if (selId != 0 && selPattern == "door") {
                             door::box(world.getMetadataAt(rayResult.blockPos), selMin, selMax);
+                        } else if (selId != 0 && (selPattern == "sign" || selPattern == "wall_sign")) {
+                            sign::bounds(selPattern == "wall_sign", world.getMetadataAt(rayResult.blockPos), selMin, selMax);
+                        } else if (selId != 0 && shape::isPartial(BlockRegistry::getInstance().getBlock(selId))) {
+                            // slabs and stairs: the box around their parts (BlockShape.h)
+                            const glm::ivec3 sp = rayResult.blockPos;
+                            auto get = [&](int dx, int dy, int dz, uint8_t& id, uint8_t& m) {
+                                id = world.getBlockAt({sp.x + dx, sp.y + dy, sp.z + dz});
+                                m = world.getMetadataAt({sp.x + dx, sp.y + dy, sp.z + dz});
+                                return true;
+                            };
+                            shape::bounds(BlockRegistry::getInstance().getBlock(selId), world.getMetadataAt(sp), get, selMin, selMax);
                         }
                     }
                     glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(rayResult.blockPos) + (selMin + selMax) * 0.5f);
@@ -8946,12 +10148,14 @@ int main(int argc, char** argv) {
                 }
 
                 // Weather: rain/snow around the camera (not underwater), then lightning flashes
+                // (a dimension with a ceiling, or without the overworld's sky, has no weather)
+                const bool weatherHere = dimType.showWeather;
                 g_Weather.update(g_Paused ? 0.0f : deltaTime, eyePos, world);
-                if (blend < 0.5f) {
+                if (blend < 0.5f && weatherHere) {
                     g_Weather.drawPrecipitation(view, proj, eyePos, glm::clamp(sunDir.y * 2.0f + 0.5f, 0.0f, 1.0f));
                 }
-                if (blend < 0.5f) g_Weather.drawBolts(view, proj, eyePos);
-                g_Weather.drawFlash();
+                if (blend < 0.5f && weatherHere) g_Weather.drawBolts(view, proj, eyePos);
+                if (weatherHere) g_Weather.drawFlash();
 
                 // The world's thumbnail: this frame's picture, before the hand and HUD go on it
                 if (!g_ThumbnailChecked && glfwGetTime() - g_WorldOpenedAt > 6.0 && !g_ActiveWorldName.empty()) {
@@ -9124,7 +10328,7 @@ int main(int argc, char** argv) {
 
                 // Name tags above other players (multiplayer)
                 {
-                    const net::PlayerMap& others = g_Server.running() ? g_Server.players() : g_Client.players();
+                    const net::PlayerMap& others = playersHere();
                     if (!others.empty() && g_FontRenderer) {
                         resetUIRenderState();
                         glUseProgram(fontProgram);
@@ -9208,7 +10412,7 @@ int main(int argc, char** argv) {
                         const glm::ivec3 n(rayResult.faceNormal);
                         const char* face = n.y > 0 ? "top" : n.y < 0 ? "bottom" : n.x > 0 ? "east (+X)"
                                          : n.x < 0 ? "west (-X)" : n.z > 0 ? "south (+Z)" : n.z < 0 ? "north (-Z)" : "?";
-                        const glm::vec3 eye = player.position + glm::vec3(0.0f, 1.62f, 0.0f);
+                        const glm::vec3 eye = player.eyePosition();
                         const float dist = glm::distance(eye, glm::vec3(b) + glm::vec3(0.5f));
                         std::snprintf(buf, sizeof(buf), "  Block %d %d %d, %s face, %.1f blocks away",
                                       b.x, b.y, b.z, face, dist);
@@ -9396,6 +10600,10 @@ int main(int argc, char** argv) {
         if (g_CurrentGameState == GameState::PLAYING) { world.finishFalling(); saveCurrentWorld(); }
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
+        g_DimWorlds.unloadAll();       // (before the generator their chunks come from goes)
+        g_DimWorlds.primary = nullptr;
+        g_DimWorlds.generator = nullptr;
+        dims::currentRef().clear();
         world.setGenerator(nullptr);   // the generator's threads stop at the end of this block
         g_ItemUseHandlers.clear();     // Lua functions: must go before the Lua state does
         g_Pinger.clear();

@@ -53,6 +53,8 @@ enum Msg : uint8_t {
                       // items dropped next to the player (thrown: with a velocity)
     C_HARVEST = 10,   // str item in hand, i32 x y z   a tool used on a block (the scythe): the
                       // server works out what happens there and gives what it yields
+    C_BLOCK_TEXT = 12,// i32 x y z, u8 side (0 front, 1 back), u8 lines, { str }   a player wrote on a
+                      // block that holds text (a sign); the server checks and decides
     C_MOD_MSG = 11,   // str channel, str data   a mod's message to the server's mods (Lua:
                       // engine.send_to_server -> on_mod_message). Text only, never run.
 
@@ -84,6 +86,15 @@ enum Msg : uint8_t {
     S_ENTITY_GONE = 85, // u16 count, { u32 id }   removed, or out of your range
     S_TIME    = 79,   // u32 wholeDays, f32 timeOfDay (0..1), f32 secondsPerDay, f32 speed  (DayTime.h)
                       // (older games ignore it and keep their own sky; no protocol change needed)
+    S_DIMENSION = 87, // str dimension, f32 x y z, then the dimension type: f32 fixedTime (<0: none),
+                      // u8 flags (1 skylight, 2 ceiling, 4 ultrawarm, 8 natural, 16 beds, 32 anchors),
+                      // f32 coordinateScale, f32 ambientLight, u16 logicalHeight, str effects,
+                      // f32 fog r g b, f32 sky r g b, u8 drawn (1 sky, 2 sun, 4 moon, 8 clouds,
+                      // 16 weather), f32 gravity   - you're now in this dimension, here: your
+                      // game drops its chunks and gets this dimension's
+    S_PLAYER_DIM = 88,// u16 id, str dimension   which dimension another player is in (you only see
+                      // the ones in yours)
+    S_BLOCK_TEXT = 89,// i32 x y z, u8 has (0: none now), then BlockText (writeText)   a block's text changed
     S_MOD_MSG = 86,   // str channel, str data   a server mod's message to this game's mods (Lua:
                       // engine.send_to_player -> on_server_message). Text only, never run.
     S_ACK     = 75,   // u32 lastInputSeq, f32 x y z, f32 vx vy vz, u8 grounded  (your real position)
@@ -102,6 +113,33 @@ constexpr double kConnectTimeoutSec  = 10.0;
 
 const glm::vec3 kInfoColor(1.0f, 1.0f, 0.4f);
 const glm::vec3 kChatColor(1.0f, 1.0f, 1.0f);
+
+// A block's text on the wire: u8 waxed, then front and back: u8 r g b, u8 glowing, u8 lines, { str }
+template <typename W> void writeText(W& w, const BlockText& t) {
+    w.u8(t.waxed ? 1 : 0);
+    for (const BlockTextSide* side : { &t.front, &t.back }) {
+        w.u8(static_cast<uint8_t>(side->color >> 16)); w.u8(static_cast<uint8_t>(side->color >> 8)); w.u8(static_cast<uint8_t>(side->color));
+        w.u8(side->glowing ? 1 : 0);
+        const size_t n = std::min(side->lines.size(), BlockText::kMaxLines);
+        w.u8(static_cast<uint8_t>(n));
+        for (size_t i = 0; i < n; ++i) w.str(side->lines[i].substr(0, BlockText::kMaxLineBytes));
+    }
+}
+template <typename R> bool readText(R& r, BlockText& t) {
+    t.waxed = r.u8() != 0;
+    for (BlockTextSide* side : { &t.front, &t.back }) {
+        const uint32_t cr = r.u8(), cg = r.u8(), cb = r.u8();
+        side->color = (cr << 16) | (cg << 8) | cb;
+        side->glowing = r.u8() != 0;
+        const int n = r.u8();
+        side->lines.clear();
+        for (int i = 0; i < n && r.ok; ++i) {
+            std::string l = r.str();
+            if (static_cast<size_t>(i) < BlockText::kMaxLines) side->lines.push_back(l.substr(0, BlockText::kMaxLineBytes));
+        }
+    }
+    return r.ok;
+}
 
 using Clock = std::chrono::steady_clock;
 double nowSeconds() {
@@ -386,7 +424,9 @@ bool GameServer::start(World& world, uint16_t port, const std::string& gameFolde
     m_views.clear();
     m_chat.clear();
     m_shared.clear();
+    m_hostDimension.clear();
     m_world->setRecordChanges(true);
+    if (forEachWorld) forEachWorld([](const std::string&, World& w) { w.setRecordChanges(true); });
     std::cout << "[Server] Hosting on port " << port << std::endl;
     return true;
 }
@@ -477,18 +517,33 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
         }
     }
 
-    // 2. Keep chunks loaded around every joined player
-    std::vector<World::LoadCenter> centers;
+    // 2. Keep chunks loaded around every joined player, in their own dimension's world (the
+    //    owner's DimensionWorlds does the same for the dimensions it keeps)
+    std::map<std::string, std::vector<World::LoadCenter>> centers;
     for (const auto& [id, c] : m_clients) {
-        if (c.joined && c.hasPosition) centers.push_back({c.position, c.viewDistance});
+        if (c.joined && c.hasPosition) centers[c.dimension].push_back({c.position, c.viewDistance});
     }
-    m_world->setExtraLoadCenters(centers);
+    if (forEachWorld) {
+        forEachWorld([&](const std::string& dim, World& w) { w.setExtraLoadCenters(centers[dim]); });
+    } else {
+        m_world->setExtraLoadCenters(centers[std::string()]);
+    }
 
     // 3. Blocks that started falling (sand, gravel), then block changes (player edits, water,
-    //    mods) -> everyone who has that chunk. Falling first: the block leaves its cell in the
-    //    same update, and players should see it start falling, not a hole.
-    sendFallingStarts(m_world->takeFallingStarts());
-    sendBlockChanges(m_world->takeBlockChanges());
+    //    mods) -> everyone in that dimension who has that chunk. Falling first: the block
+    //    leaves its cell in the same update, and players should see it start falling, not a hole.
+    if (forEachWorld) {
+        forEachWorld([&](const std::string& dim, World& w) {
+            w.setRecordChanges(true);
+            sendFallingStarts(w.takeFallingStarts(), dim);
+            sendBlockChanges(w.takeBlockChanges(), dim);
+            sendTextChanges(w, w.takeTextChanges(), dim);
+        });
+    } else {
+        sendFallingStarts(m_world->takeFallingStarts(), std::string());
+        sendBlockChanges(m_world->takeBlockChanges(), std::string());
+        sendTextChanges(*m_world, m_world->takeTextChanges(), std::string());
+    }
 
     // 4. Chunks
     for (auto& [id, c] : m_clients) {
@@ -582,7 +637,7 @@ void GameServer::handleInputs(Client& c, const uint8_t* data, size_t size) {
         const glm::vec3 before = c.sim.position;
         if (c.moveBudget + 0.001f >= dt) {
             c.moveBudget -= dt;
-            stepMovement(c.sim, in, dt, *m_world);
+            stepMovement(c.sim, in, dt, worldOf(c));
         } else {
             ++c.droppedInputs;
         }
@@ -694,7 +749,7 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         if (glm::distance(eye, centre) > reach) return;           // too far (or cheating)
         const std::string name = c.name;
         const glm::vec3 where = c.position;
-        onEntityAct(name, id, kind, item, where);
+        { dims::InDimension here(c.dimension); onEntityAct(name, id, kind, item, where); }
         break;
     }
     case C_DROP: {
@@ -719,7 +774,7 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         if (++c.drops > 30) return;
         if (glm::distance(p, c.position + glm::vec3(0.0f, 1.0f, 0.0f)) > 8.0f) return;
         const std::string name = c.name;
-        onDropItem(name, item, std::min(count, 64 * 64), p, how);
+        { dims::InDimension here(c.dimension); onDropItem(name, item, std::min(count, 64 * 64), p, how); }
         break;
     }
     case C_HARVEST: {
@@ -732,9 +787,28 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         if (++c.entityActs > 10) return;
         const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
         if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach) return;
-        if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return;
+        if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || worldOf(c).chunkData(chunkOf(glm::vec3(pos))) == nullptr) return;
         const std::string name = c.name;
+        dims::InDimension here(c.dimension);   // (the mod's world functions act in their dimension)
         onHarvest(name, item, pos);
+        break;
+    }
+    case C_BLOCK_TEXT: {
+        Reader r(data, size);
+        const glm::ivec3 pos = r.ivec3();
+        const int side = r.u8();
+        const int n = r.u8();
+        std::vector<std::string> lines;
+        for (int i = 0; i < n && r.ok; ++i) lines.push_back(r.str());
+        if (!r.ok || !c.joined || side > 1 || n > static_cast<int>(BlockText::kMaxLines)) return;
+        for (auto& l : lines) { if (l.size() > BlockText::kMaxLineBytes) l.resize(BlockText::kMaxLineBytes); l = cleanChatText(l); }
+        // (at most 10 a second, with hits and drops)
+        const double now = net::clockSeconds();
+        if (now - c.entityActWindow > 1.0) { c.entityActWindow = now; c.entityActs = 0; c.drops = 0; }
+        if (++c.entityActs > 10) return;
+        const std::string name = c.name;
+        std::string why;
+        if (!editBlockText(name, pos, side, lines, &why) && !why.empty()) sendMessageTo(c, why, glm::vec3(1.0f, 0.55f, 0.55f));
         break;
     }
     case C_MOD_MSG: {
@@ -750,6 +824,7 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         if (c.modTokens < 1.0) return;
         c.modTokens -= 1.0;
         const std::string name = c.name;   // (a mod may kick them: c gone after)
+        dims::InDimension here(c.dimension);
         onModMessage(name, channel, text);
         break;
     }
@@ -762,6 +837,7 @@ void GameServer::handlePacket(Client& c, const uint8_t* data, size_t size) {
         if (command.empty() || !allowChat(c)) return;
         if (onCommand) {
             const std::string name = c.name;   // the command may kick this player (c gone after)
+            dims::InDimension here(c.dimension);   // (a command runs where its player is, as in Minecraft)
             onCommand(name, command);
         } else {
             messagePlayer(c.name, "This server doesn't run commands", glm::vec3(1.0f, 0.55f, 0.55f));
@@ -878,17 +954,27 @@ void GameServer::finishJoin(Client& c, const std::string& name, int view) {
     // Spawn: where they were last time (dedicated server), else on the ground at the world
     // spawn if it's loaded, else next to the host
     glm::vec3 spawn = m_hostPos + glm::vec3(1.0f, 0.0f, 1.0f);
-    const int ground = m_world->groundHeightAt(8, 8);
+    World& over = worldByDim(std::string());
+    const int ground = over.groundHeightAt(8, 8);
     if (ground >= 0) spawn = glm::vec3(8.5f, static_cast<float>(ground), 8.5f);
     else if (!m_hasHost) spawn = glm::vec3(8.5f, 100.0f, 8.5f);
     glm::vec3 saved;
     if (spawnFor && spawnFor(name, saved)) spawn = saved;
+    // Where they were last time, in which dimension (a dimension that no longer exists: the
+    // overworld, at its spawn)
+    c.dimension.clear();
+    if (dimensionFor) {
+        std::string d = dimensionFor(name);
+        if (d == dims::kOverworld) d.clear();
+        if (!d.empty() && worldFor && worldFor(d)) c.dimension = d;
+        else if (!d.empty()) spawn = (ground >= 0) ? glm::vec3(8.5f, static_cast<float>(ground), 8.5f) : glm::vec3(8.5f, 100.0f, 8.5f);
+    }
     c.position = spawn;
     c.hasPosition = true;
 
     Writer w(S_WELCOME);
     w.u16(c.id);
-    w.u32(m_world->seed());
+    w.u32(over.seed());
     w.f32(spawn.x); w.f32(spawn.y); w.f32(spawn.z);
     w.str(m_hostName);
     sendTo(c.peer, w);
@@ -900,15 +986,22 @@ void GameServer::finishJoin(Client& c, const std::string& name, int view) {
         host.str(m_hostName);
         sendTo(c.peer, host);
     }
+    if (m_hasHost && !m_hostDimension.empty()) { Writer d(S_PLAYER_DIM); d.u16(0); d.str(m_hostDimension); sendTo(c.peer, d); }
     for (const auto& [id, other] : m_clients) {
         if (!other.joined || id == c.id) continue;
         Writer a(S_ADD); a.u16(id); a.str(other.name); sendTo(c.peer, a);
         Writer b(S_ADD); b.u16(c.id); b.str(c.name); sendTo(other.peer, b);
+        // which dimension each is in (the overworld isn't said: older games don't know dimensions)
+        if (!other.dimension.empty()) { Writer d(S_PLAYER_DIM); d.u16(id); d.str(other.dimension); sendTo(c.peer, d); }
+        if (!c.dimension.empty()) { Writer d(S_PLAYER_DIM); d.u16(c.id); d.str(c.dimension); sendTo(other.peer, d); }
     }
+    // Not in the overworld: their game switches to that dimension before any chunk arrives
+    if (!c.dimension.empty()) sendDimension(c);
 
     net::PlayerView& v = m_views[c.id];
     v.name = name;
     v.color = colorForName(name);
+    v.dimension = c.dimension;
     c.sim = MoveState{spawn, glm::vec3(0.0f), false};
     c.lastSeq = 0;
     c.moveBudget = 0.2f;
@@ -933,7 +1026,7 @@ void GameServer::finishJoin(Client& c, const std::string& name, int view) {
 
     std::cout << "[Server] " << name << " joined" << std::endl;
     broadcastChat(name + " joined the game", kInfoColor);
-    if (onJoin) onJoin(name);
+    if (onJoin) { dims::InDimension here(c.dimension); onJoin(name); }
 }
 
 void GameServer::sendMode(Client& c) {
@@ -979,6 +1072,133 @@ bool GameServer::teleportPlayer(const std::string& name, const glm::vec3& pos) {
         return true;
     }
     return false;
+}
+
+void GameServer::sendTextChanges(const World& world, const std::vector<glm::ivec3>& changes, const std::string& dimension) {
+    if (changes.empty()) return;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.dimension != dimension) continue;
+        for (const auto& pos : changes) {
+            if (!c.sentChunks.count(chunkOf(glm::vec3(pos)))) continue;   // (it comes with the chunk)
+            Writer w(S_BLOCK_TEXT);
+            w.i32(pos.x); w.i32(pos.y); w.i32(pos.z);
+            const BlockText* t = world.getBlockTextAt(pos);
+            w.u8(t ? 1 : 0);
+            if (t) writeText(w, *t);
+            sendTo(c.peer, w);
+        }
+    }
+}
+
+bool GameServer::editBlockText(const std::string& name, const glm::ivec3& pos, int side,
+                               std::vector<std::string> lines, std::string* why) {
+    if (why) why->clear();
+    for (auto& [cid, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        World& world = worldOf(c);
+        const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
+        if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach + 1.0f) return false;
+        if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || !world.chunkData(chunkOf(glm::vec3(pos)))) return false;
+        const uint8_t id = world.getBlockAt(pos);
+        if (id == 0 || !BlockRegistry::getInstance().getBlock(id).holdsText) return false;
+        const BlockText* old = world.getBlockTextAt(pos);
+        if (old && old->waxed) { if (why) *why = "It's waxed: it can't be changed"; return false; }
+        if (lines.size() > BlockText::kMaxLines) lines.resize(BlockText::kMaxLines);
+        dims::InDimension here(c.dimension);
+        if (canEditText) {
+            std::string refusal;
+            if (!canEditText(name, pos, side, lines, refusal)) { if (why) *why = refusal; return false; }
+        }
+        BlockText t = old ? *old : BlockText();
+        (side == 1 ? t.back : t.front).lines = lines;
+        world.setBlockTextAt(pos, t);
+        if (onTextEdit) onTextEdit(name, pos, side);
+        return true;
+    }
+    return false;
+}
+
+World& GameServer::worldByDim(const std::string& dimensionIn) const {
+    const std::string dimension = dimensionIn == dims::kOverworld ? std::string() : dimensionIn;
+    if (worldFor) {
+        if (World* w = worldFor(dimension)) return *w;
+        if (World* o = worldFor(std::string())) return *o;
+    }
+    return *m_world;
+}
+
+World& GameServer::worldOf(const Client& c) const { return worldByDim(c.dimension); }
+
+void GameServer::sendDimension(Client& c) {
+    const DimensionType t = dims::Registry::get().type(c.dimension.empty() ? std::string(dims::kOverworld) : c.dimension);
+    Writer w(S_DIMENSION);
+    w.str(c.dimension.empty() ? std::string(dims::kOverworld) : c.dimension);
+    w.f32(c.position.x); w.f32(c.position.y); w.f32(c.position.z);
+    w.f32(static_cast<float>(t.fixedTime));
+    w.u8(static_cast<uint8_t>((t.hasSkylight ? 1 : 0) | (t.hasCeiling ? 2 : 0) | (t.ultrawarm ? 4 : 0) |
+                              (t.natural ? 8 : 0) | (t.bedWorks ? 16 : 0) | (t.respawnAnchorWorks ? 32 : 0)));
+    w.f32(static_cast<float>(t.coordinateScale));
+    w.f32(t.ambientLight);
+    w.u16(static_cast<uint16_t>(t.logicalHeight));
+    w.str(t.effects);
+    w.f32(t.fogColor.r); w.f32(t.fogColor.g); w.f32(t.fogColor.b);
+    w.f32(t.skyColor.r); w.f32(t.skyColor.g); w.f32(t.skyColor.b);
+    // what's drawn overhead, and its gravity (the game predicts its own movement with it)
+    w.u8(static_cast<uint8_t>((t.showSky ? 1 : 0) | (t.showSun ? 2 : 0) | (t.showMoon ? 4 : 0) |
+                              (t.showClouds ? 8 : 0) | (t.showWeather ? 16 : 0)));
+    w.f32(t.gravity);
+    sendTo(c.peer, w);
+}
+
+std::string GameServer::playerDimension(const std::string& name) const {
+    if (m_hasHost && name == m_hostName) return m_hostDimension;
+    for (const auto& [id, c] : m_clients) if (c.joined && c.name == name) return c.dimension;
+    return std::string();
+}
+
+std::vector<GameServer::Place> GameServer::playerPlaces() const {
+    std::vector<Place> out;
+    for (const auto& [id, c] : m_clients) if (c.joined) out.push_back({c.name, c.dimension, c.position});
+    return out;
+}
+
+bool GameServer::setPlayerDimension(const std::string& name, const std::string& dimensionIn, const glm::vec3& pos) {
+    const std::string dimension = dimensionIn == dims::kOverworld ? std::string() : dimensionIn;
+    if (!dimension.empty() && !(worldFor && worldFor(dimension))) return false;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined || c.name != name) continue;
+        const std::string from = c.dimension;
+        c.dimension = dimension;
+        c.sim.position = pos;
+        c.sim.velocity = glm::vec3(0.0f);
+        c.sim.grounded = false;
+        c.position = pos;
+        c.moveBudget = 0.2f;
+        c.sentChunks.clear();       // their game drops every chunk: this dimension's come fresh
+        c.knownEntities.clear();
+        sendDimension(c);
+        // everyone else: which dimension they're in now (their game shows them or not)
+        for (auto& [oid, o] : m_clients) {
+            if (!o.joined || oid == id) continue;
+            Writer d(S_PLAYER_DIM); d.u16(id); d.str(dimension.empty() ? std::string(dims::kOverworld) : dimension);
+            sendTo(o.peer, d);
+        }
+        if (m_views.count(id)) m_views[id].dimension = dimension;
+        if (onDimensionChange && from != dimension) onDimensionChange(name, from, dimension);
+        return true;
+    }
+    return false;
+}
+
+void GameServer::setHostDimension(const std::string& dimensionIn) {
+    const std::string dimension = dimensionIn == dims::kOverworld ? std::string() : dimensionIn;
+    if (dimension == m_hostDimension) return;
+    m_hostDimension = dimension;
+    for (auto& [id, c] : m_clients) {
+        if (!c.joined) continue;
+        Writer d(S_PLAYER_DIM); d.u16(0); d.str(dimension.empty() ? std::string(dims::kOverworld) : dimension);
+        sendTo(c.peer, d);
+    }
 }
 
 void GameServer::sendDayTime(ENetPeer* peer) {
@@ -1120,21 +1340,27 @@ bool GameServer::messagePlayer(const std::string& name, const std::string& text,
 std::string GameServer::editRefusal(const Client& c, const glm::ivec3& pos, uint8_t id, uint8_t meta, float slack) {
     const glm::vec3 eye = c.position + glm::vec3(0.0f, 1.62f, 0.0f);
     if (glm::distance(eye, glm::vec3(pos) + glm::vec3(0.5f)) > kMaxReach + slack) return kSilentRefusal;
-    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || m_world->chunkData(chunkOf(glm::vec3(pos))) == nullptr) return kSilentRefusal;
-    const uint8_t was = m_world->getBlockAt(pos);
-    const uint8_t wasMeta = m_world->getMetadataAt(pos);
+    const World& world = worldOf(c);
+    if (pos.y < 0 || pos.y >= CHUNK_HEIGHT || world.chunkData(chunkOf(glm::vec3(pos))) == nullptr) return kSilentRefusal;
+    const uint8_t was = world.getBlockAt(pos);
+    const uint8_t wasMeta = world.getMetadataAt(pos);
     // Outside creative, blocks that can't be dug (bedrock...) can't be broken, whatever the
     // player's game says
     if (c.mode != "creative" && id == 0 && was != 0 &&
         blockHardness(BlockRegistry::getInstance().getBlock(was)) < 0.0f) return kSilentRefusal;
     // Mods may refuse it (spawn protection, claims...): checked last, for real changes only - a
     // different block, or new metadata on the same one (opening a door, filling a tank...)
-    if (canEdit && (was != id || wasMeta != meta)) return canEdit(c.name, pos, was, wasMeta, id, meta);
+    if (canEdit && (was != id || wasMeta != meta)) {
+        dims::InDimension here(c.dimension);
+        return canEdit(c.name, pos, was, wasMeta, id, meta);
+    }
     return "";
 }
 
 void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
     Reader r(data, size);
+    World& world = worldOf(c);
+    dims::InDimension here(c.dimension);   // (on_block_placed / broken run in their dimension)
     const uint16_t count = r.u16();
     std::vector<World::BlockChange> rejected;
     bool refusalSent = false;
@@ -1146,12 +1372,12 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
         if (!r.ok) break;
 
         uint8_t id = 0;
-        const bool loaded = m_world->chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
+        const bool loaded = world.chunkData(chunkOf(glm::vec3(pos))) != nullptr &&
                             pos.y >= 0 && pos.y < CHUNK_HEIGHT;
         const std::string why = blockIdFromName(name, id) ? editRefusal(c, pos, id, meta, 0.0f) : std::string(kSilentRefusal);
         if (why.empty()) {
-            const uint8_t oldId = m_world->getBlockAt(pos);
-            m_world->setBlockWithMetaAt(pos, id, meta);
+            const uint8_t oldId = world.getBlockAt(pos);
+            world.setBlockWithMetaAt(pos, id, meta);
             if (onPlayerEdit && oldId != id) onPlayerEdit(c.name, pos, oldId, id);
             continue;
         }
@@ -1160,7 +1386,7 @@ void GameServer::handleBlocks(Client& c, const uint8_t* data, size_t size) {
             refusalSent = true;   // one message for a whole batch of edits
         }
         // Undo the player's prediction: send them what's really there
-        if (loaded) rejected.push_back({pos, m_world->getBlockAt(pos), m_world->getMetadataAt(pos)});
+        if (loaded) rejected.push_back({pos, world.getBlockAt(pos), world.getMetadataAt(pos)});
     }
 
     if (!rejected.empty()) {
@@ -1189,10 +1415,12 @@ bool GameServer::playerSetBlock(const std::string& name, const glm::ivec3& pos, 
         }
         // (unloaded or out of reach was refused above.) Already exactly this block and metadata:
         // nothing changes, so it's no change to report - false, with no reason to show
-        const uint8_t oldId = m_world->getBlockAt(pos);
-        const uint8_t oldMeta = m_world->getMetadataAt(pos);
+        World& world = worldOf(c);
+        const uint8_t oldId = world.getBlockAt(pos);
+        const uint8_t oldMeta = world.getMetadataAt(pos);
         if (oldId == id && oldMeta == meta) return false;
-        m_world->setBlockWithMetaAt(pos, id, meta);
+        world.setBlockWithMetaAt(pos, id, meta);
+        dims::InDimension here(c.dimension);
         if (onPlayerEdit && oldId != id) onPlayerEdit(name, pos, oldId, id);
         return true;
     }
@@ -1216,7 +1444,10 @@ void GameServer::dropClient(uint16_t id) {
     if (it == m_clients.end()) return;
     const bool wasJoined = it->second.joined;
     const std::string name = it->second.name;
-    if (wasJoined && onLeave) onLeave(name, it->second.position);   // e.g. save where they were
+    if (wasJoined && onLeave) {   // e.g. save where they were
+        dims::InDimension here(it->second.dimension);
+        onLeave(name, it->second.position);
+    }
     m_clients.erase(it);
     m_views.erase(id);
 
@@ -1258,7 +1489,7 @@ void GameServer::streamChunks(Client& c) {
 
         const World::ChunkCoord cc{center.first + dx, center.second + dz};
         if (c.sentChunks.count(cc)) continue;
-        const ChunkData* data = m_world->chunkData(cc);
+        const ChunkData* data = worldOf(c).chunkData(cc);
         if (!data) continue;   // not generated yet - next time
 
         Writer w(S_CHUNK);
@@ -1270,10 +1501,10 @@ void GameServer::streamChunks(Client& c) {
     }
 }
 
-void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes) {
+void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes, const std::string& dimension) {
     if (changes.empty()) return;
     for (auto& [id, c] : m_clients) {
-        if (!c.joined) continue;
+        if (!c.joined || c.dimension != dimension) continue;
         std::vector<const World::BlockChange*> mine;
         for (const auto& ch : changes) {
             if (c.sentChunks.count(chunkOf(glm::vec3(ch.pos)))) mine.push_back(&ch);
@@ -1293,10 +1524,10 @@ void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes
     }
 }
 
-void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& starts) {
+void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& starts, const std::string& dimension) {
     if (starts.empty()) return;
     for (auto& [id, c] : m_clients) {
-        if (!c.joined) continue;
+        if (!c.joined || c.dimension != dimension) continue;
         std::vector<const World::FallingStart*> mine;
         for (const auto& f : starts) {
             if (c.sentChunks.count(chunkOf(glm::vec3(f.cell)))) mine.push_back(&f);
@@ -1316,13 +1547,13 @@ void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& start
 }
 
 void GameServer::sendPositions() {
-    struct Entry { uint16_t id; float time; glm::vec3 p; float yaw, pitch; };
+    struct Entry { uint16_t id; float time; glm::vec3 p; float yaw, pitch; std::string dim; };
     const float serverTime = net::clockSeconds();
     std::vector<Entry> all;
-    if (m_hasHost) all.push_back({0, serverTime, m_hostPos, m_hostYaw, m_hostPitch});
+    if (m_hasHost) all.push_back({0, serverTime, m_hostPos, m_hostYaw, m_hostPitch, m_hostDimension});
     for (const auto& [id, c] : m_clients) {
         if (c.joined && c.hasPosition) {
-            all.push_back({id, static_cast<float>(c.lastSnapTime), c.position, c.yaw, c.pitch});
+            all.push_back({id, static_cast<float>(c.lastSnapTime), c.position, c.yaw, c.pitch, c.dimension});
         }
     }
 
@@ -1345,7 +1576,7 @@ void GameServer::sendPositions() {
         w.u16(0);   // count, filled in below
         uint16_t n = 0;
         for (const Entry& e : all) {
-            if (e.id == id) continue;
+            if (e.id == id || e.dim != c.dimension) continue;   // (other dimensions: not seen)
             const glm::vec2 d(e.p.x - c.position.x, e.p.z - c.position.z);
             if (glm::length(d) > range) continue;   // too far to see
             w.u16(e.id);
@@ -1387,7 +1618,7 @@ void GameServer::sendEntities() {
             sendTo(peer, w, reliable);
         };
         for (const auto& [id, e] : all) {
-            if (e.removed) continue;
+            if (e.removed || e.dimension != c.dimension) continue;   // (only your dimension's)
             const glm::vec2 d(e.pos.x - c.position.x, e.pos.z - c.position.z);
             if (glm::length(d) > range) continue;
             auto known = c.knownEntities.find(id);
@@ -1626,7 +1857,6 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_chat.clear();
     m_shared.clear();
     m_sharedChanges.clear();
-    m_modMessages.clear();
     std::cout << "[Client] Connecting to " << m_addressText << " as " << m_name << std::endl;
     return true;
 }
@@ -1656,6 +1886,8 @@ void GameClient::disconnect() {
 }
 
 void GameClient::finish(const std::string& reason) {
+    m_dimension.clear();   // (back in our own world: its overworld)
+    m_dimensionChanged = false;
     m_completeAsked.clear(); m_completeText.clear(); m_completeList.clear();
     m_completeHave = m_completeArrived = false;
     const bool wasJoined = m_state == State::Joined;
@@ -1795,8 +2027,86 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         m_haveCorrection = false;
         m_corrections = 0;
         m_clockSynced = false;
+        m_dimension.clear();
+        m_dimType = DimensionType();
+        m_dimType.name = dims::kOverworld;
+        m_world->setDimension(std::string());
         m_state = State::Joined;
         std::cout << "[Client] Joined " << m_addressText << std::endl;
+        break;
+    }
+    case S_DIMENSION: {
+        // The server put us in another dimension (or this is where we were last time): a fresh
+        // world for its chunks, with its rules (sunlight, sky...)
+        if (m_state != State::Joined) return;
+        std::string name = r.str();
+        const glm::vec3 pos = r.vec3f();
+        DimensionType t;
+        t.name = name;
+        const float fixed = r.f32();
+        t.fixedTime = fixed < 0.0f ? -1.0 : static_cast<double>(std::min(fixed, 1.0f));
+        const uint8_t flags = r.u8();
+        t.hasSkylight = flags & 1; t.hasCeiling = flags & 2; t.ultrawarm = flags & 4;
+        t.natural = flags & 8; t.bedWorks = flags & 16; t.respawnAnchorWorks = flags & 32;
+        t.coordinateScale = std::clamp(static_cast<double>(r.f32()), 0.00001, 30000000.0);
+        t.ambientLight = std::clamp(r.f32(), 0.0f, 1.0f);
+        t.logicalHeight = std::clamp<int>(r.u16(), 1, 256);
+        t.effects = r.str();
+        t.fogColor = glm::clamp(r.vec3f(), glm::vec3(0.0f), glm::vec3(1.0f));
+        t.skyColor = glm::clamp(r.vec3f(), glm::vec3(0.0f), glm::vec3(1.0f));
+        {
+            const uint8_t sky = r.u8();
+            t.showSky = sky & 1; t.showSun = sky & 2; t.showMoon = sky & 4; t.showClouds = sky & 8; t.showWeather = sky & 16;
+            t.gravity = std::clamp(r.f32(), -4.0f, 10.0f);
+        }
+        if (!r.ok || !dims::validName(name)) return;
+        if (t.effects != "nether" && t.effects != "end") t.effects = "overworld";
+        t.caves = false;
+        if (name == dims::kOverworld) name.clear();
+        // (the server's rules for it win: our mods may not know this dimension)
+        if (!name.empty()) dims::Registry::get().add(t);
+        const uint32_t seed = m_world->seed();
+        m_world->reset();
+        m_world->setSaveDirectory("");
+        m_world->setSeed(seed);
+        m_world->setDimension(name);
+        m_world->setRemote(true);
+        m_dimension = name;
+        m_dimType = name.empty() ? DimensionType() : t;
+        if (name.empty()) m_dimType.name = dims::kOverworld;
+        m_dimensionPos = pos;
+        m_dimensionChanged = true;
+        m_pending.clear();
+        m_haveCorrection = false;
+        m_local.position = pos;
+        m_local.velocity = glm::vec3(0.0f);
+        m_entityViews.clear();
+        m_entitySnaps.clear();
+        for (auto& [id, v] : m_views) {   // other players: shown again once they're in ours
+            if (v.dimension != m_dimension) { v.snapshots.clear(); v.hasPosition = false; }
+        }
+        std::cout << "[Client] Now in " << (name.empty() ? std::string(dims::kOverworld) : name) << std::endl;
+        break;
+    }
+    case S_BLOCK_TEXT: {
+        if (m_state != State::Joined) return;
+        const glm::ivec3 pos = r.ivec3();
+        const bool has = r.u8() != 0;
+        BlockText t;
+        if (has && !readText(r, t)) return;
+        if (!r.ok) return;
+        m_world->applyNetworkText(pos, has ? &t : nullptr);
+        m_textArrived = true;
+        break;
+    }
+    case S_PLAYER_DIM: {
+        const uint16_t id = r.u16();
+        std::string dim = r.str();
+        if (!r.ok) return;
+        if (dim == dims::kOverworld) dim.clear();
+        auto& v = m_views[id];
+        v.dimension = dim;
+        if (dim != m_dimension) { v.snapshots.clear(); v.hasPosition = false; }
         break;
     }
     case S_CHALLENGE: {
@@ -2171,6 +2481,18 @@ void GameClient::sendEntityAct(uint32_t id, int kind, const std::string& item) {
     w.u8(static_cast<uint8_t>(kind));
     w.str(item);
     sendTo(m_peer, w);
+}
+
+bool GameClient::sendBlockText(const glm::ivec3& pos, int side, const std::vector<std::string>& lines) {
+    if (m_state != State::Joined || side < 0 || side > 1) return false;
+    Writer w(C_BLOCK_TEXT);
+    w.i32(pos.x); w.i32(pos.y); w.i32(pos.z);
+    w.u8(static_cast<uint8_t>(side));
+    const size_t n = std::min(lines.size(), BlockText::kMaxLines);
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) w.str(lines[i].substr(0, BlockText::kMaxLineBytes));
+    sendTo(m_peer, w);
+    return true;
 }
 
 bool GameClient::sendModMessage(const std::string& channel, const std::string& text) {

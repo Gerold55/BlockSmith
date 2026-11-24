@@ -24,6 +24,10 @@
 #include "CaveLua.h"
 #include "Block.h"
 #include "BlockDefs.h"
+#include "DimensionsLua.h"
+#include "BlockTextLua.h"
+#include "BlockStateLua.h"
+#include "DimensionWorlds.h"
 #include "Net.h"
 #include "Sha256.h"
 #include "ChunkGenerator.h"
@@ -671,17 +675,25 @@ fs::path playerFile(const fs::path& worldDir, const std::string& name) {
     return worldDir / "players" / (name + ".txt");
 }
 
-bool loadPlayer(const fs::path& worldDir, const std::string& name, glm::vec3& pos) {
+bool loadPlayer(const fs::path& worldDir, const std::string& name, glm::vec3& pos, std::string* dimension = nullptr) {
     std::ifstream in(playerFile(worldDir, name));
     std::string key;
-    return (in >> key >> pos.x >> pos.y >> pos.z) && key == "pos";
+    if (!((in >> key >> pos.x >> pos.y >> pos.z) && key == "pos")) return false;
+    // "dim <name>": the dimension they were in (none: the overworld)
+    if (dimension) {
+        dimension->clear();
+        std::string k, d;
+        if ((in >> k >> d) && k == "dim" && dims::validName(d) && d != dims::kOverworld) *dimension = d;
+    }
+    return true;
 }
 
-void savePlayer(const fs::path& worldDir, const std::string& name, const glm::vec3& pos) {
+void savePlayer(const fs::path& worldDir, const std::string& name, const glm::vec3& pos, const std::string& dimension = "") {
     std::error_code ec;
     fs::create_directories(worldDir / "players", ec);
     std::ofstream out(playerFile(worldDir, name), std::ios::trunc);
     out << std::fixed << std::setprecision(3) << "pos " << pos.x << " " << pos.y << " " << pos.z << "\n";
+    if (!dimension.empty()) out << "dim " << dimension << "\n";
 }
 
 // ===========================================================================
@@ -911,7 +923,15 @@ fallback(chat)
 )";
 
 struct ServerContext {
-    World* world = nullptr;
+    World* world = nullptr;                   // the overworld
+    DimensionWorlds* dims = nullptr;          // the other dimensions' worlds
+    // The world of the dimension code is running in now (Dimensions.h: dims::current())
+    World* here() const {
+        const std::string& d = dims::current();
+        if (d.empty() || !dims) return world;
+        World* w = dims->get(d);
+        return w ? w : world;
+    }
     GameServer* server = nullptr;
     ServerConfig* config = nullptr;
     DayClock* clock = nullptr;                // the time of day (sky.get_time / set_time)
@@ -1154,29 +1174,29 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         engine["set_block_meta"] = [](sol::variadic_args) {};
     } else {
         engine["get_metadata"] = [&ctx](int x, int y, int z) -> int {
-            return ctx.world->getMetadataAt(glm::ivec3(x, y, z));
+            return ctx.here()->getMetadataAt(glm::ivec3(x, y, z));
         };
         engine["set_block_meta"] = [&ctx](int x, int y, int z, const std::string& name, int meta) {
-            ctx.world->setBlockWithMetaAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name),
+            ctx.here()->setBlockWithMetaAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name),
                                           static_cast<uint8_t>(meta & 0xFF));
         };
         engine["is_opaque"] = [&ctx](int x, int y, int z) {      // (see the game's engine.is_opaque)
-            const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
+            const uint8_t id = ctx.here()->getBlockAt(glm::ivec3(x, y, z));
             if (id == 0 || FluidRegistry::get().forBlock(id)) return false;
             const auto& b = BlockRegistry::getInstance().getBlock(id);
             return b.isWalkable && !b.isTransparent && !b.isCutout;
         };
         engine["is_replaceable"] = [&ctx](int x, int y, int z) {
-            const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
+            const uint8_t id = ctx.here()->getBlockAt(glm::ivec3(x, y, z));
             if (id == 0) return true;
             const auto& prop = BlockRegistry::getInstance().getBlock(id);
             return FluidRegistry::get().forBlock(id) != nullptr || prop.pattern == "plantlike";
         };
         engine["set_block"] = [&ctx](int x, int y, int z, const std::string& name) {
-            ctx.world->setBlockAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name));
+            ctx.here()->setBlockAt(glm::ivec3(x, y, z), BlockRegistry::getInstance().getBlockId(name));
         };
         engine["get_block_name"] = [&ctx](int x, int y, int z) -> std::string {
-            const uint8_t id = ctx.world->getBlockAt(glm::ivec3(x, y, z));
+            const uint8_t id = ctx.here()->getBlockAt(glm::ivec3(x, y, z));
             return id == 0 ? std::string("air") : BlockRegistry::getInstance().getBlock(id).name;
         };
     }
@@ -1193,6 +1213,9 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
             ctx.storageDirty = true;
         };
         ctx.api.addFunctions(engine);             // players: get_online_players, kick_player...
+        // block text (signs): get / set where the world runs; the server has no player of its own
+        blocktext::install(engine, [&ctx]() { return ctx.here(); }, []() { return true; }, nullptr);
+        blockstate::install(engine, [&ctx]() { return ctx.here(); });   // BlockStateLua.h
     }
     engine["get_player_name"] = [&ctx]() { return ctx.config->name; };
     engine["send_chat"] = [&ctx](const std::string& text) {
@@ -1216,7 +1239,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         sol::table out = lv.create_table();
         if (ctx.world) {
             int i = 1;
-            for (const auto& f : ctx.world->fallingBlocks()) {
+            for (const auto& f : ctx.here()->fallingBlocks()) {
                 sol::table t = lv.create_table();
                 t["name"] = BlockRegistry::getInstance().getBlock(f.id).name;
                 t["x"] = f.pos.x; t["y"] = f.pos.y; t["z"] = f.pos.z;
@@ -1251,7 +1274,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
 
     // Fluids: engine.register_fluid etc. Not on generator threads: the fluid registry is
     // shared, and the main state already registered everything.
-    if (!worker) addFluidLuaApi(lua, engine, [&ctx]() { return ctx.world; });
+    if (!worker) addFluidLuaApi(lua, engine, [&ctx]() { return ctx.here(); });
 
     // Shared values: the server decides (e.g. the weather) and every player gets them
     engine["is_authority"] = []() { return true; };
@@ -1270,7 +1293,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         return it == ctx.server->shared().end() ? std::string() : it->second;
     };
     engine["is_outdoors"] = [&ctx](int x, int y, int z) {
-        return ctx.world && ctx.world->hasSkyAbove(glm::ivec3(x, y, z));
+        return ctx.world && ctx.here()->hasSkyAbove(glm::ivec3(x, y, z));
     };
 
     if (worker) {
@@ -1279,6 +1302,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         chat["send"] = [](sol::variadic_args) {};
         world["get_falling_blocks"] = [](sol::this_state ts) { return sol::state_view(ts).create_table(); };
     }
+    dims::installLua(lua);   // dimensions.register / get / list (before the noop fallbacks)
     lua.script(kNoopLua);
     if (!worker) {
         // The time of day is the server's: sky.get_time / set_time and friends work here (the
@@ -1457,9 +1481,16 @@ int main(int argc, char** argv) {
     World world;
     GameServer server;
     ctx.world = &world;
+    // The world's other dimensions (Dimensions.h): loaded while someone's in them, each saved in
+    // dimensions/<name>/ inside the world's folder
+    DimensionWorlds dimWorlds;
+    dimWorlds.primary = &world;
+    dimWorlds.renderDistance = config.viewDistance;
+    ctx.dims = &dimWorlds;
     ctx.server = &server;
 
     const fs::path worldDir = findFolder("saves") / safeName(config.world);
+    dimWorlds.worldDir = worldDir.string();   // (dimensions/<name>/ inside it)
     fs::create_directories(worldDir / "chunks", ec);
     WorldMeta meta = readWorldMeta(worldDir / "world.dat");
     if (meta.exists && !meta.game.empty() && meta.game != config.game) {
@@ -1517,9 +1548,13 @@ int main(int argc, char** argv) {
     // (With light data it's the real light.) Used by engine.get_light_level and mob spawning,
     // so both agree - and `sky` says whether the sky is overhead (spawn rules with sky = true).
     struct ServerLight { int level; bool sky; };
-    auto serverLight = [&world, &dayClock](int x, int y, int z) -> ServerLight {
-        const float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+    auto serverLight = [&ctx, &dayClock](int x, int y, int z) -> ServerLight {
+        World& world = *ctx.here();   // (the dimension being worked on: Dimensions.h)
+        const DimensionType& dt = world.dimensionType();
+        float day = std::clamp(dayClock.sunDirection().y * 2.0f + 0.5f, 0.0f, 1.0f);
+        if (dt.fixedTime >= 0.0) day = (dt.fixedTime >= 0.25 && dt.fixedTime < 0.75) ? 1.0f : 0.0f;
         const int dimming = static_cast<int>(std::lround((1.0f - day) * 11.0f));
+        if (!dt.hasSkylight && !world.lighting()) return { 0, false };
         if (world.lighting()) {
             const uint16_t l = world.getLightAt(glm::ivec3(x, y, z));
             const int skyNow = std::max(0, light::sky(l) - dimming);
@@ -1540,6 +1575,12 @@ int main(int argc, char** argv) {
         host.world = &world;
         host.isAuthority = [] { return true; };
         host.players = [&server]() { return server.playerPositions(); };
+        host.playerPlaces = [&server]() {
+            std::vector<std::tuple<std::string, glm::vec3, std::string>> out;
+            for (const auto& p : server.playerPlaces()) out.emplace_back(p.name, p.pos, p.dimension);
+            return out;
+        };
+        host.worldFor = [&dimWorlds](const std::string& d) -> const World* { return dimWorlds.find(d); };
         host.damagePlayer = [&server](const std::string& name, float amount, const std::string& reason) {
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%g", amount);
@@ -1570,6 +1611,10 @@ int main(int argc, char** argv) {
     server.onEntityAct = [&](const std::string& name, uint32_t id, int kind, const std::string& item, const glm::vec3& at) {
         if (kind == 0) entityLua.punch(id, name, at, item);
         else entityLua.rightClick(id, name, item);
+    };
+    server.canEditText = [&ctx](const std::string& name, const glm::ivec3& pos, int side, std::vector<std::string>& lines,
+                                std::string& refusal) {
+        return ctx.api.canEditText(name, pos, side, lines, refusal);
     };
     server.onModMessage = [&ctx](const std::string& name, const std::string& channel, const std::string& data) {
         ctx.api.modMessage(name, channel, data);
@@ -1668,6 +1713,16 @@ int main(int argc, char** argv) {
         return workerLua;
     }, meta.seed);
     world.setGenerator(&generator);
+    dimWorlds.generator = &generator;   // (one set of threads for every dimension)
+    dimWorlds.loadBudgetMs = 1000.0f / config.tickRate * 0.25f;
+    dimWorlds.onLoaded = [&](const std::string& d, World& w) {
+        if (server.running()) w.setRecordChanges(true);
+        blockMods.loadDimension(d, w.saveDirectory());
+    };
+    dimWorlds.onUnloading = [&](const std::string& d, World& w) {
+        blockMods.saveDimension(d, w.saveDirectory());
+        blockMods.forgetDimension(d);
+    };
     std::cout << "[Server] World generation: " << generator.threadCount() << " background thread"
               << (generator.threadCount() == 1 ? "" : "s") << std::endl;
 
@@ -1714,6 +1769,27 @@ int main(int argc, char** argv) {
     server.isOperator = [&](const std::string& name) { return ops.has(name); };
     accounts.load();
     ctx.api.isOperator = [&](const std::string& name) { return ops.has(name); };
+    ctx.api.changeDimension = [&](const std::string& name, const std::string& d, const glm::vec3& pos) {
+        return server.setPlayerDimension(name, d, pos);
+    };
+    ctx.api.loadArea = [&](const std::string& d, int x, int z, int radius) {
+        World* w = dimWorlds.get(d);
+        if (!w) return false;
+        dimWorlds.touch(d);
+        const int r = (radius + CHUNK_WIDTH - 1) / CHUNK_WIDTH;
+        const int ccx = static_cast<int>(std::floor(x / static_cast<float>(CHUNK_WIDTH)));
+        const int ccz = static_cast<int>(std::floor(z / static_cast<float>(CHUNK_WIDTH)));
+        bool ok = true;
+        for (int cx = ccx - r; cx <= ccx + r; ++cx)
+            for (int cz = ccz - r; cz <= ccz + r; ++cz)
+                if (!w->chunkData({cx, cz})) ok = w->loadChunk(cx, cz, lua) && ok;
+        return ok;
+    };
+    ctx.api.loadDimension = [&](const std::string& d) {
+        World* w = dimWorlds.get(d);
+        if (w) dimWorlds.touch(d);
+        return w != nullptr;
+    };
     ctx.api.rememberMode = [&](const std::string& name, const std::string& mode) {
         if (mode == config.gameMode) playerModes.remove(name); else playerModes.add(name, mode);
     };
@@ -1735,8 +1811,23 @@ int main(int argc, char** argv) {
         return true;
     };
     server.onLeave = [&](const std::string& name, const glm::vec3& pos) {
-        savePlayer(worldDir, name, pos);
+        savePlayer(worldDir, name, pos, server.playerDimension(name));
         ctx.api.playerLeft(name, pos);
+    };
+    // Dimensions: each player's, kept with them; the worlds for them
+    server.dimensionFor = [&](const std::string& name) {
+        glm::vec3 p;
+        std::string d;
+        loadPlayer(worldDir, name, p, &d);
+        return d;
+    };
+    server.worldFor = [&dimWorlds](const std::string& d) { return dimWorlds.get(d); };
+    server.forEachWorld = [&](const std::function<void(const std::string&, World&)>& fn) {
+        fn(std::string(), world);
+        dimWorlds.forEach(fn);
+    };
+    server.onDimensionChange = [&ctx](const std::string& name, const std::string& from, const std::string& to) {
+        ctx.api.dimensionChanged(name, from, to);
     };
     // A player broke or placed a block: on_block_broken(x, y, z, block, meta, player) /
     // on_block_placed(x, y, z, block, player) - the same hooks as in singleplayer, so mods like
@@ -1898,9 +1989,10 @@ int main(int argc, char** argv) {
     }, completeConsole);
 
     auto saveAll = [&]() {
-        for (const auto& [name, pos] : server.playerPositions()) savePlayer(worldDir, name, pos);
-        const int chunks = world.saveAll();
-        blockMods.saveWorld(worldDir.string());
+        for (const auto& p : server.playerPlaces()) savePlayer(worldDir, p.name, p.pos, p.dimension);
+        const int chunks = world.saveAll() + dimWorlds.saveAll();
+        dimWorlds.forEach([&](const std::string& d, World& w) { blockMods.saveDimension(d, w.saveDirectory()); });
+        blockMods.saveDimension(std::string(), worldDir.string());
         if (!entityManager.save(worldDir.string(), [&](Entity& e) { entityLua.saveData(e); })) {
             std::cerr << "[Server] Could not save entities.txt" << std::endl;
         }
@@ -1997,16 +2089,30 @@ int main(int argc, char** argv) {
         }
         // /respawn: back to the spawn point (sent by the game after dying when joined)
         if (cmd == "respawn" && !console) {
-            // their own spawn point (/spawnpoint), else the world's
+            // Like Minecraft: their own spawn point (/spawnpoint, a bed; "x y z [dimension]" -
+            // a respawn anchor's is in its dimension), else the world's spawn - in the overworld,
+            // wherever they died
+            auto moveTo = [&](const std::string& d, const glm::vec3& p) {
+                if (server.playerDimension(from) != d) server.setPlayerDimension(from, d, p);
+                else server.teleportPlayer(from, p);
+            };
             if (spawnPoints.has(from)) {
                 std::istringstream sp(spawnPoints.reason(from));
                 float x = 0, y = 0, z = 0;
-                if (sp >> x >> y >> z) { server.teleportPlayer(from, glm::vec3(x, y, z)); return; }
+                std::string d;
+                if (sp >> x >> y >> z) {
+                    sp >> d;
+                    if (d == dims::kOverworld) d.clear();
+                    if (d.empty() || dims::Registry::get().has(d)) { moveTo(d, glm::vec3(x, y, z)); return; }
+                }
             }
+            // the dimension they died in decides (its `respawn`: the overworld by default)
+            const std::string target = dims::respawnDimension(server.playerDimension(from));
+            if (!target.empty()) { moveTo(target, dims::Registry::get().type(target).spawn); return; }
             const int sx = config.spawnX, sz = config.spawnZ;
             int ground = world.groundHeightAt(sx, sz);
             if (ground < 0) ground = 80;
-            server.teleportPlayer(from, glm::vec3(sx + 0.5f, static_cast<float>(ground), sz + 0.5f));
+            moveTo(std::string(), glm::vec3(sx + 0.5f, static_cast<float>(ground), sz + 0.5f));
             return;
         }
         // /gamemode on its own: anyone may ask which mode they're in
@@ -2745,6 +2851,11 @@ int main(int argc, char** argv) {
         }
         server.update(spawnCenter, 0.0f, 0.0f, tickDt);
         world.updateFluids(tickDt);   // each fluid at its own speed (Fluids.h)
+        // The other dimensions with players in them: loading around those players, fluids...
+        // and the ones left empty a while are saved and unloaded
+        std::map<std::string, std::vector<glm::vec3>> playersByDim;
+        for (const auto& p : server.playerPlaces()) playersByDim[p.dimension].push_back(p.pos);
+        dimWorlds.update(lua, tickDt, std::chrono::duration<double>(Clock::now() - serverStart).count(), playersByDim);
 
         // Lua every tick: shared values that changed, then on_update (weather etc.)
         // (time-limited, and a repeating error is printed once - not every tick)
@@ -2759,10 +2870,12 @@ int main(int argc, char** argv) {
         }
         ctx.api.call("on_update", [](sol::protected_function_result&) {}, tickDt);
         entityLua.step(tickDt);   // mobs move and think, items get picked up, new mobs spawn
-        {                         // ABMs near players, LBMs on chunks that just loaded
-            std::vector<glm::vec3> nearPlayers;
-            for (const auto& p : server.playerPositions()) nearPlayers.push_back(p.second);
-            blockMods.update(tickDt, world, nearPlayers);
+        {                         // ABMs near players, LBMs on chunks that just loaded (each dimension's own)
+            blockMods.update(tickDt, world, playersByDim[std::string()]);
+            dimWorlds.forEach([&](const std::string& d, World& w) {
+                dims::InDimension here(d);
+                blockMods.update(tickDt, w, playersByDim[d]);
+            });
         }
         remoteContent.update();   // finished downloads -> mods' callbacks
         updates.update(std::chrono::duration<double>(Clock::now() - serverStart).count());

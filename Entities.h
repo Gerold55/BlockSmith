@@ -46,6 +46,7 @@ struct EntityType {
 struct Entity {
     uint32_t id = 0;
     std::string type;
+    std::string dimension;       // which dimension it's in ("" = the overworld; Dimensions.h)
     glm::vec3 pos{0.0f};         // feet, centre
     glm::vec3 vel{0.0f};         // blocks per second
     float yaw = 0.0f;            // degrees (0 = facing +x, 90 = +z), the same as engine.add_model
@@ -120,6 +121,9 @@ struct SpawnRule {
     int maxNearby = 6;                   // no more of this type than this within 48 blocks
     std::string when = "any";            // "day", "night" or "any"
     bool needsSky = false;               // only where the sky is overhead (animals in fields)
+    // The dimensions it spawns in ("" = the overworld; "*" = every one). Default: the overworld
+    // only, so a mob written before dimensions doesn't turn up in a new one.
+    std::vector<std::string> dimensions{ std::string() };
 };
 
 class EntityManager {
@@ -216,7 +220,15 @@ private:
     std::vector<std::string> m_unknownLines;    // saved entities whose mod isn't loaded
     uint32_t m_nextId = 1;
     std::vector<SpawnRule> m_spawnRules;
-    float m_spawnTimer = 0.0f;
+    std::map<std::string, float> m_spawnTimers;   // per dimension
+    // Dimensions: while stepping one dimension's entities, only theirs (nullptr = all)
+    const std::string* m_only = nullptr;
+    bool here(const Entity& e) const { return !m_only || e.dimension == *m_only; }
+public:
+    // Steps, spawning and pick-ups after this only see one dimension's entities (nullptr: all).
+    // EntityLua sets it around each dimension's turn.
+    void onlyDimension(const std::string* dimension) { m_only = dimension; }
+private:
     uint32_t m_rng = 0x9E3779B9u;
     float random01();
 };

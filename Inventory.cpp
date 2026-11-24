@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX   // (windows.h's min/max macros would break std::max and glm::max)
+#endif
+#include "BlockShape.h"
 #include "Inventory.h"
 #include "Block.h"
 #include "Hotbar.h"
@@ -353,7 +357,9 @@ void drawFlatIcon(const BlockProperty& block, float x, float y, float s) {
     drawFace(*face, block.defaultTint, c, 1.0f);
 }
 
-// True isometric cube (matches the hotbar's 35.264 degree rotation)
+// True isometric cube (matches the hotbar's 35.264 degree rotation). Slabs and stairs are drawn
+// in their shape (BlockShape.h: a bottom slab, stairs with the step at the back), box by box -
+// the base first, the step after it - each face showing its part of the picture.
 void drawCubeIcon(const BlockProperty& block, float x, float y, float s) {
     const FaceDefinition* fallback = getIconFace(block);
     if (!fallback) return;
@@ -365,33 +371,37 @@ void drawCubeIcon(const BlockProperty& block, float x, float y, float s) {
     const float w    = s * 0.8660f;
     const float edge = w * 0.5774f;
     const float d    = w * 0.2887f;
-
     const float x0 = x + (s - w) * 0.5f;
-    const float x1 = x0 + w;
     const float cx = x0 + w * 0.5f;
-
     const float yTop = y;
-    const float yQ1  = y + d;
-    const float yMid = y + 2.0f * d;
-    const float yQ3  = yQ1 + edge;
-    const float yBot = yMid + edge;
 
-    QuadCorner top[4] = {
-        { cx, yTop, 0.0f, 0.0f }, { x1, yQ1, 1.0f, 0.0f },
-        { cx, yMid, 1.0f, 1.0f }, { x0, yQ1, 0.0f, 1.0f },
-    };
-    QuadCorner left[4] = {
-        { x0, yQ1, 0.0f, 0.0f }, { cx, yMid, 1.0f, 0.0f },
-        { cx, yBot, 1.0f, 1.0f }, { x0, yQ3, 0.0f, 1.0f },
-    };
-    QuadCorner right[4] = {
-        { cx, yMid, 0.0f, 0.0f }, { x1, yQ1, 1.0f, 0.0f },
-        { x1, yQ3, 1.0f, 1.0f }, { cx, yBot, 0.0f, 1.0f },
+    // A point of the block (0..1 each way) on the screen: +X goes right and down, +Z left and down
+    auto corner = [&](float px, float py, float pz, int face) {
+        const glm::vec2 uv = shape::faceUV(face, glm::vec3(px, py, pz));
+        return QuadCorner{ cx + (px - pz) * w * 0.5f, yTop + d * (px + pz) + edge * (1.0f - py), uv.x, uv.y };
     };
 
-    drawFace(pick(2), block.defaultTint, top,   1.0f);
-    drawFace(pick(4), block.defaultTint, left,  0.8f);
-    drawFace(pick(0), block.defaultTint, right, 0.6f);
+    shape::Box boxes[shape::kMaxBoxes];
+    auto none = [](int, int, int, uint8_t&, uint8_t&) { return false; };
+    int n = 1;
+    boxes[0] = { glm::vec3(0.0f), glm::vec3(1.0f) };
+    if (shape::isPartial(block)) n = shape::boxes(block, 0, none, boxes);
+
+    for (int i = 0; i < n; ++i) {
+        const glm::vec3 a = boxes[i].mn, b = boxes[i].mx;
+        QuadCorner top[4] = {   // (+Y)
+            corner(a.x, b.y, a.z, 2), corner(b.x, b.y, a.z, 2), corner(b.x, b.y, b.z, 2), corner(a.x, b.y, b.z, 2),
+        };
+        QuadCorner left[4] = {  // (+Z)
+            corner(a.x, b.y, b.z, 4), corner(b.x, b.y, b.z, 4), corner(b.x, a.y, b.z, 4), corner(a.x, a.y, b.z, 4),
+        };
+        QuadCorner right[4] = { // (+X)
+            corner(b.x, b.y, b.z, 0), corner(b.x, b.y, a.z, 0), corner(b.x, a.y, a.z, 0), corner(b.x, a.y, b.z, 0),
+        };
+        drawFace(pick(2), block.defaultTint, top,   1.0f);
+        drawFace(pick(4), block.defaultTint, left,  0.8f);
+        drawFace(pick(0), block.defaultTint, right, 0.6f);
+    }
 }
 
 // Purple/black checkerboard for blocks without a texture
@@ -424,7 +434,8 @@ void drawItemIcon(uint8_t id, float x, float y, float s) {
         drawMissing(x + inset, y + inset, s - 2 * inset);
         return;
     }
-    if (block.pattern == "cube") drawCubeIcon(block, x, y, s);
+    // (slabs and stairs too: drawn in their shape)
+    if (block.pattern == "cube" || shape::isPartial(block)) drawCubeIcon(block, x, y, s);
     else                         drawFlatIcon(block, x, y, s);
 }
 

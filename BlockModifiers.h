@@ -43,6 +43,12 @@ public:
     void loadWorld(const std::string& worldDir);
     void saveWorld(const std::string& worldDir) const;
     void clearWorld();
+    // Dimensions (Dimensions.h): each world - the overworld and every other dimension that's
+    // loaded - has its own ABM timers, scan, random-tick carry and once-only LBM record. update()
+    // picks the world's own; these load / save / drop another dimension's ("" = the overworld).
+    void loadDimension(const std::string& dimension, const std::string& dir);
+    void saveDimension(const std::string& dimension, const std::string& dir);
+    void forgetDimension(const std::string& dimension);
 
     // How far from a player blocks are "active" (chunks, each way). Luanti's default is about 3.
     int activeRadius = 3;
@@ -107,6 +113,21 @@ private:
     // Once-only LBMs: the chunks each has done (by name)
     std::map<std::string, std::set<std::pair<int, int>>> m_lbmDone;
     bool m_lbmDirty = false;
+
+    // The other dimensions' state, while another's is in the members above (select swaps)
+    struct WorldState {
+        std::vector<float> timers;
+        double tickCarry = 0.0;
+        std::vector<World::ChunkCoord> scanChunks;
+        size_t scanNext = 0;
+        std::vector<int> scanDue;
+        std::map<std::string, std::set<std::pair<int, int>>> lbmDone;
+        bool lbmDirty = false;
+        bool started = false;
+    };
+    std::map<std::string, WorldState> m_otherWorlds;
+    std::string m_currentDim;            // whose state is in the members ("" = the overworld)
+    void select(const std::string& dimension);
 
     std::map<std::string, std::string> m_lastError;
     uint32_t m_rng = 0x1234567u;

@@ -45,6 +45,11 @@ public:
 
     void setSkyTint(const glm::vec4& rgba) { m_skyTint = rgba; }
     const glm::vec4& skyTint() const { return m_skyTint; }
+    // The tint as drawn: clouds, rain and snow grey the sky over firmly (a flat overcast grey,
+    // not a pale glow at the horizon). The world's fog uses the same, so the two always match.
+    glm::vec4 drawnSkyTint() const {
+        return glm::vec4(glm::vec3(m_skyTint), glm::clamp(m_skyTint.a * 1.6f, 0.0f, 0.95f));
+    }
     void setLight(float level) { m_light = glm::clamp(level, 0.0f, 1.5f); }
     float light() const { return m_light; }
     // Light including any lightning flash: what the shaders use

@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX   // (windows.h's min/max macros would break std::max and glm::max below)
+#endif
+#include "BlockShape.h"
 #include "ChunkMesh.h"
 #include "ChunkData.h"
 #include "Block.h"
@@ -5,6 +9,7 @@
 #include "Fluids.h"
 #include "Light.h"
 #include "DoorShape.h"
+#include "SignShape.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -152,13 +157,19 @@ inline bool isCutout(const BlockProperty& p) {
 inline bool canWaterlog(const BlockProperty& p) {
     // Doors use their metadata for facing/open, not for "waterlogged"
     // (doors and tanks use their metadata for other things: facing, how full)
-    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door" && p.pattern != "tank";
+    return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door" && p.pattern != "tank"
+        && !shape::isPartial(p);   // (slabs and stairs use bit 7: BlockShape.h)
+}
+// Does the block hold water: a waterlogged plant (bit 0) or slab / stairs (bit 7)?
+inline bool holdsWater(const BlockProperty& p, uint8_t meta) {
+    return (canWaterlog(p) && (meta & 1) != 0) || shape::isWaterlogged(p, meta);
 }
 
 // Fluids never hide what's next to them (even opaque ones like lava: their surface is
 // lower than a full block, so the faces behind must still be drawn)
 inline bool isOpaqueSolid(const BlockProperty& p) {
-    return !p.isTransparent && !isPlantLike(p) && !isCutout(p) && !fluidOf(p.id);
+    // (slabs and stairs don't fill their cell: what's next to them still shows)
+    return !p.isTransparent && !isPlantLike(p) && !isCutout(p) && !fluidOf(p.id) && !shape::isPartial(p);
 }
 
 // A cell of `fluid` (local coords, may be in a neighbouring chunk): is it that fluid, and
@@ -175,7 +186,7 @@ bool fluidSurfaceAt(const ChunkData& data, const BlockRegistry& registry, const 
         source = c.source || c.falling;   // falling weighs like a source in the corner average
         return true;
     }
-    if (fluid.name == "water" && canWaterlog(registry.getBlock(id)) && (meta & 1) != 0) {
+    if (fluid.name == "water" && holdsWater(registry.getBlock(id), meta)) {
         height = kWaterSurfaceY;
         source = true;
         return true;
@@ -239,6 +250,12 @@ void ChunkMesh::buildSingleBlock(uint8_t id, const float light[4], std::vector<V
     out.clear();
     if (id == 0) return;
     const auto& prop = BlockRegistry::getInstance().getBlock(id);
+    // Its shape: slabs as a bottom slab, stairs as a flight going up to the east (BlockShape.h)
+    shape::Box bs[shape::kMaxBoxes];
+    auto none = [](int, int, int, uint8_t&, uint8_t&) { return false; };
+    const int nb = shape::isPartial(prop) ? shape::boxes(prop, shape::isStairs(prop) ? 1 : 0, none, bs) : 1;
+    if (!shape::isPartial(prop)) bs[0] = { glm::vec3(0.0f), glm::vec3(1.0f) };
+    for (int bi = 0; bi < nb; ++bi)
     for (int f = 0; f < 6; ++f) {
         // A face with no texture of its own uses another's, as chunks do
         int texFace = f;
@@ -256,12 +273,13 @@ void ChunkMesh::buildSingleBlock(uint8_t id, const float light[4], std::vector<V
         };
         float fv[4][3];
         faceCorners(f, 0.0f, 0.0f, 0.0f, 1.0f, fv);
-        Vertex q[4] = {
-            makeVertex(fv[0][0], fv[0][1], fv[0][2], 0.0f, 1.0f, style),
-            makeVertex(fv[1][0], fv[1][1], fv[1][2], 1.0f, 1.0f, style),
-            makeVertex(fv[2][0], fv[2][1], fv[2][2], 1.0f, 0.0f, style),
-            makeVertex(fv[3][0], fv[3][1], fv[3][2], 0.0f, 0.0f, style),
-        };
+        Vertex q[4];
+        for (int i = 0; i < 4; ++i) {
+            // the unit face's corner, moved onto this box; the picture lined up as in the world
+            const glm::vec3 p = bs[bi].mn + glm::vec3(fv[i][0], fv[i][1], fv[i][2]) * (bs[bi].mx - bs[bi].mn);
+            const glm::vec2 uv = shape::faceUV(f, p);
+            q[i] = makeVertex(p.x, p.y, p.z, uv.x, uv.y, style);
+        }
         for (Vertex& v : q) setLight(v, light[0], light[1], light[2], light[3]);
         pushQuad(out, q);
     }
@@ -279,6 +297,8 @@ ChunkMesh::~ChunkMesh() {
     if (opaqueVBO != 0)      glDeleteBuffers(1, &opaqueVBO);
     if (transparentVAO != 0) glDeleteVertexArrays(1, &transparentVAO);
     if (transparentVBO != 0) glDeleteBuffers(1, &transparentVBO);
+    if (liquidVAO != 0)      glDeleteVertexArrays(1, &liquidVAO);
+    if (liquidVBO != 0)      glDeleteBuffers(1, &liquidVBO);
     if (tintVAO != 0)        glDeleteVertexArrays(1, &tintVAO);
     if (tintVBO != 0)        glDeleteBuffers(1, &tintVBO);
 }
@@ -286,6 +306,7 @@ ChunkMesh::~ChunkMesh() {
 void ChunkMesh::generateMeshData(const ChunkData& data) {
     cpuOpaqueVertices.clear();
     cpuTransparentVertices.clear();
+    cpuLiquidVertices.clear();
     cpuTintVertices.clear();
 
     auto& registry = BlockRegistry::getInstance();
@@ -532,6 +553,53 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         }
     };
 
+    // Signs (patterns "sign" and "wall_sign", SignShape.h): the board, turned to its rotation, and
+    // a standing sign's post. Textured with the block's picture: the board shows its top half
+    // (its sides and edges a thin strip), the post a strip from the middle. The text is drawn
+    // separately (it changes without the chunk being meshed again).
+    auto emitSign = [&](int x, int y, int z, const BlockProperty& prop, bool wall) {
+        int layer = prop.faces[4].baseLayer;
+        for (int f : { 0, 2, 1, 5, 3 }) if (layer < 0) layer = prop.faces[f].baseLayer;
+        if (layer < 0) return;
+        const uint8_t meta = data.getLocalMetadata(x, y, z);
+        const sign::Board b = sign::board(wall, meta);
+        // one box, oriented: centre, its three half-axes, and the picture's area for each face
+        auto box = [&](const glm::vec3& c, const glm::vec3& ax, const glm::vec3& ay, const glm::vec3& az,
+                       float u0, float v0, float u1, float v1) {
+            // faces: +az (front), -az (back), +ay (top), -ay (bottom), +ax, -ax
+            const glm::vec3 faces[6][4] = {
+                { c - ax - ay + az, c + ax - ay + az, c + ax + ay + az, c - ax + ay + az },
+                { c + ax - ay - az, c - ax - ay - az, c - ax + ay - az, c + ax + ay - az },
+                { c - ax + ay + az, c + ax + ay + az, c + ax + ay - az, c - ax + ay - az },
+                { c - ax - ay - az, c + ax - ay - az, c + ax - ay + az, c - ax - ay + az },
+                { c + ax - ay + az, c + ax - ay - az, c + ax + ay - az, c + ax + ay + az },
+                { c - ax - ay - az, c - ax - ay + az, c - ax + ay + az, c - ax + ay - az },
+            };
+            const float shades[6] = { 1.0f, 0.75f, 1.0f, 0.5f, 0.8f, 0.8f };
+            for (int f = 0; f < 6; ++f) {
+                const FaceStyle style{ prop.defaultTint.r, prop.defaultTint.g, prop.defaultTint.b,
+                                       static_cast<float>(layer), -1.0f, 0.0f, 0.0f, shades[f] };
+                // big faces get the whole area; edges a thin strip of it
+                const bool big = f < 2;
+                const float uv[4][2] = { { u0, v1 }, { u1, v1 }, { u1, big ? v0 : v1 - (v1 - v0) * 0.15f }, { u0, big ? v0 : v1 - (v1 - v0) * 0.15f } };
+                Vertex q[4];
+                for (int i = 0; i < 4; ++i) {
+                    const glm::vec3& p = faces[f][i];
+                    q[i] = makeVertex(x + p.x, y + p.y, z + p.z, uv[i][0], uv[i][1], style);
+                }
+                lightCell(q, 4, x, y, z);
+                pushDoubleSided(cpuOpaqueVertices, q);
+            }
+        };
+        box(b.center, b.right * (sign::kWidth * 0.5f), b.up * (sign::kHeight * 0.5f), b.normal * (sign::kThickness * 0.5f),
+            0.0f, 0.0f, 1.0f, 0.5f);
+        if (!wall) {
+            const float h = sign::kPostTop * 0.5f;
+            box(glm::vec3(0.5f, h, 0.5f), b.right * (sign::kPostWidth * 0.5f), glm::vec3(0, h, 0),
+                b.normal * (sign::kPostWidth * 0.5f), 0.45f, 0.5f, 0.55f, 1.0f);
+        }
+    };
+
     // Tanks (pattern "tank"): the liquid inside first, as full as the metadata says (0..16),
     // drawn with the liquid block's own pictures; then the see-through shell around it. A spout
     // (tank.stream) also has a thin stream falling out of its bottom.
@@ -542,7 +610,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         const uint8_t fluidId = prop.tankFluid.empty() ? 0 : registry.getBlockId(prop.tankFluid);
         const uint8_t fluid2Id = prop.tankFluid2.empty() ? 0 : registry.getBlockId(prop.tankFluid2);
         auto bufFor = [&](const BlockProperty& liquid) -> std::vector<Vertex>& {
-            return (liquid.isTransparent && !isCutout(liquid)) ? cpuTransparentVertices : cpuOpaqueVertices;
+            return (liquid.isTransparent && !isCutout(liquid)) ? cpuLiquidVertices : cpuOpaqueVertices;
         };
         if (fluidId != 0) {
             const BlockProperty& liquid = registry.getBlock(fluidId);
@@ -583,6 +651,21 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 blended && prop.tintView, false, false);
     };
 
+    // Slabs and stairs (BlockShape.h): their boxes, each face textured like the block's own
+    // face on that side and lined up with the world (so a stair's step continues the wall)
+    auto emitShape = [&](int x, int y, int z, const BlockProperty& prop) {
+        shape::Box bs[shape::kMaxBoxes];
+        auto get = [&](int dx, int dy, int dz, uint8_t& id, uint8_t& m) {
+            id = data.getBlock(x + dx, y + dy, z + dz);
+            m = data.getMetadata(x + dx, y + dy, z + dz);
+            return true;
+        };
+        const int n = shape::boxes(prop, data.getLocalMetadata(x, y, z), get, bs);
+        const bool blended = prop.isTransparent && !isCutout(prop);
+        auto& buf = blended ? cpuTransparentVertices : cpuOpaqueVertices;
+        for (int i = 0; i < n; ++i) emitBox(x, y, z, bs[i].mn, bs[i].mx, prop, false, false, buf, false, false, false);
+    };
+
     auto emitCube = [&](int x, int y, int z, uint8_t blockId, const BlockProperty& selfProp,
                         const BlockProperty& renderProp, const FluidDef* renderingFluid) {
         const bool renderingWater = renderingFluid != nullptr;   // any fluid
@@ -603,6 +686,12 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                     cornerTop[cx][cz] = fluidCornerHeight(data, registry, *renderingFluid, x, y, z, cx, cz);
         }
 
+        // A turned block (rotation = facing / facing_all / axis): each world face shows the
+        // block's own face that's turned to it, its picture turned with it (BlockShape.h)
+        const uint8_t selfMeta = (!renderingWater && renderProp.rotation != 0) ? data.getLocalMetadata(x, y, z) : 0;
+        const bool turned = !renderingWater && shape::isTurned(renderProp.rotation, selfMeta);
+        const glm::mat3 turn = turned ? shape::rotationMatrix(renderProp.rotation, selfMeta) : glm::mat3(1.0f);
+
         for (int f = 0; f < 6; ++f) {
             const int nx = x + kFaceOffset[f][0];
             const int ny = y + kFaceOffset[f][1];
@@ -612,7 +701,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
             if (neighborId != 0) {
                 const auto& nProp = registry.getBlock(neighborId);
                 const uint8_t neighborMeta = data.getMetadata(nx, ny, nz);   // looks across chunk borders
-                const bool nWaterlogged = canWaterlog(nProp) && ((neighborMeta & 1) != 0);
+                const bool nWaterlogged = holdsWater(nProp, neighborMeta);
 
                 if (isFaceHidden(selfProp, blockId, renderingFluid, nProp, neighborId, nWaterlogged)) {
                     continue;
@@ -622,7 +711,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
             // A face with no texture of its own uses the top's (or any face that has one),
             // e.g. water whose game only gave it a top texture: its sides show in holes
             // and waterfalls, and would otherwise be black
-            int texFace = f;
+            int texFace = turned ? shape::ownFace(turn, f) : f;
             // Water: every face looks like the surface (as in Minecraft). A game's water
             // side/bottom faces may have no texture, an overlay or a tint meant only for
             // underwater views - those drew black in holes, waterfalls and along shores.
@@ -657,13 +746,23 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 makeVertex(fv[2][0], fv[2][1], fv[2][2], 1.0f, 0.0f, style),
                 makeVertex(fv[3][0], fv[3][1], fv[3][2], 0.0f, 0.0f, style),
             };
+            if (turned) {
+                for (int i = 0; i < 4; ++i) {
+                    const glm::vec2 uv = shape::turnedUV(turn, texFace, glm::vec3(fv[i][0] - fx, fv[i][1] - fy, fv[i][2] - fz));
+                    q[i] = makeVertex(fv[i][0], fv[i][1], fv[i][2], uv.x, uv.y, style);
+                }
+            }
 
             const bool blended = renderProp.isTransparent && !isCutout(renderProp);
             auto& buf = blended ? cpuTransparentVertices : cpuOpaqueVertices;
             if (!renderingWater) applyBiomeTint(q, 4, renderProp.biomeTint);
             if (selfProp.pattern == "cube" || renderingWater) lightFace(q, f, x, y, z);
             else lightCell(q, 4, x, y, z);
-            pushQuad(buf, q);
+            // See-through blocks are drawn with the faces turned away culled (WorldRenderer), so
+            // a block's far side can't paint over its near one. Liquids keep both sides: their
+            // surface shows from underneath too.
+            if (blended && renderingWater) pushDoubleSided(cpuLiquidVertices, q);
+            else pushQuad(buf, q);
             if (blended && renderProp.tintView && !renderingWater) pushQuad(cpuTintVertices, q);
         }
     };
@@ -675,7 +774,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 if (blockId == 0) continue;
 
                 const auto& prop = registry.getBlock(blockId);
-                const bool waterlogged = canWaterlog(prop) && ((data.getLocalMetadata(x, y, z) & 1) != 0);
+                const bool waterlogged = holdsWater(prop, data.getLocalMetadata(x, y, z));
 
                 if (prop.pattern == "door") {
                     emitDoor(x, y, z, prop);
@@ -684,6 +783,14 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                 if (prop.pattern == "tank") {
                     emitTank(x, y, z, prop);
                     continue;
+                }
+                if (prop.pattern == "sign" || prop.pattern == "wall_sign") {
+                    emitSign(x, y, z, prop, prop.pattern == "wall_sign");
+                    continue;
+                }
+                if (shape::isPartial(prop)) {
+                    emitShape(x, y, z, prop);
+                    if (!waterlogged) continue;          // (waterlogged: its water below)
                 }
                 if (isPlantLike(prop)) {
                     emitPlant(x, y, z, prop);
@@ -708,10 +815,12 @@ void ChunkMesh::uploadMesh() {
 
     opaqueVertexCount      = static_cast<GLsizei>(cpuOpaqueVertices.size());
     transparentVertexCount = static_cast<GLsizei>(cpuTransparentVertices.size());
+    liquidVertexCount      = static_cast<GLsizei>(cpuLiquidVertices.size());
     tintVertexCount        = static_cast<GLsizei>(cpuTintVertices.size());
 
     uploadBuffer(opaqueVAO,      opaqueVBO,      cpuOpaqueVertices);
     uploadBuffer(transparentVAO, transparentVBO, cpuTransparentVertices);
+    if (liquidVertexCount > 0 || liquidVAO != 0) uploadBuffer(liquidVAO, liquidVBO, cpuLiquidVertices);
     if (tintVertexCount > 0 || tintVAO != 0) uploadBuffer(tintVAO, tintVBO, cpuTintVertices);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -720,6 +829,7 @@ void ChunkMesh::uploadMesh() {
     // The GPU has its own copy now; free the CPU-side vertices
     std::vector<Vertex>().swap(cpuOpaqueVertices);
     std::vector<Vertex>().swap(cpuTransparentVertices);
+    std::vector<Vertex>().swap(cpuLiquidVertices);
     std::vector<Vertex>().swap(cpuTintVertices);
 
     meshReadyForUpload = false;
@@ -737,6 +847,13 @@ void ChunkMesh::drawTint() const {
     if (tintVertexCount == 0 || tintVAO == 0) return;
     glBindVertexArray(tintVAO);
     glDrawArrays(GL_TRIANGLES, 0, tintVertexCount);
+    glBindVertexArray(0);
+}
+
+void ChunkMesh::drawLiquid() const {
+    if (liquidVertexCount == 0 || liquidVAO == 0) return;
+    glBindVertexArray(liquidVAO);
+    glDrawArrays(GL_TRIANGLES, 0, liquidVertexCount);
     glBindVertexArray(0);
 }
 

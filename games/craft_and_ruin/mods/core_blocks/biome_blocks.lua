@@ -13,6 +13,7 @@ engine.register_block("log_spruce", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_spruce_log_top.png",
     sides  = "textures/cw_spruce_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Spruce Log",
     transparent = false,
     walkable = true,
@@ -20,7 +21,7 @@ engine.register_block("log_spruce", 1.0, 1.0, 1.0, {
 })
 
 -- Spruce Leaves (dark, coloured by the biome)
-engine.register_block("leaves_spruce", 60, 120, 70, "spruce_leaves.png", nil, {
+engine.register_block("leaves_spruce", 60, 120, 70, "textures/cw_spruce_leaves.png", nil, {
     description = "Spruce Leaves",
     transparent = true,
     cutout      = true,
@@ -37,6 +38,7 @@ engine.register_block("log_jungle", 1.0, 1.0, 1.0, {
     bottom = "textures/log_jungle_top.png",
     sides  = "textures/log_jungle.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Jungle Log",
     transparent = false,
     walkable = true,
@@ -61,6 +63,7 @@ engine.register_block("log_acacia", 1.0, 1.0, 1.0, {
     bottom = "textures/acacia_log_top.png",
     sides  = "textures/acacia_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Acacia Log",
     transparent = false,
     walkable = true,

@@ -1,9 +1,11 @@
+#include "Dimensions.h"
 // Entities.cpp: see Entities.h
 #include "Entities.h"
 #include "World.h"
 #include "Block.h"
 #include "Fluids.h"
 #include "DoorShape.h"
+#include "BlockShape.h"
 #include "Light.h"
 #include "Types.h"
 
@@ -19,24 +21,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// A block's collision box (world coordinates); false = nothing to bump into
-bool solidBox(const World& world, int x, int y, int z, glm::vec3& mn, glm::vec3& mx) {
-    if (y < 0 || y >= CHUNK_HEIGHT) return false;
-    const uint8_t id = world.getBlockAt({x, y, z});
-    if (id == 0) return false;
-    if (FluidRegistry::get().forBlock(id)) return false;
-    const auto& prop = BlockRegistry::getInstance().getBlock(id);
-    if (!prop.isWalkable) return false;
-    const glm::vec3 cell(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-    if (prop.pattern == "door") {
-        door::box(world.getMetadataAt({x, y, z}), mn, mx);
-        mn += cell;
-        mx += cell;
-    } else {
-        mn = cell;
-        mx = cell + glm::vec3(1.0f);
-    }
-    return true;
+// A block's collision boxes (world coordinates); none = nothing to bump into. Slabs, stairs and
+// doors are their parts (BlockShape.h), the same as for players.
+int solidBoxes(const World& world, int x, int y, int z, shape::Box out[shape::kMaxBoxes]) {
+    if (y < 0 || y >= CHUNK_HEIGHT) return 0;
+    return shape::worldBoxes(world, x, y, z, [](uint8_t id) { return FluidRegistry::get().forBlock(id) != nullptr; }, out);
 }
 
 // How far the box [mn, mx] can move along `axis` by `d` before touching a block. Boxes it
@@ -50,20 +39,23 @@ float sweep(const World& world, const glm::vec3& mn, const glm::vec3& mx, int ax
     for (int x = static_cast<int>(std::floor(lo.x)); x <= static_cast<int>(std::floor(hi.x - kEps)); ++x) {
         for (int y = static_cast<int>(std::floor(lo.y)); y <= static_cast<int>(std::floor(hi.y - kEps)); ++y) {
             for (int z = static_cast<int>(std::floor(lo.z)); z <= static_cast<int>(std::floor(hi.z - kEps)); ++z) {
-                glm::vec3 bmn, bmx;
-                if (!solidBox(world, x, y, z, bmn, bmx)) continue;
-                bool across = true;
-                for (int k = 0; k < 3 && across; ++k) {
-                    if (k == axis) continue;
-                    across = mn[k] < bmx[k] - kEps && mx[k] > bmn[k] + kEps;
-                }
-                if (!across) continue;
-                if (d > 0.0f) {
-                    if (bmn[axis] < mx[axis] - kEps) continue;             // already inside it
-                    allowed = std::min(allowed, std::max(0.0f, bmn[axis] - mx[axis] - (axis == 1 ? 0.0f : kEps)));
-                } else {
-                    if (bmx[axis] > mn[axis] + kEps) continue;
-                    allowed = std::max(allowed, std::min(0.0f, bmx[axis] - mn[axis] + (axis == 1 ? 0.0f : kEps)));
+                shape::Box bs[shape::kMaxBoxes];
+                const int nb = solidBoxes(world, x, y, z, bs);
+                for (int bi = 0; bi < nb; ++bi) {
+                    const glm::vec3 bmn = bs[bi].mn, bmx = bs[bi].mx;
+                    bool across = true;
+                    for (int k = 0; k < 3 && across; ++k) {
+                        if (k == axis) continue;
+                        across = mn[k] < bmx[k] - kEps && mx[k] > bmn[k] + kEps;
+                    }
+                    if (!across) continue;
+                    if (d > 0.0f) {
+                        if (bmn[axis] < mx[axis] - kEps) continue;             // already inside it
+                        allowed = std::min(allowed, std::max(0.0f, bmn[axis] - mx[axis] - (axis == 1 ? 0.0f : kEps)));
+                    } else {
+                        if (bmx[axis] > mn[axis] + kEps) continue;
+                        allowed = std::max(allowed, std::min(0.0f, bmx[axis] - mn[axis] + (axis == 1 ? 0.0f : kEps)));
+                    }
                 }
             }
         }
@@ -75,9 +67,12 @@ bool boxFree(const World& world, const glm::vec3& mn, const glm::vec3& mx) {
     for (int x = static_cast<int>(std::floor(mn.x)); x <= static_cast<int>(std::floor(mx.x - 1e-4f)); ++x)
         for (int y = static_cast<int>(std::floor(mn.y)); y <= static_cast<int>(std::floor(mx.y - 1e-4f)); ++y)
             for (int z = static_cast<int>(std::floor(mn.z)); z <= static_cast<int>(std::floor(mx.z - 1e-4f)); ++z) {
-                glm::vec3 bmn, bmx;
-                if (!solidBox(world, x, y, z, bmn, bmx)) continue;
-                if (mn.x < bmx.x && mx.x > bmn.x && mn.y < bmx.y && mx.y > bmn.y && mn.z < bmx.z && mx.z > bmn.z) return false;
+                shape::Box bs[shape::kMaxBoxes];
+                const int nb = solidBoxes(world, x, y, z, bs);
+                for (int bi = 0; bi < nb; ++bi) {
+                    const glm::vec3 bmn = bs[bi].mn, bmx = bs[bi].mx;
+                    if (mn.x < bmx.x && mx.x > bmn.x && mn.y < bmx.y && mx.y > bmn.y && mn.z < bmx.z && mx.z > bmn.z) return false;
+                }
             }
     return true;
 }
@@ -152,7 +147,7 @@ void EntityManager::clear() {
     m_entities.clear();
     m_removedIds.clear();
     m_unknownLines.clear();
-    m_spawnTimer = 0.0f;
+    m_spawnTimers.clear();
 }
 
 const EntityType* EntityManager::type(const std::string& name) const {
@@ -190,6 +185,7 @@ uint32_t EntityManager::spawn(const std::string& typeName, const glm::vec3& pos)
     e.type = typeName;
     e.pos = pos;
     e.health = t->maxHealth;
+    e.dimension = dims::current();   // made in the dimension the code runs in (Dimensions.h)
     m_entities[e.id] = e;
     return e.id;
 }
@@ -279,8 +275,8 @@ void EntityManager::moveAndCollide(Entity& e, const EntityType& t, float dt, con
             const float target = std::clamp((submerged - floatDepth) * 4.0f, -2.0f, 2.5f);
             e.vel.y += (target - e.vel.y) * std::min(1.0f, 5.0f * dt);
         } else {
-            e.vel.y -= 24.0f * dt;
-            e.vel.y = std::max(e.vel.y, -50.0f);
+            e.vel.y -= 24.0f * world.dimensionType().gravity * dt;   // (a dimension's own gravity)
+            e.vel.y = std::clamp(e.vel.y, -50.0f, 50.0f);
         }
     }
 
@@ -372,7 +368,7 @@ void EntityManager::step(float dt, const World& world, const std::vector<glm::ve
     FluidRegistry::get().ensureFresh();
     std::vector<Entity*> active;     // moved this step (for pushing each other apart, below)
     for (auto& [id, e] : m_entities) {
-        if (e.removed) continue;
+        if (e.removed || !here(e)) continue;
         const EntityType* t = type(e.type);
         if (!t) continue;
         e.age += dt;
@@ -408,7 +404,7 @@ void EntityManager::step(float dt, const World& world, const std::vector<glm::ve
 
     // Dropped items next to each other become one stack
     std::vector<Entity*> items;
-    for (auto& [id, e] : m_entities) if (!e.removed && e.type == kItemType && e.age > 0.5f) items.push_back(&e);
+    for (auto& [id, e] : m_entities) if (!e.removed && here(e) && e.type == kItemType && e.age > 0.5f) items.push_back(&e);
     if (items.size() > 1 && items.size() < 400) {
         for (size_t i = 0; i < items.size(); ++i) {
             Entity* a = items[i];
@@ -512,7 +508,7 @@ uint32_t EntityManager::raycast(const glm::vec3& o, const glm::vec3& d, float ma
     uint32_t best = 0;
     float bestT = maxDist;
     for (const auto& [id, e] : m_entities) {
-        if (e.removed) continue;
+        if (e.removed || e.dimension != dims::current()) continue;   // (only this dimension's)
         const EntityType* t = type(e.type);
         if (!t || t->isItem) continue;       // items can't be hit (walk over them)
         const float hw = t->width * 0.5f + 0.05f;
@@ -861,7 +857,7 @@ bool EntityManager::lineOfSight(const World& world, const glm::vec3& a, const gl
 std::vector<std::pair<uint32_t, size_t>> EntityManager::itemsInReach(const std::vector<glm::vec3>& players) const {
     std::vector<std::pair<uint32_t, size_t>> out;
     for (const auto& [id, e] : m_entities) {
-        if (e.removed || e.type != kItemType || e.pickupDelay > 0.0f) continue;
+        if (e.removed || !here(e) || e.type != kItemType || e.pickupDelay > 0.0f) continue;
         for (size_t i = 0; i < players.size(); ++i) {
             const glm::vec3& p = players[i];
             const float dx = e.pos.x - p.x, dz = e.pos.z - p.z;
@@ -915,7 +911,9 @@ bool EntityManager::save(const std::string& worldDir, const std::function<void(E
             if (saveData && t && !t->isItem) saveData(e);
             std::snprintf(buf, sizeof(buf), "%.3f\t%.3f\t%.3f\t%.1f\t%.2f", e.pos.x, e.pos.y, e.pos.z, e.yaw, e.health);
             f << escapeField(e.type) << '\t' << buf << '\t' << escapeField(e.nametag) << '\t'
-              << escapeField(e.item) << '\t' << e.itemCount << '\t' << escapeField(e.saved) << '\n';
+              << escapeField(e.item) << '\t' << e.itemCount << '\t' << escapeField(e.saved);
+            if (!e.dimension.empty()) f << '\t' << escapeField(e.dimension);   // (older games read 10 columns)
+            f << '\n';
         }
         for (const auto& line : m_unknownLines) f << line << '\n';
         if (!f) return false;
@@ -965,6 +963,8 @@ int EntityManager::load(const std::string& worldDir) {
         e->item = unescapeField(parts[7]);
         try { e->itemCount = std::stoi(parts[8]); } catch (...) { e->itemCount = 1; }
         e->saved = unescapeField(parts[9]);
+        e->dimension = parts.size() >= 11 ? unescapeField(parts[10]) : std::string();   // which dimension
+        if (!e->dimension.empty() && !dims::validName(e->dimension)) e->dimension.clear();
         if (typeName == kItemType && (e->item.empty() || e->itemCount <= 0)) { m_entities.erase(id); continue; }
         ++n;
     }
@@ -976,15 +976,17 @@ std::vector<uint32_t> EntityManager::trySpawning(float dt, const World& world, c
                                                  bool enabled, const std::function<bool(int, int, int)>& skyVisible) {
     std::vector<uint32_t> spawned;
     if (!enabled || m_spawnRules.empty() || players.empty()) return spawned;
-    m_spawnTimer -= dt;
-    if (m_spawnTimer > 0.0f) return spawned;
-    m_spawnTimer = 2.0f;
+    float& timer = m_spawnTimers[m_only ? *m_only : std::string()];
+    timer -= dt;
+    if (timer > 0.0f) return spawned;
+    timer = 2.0f;
     auto& reg = BlockRegistry::getInstance();
 
     for (const glm::vec3& player : players) {
         // No more than 40 spawned mobs around any one player
         int around = 0;
         for (const auto& [id, e] : m_entities) {
+            if (!here(e)) continue;
             const EntityType* t = type(e.type);
             if (t && t->despawn && glm::distance(e.pos, player) < 64.0f) ++around;
         }
@@ -994,6 +996,12 @@ std::vector<uint32_t> EntityManager::trySpawning(float dt, const World& world, c
             const SpawnRule& rule = m_spawnRules[static_cast<size_t>(random01() * m_spawnRules.size()) % m_spawnRules.size()];
             const EntityType* t = type(rule.type);
             if (!t) continue;
+            {   // only in its dimensions (the one being stepped now)
+                const std::string here = m_only ? *m_only : dims::current();
+                bool ok = false;
+                for (const auto& d : rule.dimensions) if (d == "*" || d == here) { ok = true; break; }
+                if (!ok) continue;
+            }
             if ((rule.when == "day" && !isDay) || (rule.when == "night" && isDay)) continue;
             if (random01() > rule.chance) continue;
             // A column 24..48 blocks away
@@ -1036,7 +1044,7 @@ std::vector<uint32_t> EntityManager::trySpawning(float dt, const World& world, c
             for (const auto& p : players) if (glm::distance(p, at) < 24.0f) tooClose = true;
             if (tooClose) continue;
             int same = 0;
-            for (const auto& [id, e] : m_entities) if (e.type == rule.type && glm::distance(e.pos, at) < 48.0f) ++same;
+            for (const auto& [id, e] : m_entities) if (here(e) && e.type == rule.type && glm::distance(e.pos, at) < 48.0f) ++same;
             if (same >= rule.maxNearby) continue;
             const int group = rule.groupMin + static_cast<int>(random01() * (rule.groupMax - rule.groupMin + 1));
             for (int g = 0; g < std::max(1, group) && same + g < rule.maxNearby; ++g) {

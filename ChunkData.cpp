@@ -9,11 +9,15 @@ ChunkData::ChunkData() {
 }
 
 void ChunkData::setBlock(int x, int y, int z, uint8_t blockId) {
-    if (inside(x, y, z)) blocks[x][y][z] = blockId;
+    if (inside(x, y, z)) {
+        if (!texts.empty() && blocks[x][y][z] != blockId) texts.erase(textKey(x, y, z));   // (another block: its text goes)
+        blocks[x][y][z] = blockId;
+    }
 }
 
 void ChunkData::setBlockWithMeta(int x, int y, int z, uint8_t blockId, uint8_t meta) {
     if (inside(x, y, z)) {
+        if (!texts.empty() && blocks[x][y][z] != blockId) texts.erase(textKey(x, y, z));
         blocks[x][y][z] = blockId;
         metadata[x][y][z] = meta;
     }

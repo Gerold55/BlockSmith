@@ -27,6 +27,9 @@ public:
 
     void drawOpaque() const;
     void drawTransparent() const;
+    // See-through liquids (water...), kept apart so they're drawn before other see-through
+    // blocks: ice on a lake, glass in a tank, are then never covered by the water under them
+    void drawLiquid() const;
     // See-through blocks that tint the view (stained glass, tintView): their faces again, for
     // the colour-filter pass (WorldRenderer multiplies what's behind them by their colour)
     void drawTint() const;
@@ -42,6 +45,8 @@ public:
     GLsizei opaqueVertexCount = 0;
     GLuint transparentVAO = 0, transparentVBO = 0;
     GLsizei transparentVertexCount = 0;
+    GLuint liquidVAO = 0, liquidVBO = 0;
+    GLsizei liquidVertexCount = 0;
     GLuint tintVAO = 0, tintVBO = 0;
     GLsizei tintVertexCount = 0;
 
@@ -51,5 +56,6 @@ public:
 private:
     std::vector<Vertex> cpuOpaqueVertices;
     std::vector<Vertex> cpuTransparentVertices;
+    std::vector<Vertex> cpuLiquidVertices;
     std::vector<Vertex> cpuTintVertices;
 };

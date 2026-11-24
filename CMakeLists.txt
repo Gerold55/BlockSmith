@@ -1,6 +1,18 @@
 # 3.24+: the ENet and OpenAL downloads below use FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP (new
 # in 3.24), and FindLua knows Lua 5.4. Visual Studio 2022 and current vcpkg ship a newer CMake.
 cmake_minimum_required(VERSION 3.24)
+
+# Release by default. Visual Studio / Xcode (several configurations in one build folder): Release
+# is listed first, so the IDE starts on it - but `cmake --build` still needs `--config Release`
+# (without it, CMake builds Debug there). Ninja / Makefiles: CMAKE_BUILD_TYPE is Release unless
+# you say otherwise (-DCMAKE_BUILD_TYPE=Debug). Applies to a new build folder (these are cached).
+if (NOT DEFINED CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_CONFIGURATION_TYPES "Release;RelWithDebInfo;Debug;MinSizeRel" CACHE STRING "Build configurations (Release first)")
+endif()
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release, Debug, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+
 project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
@@ -131,6 +143,12 @@ add_executable(BlockSmith
     CaveGenerator.cpp
     CaveGenerator.h
     Model.cpp
+    VoxelVolume.cpp
+    Spotlights.cpp
+    GpuCheck.cpp
+    Bloom.cpp
+    SunShafts.cpp
+    ArtNet.cpp
     Model.h
     ChatSystem.cpp
     WebLink.cpp
@@ -222,13 +240,6 @@ if (TARGET unofficial::lua::lua)
     target_link_libraries(BlockSmith PRIVATE unofficial::lua::lua)
 else()
     target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
-endif()
-
-if (NOT WIN32)
-    find_library(EXECINFO_LIBRARY execinfo)
-    if (EXECINFO_LIBRARY)
-        target_link_libraries(BlockSmith PRIVATE ${EXECINFO_LIBRARY})
-    endif()
 endif()
 
 endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
@@ -343,11 +354,6 @@ endif()
 if (NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
-
-    find_library(EXECINFO_LIBRARY execinfo)
-    if (EXECINFO_LIBRARY)
-        target_link_libraries(BlockSmithServer PRIVATE ${EXECINFO_LIBRARY})
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -430,4 +436,14 @@ else()
     else()
         message(STATUS "BlockSmith: libcurl not found - online mod content (remote.*) is disabled in this build")
     endif()
+endif()
+
+# Windows: <windows.h> defines min() and max() as macros, which breaks std::max / glm::max in
+# any file that ends up including it (through GLFW, the console code...). NOMINMAX turns them off.
+if (WIN32)
+    foreach(_bs_target BlockSmith BlockSmithServer)
+        if (TARGET ${_bs_target})
+            target_compile_definitions(${_bs_target} PRIVATE NOMINMAX)
+        endif()
+    endforeach()
 endif()

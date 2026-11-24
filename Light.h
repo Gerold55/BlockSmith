@@ -65,6 +65,9 @@ public:
     std::vector<ChunkData*> takeTouched();
     // Forget a chunk that's being unloaded (so takeTouched never returns it)
     void forget(ChunkData* chunk) { m_touched.erase(chunk); }
+    // Sunlight (false: a dimension without skylight - only blocks give light)
+    void setSkylight(bool on) { m_sky = on; }
+    bool skylight() const { return m_sky; }
 
 private:
     struct Node { ChunkData* c; int16_t x; int16_t y; int16_t z; };
@@ -78,4 +81,5 @@ private:
     std::vector<Node> m_add;
     std::vector<RemoveNode> m_remove;
     std::unordered_set<ChunkData*> m_touched;
+    bool m_sky = true;
 };

@@ -1,3 +1,7 @@
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX   // (windows.h's min/max macros would break std::max and glm::max)
+#endif
+#include "BlockShape.h"
 #include "Fluids.h"
 #include "Block.h"
 #include "Types.h"
@@ -99,7 +103,15 @@ FluidCell FluidRegistry::cell(uint8_t blockId, uint8_t meta) const {
     FluidCell c;
     if (blockId == 0) return c;
     c.fluid = forBlock(blockId);
-    if (!c.fluid) return c;
+    if (!c.fluid) {
+        // A waterlogged slab or stairs holds a water source (BlockShape.h)
+        if (shape::isWaterlogged(BlockRegistry::getInstance().getBlock(blockId), meta)) {
+            c.fluid = byName("water");
+            c.source = c.fluid != nullptr;
+            c.held = c.source;
+        }
+        return c;
+    }
     const bool separateFlowing = c.fluid->flowingId != c.fluid->sourceId;
     c.source = blockId == c.fluid->sourceId && (separateFlowing || (meta & 0x0F) == 0);
     if (!c.source) {
@@ -142,8 +154,8 @@ void FluidSimulator::noteChange(const glm::ivec3& loc) {
     reg.ensureFresh();
     for (const auto& o : kWakeOffsets) {
         const glm::ivec3 p(loc.x + o[0], loc.y + o[1], loc.z + o[2]);
-        const FluidDef* f = reg.forBlock(m_world.getBlockAt(p));
-        if (f) m_active[f->name].insert(p);
+        const FluidCell c = reg.cell(m_world.getBlockAt(p), m_world.getMetadataAt(p));   // (waterlogged too)
+        if (c) m_active[c.fluid->name].insert(p);
     }
 }
 
@@ -236,6 +248,9 @@ void FluidSimulator::step(const FluidDef& fluid) {
     for (const glm::ivec3& p : batch) {
         const FluidCell self = cellAt(p);
         if (!isSame(self) || p.y <= 0) continue;
+        // Water held in a slab or stairs: flows out like a source, but the block stays (no
+        // reacting with lava into stone), and never down through a solid bottom
+        const bool held = self.held;
 
         // 0. Touching another fluid it reacts with? Then it turns into a block.
         bool reacted = false;
@@ -244,7 +259,7 @@ void FluidSimulator::step(const FluidDef& fluid) {
             const FluidCell other = cellAt({p.x + o[0], p.y + o[1], p.z + o[2]});
             if (!other || other.fluid->name == fluid.name) continue;
             const FluidReaction* r = reg.reaction(fluid.name, other.fluid->name);
-            if (!r) continue;
+            if (!r || held) continue;
             uint8_t id = blocks.getBlockId(self.source ? r->sourceBecomes : r->flowingBecomes);
             if (id == 0) id = blocks.getBlockId("stone");      // the game has no such block
             if (id == 0) continue;
@@ -291,7 +306,8 @@ void FluidSimulator::step(const FluidDef& fluid) {
         //    Fluid that can fall only spreads sideways too when 3+ sources surround it.
         const glm::ivec3 below(p.x, p.y - 1, p.z);
         const FluidCell under = cellAt(below);
-        const bool canFall = canReplace(below) || (isSame(under) && !under.source && !under.falling);
+        bool canFall = canReplace(below) || (isSame(under) && !under.source && !under.falling);
+        if (held && shape::fullBottom(blocks.getBlock(m_world.getBlockAt(p)), m_world.getMetadataAt(p))) canFall = false;
         if (canFall) {
             proposeFlowing(below, kFallingBit);
             int sources = 0;
