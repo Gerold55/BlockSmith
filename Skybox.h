@@ -24,6 +24,18 @@ public:
     // How bright the sky is drawn (1 = as is). Lighting Low/High set it a little lower and
     // deeper, so the sky sits right with the land's realistic light instead of washing it out.
     float brightness = 1.0f;
+    // The aurora (sky.set_aurora): how strong (0 = none), its colours low and high in the
+    // curtains, and the time (seconds) that moves them. It shows only at night.
+    float aurora = 0.0f;
+    glm::vec3 auroraLow{ 0.30f, 0.95f, 0.82f };
+    glm::vec3 auroraHigh{ 0.55f, 0.34f, 1.00f };
+    float auroraSpeed = 1.0f;        // how fast the curtains ripple
+    float auroraSize = 1.0f;         // how big the folds are
+    float auroraDirection = 0.0f;    // where in the sky it hangs: compass degrees (0 north, 90 east)
+    bool auroraNightOnly = true;     // false: by day too (a strange dimension's sky)
+    float auroraHaze = 1.0f;         // the soft glow round the curtains (0 = none, 1 = normal, up to 3)
+    float auroraPixels = 0.0f;       // the pixel style: sky pixels across 90 degrees (0 = smooth)
+    float time = 0.0f;
 
 private:
     GLuint VAO = 0;

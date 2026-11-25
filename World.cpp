@@ -1081,6 +1081,7 @@ void World::updateFluids(float dt) {
     NaturalChanges nature;   // flowing and falling: not building
     m_fluids->update(dt);
     updateFalling(dt);
+    updateMoves();
 }
 
 void World::noteFluidChange(const glm::ivec3& loc) {
@@ -1486,4 +1487,198 @@ void World::lightBlockChanged(const glm::ivec3& loc, uint8_t oldId) {
 
 void World::markLightTouched() {
     for (ChunkData* c : m_light->takeTouched()) markDirty(c->chunkX, c->chunkZ);
+}
+
+// ---------------------------------------------------------------------------
+// Regions (Region.h): reading and writing boxes of blocks, and moving them (seen moving)
+// ---------------------------------------------------------------------------
+
+namespace {
+double steadySeconds() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+void sortCorners(const glm::ivec3& a, const glm::ivec3& b, glm::ivec3& mn, glm::ivec3& mx) {
+    mn = glm::min(a, b);
+    mx = glm::max(a, b);
+}
+}
+
+bool World::regionLoaded(const glm::ivec3& a, const glm::ivec3& b) const {
+    glm::ivec3 mn, mx;
+    sortCorners(a, b, mn, mx);
+    for (int cx = floorDiv(mn.x, CHUNK_WIDTH); cx <= floorDiv(mx.x, CHUNK_WIDTH); ++cx)
+        for (int cz = floorDiv(mn.z, CHUNK_WIDTH); cz <= floorDiv(mx.z, CHUNK_WIDTH); ++cz)
+            if (!chunkData(ChunkCoord{ cx, cz })) return false;
+    return true;
+}
+
+bool World::readRegion(const glm::ivec3& a, const glm::ivec3& b, Region& out, std::string& why) const {
+    glm::ivec3 mn, mx;
+    sortCorners(a, b, mn, mx);
+    mn.y = std::max(mn.y, 0);
+    mx.y = std::min(mx.y, CHUNK_HEIGHT - 1);
+    if (mx.y < mn.y) { why = "the box is above or below the world"; return false; }
+    const glm::ivec3 size = mx - mn + glm::ivec3(1);
+    if (static_cast<size_t>(size.x) * size.y * size.z > Region::kMaxCells) {
+        why = "too big (" + std::to_string(Region::kMaxCells) + " blocks at most)";
+        return false;
+    }
+    if (!regionLoaded(mn, mx)) { why = "part of the box isn't loaded"; return false; }
+    out.resize(size);
+    for (int x = 0; x < size.x; ++x)
+        for (int z = 0; z < size.z; ++z) {
+            const glm::ivec3 col(mn.x + x, 0, mn.z + z);
+            const ChunkData* c = chunkAt(col);
+            const int lx = positiveMod(col.x, CHUNK_WIDTH), lz = positiveMod(col.z, CHUNK_WIDTH);
+            for (int y = 0; y < size.y; ++y) {
+                const size_t i = out.index(x, y, z);
+                out.ids[i] = c->getLocalBlock(lx, mn.y + y, lz);
+                out.metas[i] = c->getLocalMetadata(lx, mn.y + y, lz);
+                if (const BlockText* t = c->getText(lx, mn.y + y, lz)) out.texts[static_cast<uint32_t>(i)] = *t;
+            }
+        }
+    return true;
+}
+
+size_t World::writeRegion(const Region& r, const glm::ivec3& origin, bool withAir) {
+    size_t changed = 0;
+    for (int x = 0; x < r.size.x; ++x)
+        for (int z = 0; z < r.size.z; ++z)
+            for (int y = 0; y < r.size.y; ++y) {
+                const glm::ivec3 p = origin + glm::ivec3(x, y, z);
+                if (p.y < 0 || p.y >= CHUNK_HEIGHT) continue;
+                const size_t i = r.index(x, y, z);
+                const uint8_t id = r.ids[i], meta = r.metas[i];
+                if (id == 0 && !withAir) continue;
+                if (!chunkAt(p)) continue;
+                const auto t = r.texts.find(static_cast<uint32_t>(i));
+                if (getBlockAt(p) != id || getMetadataAt(p) != meta) {
+                    setBlockWithMetaAt(p, id, meta);
+                    ++changed;
+                }
+                if (t != r.texts.end()) setBlockTextAt(p, t->second);
+                else if (getBlockTextAt(p)) clearBlockTextAt(p);
+            }
+    return changed;
+}
+
+std::vector<uint16_t> World::sampleLight(const glm::ivec3& mn, const glm::ivec3& size) const {
+    // a box one block bigger on every side, so the faces at its edges get the light in front of them
+    const glm::ivec3 s = size + glm::ivec3(2);
+    std::vector<uint16_t> out(static_cast<size_t>(s.x) * s.y * s.z, ChunkData::kFullSky);
+    if (!m_lightingOn) return out;
+    for (int x = 0; x < s.x; ++x)
+        for (int y = 0; y < s.y; ++y)
+            for (int z = 0; z < s.z; ++z)
+                out[(static_cast<size_t>(x) * s.y + y) * s.z + z] = getLightAt(mn - glm::ivec3(1) + glm::ivec3(x, y, z));
+    return out;
+}
+
+uint32_t World::startMove(const glm::ivec3& a, const glm::ivec3& b, const glm::ivec3& offset, float seconds, std::string& why) {
+    if (m_remote) { why = "only where the world runs"; return 0; }
+    if (m_moves.size() >= kMaxMoves) { why = "too many moving at once"; return 0; }
+    glm::ivec3 mn, mx;
+    sortCorners(a, b, mn, mx);
+    const glm::ivec3 size = mx - mn + glm::ivec3(1);
+    if (static_cast<size_t>(size.x) * size.y * size.z > kMaxMoveCells) {
+        why = "too big to move (" + std::to_string(kMaxMoveCells) + " blocks at most)";
+        return 0;
+    }
+    if (mn.y + offset.y < 0 || mx.y + offset.y >= CHUNK_HEIGHT) { why = "it would leave the world"; return 0; }
+    if (!regionLoaded(mn + offset, mx + offset)) { why = "where it's going isn't loaded"; return 0; }
+    // (no overlapping moves: one would take the other's blocks halfway)
+    for (const auto& m : m_moves) {
+        const glm::ivec3 omn = glm::min(m.from, m.from + m.offset), omx = glm::max(m.from, m.from + m.offset) + m.region.size - glm::ivec3(1);
+        const glm::ivec3 nmn = glm::min(mn, mn + offset), nmx = glm::max(mx, mx + offset);
+        if (glm::all(glm::lessThanEqual(omn, nmx)) && glm::all(glm::lessThanEqual(nmn, omx))) { why = "something is already moving there"; return 0; }
+    }
+    MovingRegion m;
+    if (!readRegion(mn, mx, m.region, why)) return 0;
+    m.id = m_nextMoveId++;
+    m.from = mn;
+    m.offset = offset;
+    m.seconds = std::clamp(seconds, 0.0f, 60.0f);
+    m.startedAt = steadySeconds();
+    m.light = sampleLight(mn, m.region.size);
+    m.visualOnly = false;
+    if (m_recordChanges) m_moveStarts.push_back(MoveStart{ m.id, m.from, m.offset, m.seconds, m.region });   // (a server sends these)
+    // it leaves the world now (the players were told first: they see it lift out, not a hole)
+    Region air;
+    air.resize(m.region.size);
+    writeRegion(air, mn, true);
+    if (m.seconds <= 0.0f) {
+        placeMove(m);
+        return m.id;
+    }
+    m_moves.push_back(std::move(m));
+    return m_moves.back().id;
+}
+
+void World::placeMove(const MovingRegion& m) {
+    writeRegion(m.region, m.from + m.offset, true);
+    if (m_recordChanges) m_moveEnds.push_back(m.id);
+    m_movesDone.push_back(m.id);
+}
+
+void World::updateMoves() {
+    if (m_moves.empty()) return;
+    const double now = steadySeconds();
+    for (size_t i = 0; i < m_moves.size();) {
+        MovingRegion& m = m_moves[i];
+        const double t = now - m.startedAt;
+        if (m.visualOnly) {
+            // (the server's "it's placed" never came: gone after a while)
+            if (t > m.seconds + 5.0) { m_moves.erase(m_moves.begin() + i); continue; }
+            ++i;
+            continue;
+        }
+        if (t >= m.seconds) {
+            placeMove(m);
+            m_moves.erase(m_moves.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+}
+
+void World::finishMoves() {
+    for (const auto& m : m_moves) if (!m.visualOnly) placeMove(m);
+    m_moves.clear();
+}
+
+void World::addMoveVisual(uint32_t id, const glm::ivec3& from, const glm::ivec3& offset, float seconds, Region region) {
+    if (region.cells() > kMaxMoveCells) return;
+    for (const auto& m : m_moves) if (m.id == id) return;
+    updateMoves();     // (drops copies whose end never came)
+    while (m_moves.size() >= kMaxMoves) m_moves.erase(m_moves.begin());
+    MovingRegion m;
+    m.id = id;
+    m.from = from;
+    m.offset = offset;
+    m.seconds = std::clamp(seconds, 0.0f, 60.0f);
+    m.startedAt = steadySeconds();
+    m.light = sampleLight(from, region.size);     // (the blocks are still here: the server's "air" comes next)
+    m.region = std::move(region);
+    m.visualOnly = true;
+    m_moves.push_back(std::move(m));
+}
+
+void World::endMoveVisual(uint32_t id) {
+    for (size_t i = 0; i < m_moves.size(); ++i)
+        if (m_moves[i].id == id && m_moves[i].visualOnly) { m_moves.erase(m_moves.begin() + i); return; }
+}
+
+std::vector<World::MoveView> World::movingRegions() const {
+    std::vector<MoveView> out;
+    if (m_moves.empty()) return out;
+    const double now = steadySeconds();
+    for (const auto& m : m_moves) {
+        if (m.visualOnly && now - m.startedAt > m.seconds + 5.0) continue;   // (never ended: stop drawing it)
+        float f = m.seconds > 0.0f ? static_cast<float>((now - m.startedAt) / m.seconds) : 1.0f;
+        f = std::clamp(f, 0.0f, 1.0f);
+        f = f * f * (3.0f - 2.0f * f);          // eases in and out
+        out.push_back(MoveView{ m.id, glm::vec3(m.from) + glm::vec3(m.offset) * f, m.from, &m.region, &m.light });
+    }
+    return out;
 }

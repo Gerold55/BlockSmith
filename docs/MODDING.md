@@ -60,6 +60,8 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [C24. Signs that greet players](#c24-signs-that-greet-players)
    - [C25. A spotlight run from a lighting console (Art-Net)](#c25-a-spotlight-run-from-a-lighting-console-art-net)
    - [C26. Mirrors](#c26-mirrors)
+   - [C27. Moving a build](#c27-moving-a-build)
+   - [C28. Animated blocks and items](#c28-animated-blocks-and-items)
 3. [Part 3: Reference](#part-3-reference)
    - [Function index](#function-index): every function and hook, A to Z per table
    - [1. Folders](#1-folders)
@@ -1846,6 +1848,78 @@ swap_mirror(x, y, z, "mymod:mirror")           -- clear again
 - Players turn reflections off in Settings (Mirror Reflections) on slow computers; mirrors then show their glass colour. Mods can't change that setting, so pick a `glass` colour that looks right on its own.
 - Without the library: `engine.register_block(name, 1, 1, 1, "frame.png", nil, { mirror = { tint = ..., clarity = ..., glass = ... } })` ([mirrors](#mirrors)).
 
+## C27. Moving a build
+
+A drawbridge that rises and lowers when a lever is used, and a command that sends a house sliding to wherever you point. Put it in a mod the server **and** its players have.
+
+```lua
+-- mods/bridge/init.lua
+local BRIDGE = { { x = 10, y = 64, z = 0 }, { x = 12, y = 64, z = 8 } }   -- its two corners, lowered
+local raised = false
+
+engine.register_block("bridge:lever", 1, 1, 1, "lever.png", nil, { description = "Bridge Lever" })
+
+local prev = on_right_click_block
+function on_right_click_block(x, y, z, block, item, sneaking, rep, ...)
+    if block == "bridge:lever" and not rep then
+        if world.is_moving() then return true end                  -- (still going: wait)
+        local up = raised and -6 or 6                                -- six blocks up, or back down
+        local id, why = world.move_region(BRIDGE[1], BRIDGE[2], { x = 0, y = up, z = 0 }, {
+            seconds = 2.5,
+            on_done = function() chat.send(raised and "The bridge is up" or "The bridge is down") end,
+        })
+        if id then
+            raised = not raised
+            BRIDGE[1].y, BRIDGE[2].y = BRIDGE[1].y + up, BRIDGE[2].y + up   -- where it is now
+        else
+            chat.send("It won't move: " .. why)
+        end
+        return true
+    end
+    if prev then return prev(x, y, z, block, item, sneaking, rep, ...) end
+    return false
+end
+```
+
+- The lever runs where the world runs in singleplayer. On a server, have the lever's click send a [mod message](#fn-engine-send_to_server) and move the bridge in the server's `on_mod_message`, as the WorldEdit wand does. Every player sees it rise.
+- Keep the bridge's position with the world ([`engine.set_storage`](#fn-engine-set_storage)) so it's right after a restart.
+
+**A build you copy, turn and set down somewhere else:**
+
+```lua
+local house = world.read_region({ x = 0, y = 64, z = 0 }, { x = 8, y = 72, z = 10 })
+if house then
+    world.write_region(house:rotate(90), { x = 40, y = 64, z = 0 })     -- a turned copy
+    world.save_schematic("cottage", house)                               -- any world of this game can load it
+end
+local cottage = world.load_schematic("cottage")
+if cottage then world.write_region(cottage, { x = -20, y = 70, z = 5 }, { air = false }) end
+```
+
+## C28. Animated blocks and items
+
+A glowing crystal that pulses in the world and in the hotbar, and a coin item that spins in the inventory.
+
+**1.** Draw the frames one under another, top frame first. `mymod_crystal.png` is 16 wide and 64 tall: 4 frames. `mymod_coin.png` is 16x128: 8 frames of a coin turning.
+
+**2.** Register them with `animation`:
+
+```lua
+engine.register_block("mymod:crystal", 1, 1, 1, "mymod_crystal.png", nil, {
+    description = "Pulsing Crystal",
+    light = 10,
+    animation = { frame_time = 0.25 },
+})
+
+engine.register_block("mymod:coin", 1, 1, 1, "mymod_coin.png", nil, {
+    description = "Gold Coin",
+    inventory_image = "mymod_coin.png",   -- an item: its picture animates in the hotbar
+    animation = 0.08,                     -- (a number is the frame time)
+})
+```
+
+That's all: the engine plays them wherever they're drawn. To slow a frame down (the crystal resting dim between pulses), put it in the strip more than once. See [Animated pictures](#animated-pictures).
+
 ---
 
 # Part 3: Reference
@@ -1885,6 +1959,9 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 **mirrors** (5, mods/base/mirrors.lua)  
 [`mirrors.register`](#fn-mirrors-register) · [`mirrors.register_frame`](#fn-mirrors-register_frame) · [`mirrors.place`](#fn-mirrors-place) · [`mirrors.get_facing`](#fn-mirrors-get_facing) · [`mirrors.is_mirror`](#fn-mirrors-is_mirror)
 
+**aurora** (6, mods/aurora)  
+[`aurora.set_options`](#fn-aurora-set_options) · [`aurora.start`](#fn-aurora-start) · [`aurora.stop`](#fn-aurora-stop) · [`aurora.is_active`](#fn-aurora-is_active) · [`aurora.is_visible`](#fn-aurora-is_visible) · [`aurora.on_change`](#fn-aurora-on_change)
+
 **hud** (21, mods/base/hud.lua)  
 [`hud.actionbar`](#fn-hud-actionbar) · [`hud.bossbar`](#fn-hud-bossbar) · [`hud.clear`](#fn-hud-show) · [`hud.decode`](#fn-hud-encode) · [`hud.encode`](#fn-hud-encode) · [`hud.get`](#fn-hud-get) · [`hud.hide`](#fn-hud-hide) · [`hud.hide_here`](#fn-hud-show_here) · [`hud.image`](#fn-hud-image) · [`hud.is_visible`](#fn-hud-set_visible) · [`hud.list`](#fn-hud-get) · [`hud.register_type`](#fn-hud-register_type) · [`hud.set_visible`](#fn-hud-set_visible) · [`hud.show`](#fn-hud-show) · [`hud.show_here`](#fn-hud-show_here) · [`hud.shown`](#fn-hud-shown) · [`hud.sidebar`](#fn-hud-sidebar) · [`hud.style`](#fn-hud-style) · [`hud.text`](#fn-hud-text) · [`hud.timer`](#fn-hud-timer) · [`hud.title`](#fn-hud-title) · [`hud.update`](#fn-hud-update)
 
@@ -1898,7 +1975,9 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 [`entities.register`](#fn-entities-register) · [`entities.spawn`](#fn-entities-spawn) · [`entities.get`](#fn-entities-get) · [`entities.get_all`](#fn-entities-get) · [`entities.in_radius`](#fn-entities-in_radius) · [`entities.nearest_player`](#fn-entities-nearest_player) · [`entities.get_players`](#fn-entities-get_players) · [`entities.damage_player`](#fn-entities-damage_player) · [`entities.drop_item`](#fn-entities-drop_item) · [`entities.get_attack_damage`](#fn-entities-get_attack_damage) · [`entities.register_spawn`](#fn-entities-register_spawn) · [`entities.line_of_sight`](#fn-entities-line_of_sight) · [`entities.find_path`](#fn-entities-find_path) · [`self:go_to`](#fn-entity-go_to) · [`self:wander`](#fn-entity-wander) · [`self:path_state`](#fn-entity-path_state) · [`self:can_see`](#fn-entity-can_see) · [`self:find_land`](#fn-entity-find_land) · [`self:is_blocked`](#fn-entity-is_blocked) · [`self:walk`](#fn-entity-walk) · [`self:walk_to`](#fn-entity-walk_to) · [`self:set_animation`](#fn-entity-set_animation) · [`self:damage`](#fn-entity-damage) · [`self:get_pos`](#fn-entity-get_pos)
 
 **sky** (38)  
-[`sky.add_light`](#fn-sky-add_light) · [`sky.set_bloom`](#fn-sky-set_bloom) · [`sky.get_bloom`](#fn-sky-get_bloom) · [`sky.set_sun_shafts`](#fn-sky-set_sun_shafts) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.lightning_bolt`](#fn-sky-lightning_bolt) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
+[`world.read_region`](#fn-world-read_region) · [`world.write_region`](#fn-world-write_region) · [`world.fill`](#fn-world-fill) · [`world.replace`](#fn-world-replace) · [`world.count`](#fn-world-count) · [`world.move_region`](#fn-world-move_region) · [`world.is_moving`](#fn-world-is_moving) · [`world.new_region`](#fn-world-new_region) · [`world.region_from_text`](#fn-world-region_from_text) · [`world.save_schematic`](#fn-world-save_schematic) · [`world.load_schematic`](#fn-world-load_schematic) · [`world.list_schematics`](#fn-world-list_schematics) · [`world.delete_schematic`](#fn-world-delete_schematic) · [`engine.set_outline`](#fn-engine-set_outline) · [`engine.clear_outline`](#fn-engine-clear_outline)
+
+[`sky.add_light`](#fn-sky-add_light) · [`sky.set_bloom`](#fn-sky-set_bloom) · [`sky.get_bloom`](#fn-sky-get_bloom) · [`sky.set_sun_shafts`](#fn-sky-set_sun_shafts) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.lightning_bolt`](#fn-sky-lightning_bolt) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.set_aurora`](#fn-sky-set_aurora) · [`sky.get_aurora`](#fn-sky-get_aurora) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
 
 **lights** (11, spotlights)  
 [`lights.add_spot`](#fn-lights-add_spot) · [`lights.set`](#fn-lights-set) · [`lights.get`](#fn-lights-get) · [`lights.aim`](#fn-lights-aim) · [`lights.remove`](#fn-lights-remove) · [`lights.list`](#fn-lights-list) · [`lights.clear`](#fn-lights-clear) · [`lights.set_haze`](#fn-lights-set_haze) · [`lights.get_haze`](#fn-lights-get_haze) · [`lights.get_quality`](#fn-lights-get_quality)
@@ -2088,6 +2167,7 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 | `in_creative` | true | listed in the creative inventory |
 | `description` | made from the name | the name players see, like Luanti's: `"Oak Log"`. It's shown above the hotbar for a moment when it's picked, in the inventory, and in `/give`'s answer. Without one, `log_oak` shows as "Log Oak". |
 | `inventory_image` | none | shows a flat picture in the inventory and hotbar. The block becomes an **item**: right-click never places it |
+| `animation` | none | the block's pictures are [animated](#animated-pictures): `{ frame_time = 0.15 }` (seconds each frame shows), or just `0.15` |
 | `pick` | the block itself | what [pick block](#pick-block) gives for this block, e.g. `"wheat_seeds"` for a crop, or `"ruby_lamp"` for a lit lamp |
 
 **Rules:**
@@ -2096,6 +2176,26 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 - Worlds save blocks by **name**, so the order you register them in doesn't matter.
 
 **Metadata:** each block has one extra byte, 0–255. Water uses it for its flow level. Plants use bit 1 to mean "waterlogged". Slabs, stairs and logs keep their state in it (use [`engine.get_block_state`](#fn-engine-get_block_state) rather than the numbers). Your other blocks can use it for anything.
+
+<a id="animated-pictures"></a>### Animated pictures
+
+```lua
+engine.register_block("mymod:lava_lamp", 1, 1, 1, "mymod_lava_lamp.png", nil, {
+    description = "Lava Lamp",
+    animation = { frame_time = 0.2 },   -- each frame shows for 0.2 seconds
+})
+```
+
+An animated picture is a **vertical strip of square frames**, the top one first: four 16x16 frames make a 16x64 picture. With `animation` set, every picture the block has plays through its frames, over and over: its faces (one picture, or `top`, `bottom` and `sides`), its overlay and its `inventory_image`.
+
+- It plays **everywhere the block is drawn**: placed in the world, in the hotbar and inventory icons, in the player's hand, as a dropped item, and while falling or being moved.
+- All blocks with the same `frame_time` stay in step, and every player sees the same frame at the same time (the clock is the game's, not the block's).
+- From 2 to 64 frames. A picture that isn't a strip (as tall as it is wide) just doesn't animate.
+- Without `animation`, a strip shows its top frame only. So the same picture can be used still by one block and animated by another.
+- Texture packs can replace a strip with their own: give it the same number of frames.
+- Each frame takes a place in the texture list (1024 places, or fewer on old graphics cards, which the console reports when they run out). Long strips on many blocks use them up quickly.
+
+`frame_time` is from 0.02 to 60 seconds. To show frames for different lengths of time, repeat a frame in the strip.
 
 <a id="slabs-and-stairs"></a>### Slabs, stairs and logs
 
@@ -2340,6 +2440,76 @@ Craft & Ruin's `grass` mod (`games/craft_and_ruin/mods/grass`) spreads grass on 
 - with light 9 or more above it, it tries 4 random spots nearby (one block each way, from 3 below to 1 above), and dirt there with an open top and light 4 or more becomes grass.
 
 On a dedicated server, which keeps no light, `engine.get_light_level` is open sky (sunlight for the time of day) or dark under cover.
+
+<a id="regions"></a>### Editing in boxes: regions, filling, moving builds
+
+<a id="fn-world-read_region"></a><a id="fn-world-write_region"></a><a id="fn-world-fill"></a><a id="fn-world-replace"></a><a id="fn-world-count"></a><a id="fn-world-move_region"></a><a id="fn-world-is_moving"></a><a id="fn-world-new_region"></a><a id="fn-world-region_from_text"></a>
+Whole boxes of blocks at once: copy a build, write it somewhere else, fill, replace, and **move a build while everyone watches it glide there**. Positions are tables, `{ x = 1, y = 2, z = 3 }` or `{ 1, 2, 3 }`. A box's two corners are included and can be in any order, and every chunk in it must be loaded. These run where the world runs (singleplayer, the host, the server); a joined player's game asks its server through a mod, as the [WorldEdit mod](#worldedit) does.
+
+| function | |
+|---|---|
+| `world.read_region(p1, p2)` | a **region**: the blocks, their states and sign text. `nil, why` if part isn't loaded or it's too big (4,096,000 blocks at most) |
+| `world.write_region(region, pos [, { air = true }])` | writes it with its lowest corner at `pos`; returns how many blocks changed. `air = false` leaves what's there where the region has air |
+| `world.fill(p1, p2, block [, meta])` | fills the box; `"air"` clears it. Returns how many changed |
+| `world.replace(p1, p2, from, to [, meta])` | one block for another in the box |
+| `world.count(p1, p2 [, block])` | every block but air, or just that one |
+| `world.move_region(p1, p2, offset [, { seconds = 1.5, on_done = function(id) end }])` | moves the box by `offset` (whole blocks). Returns an id, or `nil, why` |
+| `world.is_moving([id])` | any move (or that one) still under way |
+| `world.new_region(sx, sy, sz)` | an empty region (air) to fill with `region:set` |
+| `world.region_from_text(text)` | a region from `region:to_text()`: `region`, or `nil, why`; third, a list of blocks this game doesn't have (they become air) |
+
+**Moving a build, seen moving.** `world.move_region` lifts the blocks out and glides them as one piece, drawn exactly as they look in the world (doors, slabs, plants, glass and all), easing in and out. Then it sets them down at the new place, replacing what was there. Every player in that world sees the same thing. On a server the movement is sent once, and each player's game draws it. The blocks leaving and arriving are ordinary block changes, so nothing is lost if a player joins halfway. Up to 262,144 blocks (64 × 64 × 64) per move and 16 moves at once; moves can't overlap. `seconds = 0` moves it at once. When it's placed, its `on_done(id)` runs, and so does the hook `on_region_moved(id)`. A world that's closed or saved mid-move places it first. Players and mobs standing on a moving build aren't carried along.
+
+<a id="fn-region"></a>**Regions** (what `read_region` gives):
+
+| method | |
+|---|---|
+| `region:size()` | `sx, sy, sz` |
+| `region:get(x, y, z)` | `block, meta` (0-based, inside the region) |
+| `region:set(x, y, z, block [, meta])` | |
+| `region:count([block])` | |
+| `region:rotate(degrees)` | a new region, turned clockwise seen from above (90, 180, 270, -90...). Stairs, doors, signs, mirrors and logs turn with it |
+| `region:flip("x" \| "y" \| "z")` | a new region, mirrored. Stair corners and door hinges swap sides; `"y"` turns slabs and stairs over |
+| `region:copy()` | |
+| `region:to_text()` | JSON you can save (the schematic format below). **Data only**: loading it never runs anything |
+
+<a id="fn-world-save_schematic"></a><a id="fn-world-load_schematic"></a><a id="fn-world-list_schematics"></a><a id="fn-world-delete_schematic"></a>**Schematics: builds shared between worlds.** A region saved as a schematic is a file every world of the same game can load: a **JSON file**, `schematics/<game>/<name>.json`, next to the mods folder (on a dedicated server, next to where it runs). Copy a file to another player's same folder to give them the build; other tools can read and write it too:
+
+```json
+{
+  "format": "blocksmith-region", "version": 1,
+  "size": [5, 5, 5],
+  "palette": ["air", "terracotta_red", "planks_birch"],
+  "cells": [[1, 0, 5], [0, 0, 3], ...],
+  "texts": [{ "cell": 12, "waxed": false, "front": { "color": "#000000", "glowing": false, "lines": ["Hello"] }, "back": { ... } }]
+}
+```
+
+`palette` names the blocks (so ids never matter: a block another game calls the same loads the same). `cells` are runs of `[palette index, metadata, how many]` through the box in x, then y, then z order: cell (x, y, z) is number `(x * sy + y) * sz + z`. `region:to_text()` gives the same JSON, and `world.region_from_text` reads it. Names are letters, numbers, `_` and `-` (up to 40).
+
+| function | |
+|---|---|
+| `world.save_schematic(name, region)` | `true`, or `nil, why` (replaces one with that name) |
+| `world.load_schematic(name)` | `region`, or `nil, why`; third, the blocks this game lacks |
+| `world.list_schematics()` | `{ name, ... }`, sorted |
+| `world.delete_schematic(name)` | `true` if there was one |
+
+<a id="fn-engine-set_outline"></a><a id="fn-engine-clear_outline"></a><a id="fn-engine-clear_outlines"></a>**Outline boxes.** `engine.set_outline(key, p1, p2 [, color])` draws an outline round the blocks from `p1` to `p2` in this game, faintly visible through walls: a selection, a plot, a build site. `color` is `"#rrggbb"` or `{ r, g, b [, a] }` (0..1), default white. Setting a key again moves it; up to 64 at once. `engine.clear_outline(key)`, `engine.clear_outlines()`. They're only drawn in the game that sets them: a server mod sends its players what to draw ([mod messages](#fn-engine-send_to_player)).
+
+<a id="worldedit"></a>**The WorldEdit mod** (`mods/worldedit`, switch it on for your game) is all of this for players, in the style of Luanti's WorldEdit. **Creative mode only**, and on a server operators only. Select a box with the **WorldEdit Wand** (in the creative inventory: right-click a block for corner 1, sneak + right-click for corner 2), or `//pos1` and `//pos2` where you stand; the selection shows as a yellow outline.
+
+| command | |
+|---|---|
+| `//pos1`, `//pos2`, `//sel`, `//desel` | corners, what's selected, clear it |
+| `//set <block>`, `//replace <from> <to>`, `//count [block]` | |
+| `//copy`, `//cut`, `//paste` | paste goes where you stand, as it was to you when you copied |
+| `//move <n> <up\|down\|north\|south\|east\|west>` or `//move <dx> <dy> <dz>` | moves it, seen moving; the selection follows |
+| `//stack <times> <direction>` | copies in a row |
+| `//rotate <90\|180\|270>`, `//flip <x\|y\|z>` | turns or mirrors it where it stands |
+| `//undo`, `//redo` | 10 steps each, per player |
+| `//save <name>`, `//load <name>`, `//schematics`, `//delschem <name>` | schematics every world of this game shares |
+
+<a id="fn-worldedit-register_command"></a><a id="fn-worldedit-get_selection"></a><a id="fn-worldedit-set_selection"></a>Other mods: `worldedit.get_selection(name)` → `p1, p2`, `worldedit.set_selection(name, p1, p2)`, and `worldedit.register_command(name, { params, description, func = function(player, args, reply) end })` adds a `//name` command (run where the world runs, with the same checks).
 
 ## 5. World generation
 
@@ -2683,6 +2853,31 @@ weather.is_cold = function(x, z) return my_temperature(x, z) < 0.25 end   -- rai
 
 The `/weather [type [seconds]] | list | cycle on|off` command works in singleplayer and for operators on servers.
 
+<a id="aurora"></a><a id="fn-aurora-set_options"></a><a id="fn-aurora-start"></a><a id="fn-aurora-stop"></a><a id="fn-aurora-is_active"></a><a id="fn-aurora-is_visible"></a><a id="fn-aurora-on_change"></a>**Aurora nights** come from `mods/aurora` (switch it on for your game). Now and then a night has an aurora; whoever runs the world decides which nights, so every player on a server sees the same one, and each player's game shows it where your game says it can be seen, under a clear sky. Your game tunes it, like `weather.register`:
+
+```lua
+aurora.set_options({
+    chance = 0.12,                               -- the chance a night has one (0..1)
+    where = function(x, y, z)                    -- where it can be seen (default: everywhere)
+        local b = get_biome(math.floor(x), math.floor(z))
+        return b == "snowy_plains" or b == "snowy_taiga"
+    end,
+    strength = { 0.7, 1.3 },                     -- picked each aurora night
+    palettes = { { "#4cf2d1", "#8c57ff" }, { "#59ff7a", "#a24cff" } },   -- one picked each night
+    speed = 1, size = 1, direction = 0,          -- as for sky.set_aurora
+    style = "smooth", pixels = 80,               -- as for sky.set_aurora ("pixel": square sky pixels)
+    haze = 1, light = 1,                         -- the glow round it in the sky, and on the land
+    fade = 20,                                   -- seconds to fade in and out (walking into or out of `where` too)
+    hidden_by = { "cloudy", "rain", "thunder", "snow", "blizzard" },     -- weathers whose clouds hide it
+})
+aurora.start([palette]) / aurora.stop()          -- tonight (where the world runs); by day: the coming night
+aurora.is_active()                               -- is tonight an aurora night
+aurora.is_visible()                              -- is it showing in this game now
+aurora.on_change(function(active) end)
+```
+
+`/aurora` says whether tonight has one; operators can use `/aurora on [palette]` and `/aurora off`. A night is decided once, at dusk, and kept if the world is reloaded. Craft & Ruin's terrain sets `where` to its snowy biomes, about one night in eight.
+
 **Sky:**
 - <a id="fn-sky-get_time"></a><a id="fn-sky-set_time"></a>**The time of day.** `sky.get_time()` goes from 0 to 1 over a whole day: `0.25` midnight, `0.5` sunrise, `0.75` midday, `0` sunset. `sky.set_time(t [, forward])` jumps there and the clock keeps running; with `forward = true` it goes on to the *next* time it's `t` (so the day count goes up, like `/time set`).
   - <a id="fn-sky-get_day"></a><a id="fn-sky-get_clock"></a>`sky.get_day()`: days since the world began (0 is the first; it goes up at midnight). `sky.get_clock()`: the time as `"07:15"`.
@@ -2695,6 +2890,28 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
   In chat: `/time` (what time and day it is), `/time set day|noon|night|midnight|sunrise|sunset|<hh:mm>`, `/time add <hours>`, `/time speed <x>`. On a dedicated server these go to the server (operators only); its console has the same `time` command.
 - <a id="fn-sky-get_moon_phase"></a><a id="fn-sky-set_moon_phase"></a><a id="fn-sky-set_moon_textures"></a>`sky.set_moon_phase(n)` / `get_moon_phase()`, `sky.set_moon_textures({ ... })`
 - <a id="fn-sky-set_stars"></a><a id="fn-sky-get_stars"></a>`sky.set_stars(density [, brightness])` / `get_stars()`: how starry the night is. `density` 0–1 (default 0.06), `brightness` 0 = no stars (default 0.9). Stars are fixed, steady dots that fade in at dusk.
+- <a id="fn-sky-set_aurora"></a><a id="fn-sky-get_aurora"></a>**Aurora.** `sky.set_aurora(def)` puts an aurora in this game's sky, drawn the way the real thing looks: thin, see-through sheets of light hanging high over the land like curtains - a ring of them all round the sky, folding in and out, and a ribbon curling overhead. A sheet seen face on is a faint veil; where it folds and is seen edge on it glows bright, and where sheets overlap they add up. Fine streaks run up through them, shimmering slowly, and their lower edge wanders up and down. Each glows in the low colour at its bright lower edge and fades up into the high colour (teal below, violet above, by default). Like the real thing it gives off light: a soft haze glows in the sky round the curtains, and the land below, wherever it's open to the sky (snow most of all), is faintly lit in its colour, with every Lighting setting. Caves and roofed rooms stay dark. `style = "pixel"` draws it on square sky pixels in a few flat steps of colour instead, for a pixel-art sky. Like the rest of `sky.*` it's what each player's own game shows, so mods decide when and where (the [aurora mod](#aurora) is one way). Every field is optional; one left out keeps what's set:
+
+  ```lua
+  sky.set_aurora({
+      strength = 1,                         -- 0 = none .. 1 strong (up to 2)
+      fade = 20,                            -- seconds to get there (default 0: at once)
+      colors = { "#4cf2d1", "#8c57ff" },    -- the bottom of the curtains, the top ("#rrggbb" or {r, g, b})
+      speed = 1,                            -- how fast it ripples (0 = still)
+      size = 1,                             -- how big its folds are
+      direction = 0,                        -- turns it round the sky (compass degrees: where the overhead ribbon heads)
+      night_only = true,                    -- false: by day too (a strange dimension's sky)
+      style = "smooth",                     -- "smooth" (the default), or "pixel": square sky pixels and
+                                            -- flat steps of colour, for a pixel-art sky
+      pixels = 80,                          -- the pixel style's grid: sky pixels across 90 degrees
+      haze = 1,                             -- the soft glow it spreads into the sky round it (0 = none, up to 3)
+      light = 1,                            -- how much it lights the land below (0 = none, up to 3)
+  })
+  sky.set_aurora(0)                         -- a number is short for { strength = n }: off
+  local a = sky.get_aurora()                -- the same fields, and `shown`: the strength on screen mid-fade
+  ```
+
+  With `night_only` it fades out at dawn and back in at dusk by itself. The weather's sky tint covers it (clouds hide it), and it's in mirrors too. It isn't saved: mods set it again when a world loads.
 - <a id="fn-engine-set_moon_texture"></a><a id="fn-engine-set_sun_texture"></a>`engine.set_sun_texture(path)`, `engine.set_moon_texture(path)`
 - <a id="fn-sky-set_ambient_color"></a><a id="fn-sky-set_fog_color"></a><a id="fn-sky-set_sun_color"></a>`sky.set_sun_color(r,g,b)`, `set_ambient_color(r,g,b)`, `set_fog_color(r,g,b)`
 - <a id="fn-sky-set_ambient_intensity"></a><a id="fn-sky-set_sun_intensity"></a>`sky.set_sun_intensity(v)`, `set_ambient_intensity(v)`

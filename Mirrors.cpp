@@ -107,6 +107,82 @@ bool screenRect(const glm::vec3* pts, int n, const glm::mat4& viewProj, int w, i
     return true;
 }
 
+bool screenPolygon(const glm::vec3* pts, int n, const glm::mat4& viewProj, int w, int h,
+                   std::vector<glm::vec2>& polygon) {
+    constexpr float kNear = 0.05f;
+    std::vector<glm::vec4> clip;
+    clip.reserve(n + 2);
+    for (int i = 0; i < n; ++i) clip.push_back(viewProj * glm::vec4(pts[i], 1.0f));
+
+    std::vector<glm::vec4> nearClipped;
+    for (size_t i = 0; i < clip.size(); ++i) {
+        const glm::vec4& a = clip[i];
+        const glm::vec4& b = clip[(i + 1) % clip.size()];
+        const bool aInside = a.w > kNear, bInside = b.w > kNear;
+        if (aInside) nearClipped.push_back(a);
+        if (aInside != bInside) nearClipped.push_back(glm::mix(a, b, (kNear - a.w) / (b.w - a.w)));
+    }
+    if (nearClipped.size() < 3) return false;
+
+    polygon.clear();
+    polygon.reserve(nearClipped.size() + 4);
+    for (const glm::vec4& p : nearClipped) {
+        const glm::vec2 ndc = glm::vec2(p) / p.w;
+        polygon.emplace_back((ndc.x * 0.5f + 0.5f) * w, (ndc.y * 0.5f + 0.5f) * h);
+    }
+    for (int edge = 0; edge < 4; ++edge) {
+        const std::vector<glm::vec2> input = polygon;
+        polygon.clear();
+        if (input.empty()) return false;
+        auto inside = [&](const glm::vec2& p) {
+            if (edge == 0) return p.x >= 0.0f;
+            if (edge == 1) return p.x <= static_cast<float>(w);
+            if (edge == 2) return p.y >= 0.0f;
+            return p.y <= static_cast<float>(h);
+        };
+        auto intersect = [&](const glm::vec2& a, const glm::vec2& b) {
+            if (edge < 2) {
+                const float x = edge == 0 ? 0.0f : static_cast<float>(w);
+                return glm::mix(a, b, (x - a.x) / (b.x - a.x));
+            }
+            const float y = edge == 2 ? 0.0f : static_cast<float>(h);
+            return glm::mix(a, b, (y - a.y) / (b.y - a.y));
+        };
+        for (size_t i = 0; i < input.size(); ++i) {
+            const glm::vec2& a = input[i];
+            const glm::vec2& b = input[(i + 1) % input.size()];
+            const bool aInside = inside(a), bInside = inside(b);
+            if (aInside) polygon.push_back(a);
+            if (aInside != bInside) polygon.push_back(intersect(a, b));
+        }
+    }
+    return polygon.size() >= 3;
+}
+
+float polygonArea(const std::vector<glm::vec2>& polygon) {
+    float twiceArea = 0.0f;
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        const glm::vec2& a = polygon[i];
+        const glm::vec2& b = polygon[(i + 1) % polygon.size()];
+        twiceArea += a.x * b.y - a.y * b.x;
+    }
+    return std::abs(twiceArea) * 0.5f;
+}
+
+bool polygonContains(const std::vector<glm::vec2>& polygon, const glm::vec2& p) {
+    bool inside = false;
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        const glm::vec2& a = polygon[i];
+        const glm::vec2& b = polygon[(i + 1) % polygon.size()];
+        const glm::vec2 edge = b - a, toPoint = p - a;
+        const float cross = edge.x * toPoint.y - edge.y * toPoint.x;
+        if (std::abs(cross) < 0.001f && glm::dot(toPoint, p - b) <= 0.001f) return true;
+        if ((a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)
+            inside = !inside;
+    }
+    return inside;
+}
+
 } // namespace
 
 bool Mirrors::choose(const std::vector<Cell>& cells, const glm::mat4& viewProj, const glm::vec3& eye, int fbw, int fbh) {
@@ -117,9 +193,12 @@ bool Mirrors::choose(const std::vector<Cell>& cells, const glm::mat4& viewProj, 
         glm::vec4 plane;
         float nearest = 1e9f;
         glm::vec4 rect{ 1e9f, 1e9f, -1e9f, -1e9f };
+        float area = 0.0f;
+        bool coversCentre = false;
         std::vector<Cell> cells;
     };
     std::map<std::pair<int, int>, Surface> surfaces;
+    const glm::vec2 screenCentre(fbw * 0.5f, fbh * 0.5f);
     for (const Cell& c : cells) {
         const glm::vec4 pl = mirror::plane(c.pos, c.meta);
         const float side = glm::dot(glm::vec3(pl), eye) + pl.w;
@@ -128,6 +207,8 @@ bool Mirrors::choose(const std::vector<Cell>& cells, const glm::mat4& viewProj, 
         mirror::frontCorners(c.pos, c.meta, corners);
         glm::vec4 r;
         if (!screenRect(corners, 4, viewProj, fbw, fbh, r)) continue;
+        std::vector<glm::vec2> polygon;
+        if (!screenPolygon(corners, 4, viewProj, fbw, fbh, polygon)) continue;
         const glm::vec3 centre = (corners[0] + corners[2]) * 0.5f;
         const float dist = glm::length(centre - eye);
         if (dist > kRange) continue;
@@ -135,20 +216,26 @@ bool Mirrors::choose(const std::vector<Cell>& cells, const glm::mat4& viewProj, 
         s.plane = pl;
         s.nearest = std::min(s.nearest, dist);
         s.rect = glm::vec4(std::min(s.rect.x, r.x), std::min(s.rect.y, r.y), std::max(s.rect.z, r.z), std::max(s.rect.w, r.w));
+        s.area += polygonArea(polygon);
+        s.coversCentre = s.coversCentre || polygonContains(polygon, screenCentre);
         s.cells.push_back(c);
     }
     // The one being looked at: under the middle of the screen first, then the one covering most of
     // the screen (a mirror at the edge of the view loses to the one in front of you)
     const Surface* best = nullptr;
+    std::pair<int, int> bestKey{ 0, 0 };
     float bestScore = -1.0f;
-    const float cx = fbw * 0.5f, cy = fbh * 0.5f;
     for (const auto& [key, s] : surfaces) {
-        const float area = std::max(0.0f, s.rect.z - s.rect.x) * std::max(0.0f, s.rect.w - s.rect.y) / (static_cast<float>(fbw) * fbh);
-        const bool centre = cx >= s.rect.x && cx <= s.rect.z && cy >= s.rect.y && cy <= s.rect.w;
-        const float score = area + (centre ? 1.0f : 0.0f) + 0.001f / (1.0f + s.nearest);
-        if (score > bestScore) { bestScore = score; best = &s; }
+        const float area = s.area / (static_cast<float>(fbw) * fbh);
+        float score = area + (s.coversCentre ? 1.0f : 0.0f) + 0.001f / (1.0f + s.nearest);
+        // (the mirror that was live stays live unless another clearly wins: no flicking between
+        // two that score about the same while you move)
+        if (m_hasLast && key == m_lastKey) score += 0.2f;
+        if (score > bestScore) { bestScore = score; best = &s; bestKey = key; }
     }
-    if (!best) return false;
+    if (!best) { m_hasLast = false; return false; }
+    m_lastKey = bestKey;
+    m_hasLast = true;
     if (!ensureTarget(fbw, fbh) || !ensureProgram()) return false;
     m_plane = best->plane;
     m_chosen = best->cells;
@@ -176,26 +263,10 @@ glm::vec3 Mirrors::reflect(const glm::vec3& p) const {
     return p - 2.0f * (glm::dot(n, p) + m_plane.w) * n;
 }
 
-glm::mat4 Mirrors::clippedProjection(const glm::mat4& proj, const glm::mat4& mirroredView) const {
-    // Lengyel's oblique near plane: the near plane becomes the mirror's surface (moved a hair
-    // into the room, so the glass itself isn't in its own reflection)
-    glm::vec4 worldPlane = m_plane;
-    worldPlane.w -= 0.004f;
-    const glm::vec4 c = glm::transpose(glm::inverse(mirroredView)) * worldPlane;
-    glm::mat4 p = proj;
-    auto sgn = [](float v) { return v > 0.0f ? 1.0f : v < 0.0f ? -1.0f : 0.0f; };
-    glm::vec4 q;
-    q.x = (sgn(c.x) + p[2][0]) / p[0][0];
-    q.y = (sgn(c.y) + p[2][1]) / p[1][1];
-    q.z = -1.0f;
-    q.w = (1.0f + p[2][2]) / p[3][2];
-    const float cq = glm::dot(c, q);
-    if (std::fabs(cq) < 1e-8f) return proj;
-    const glm::vec4 m = c * (2.0f / cq);
-    p[0][2] = m.x;
-    p[1][2] = m.y;
-    p[2][2] = m.z + 1.0f;
-    p[3][2] = m.w;
+glm::vec4 Mirrors::clipPlane() const {
+    // (a hair into the room, so the glass itself isn't in its own reflection)
+    glm::vec4 p = m_plane;
+    p.w -= 0.004f;
     return p;
 }
 
@@ -300,6 +371,10 @@ void Mirrors::composite(const glm::mat4& viewProj, GLuint textureArray) {
     for (const Cell& c : m_chosen) {
         glm::vec3 p[4];
         mirror::frontCorners(c.pos, c.meta, p);
+        // (laid a hair in front of the glass: drawn on the very same spot, the depth test could go
+        // either way as you move - the reflection flickered, and up close it lost to the glass)
+        const glm::vec3 lift = glm::vec3(mirror::normalOf(c.meta & 3)) * 0.003f;
+        for (glm::vec3& q : p) q += lift;
         for (int i : { 0, 1, 2, 0, 2, 3 }) {
             v.insert(v.end(), { p[i].x, p[i].y, p[i].z, uv[i][0], uv[i][1], static_cast<float>(c.layer),
                                 static_cast<float>(c.joined), c.tint.r, c.tint.g, c.tint.b, c.clarity,
@@ -307,6 +382,8 @@ void Mirrors::composite(const glm::mat4& viewProj, GLuint textureArray) {
         }
     }
     const GLboolean blendWas = glIsEnabled(GL_BLEND), cullWas = glIsEnabled(GL_CULL_FACE);
+    GLboolean depthMaskWas = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMaskWas);
     GLint depthFunc = GL_LESS;
     glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
     glUseProgram(m_program);
@@ -320,17 +397,14 @@ void Mirrors::composite(const glm::mat4& viewProj, GLuint textureArray) {
     glDisable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(-1.0f, -2.0f);          // (on the very same spot as the glass already drawn)
+    glDepthMask(GL_TRUE);
     glBindVertexArray(m_vao);
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(v.size() * sizeof(float)), v.data(), GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(v.size() / 14));
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDepthMask(GL_TRUE);
+    glDepthMask(depthMaskWas);
     glDepthFunc(static_cast<GLenum>(depthFunc));
     if (blendWas) glEnable(GL_BLEND);
     if (cullWas) glEnable(GL_CULL_FACE);

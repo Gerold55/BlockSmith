@@ -121,7 +121,7 @@ inline RaycastResult raycastBlock(const glm::vec3& rayOrigin, const glm::vec3& r
                 mirror::bounds(world.getMetadataAt({x, y, z}), mn, mx);
                 const glm::vec3 cell(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                 float t; glm::ivec3 n;
-                hitShape = rayEntersBox(rayOrigin, rayDir, cell + mn, cell + mx, t, n);
+                hitShape = rayEntersBox(rayOrigin, rayDir, cell + mn, cell + mx, t, n) && t <= maxDistance;
                 if (hitShape) { shapeT = t; shapeNormal = n == glm::ivec3(0) ? normal : n; }
             } else if (prop.isSelectable && (prop.pattern == "sign" || prop.pattern == "wall_sign")) {
                 glm::vec3 mn, mx;

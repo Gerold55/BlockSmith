@@ -362,6 +362,7 @@ end
 
 local function set_advanced(on)
     state.advanced = on
+    if not on then state.waiting = nil end
     if engine.set_ui_setting then engine.set_ui_setting("settings_advanced", on and "1" or "0") end
 end
 

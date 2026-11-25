@@ -56,6 +56,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "SignText.h"
 #include "BlockTextLua.h"
 #include "BlockStateLua.h"
+#include "StructureAPI.h"
+#include "TextureAnim.h"
 #include "VoxelVolume.h"
 #include "Spotlights.h"
 #include "UdpInput.h"
@@ -163,6 +165,37 @@ bool g_PlayerSettingsClick = false;
 int g_LightQuality = 0;
 bool g_BloomOn = false;
 bool g_MirrorsOn = true;     // Settings: Mirror Reflections (the player's choice only)
+// The aurora (sky.set_aurora): what's shown now fades toward the target at `rate` per second
+struct AuroraState {
+    float current = 0.0f, target = 0.0f, rate = 0.0f;
+    glm::vec3 low{ 0.30f, 0.95f, 0.82f }, high{ 0.55f, 0.34f, 1.00f };
+    float speed = 1.0f, size = 1.0f, direction = 0.0f;
+    bool nightOnly = true;
+    float pixels = 0.0f;      // "pixel" style: sky pixels across 90 degrees; 0 = "smooth"
+    float haze = 1.0f;        // the soft glow round the curtains in the sky
+    float light = 1.0f;       // how much it lights the land
+    void update(float dt) {
+        if (current == target) return;
+        if (rate <= 0.0f) { current = target; return; }
+        const float step = rate * dt;
+        current = current < target ? std::min(target, current + step) : std::max(target, current - step);
+    }
+};
+AuroraState g_Aurora;
+
+// Outline boxes mods draw in the world (engine.set_outline): a selection, a plot, a build site
+struct OutlineBox { glm::vec3 mn, mx; glm::vec4 color; };
+std::map<std::string, OutlineBox> g_Outlines;
+constexpr size_t kMaxOutlines = 64;
+
+// Builds moving (World::movingRegions, StructureAPI.h): each drawn with the real chunk mesher, as
+// 16 x 16 columns of blocks, meshed once when it starts moving and slid along as it goes
+struct MovingVisual {
+    const World* world = nullptr;
+    struct Piece { std::unique_ptr<ChunkData> data; std::unique_ptr<ChunkMesh> mesh; glm::ivec3 at; };
+    std::vector<Piece> pieces;
+};
+std::map<uint32_t, MovingVisual> g_MovingVisuals;
 bool g_FilmicOn = true;          // filmic exposure for Lighting Low/High (Settings; the player's choice)
 SceneCopy g_SceneCopy;           // the frame before water is drawn: water reflections (High)
 float g_BloomStrength = 0.6f, g_BloomThreshold = 0.75f;   // (a game can tune them: sky.set_bloom)
@@ -1143,19 +1176,18 @@ bool requestModReload(std::string& why, const std::string& note) {
 // Lua file, picture, sound or model reloads the mods by itself, once the files have stopped
 // changing (an editor saving several files counts once).
 std::vector<fs::path> modWatchRoots();
-void watchModFiles(double now) {
-    static int gen = -1;
-    static double nextScan = 0.0, changedAt = -1.0;
-    static uint64_t baseline = 0, pending = 0;
-    static std::string changedFile;
-    if (gen != g_SessionGeneration) { gen = g_SessionGeneration; baseline = 0; changedAt = -1.0; nextScan = 0.0; }
-    if (now < nextScan || g_Reload.pending) return;
-    nextScan = now + 1.0;
-    static const std::set<std::string> kExt = { ".lua", ".png", ".jpg", ".jpeg", ".ogg", ".wav", ".json", ".bbmodel", ".obj" };
-    uint64_t fp = 1469598103934665603ull;
+struct ModWatchSnapshot {
+    uint64_t fingerprint = 1469598103934665603ull;
     std::string newest;
+};
+
+ModWatchSnapshot modWatchSnapshot() {
+    static const std::set<std::string> kExt = {
+        ".lua", ".png", ".jpg", ".jpeg", ".ogg", ".wav", ".json", ".bbmodel", ".obj", ".b3d"
+    };
+    ModWatchSnapshot snapshot;
     fs::file_time_type newestTime{};
-    bool haveNewest = false;        // (a default time isn't "long ago" on every compiler)
+    bool haveNewest = false;
     for (const fs::path& root : modWatchRoots()) {
         std::error_code ec;
         for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
@@ -1174,15 +1206,37 @@ void watchModFiles(double now) {
             if (ec) continue;
             const uint64_t h = std::hash<std::string>{}(p.generic_string()) ^
                                static_cast<uint64_t>(t.time_since_epoch().count());
-            fp = (fp ^ h) * 1099511628211ull;
-            if (!haveNewest || t > newestTime) { newestTime = t; newest = name; haveNewest = true; }
+            snapshot.fingerprint = (snapshot.fingerprint ^ h) * 1099511628211ull;
+            if (!haveNewest || t > newestTime) { newestTime = t; snapshot.newest = name; haveNewest = true; }
         }
     }
-    if (baseline == 0) { baseline = fp; return; }                       // (the files as the session found them)
-    if (fp == baseline) { changedAt = -1.0; return; }
-    if (changedAt < 0.0 || fp != pending) { changedAt = now; pending = fp; changedFile = newest; return; }
+    return snapshot;
+}
+
+uint64_t g_ModWatchBaseline = 0;
+int g_ModWatchBaselineGeneration = -1;
+
+void initializeModWatchBaseline() {
+    g_ModWatchBaseline = modWatchSnapshot().fingerprint;
+    g_ModWatchBaselineGeneration = g_SessionGeneration;
+}
+
+void watchModFiles(double now) {
+    static int gen = -1;
+    static double nextScan = 0.0, changedAt = -1.0;
+    static uint64_t pending = 0;
+    static std::string changedFile;
+    if (gen != g_SessionGeneration) { gen = g_SessionGeneration; changedAt = -1.0; nextScan = 0.0; }
+    if (g_ModWatchBaselineGeneration != g_SessionGeneration) return;
+    if (now < nextScan || g_Reload.pending) return;
+    nextScan = now + 1.0;
+    const ModWatchSnapshot snapshot = modWatchSnapshot();
+    if (snapshot.fingerprint == g_ModWatchBaseline) { changedAt = -1.0; return; }
+    if (changedAt < 0.0 || snapshot.fingerprint != pending) {
+        changedAt = now; pending = snapshot.fingerprint; changedFile = snapshot.newest; return;
+    }
     if (now - changedAt < 0.6) return;                                  // (still being saved)
-    baseline = fp;
+    g_ModWatchBaseline = snapshot.fingerprint;
     std::string why;
     if (!requestModReload(why, changedFile + " changed") && g_ChatSystem)
         g_ChatSystem->addMessage("[Mods] " + changedFile + " changed, but can't reload: " + why, glm::vec3(1.0f, 0.8f, 0.4f));
@@ -1371,11 +1425,13 @@ std::vector<ModRoot> modRoots() {
 std::vector<fs::path> modWatchRoots() {
     std::vector<fs::path> out;
     for (const auto& r : modRoots()) out.push_back(r.path);
-    for (const std::string& rel : { std::string("lualib"), std::string("games/") + g_LoadedGameFolder + "/lualib",
-                                    std::string("clientmods") }) {
+    for (const std::string& rel : { std::string("lualib"), std::string("games/") + g_LoadedGameFolder + "/lualib" }) {
         std::error_code ec;
         if (fs::is_directory(rel, ec)) out.push_back(rel);
         else if (fs::is_directory("../../" + rel, ec)) out.push_back("../../" + rel);
+    }
+    if (g_ClientMods && !g_ClientMods->folder().empty()) {
+        out.push_back(g_ClientMods->folder());
     }
     return out;
 }
@@ -1775,11 +1831,39 @@ struct EngineContext {
 };
 
 const int TEX_SIZE = 16;
-const int MAX_TEXTURE_LAYERS = 256;
+// Layers in the block texture array: 1024 (animated pictures take one per frame), or what the
+// graphics card allows if that's fewer (OpenGL 3.3 promises at least 256)
+int MAX_TEXTURE_LAYERS = 256;
 GLuint g_TextureArrayID = 0;
 int g_NextTextureLayer = 0;
+// Animated textures (TextureAnim.h): for each layer, frames and seconds a frame, as a 1-row
+// texture the world shader reads (u_AnimTable, unit 4)
+GLuint g_AnimTableTex = 0;
+
+void uploadAnimTable() {
+    if (!layerAnimationsChanged() && g_AnimTableTex != 0) return;
+    layerAnimationsChanged() = false;
+    std::vector<float> row(static_cast<size_t>(MAX_TEXTURE_LAYERS) * 2, 0.0f);
+    const auto& v = layerAnimations();
+    for (size_t i = 0; i < v.size() && i < static_cast<size_t>(MAX_TEXTURE_LAYERS); ++i) {
+        row[i * 2] = static_cast<float>(v[i].frames);
+        row[i * 2 + 1] = v[i].frameTime;
+    }
+    if (g_AnimTableTex == 0) glGenTextures(1, &g_AnimTableTex);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, g_AnimTableTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, MAX_TEXTURE_LAYERS, 1, 0, GL_RG, GL_FLOAT, row.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glActiveTexture(GL_TEXTURE0);
+}
 
 void initTextureArray() {
+    GLint maxLayers = 256;
+    glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &maxLayers);
+    MAX_TEXTURE_LAYERS = std::clamp(static_cast<int>(maxLayers), 256, 1024);
     glGenTextures(1, &g_TextureArrayID);
     glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, TEX_SIZE, TEX_SIZE, MAX_TEXTURE_LAYERS, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -1801,6 +1885,7 @@ void initTextureArray() {
 struct TextureSource {
     std::string requested;   // name the game asked for, e.g. "stone.png"
     std::string resolved;    // file it was found at without a pack ("" = not found)
+    int frame = 0;           // an animated picture's frame (a vertical strip: 0 = the top one)
 };
 
 std::vector<TextureSource> g_LayerSources;                 // block texture layer -> source
@@ -1837,19 +1922,22 @@ std::string packOverride(const std::string& requested) {
 }
 
 // Loads an image as RGBA, resized (nearest neighbour) to size x size.
-// Tall animation strips (frames stacked vertically) use their first frame.
-bool loadImageScaled(const std::string& file, int size, std::vector<unsigned char>& out) {
+// Tall animation strips (frames stacked vertically) use their first frame, or `frame`.
+bool loadImageScaled(const std::string& file, int size, std::vector<unsigned char>& out, int frame = 0) {
     int w = 0, h = 0, n = 0;
     stbi_set_flip_vertically_on_load(false);
     unsigned char* d = stbi_load(file.c_str(), &w, &h, &n, 4);
     if (!d) return false;
 
-    int srcH = h;
-    if (h > w && w > 0 && h % w == 0) srcH = w;   // first frame of an animation strip
+    int srcH = h, top = 0;
+    if (h > w && w > 0 && h % w == 0) {           // an animation strip: one frame of it
+        srcH = w;
+        top = (std::max(frame, 0) % (h / w)) * w;
+    }
 
     out.resize(static_cast<size_t>(size) * size * 4);
     for (int y = 0; y < size; ++y) {
-        const int sy = y * srcH / size;
+        const int sy = top + y * srcH / size;
         for (int x = 0; x < size; ++x) {
             const int sx = x * w / size;
             const unsigned char* s = d + (static_cast<size_t>(sy) * w + sx) * 4;
@@ -1865,8 +1953,8 @@ bool loadImageScaled(const std::string& file, int size, std::vector<unsigned cha
 void uploadLayer(int layer, const TextureSource& src) {
     std::vector<unsigned char> px;
     const std::string override = packOverride(src.requested);
-    bool ok = !override.empty() && loadImageScaled(override, TEX_SIZE, px);
-    if (!ok && !src.resolved.empty()) ok = loadImageScaled(src.resolved, TEX_SIZE, px);
+    bool ok = !override.empty() && loadImageScaled(override, TEX_SIZE, px, src.frame);
+    if (!ok && !src.resolved.empty()) ok = loadImageScaled(src.resolved, TEX_SIZE, px, src.frame);
     if (!ok) px.assign(static_cast<size_t>(TEX_SIZE) * TEX_SIZE * 4, 255);   // missing texture: white
 
     glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
@@ -1931,7 +2019,17 @@ static void reportMissingTextures() {
 
 }
 
-int loadTextureToLayer(const std::string& path) {
+// Animated: "picture.png\x1fanim=0.15" (BlockDefs.cpp adds it for blocks with `animation`): a
+// vertical strip of square frames, each shown that many seconds
+constexpr char kAnimMark[] = "\x1f" "anim=";
+
+int loadTextureToLayer(const std::string& pathIn) {
+    std::string path = pathIn;
+    float animTime = 0.0f;
+    if (const size_t m = path.find(kAnimMark); m != std::string::npos) {
+        try { animTime = std::stof(path.substr(m + sizeof(kAnimMark) - 1)); } catch (...) { animTime = 0.0f; }
+        path = path.substr(0, m);
+    }
     std::string finalPath = path;
 
     std::vector<std::string> searchPaths = {
@@ -1964,26 +2062,38 @@ int loadTextureToLayer(const std::string& path) {
             if (g_MissingTexturesReported) std::cerr << "[Texture] Missing block texture: " << path << std::endl;
         }
     }
-    if (found && packOverride(path).empty()) {
-        int w, h, n;
-        if (!stbi_info(finalPath.c_str(), &w, &h, &n)) return -1;   // unreadable image
+    int frames = 1;
+    {
+        const std::string file = packOverride(path).empty() ? (found ? finalPath : std::string()) : packOverride(path);
+        int w = 0, h = 0, n = 0;
+        if (!file.empty() && !stbi_info(file.c_str(), &w, &h, &n)) {
+            if (found && packOverride(path).empty()) return -1;   // unreadable image
+        }
+        // animated: as many frames as the strip has squares (2 to 64)
+        if (animTime > 0.0f && w > 0 && h > w && h % w == 0) frames = std::min(h / w, 64);
     }
     // The same picture file used by several blocks (or particles) shares one layer
     static std::unordered_map<std::string, int> layerOfFile;
     static int layerGen = -1;                       // (a mod reload starts the layers again)
     if (layerGen != g_SessionGeneration) { layerOfFile.clear(); layerGen = g_SessionGeneration; }
-    const std::string fileKey = found ? fs::path(finalPath).lexically_normal().generic_string() : ("?" + path);
+    std::string fileKey = found ? fs::path(finalPath).lexically_normal().generic_string() : ("?" + path);
+    if (frames > 1) fileKey += "#anim";      // (the same picture used still elsewhere: its own layer)
     if (auto it = layerOfFile.find(fileKey); it != layerOfFile.end() && it->second < g_NextTextureLayer) return it->second;
-    if (g_NextTextureLayer >= MAX_TEXTURE_LAYERS) {
+    if (g_NextTextureLayer + frames > MAX_TEXTURE_LAYERS) {
         std::cerr << "[Texture] Out of texture layers (max " << MAX_TEXTURE_LAYERS << "): " << path << std::endl;
         return -1;
     }
 
-    const int layer = g_NextTextureLayer++;
+    const int layer = g_NextTextureLayer;
+    g_NextTextureLayer += frames;
     layerOfFile[fileKey] = layer;
-    if (static_cast<int>(g_LayerSources.size()) <= layer) g_LayerSources.resize(layer + 1);
-    g_LayerSources[layer] = TextureSource{ path, found ? finalPath : "" };
-    uploadLayer(layer, g_LayerSources[layer]);
+    if (static_cast<int>(g_LayerSources.size()) < layer + frames) g_LayerSources.resize(layer + frames);
+    for (int f = 0; f < frames; ++f) {
+        g_LayerSources[layer + f] = TextureSource{ path, found ? finalPath : "", f };
+        uploadLayer(layer + f, g_LayerSources[layer + f]);
+    }
+    setLayerAnimation(layer, frames, animTime);
+    if (frames > 1) std::cout << "[Texture] " << path << ": animated, " << frames << " frames of " << animTime << " s" << std::endl;
     return layer;
 }
 
@@ -3855,6 +3965,7 @@ uniform mat4 projection;
 uniform vec3 u_SunDir;
 uniform int u_Unlit;
 uniform float u_Time;
+uniform vec4 u_ClipPlane;     // a mirror's reflection: what's behind the glass is cut away (Mirrors.h)
 
 void main() {
     vec3 pos = aPos;
@@ -3878,6 +3989,7 @@ void main() {
     vec4 viewPos = view * model * vec4(pos, 1.0);
     FragPos = viewPos.xyz;
     gl_Position = projection * viewPos;
+    gl_ClipDistance[0] = dot(vec4(WorldPos, 1.0), u_ClipPlane);
 }
 )";
 
@@ -3896,6 +4008,8 @@ in vec4 VoxelLight;
 
 out vec4 FragColorOut;
 uniform sampler2DArray textureArray;
+// Animated pictures (TextureAnim.h): per layer, (frames, seconds a frame); 1 frame = still
+uniform sampler2D u_AnimTable;
 uniform int u_IsGUI;
 uniform int u_Unlit;
 uniform vec3 u_SunDir;
@@ -3943,6 +4057,9 @@ uniform float u_SkyBrightness;    // the sky's brightness (Skybox::brightness): 
 uniform float u_SkyHalo;          // the sky's glow around the sun (0 = the standard look)
 uniform vec4  u_WeatherTint;      // the weather's tint over the sky (rgb, how much): fog and reflections get it too
 uniform int   u_SSR;              // 1 = water reflects the world (lighting High)
+uniform vec3  u_AuroraLight;      // an aurora's glow on the land, from the open sky (sky.set_aurora)
+uniform int   u_Detached;         // 1 = blocks drawn away from their cells (moving builds, falling sand):
+                                  // the traced blocks around say nothing about what they are
 uniform sampler2D u_SceneColor;   // the frame before water was drawn (SceneCopy.h)
 uniform sampler2D u_SceneDepth;
 uniform mat4  u_ViewProj;
@@ -4004,6 +4121,14 @@ float waterCaustic(vec2 p, float t) {
     return clamp(pow(abs(c), 8.0), 0.0, 2.0);
 }
 
+// The layer showing now: an animated picture's first layer + the frame it's on
+float animLayer(float l) {
+    if (l < 0.0) return l;
+    vec2 a = texelFetch(u_AnimTable, ivec2(int(l + 0.5), 0), 0).rg;
+    if (a.x > 1.5) l += mod(floor(u_Time / max(a.y, 0.001)), a.x);
+    return l;
+}
+
 void main() {
     vec4 finalColor = vec4(TintColor, 1.0);
     // The surface's true direction (before anything can skip a pixel: screen-space slopes need
@@ -4018,6 +4143,8 @@ void main() {
 
     if (BaseLayer >= 0.0) {
         vec2 animatedUV = TexCoord;
+        float baseL = animLayer(BaseLayer);
+        float overL = animLayer(OverlayLayer);
 
         if (TintColor.b > TintColor.r && TintColor.b > TintColor.g && BaseLayer > 0.0 && u_IsGUI == 0) {
             // Water moves the way water goes. (Texture v runs down a block's sides, and along +z
@@ -4039,7 +4166,7 @@ void main() {
             animatedUV.x += sin(u_Time * 1.2f + WorldPos.z * 0.5f) * 0.02f;
         }
 
-        vec4 baseTex = texture(textureArray, vec3(animatedUV, BaseLayer));
+        vec4 baseTex = texture(textureArray, vec3(animatedUV, baseL));
         // A mirror's front (MirrorShape.h, overlay layer -2): where its picture is see-through,
         // silvered glass (the reflection is laid over it afterwards: Mirrors.h); the rest is its frame
         if (OverlayLayer < -1.5) {
@@ -4051,7 +4178,7 @@ void main() {
             if ((joined & 2) != 0) juv.x = min(juv.x, 0.5);
             if ((joined & 4) != 0) juv.y = min(juv.y, 0.5);
             if ((joined & 8) != 0) juv.y = max(juv.y, 0.5);
-            baseTex = texture(textureArray, vec3(juv, BaseLayer));
+            baseTex = texture(textureArray, vec3(juv, baseL));
             if (baseTex.a < 0.5) {
                 vec3 V = normalize(u_CameraPos - WorldPos);
                 float sheen = 0.5 + 0.5 * sin((WorldPos.x + WorldPos.z) * 1.7 + WorldPos.y * 0.9 + V.x * 2.0 + V.z * 2.0);
@@ -4067,7 +4194,7 @@ void main() {
         finalColor = vec4(baseRgb, baseTex.a);
 
         if (OverlayLayer >= 0.0) {
-            vec4 overlayTex = texture(textureArray, vec3(TexCoord, OverlayLayer));
+            vec4 overlayTex = texture(textureArray, vec3(TexCoord, overL));
             if (overlayTex.a > 0.05) {
                 vec3 overlayRgb = (TintOverlay > 0.5) ? (overlayTex.rgb * TintColor) : overlayTex.rgb;
                 finalColor.rgb = mix(finalColor.rgb, overlayRgb, overlayTex.a);
@@ -4128,7 +4255,7 @@ void main() {
         bool leaf = abs(selfO - 0.50196) < 0.002;
         // (the water's surface seen from below has air behind it: that's water, not a plant)
         bool waterFace = voxIsWater(ivec3(floor(WorldPos + faceN * 0.02))) || voxIsWater(ivec3(floor(WorldPos - faceN * 0.02)));
-        bool plant = selfO < 0.01 && !waterFace;
+        bool plant = selfO < 0.01 && !waterFace && u_Detached == 0;
         vec3 n = plant ? vec3(0.0, 1.0, 0.0) : faceN;
         float ao = vao * ((plant || !voxColumnReady(ivec3(floor(WorldPos)))) ? 1.0 : voxAO(WorldPos, faceN));
         vec3 sd = normalize(u_SunDir);
@@ -4167,6 +4294,8 @@ void main() {
         skyCol = mix(vec3(dot(skyCol, vec3(0.333))), skyCol, clearSky * 0.7 + 0.3) * mix(0.55, 1.0, u_WeatherLight);
         float hemi = 0.62 + 0.38 * n.y;                    // tops see the whole sky, sides half
         vec3 ambient = skyCol * hemi * sky * ao;
+        // an aurora's glow, from the sky above (tops most, sides some)
+        ambient += u_AuroraLight * 1.6 * (0.55 + 0.45 * n.y) * sky * ao;
         // sunlight bounced off the ground onto sides and undersides
         vec3 bounce = sunLight * 0.10 * sky * (0.5 - 0.5 * n.y) * ao * vec3(1.0, 0.92, 0.8);
 
@@ -4228,6 +4357,8 @@ void main() {
         // and nights come up too. The darkest anything gets rises a little (2% -> 8% at full),
         // then the whole range is lifted with Minecraft's curve: a pitch-black cave ends up
         // about 28% lit at "Bright", while daylight barely changes.
+        // an aurora's glow, on whatever is open to the sky
+        lightAmount += u_AuroraLight * lightCurve(L.x) * (0.6f + 0.4f * max(faceN.y, 0.0f));
         lightAmount = max(lightAmount, vec3(mix(u_MinLight, max(u_MinLight, 0.08f), u_Gamma)));
         vec3 inv = vec3(1.0f) - clamp(lightAmount, 0.0f, 1.0f);
         lightAmount = mix(lightAmount, vec3(1.0f) - inv * inv * inv * inv, u_Gamma);
@@ -4570,12 +4701,14 @@ out vec3 FragPos;
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
+uniform vec4 u_ClipPlane;     // a mirror's reflection: what's behind the glass is cut away (Mirrors.h)
 
 void main() {
     FragPos = vec3(model * vec4(aPos, 1.0));
     Normal = mat3(transpose(inverse(model))) * aNormal;
     TexCoords = aTexCoords;
     gl_Position = projection * view * vec4(FragPos, 1.0);
+    gl_ClipDistance[0] = dot(vec4(FragPos, 1.0), u_ClipPlane);
 }
 )";
 
@@ -4772,6 +4905,8 @@ void resetForReload() {
 
     // Textures: the block texture array and every picture loaded by name
     if (g_TextureArrayID) { glDeleteTextures(1, &g_TextureArrayID); g_TextureArrayID = 0; }
+    layerAnimations().clear();          // (the layers are given out again)
+    layerAnimationsChanged() = true;
     g_NextTextureLayer = 0;
     g_LayerSources.clear();
     for (const auto& [tex, src] : g_StandardTextureSources) { GLuint t = tex; glDeleteTextures(1, &t); }
@@ -4796,6 +4931,9 @@ void resetForReload() {
     g_ModStorageDirty = false;
     g_ModelInstances.clear();
     g_NextModelInstance = 1;
+    structure::clearMoveCallbacks();     // (the old mods' on_done callbacks)
+    g_Outlines.clear();
+    g_MovingVisuals.clear();
     g_EntityVisuals.clear();
 
     // Settings mods change, back to the engine's own
@@ -4807,6 +4945,7 @@ void resetForReload() {
     g_LuaInventoryOpen = false;
     g_FirstPerson = FirstPersonView{};
     g_LightSettings = LightSettings{};
+    g_Aurora = AuroraState{};            // (mods set it again)
     g_HeldLight = HeldLight{};
     g_Fog = FogSettings{};
     g_Underwater = UnderwaterSettings{};
@@ -5272,7 +5411,12 @@ int main(int argc, char** argv) {
         auto uiTable = lua.create_named_table("ui");
         // Pictures drawn by ui.draw_image, loaded once (by path) and kept
         static std::unordered_map<std::string, GLuint> s_uiImages;
+        static int s_uiImagesGeneration = -1;
         auto uiImage = [](const std::string& path) {
+            if (s_uiImagesGeneration != g_SessionGeneration) {
+                s_uiImages.clear();
+                s_uiImagesGeneration = g_SessionGeneration;
+            }
             auto it = s_uiImages.find(path);
             if (it == s_uiImages.end()) it = s_uiImages.emplace(path, loadStandardTexture(path)).first;
             return it->second;
@@ -5633,6 +5777,88 @@ int main(int argc, char** argv) {
             if (!g_Skybox) return;
             g_Skybox->starDensity = std::max(0.0f, std::min(1.0f, density));
             if (brightness) g_Skybox->starBrightness = std::max(0.0f, *brightness);
+        };
+        // sky.set_aurora(def): the aurora in this game's sky (like the rest of sky.*, what each
+        // player's game shows; mods decide when and where). Fields, all optional - left out keeps
+        // what's set:
+        //   strength 0 = none .. 1 = strong (up to 2), fade = seconds to get there (default 0),
+        //   colors = { low, high }: the bottom of the curtains and the top ("#rrggbb" or {r,g,b}),
+        //   speed = 1 (how fast it ripples), size = 1 (how big its folds are), direction = 0
+        //   (where it hangs, compass degrees: 0 north, 90 east), night_only = true,
+        //   style = "smooth" (the default) or "pixel" (square sky pixels and flat steps of colour),
+        //   pixels = 80 (the pixel style's grid: pixels across 90 degrees), haze = 1 (the soft glow
+        //   round the curtains, 0..3), light = 1 (how much it lights the land below, 0..3).
+        // A number is short for { strength = n }. Not saved: mods set it again when a world loads.
+        // sky.get_aurora() -> the same fields, plus `shown` (the strength on screen mid-fade)
+        skyTable["set_aurora"] = [](sol::object arg) {
+            auto color = [](const sol::object& o, glm::vec3& out) {
+                if (o.is<std::string>()) {
+                    std::string hex = o.as<std::string>();
+                    if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
+                    if (hex.size() != 6 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+                        throw sol::error("sky.set_aurora: a colour is \"#rrggbb\" or { r, g, b }");
+                    const unsigned long v = std::strtoul(hex.c_str(), nullptr, 16);
+                    out = glm::vec3(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f);
+                } else if (o.is<sol::table>()) {
+                    const sol::table t = o.as<sol::table>();
+                    const float r = t.get_or(1, -1.0f), g = t.get_or(2, -1.0f), b = t.get_or(3, -1.0f);
+                    if (!(r >= 0.0f && g >= 0.0f && b >= 0.0f)) throw sol::error("sky.set_aurora: a colour is \"#rrggbb\" or { r, g, b }");
+                    out = glm::clamp(glm::vec3(r, g, b), 0.0f, 1.0f);
+                }
+            };
+            auto num = [](const sol::table& t, const char* k, float lo, float hi, float& out) {
+                const sol::optional<float> v = t[k];
+                if (v && std::isfinite(*v)) out = std::clamp(*v, lo, hi);
+            };
+            AuroraState& a = g_Aurora;
+            if (arg.is<double>()) {
+                const double v = arg.as<double>();
+                if (std::isfinite(v)) { a.target = std::clamp(static_cast<float>(v), 0.0f, 2.0f); a.rate = 0.0f; }
+                return;
+            }
+            if (!arg.is<sol::table>()) throw sol::error("sky.set_aurora({ strength = ..., fade = ..., colors = {...} })");
+            const sol::table t = arg.as<sol::table>();
+            float strength = a.target, fade = 0.0f;
+            num(t, "strength", 0.0f, 2.0f, strength);
+            num(t, "fade", 0.0f, 3600.0f, fade);
+            num(t, "speed", 0.0f, 20.0f, a.speed);
+            num(t, "size", 0.1f, 10.0f, a.size);
+            num(t, "direction", -3600.0f, 3600.0f, a.direction);
+            num(t, "haze", 0.0f, 3.0f, a.haze);
+            num(t, "light", 0.0f, 3.0f, a.light);
+            const sol::optional<bool> night = t["night_only"];
+            if (night) a.nightOnly = *night;
+            float px = a.pixels > 0.0f ? a.pixels : 80.0f;
+            num(t, "pixels", 8.0f, 512.0f, px);
+            const sol::optional<std::string> style = t["style"];
+            if (style) {
+                if (*style == "smooth") a.pixels = 0.0f;
+                else if (*style == "pixel") a.pixels = px;
+                else throw sol::error("sky.set_aurora: style is \"pixel\" or \"smooth\"");
+            } else if (a.pixels > 0.0f) {
+                a.pixels = px;
+            }
+            const sol::optional<sol::table> colors = t["colors"];
+            if (colors) { color((*colors)[1], a.low); color((*colors)[2], a.high); }
+            a.target = strength;
+            a.rate = fade > 0.0f ? std::max(std::fabs(a.target - a.current), 0.001f) / fade : 0.0f;
+        };
+        skyTable["get_aurora"] = [](sol::this_state ts) {
+            sol::state_view lv(ts);
+            const AuroraState& a = g_Aurora;
+            auto hex = [](const glm::vec3& c) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", static_cast<int>(std::lround(c.r * 255.0f)),
+                              static_cast<int>(std::lround(c.g * 255.0f)), static_cast<int>(std::lround(c.b * 255.0f)));
+                return std::string(buf);
+            };
+            return lv.create_table_with("strength", a.target, "shown", a.current,
+                                        "colors", lv.create_table_with(1, hex(a.low), 2, hex(a.high)),
+                                        "speed", a.speed, "size", a.size, "direction", a.direction,
+                                        "night_only", a.nightOnly,
+                                        "style", std::string(a.pixels > 0.0f ? "pixel" : "smooth"),
+                                        "pixels", a.pixels > 0.0f ? a.pixels : 80.0f,
+                                        "haze", a.haze, "light", a.light);
         };
         skyTable["get_stars"] = []() -> std::tuple<float, float> {
             return g_Skybox ? std::make_tuple(g_Skybox->starDensity, g_Skybox->starBrightness) : std::make_tuple(0.0f, 0.0f);
@@ -6158,6 +6384,13 @@ int main(int argc, char** argv) {
         });
 
         auto worldTable = lua.create_named_table("world");
+        // Editing in boxes: copying, filling, moving builds (StructureAPI.h)
+        structure::install(lua, []() { return apiWorld(); },
+                           []() { return g_Client.state() != GameClient::State::Joined; },
+                           []() {   // schematics/<game>/, next to the mods folder: every world of this game shares them
+                               const fs::path mods = globalModsFolder();
+                               return (mods.has_parent_path() ? mods.parent_path() : fs::path(".")) / "schematics" / g_ActiveGameFolder;
+                           });
         worldTable["set_render_distance"] = [](int chunks) { if (g_WorldInstance) g_WorldInstance->setRenderDistance(chunks); };
         worldTable["get_render_distance"] = []() { return g_WorldInstance ? g_WorldInstance->renderDistance() : 10; };
         worldTable["get_falling_blocks"] = [](sol::this_state ts) {
@@ -7066,6 +7299,32 @@ int main(int argc, char** argv) {
             return true;
         };
 
+        // engine.set_outline(key, p1, p2 [, color]): an outline box drawn round the blocks from p1 to
+        // p2 (positions { x, y, z }, corners included, in any order) in this game - a selection, a
+        // plot, a build site. Seen faintly through walls. color "#rrggbb" or { r, g, b [, a] } (0..1),
+        // default white. Setting the same key again moves it. Up to 64 at once.
+        // engine.clear_outline(key) / engine.clear_outlines()
+        engineTable["set_outline"] = [](const std::string& key, sol::object a, sol::object b, sol::object color) {
+            if (key.empty() || key.size() > 64) throw sol::error("engine.set_outline: a key (1 to 64 characters)");
+            const glm::ivec3 p = structure::posFrom(a, "engine.set_outline"), q = structure::posFrom(b, "engine.set_outline");
+            glm::vec4 c(1.0f);
+            if (color.is<std::string>()) {
+                std::string hex = color.as<std::string>();
+                if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
+                if (hex.size() != 6 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+                    throw sol::error("engine.set_outline: a colour is \"#rrggbb\" or { r, g, b [, a] }");
+                const unsigned long v = std::strtoul(hex.c_str(), nullptr, 16);
+                c = glm::vec4(((v >> 16) & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, (v & 255) / 255.0f, 1.0f);
+            } else if (color.is<sol::table>()) {
+                const sol::table t = color.as<sol::table>();
+                c = glm::clamp(glm::vec4(t.get_or(1, 1.0f), t.get_or(2, 1.0f), t.get_or(3, 1.0f), t.get_or(4, 1.0f)), 0.0f, 1.0f);
+            }
+            if (!g_Outlines.count(key) && g_Outlines.size() >= kMaxOutlines) throw sol::error("engine.set_outline: 64 outlines at most");
+            g_Outlines[key] = OutlineBox{ glm::vec3(glm::min(p, q)), glm::vec3(glm::max(p, q) + glm::ivec3(1)), c };
+        };
+        engineTable["clear_outline"] = [](const std::string& key) { g_Outlines.erase(key); };
+        engineTable["clear_outlines"] = []() { g_Outlines.clear(); };
+
         // engine.get_video_settings() -> { { id, value, min, max, step }, ... }
         engineTable["get_video_settings"] = [&lua]() {
             sol::table t = lua.create_table();
@@ -7153,7 +7412,7 @@ int main(int argc, char** argv) {
             // Save, then unload the world so the next one starts clean (blocks still falling
             // land first, so none is lost in the air)
             if (g_CurrentGameState == GameState::PLAYING) {
-                if (g_WorldInstance) g_WorldInstance->finishFalling();
+                if (g_WorldInstance) { g_WorldInstance->finishFalling(); g_WorldInstance->finishMoves(); }
                 saveCurrentWorld();
             }
             g_DimWorlds.unloadAll();          // (the world's other dimensions close with it)
@@ -8203,6 +8462,8 @@ int main(int argc, char** argv) {
             });
         }
 
+        initializeModWatchBaseline();   // the watcher compares with the versions loaded for this session
+
         // Saved video settings win over values set by mods during loading
         applyStoredVideoSettings();
 
@@ -8305,6 +8566,7 @@ int main(int argc, char** argv) {
             glUseProgram(shaderProgram);
             glUniform1i(glGetUniformLocation(shaderProgram, "textureArray"), 0);
             glUniform1i(glGetUniformLocation(shaderProgram, "u_Voxels"), 3);
+            glUniform1i(glGetUniformLocation(shaderProgram, "u_AnimTable"), 4);
             glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneColor"), 5);
             glUniform1i(glGetUniformLocation(shaderProgram, "u_SceneDepth"), 6);
         }
@@ -8533,6 +8795,15 @@ int main(int argc, char** argv) {
             float currentFrameTime = static_cast<float>(glfwGetTime());
             float deltaTime = currentFrameTime - lastFrameTime;
             lastFrameTime = currentFrameTime;
+            g_Aurora.update(deltaTime);
+            // animated pictures: the clock the inventory screens follow, and the table the shader reads
+            animationClock() = glfwGetTime();
+            if (g_TextureArrayID != 0) {
+                uploadAnimTable();
+                glActiveTexture(GL_TEXTURE4);
+                glBindTexture(GL_TEXTURE_2D, g_AnimTableTex);
+                glActiveTexture(GL_TEXTURE0);
+            }   // (fading on, also while the sky isn't drawn: loading, menus)
             {
                 static int frames = 0;
                 static float fpsTimer = 0.0f;
@@ -8995,6 +9266,7 @@ int main(int argc, char** argv) {
                 // Each fluid keeps its own step timer (water 0.25 s, lava 1.5 s...), see Fluids.h
                 if (!g_Paused || g_Server.running()) {
                     world.updateFluids(deltaTime);
+                    structure::runMoveCallbacks(lua, world);   // (moves placed: mods' on_done)
                 }
             }
 
@@ -9570,6 +9842,16 @@ int main(int argc, char** argv) {
                     g_Skybox->sunDirection = sunDir;
                     g_Skybox->brightness = g_LightQuality > 0 ? 0.86f : 1.0f;
                     g_Skybox->sunHalo = g_LightQuality > 0 ? 1.0f : 0.0f;
+                    g_Skybox->aurora = g_Aurora.current;
+                    g_Skybox->auroraLow = g_Aurora.low;
+                    g_Skybox->auroraHigh = g_Aurora.high;
+                    g_Skybox->auroraSpeed = g_Aurora.speed;
+                    g_Skybox->auroraSize = g_Aurora.size;
+                    g_Skybox->auroraDirection = g_Aurora.direction;
+                    g_Skybox->auroraNightOnly = g_Aurora.nightOnly;
+                    g_Skybox->auroraPixels = g_Aurora.pixels;
+                    g_Skybox->auroraHaze = g_Aurora.haze;
+                    g_Skybox->time = static_cast<float>(std::fmod(glfwGetTime(), 100000.0));
                     if (dimType.showSky) g_Skybox->render(view, proj, sunDir.y);
 
                     glDepthMask(GL_FALSE);
@@ -9649,6 +9931,14 @@ int main(int argc, char** argv) {
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyFog"), skyFog);
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyBrightness"), g_LightQuality > 0 ? 0.86f : 1.0f);
                     glUniform1f(glGetUniformLocation(shaderProgram, "u_SkyHalo"), g_LightQuality > 0 ? 1.0f : 0.0f);
+                    // An aurora's glow on the land (night only, unless it's set to show by day; none
+                    // where the dimension draws no sky): mostly its low colour, a little of the high
+                    {
+                        const float night = g_Aurora.nightOnly ? glm::clamp((-sunDir.y + 0.05f) * 4.0f, 0.0f, 1.0f) : 1.0f;
+                        const float amount = (dimType.showSky ? 1.0f : 0.0f) * g_Aurora.current * g_Aurora.light * night * 0.09f;
+                        const glm::vec3 glow = (g_Aurora.low * 0.75f + g_Aurora.high * 0.25f) * amount;
+                        glUniform3f(glGetUniformLocation(shaderProgram, "u_AuroraLight"), glow.r, glow.g, glow.b);
+                    }
                     {
                         const glm::vec4 tint = (normalSky && dimType.showWeather && blend <= 0.0f) ? g_Weather.drawnSkyTint() : glm::vec4(0.0f);
                         glUniform4f(glGetUniformLocation(shaderProgram, "u_WeatherTint"), tint.r, tint.g, tint.b, glm::clamp(tint.a, 0.0f, 1.0f));
@@ -9785,6 +10075,7 @@ int main(int argc, char** argv) {
                         static std::vector<Vertex> verts;
                         const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
                         glUniform1f(glGetUniformLocation(shaderProgram, "u_ChunkFade"), 1.0f);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_Detached"), 1);
                         glDisable(GL_BLEND);
                         for (const auto& fb : falling) {
                             const glm::ivec3 cell(static_cast<int>(std::floor(fb.pos.x)),
@@ -9801,10 +10092,103 @@ int main(int argc, char** argv) {
                             glBindVertexArray(fallVao);
                             glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
                         }
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_Detached"), 0);
                         glBindVertexArray(0);
                         glEnable(GL_BLEND);
                     }
                 }
+                // Builds moving (world.move_region): meshed once, as the world draws its chunks, and
+                // slid along to where they are this frame
+                {
+                    const auto moving = world.movingRegions();
+                    // the ones that have finished (or belong to a world we've left): their meshes go
+                    for (auto it = g_MovingVisuals.begin(); it != g_MovingVisuals.end();) {
+                        bool still = false;
+                        for (const auto& m : moving) if (m.id == it->first && it->second.world == &world) still = true;
+                        it = still ? std::next(it) : g_MovingVisuals.erase(it);
+                    }
+                    if (!moving.empty()) {
+                        auto& breg = BlockRegistry::getInstance();
+                        const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+                        glUniform1f(glGetUniformLocation(shaderProgram, "u_ChunkFade"), 1.0f);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_Detached"), 1);
+                        for (const auto& m : moving) {
+                            MovingVisual& vis = g_MovingVisuals[m.id];
+                            if (vis.world != &world) {
+                                vis = MovingVisual{};
+                                vis.world = &world;
+                                const Region& r = *m.region;
+                                const glm::ivec3 ls = r.size + glm::ivec3(2);          // the light box (one bigger all round)
+                                auto lightAt = [&](int rx, int ry, int rz) -> uint16_t {
+                                    if (rx < -1 || ry < -1 || rz < -1 || rx > r.size.x || ry > r.size.y || rz > r.size.z) return ChunkData::kFullSky;
+                                    return (*m.light)[(static_cast<size_t>(rx + 1) * ls.y + (ry + 1)) * ls.z + (rz + 1)];
+                                };
+                                const int px = (r.size.x + CHUNK_WIDTH - 1) / CHUNK_WIDTH, pz = (r.size.z + CHUNK_WIDTH - 1) / CHUNK_WIDTH;
+                                vis.pieces.resize(static_cast<size_t>(px) * pz);
+                                for (int i = 0; i < px; ++i)
+                                    for (int j = 0; j < pz; ++j) {
+                                        auto& piece = vis.pieces[static_cast<size_t>(i) * pz + j];
+                                        piece.at = glm::ivec3(i * CHUNK_WIDTH, 0, j * CHUNK_WIDTH);
+                                        piece.data = std::make_unique<ChunkData>();
+                                        ChunkData& d = *piece.data;
+                                        d.enableLight();
+                                        for (int lx = 0; lx < CHUNK_WIDTH; ++lx)
+                                            for (int lz = 0; lz < CHUNK_WIDTH; ++lz) {
+                                                const int rx = piece.at.x + lx, rz = piece.at.z + lz;
+                                                for (int y = 0; y < CHUNK_HEIGHT; ++y) d.setLocalLight(lx, y, lz, lightAt(rx, y - m.from.y, rz));
+                                                // the biome colours where it started (grass stays its colour)
+                                                if (const ChunkData* src = world.chunkData(World::ChunkCoord{
+                                                        static_cast<int>(std::floor(static_cast<float>(m.from.x + rx) / CHUNK_WIDTH)),
+                                                        static_cast<int>(std::floor(static_cast<float>(m.from.z + rz) / CHUNK_WIDTH)) })) {
+                                                    const int sx = ((m.from.x + rx) % CHUNK_WIDTH + CHUNK_WIDTH) % CHUNK_WIDTH;
+                                                    const int sz = ((m.from.z + rz) % CHUNK_WIDTH + CHUNK_WIDTH) % CHUNK_WIDTH;
+                                                    for (int ch = 0; ch < ChunkData::kTintChannels; ++ch)
+                                                        if (src->hasTint(ch)) d.setColumnTint(lx, lz, src->getColumnTint(sx, sz, ch), ch);
+                                                }
+                                                if (rx >= r.size.x || rz >= r.size.z) continue;
+                                                for (int y = 0; y < r.size.y; ++y) {
+                                                    const int wy = m.from.y + y;
+                                                    if (wy < 0 || wy >= CHUNK_HEIGHT) continue;
+                                                    const size_t idx = r.index(rx, y, rz);
+                                                    if (r.ids[idx] != 0 && breg.getBlock(r.ids[idx]).id == r.ids[idx]) d.setBlockWithMeta(lx, wy, lz, r.ids[idx], r.metas[idx]);
+                                                }
+                                            }
+                                    }
+                                // linked to each other, so faces between them are left out as in the world
+                                for (int i = 0; i < px; ++i)
+                                    for (int j = 0; j < pz; ++j) {
+                                        ChunkData& d = *vis.pieces[static_cast<size_t>(i) * pz + j].data;
+                                        if (i + 1 < px) d.neighbors[0] = vis.pieces[static_cast<size_t>(i + 1) * pz + j].data.get();
+                                        if (i > 0)      d.neighbors[1] = vis.pieces[static_cast<size_t>(i - 1) * pz + j].data.get();
+                                        if (j + 1 < pz) d.neighbors[4] = vis.pieces[static_cast<size_t>(i) * pz + j + 1].data.get();
+                                        if (j > 0)      d.neighbors[5] = vis.pieces[static_cast<size_t>(i) * pz + j - 1].data.get();
+                                    }
+                                for (auto& piece : vis.pieces) {
+                                    piece.mesh = std::make_unique<ChunkMesh>();
+                                    piece.mesh->generateMeshData(*piece.data);
+                                    piece.mesh->uploadMesh();
+                                }
+                            }
+                            // solid blocks, then see-through ones (glass, leaves, water) over them
+                            for (int pass = 0; pass < 2; ++pass) {
+                                if (pass == 0) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+                                else { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+                                for (const auto& piece : vis.pieces) {
+                                    const glm::vec3 at = m.corner + glm::vec3(piece.at) - glm::vec3(0.0f, static_cast<float>(m.from.y), 0.0f);
+                                    const glm::mat4 model = glm::translate(glm::mat4(1.0f), at);
+                                    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+                                    if (pass == 0) piece.mesh->drawOpaque();
+                                    else { piece.mesh->drawLiquid(); piece.mesh->drawTransparent(); }
+                                }
+                            }
+                        }
+                        glDepthMask(GL_TRUE);
+                        glEnable(GL_BLEND);
+                        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_Detached"), 0);
+                    }
+                }
+
                 // Entities this frame (ours or the server's), and dropped items: a small spinning,
                 // bobbing copy of the block, or a flat picture for items and plants. Mobs whose
                 // model isn't known here (a server-only mod) are a plain box the size of their hitbox.
@@ -10104,7 +10488,11 @@ int main(int argc, char** argv) {
                     }
                     if (g_MirrorsOn && g_Mirrors.choose(mirrorCells, proj * view, camWorld, fbw, fbh)) {
                         const glm::mat4 mview = view * g_Mirrors.reflection();
-                        const glm::mat4 mproj = g_Mirrors.clippedProjection(proj, mview);
+                        // (an ordinary projection: things behind the glass are cut away by the clip
+                        // plane below, which doesn't bend the depth range the way an oblique near plane did)
+                        const glm::mat4 mproj = proj;
+                        const glm::vec4 clipPlane = g_Mirrors.clipPlane();
+                        const glm::vec4 noClip(0.0f, 0.0f, 0.0f, 1.0f);
                         const glm::vec3 mcam = g_Mirrors.reflect(camWorld);
                         const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
                         g_Mirrors.begin(clearCol);
@@ -10121,6 +10509,8 @@ int main(int argc, char** argv) {
                         glUniform1i(glGetUniformLocation(shaderProgram, "u_IsGUI"), 0);
                         glUniform1i(glGetUniformLocation(shaderProgram, "u_Unlit"), 0);
                         glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 1);
+                        glUniform4fv(glGetUniformLocation(shaderProgram, "u_ClipPlane"), 1, glm::value_ptr(clipPlane));
+                        glEnable(GL_CLIP_DISTANCE0);
                         glEnable(GL_DEPTH_TEST);
                         glDepthFunc(GL_LESS);
                         glEnable(GL_BLEND);
@@ -10135,6 +10525,7 @@ int main(int argc, char** argv) {
                         glUseProgram(modelShaderProgram);
                         glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(mproj));
                         glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(mview));
+                        glUniform4fv(glGetUniformLocation(modelShaderProgram, "u_ClipPlane"), 1, glm::value_ptr(clipPlane));
                         const GLint localLight = glGetUniformLocation(modelShaderProgram, "u_LocalLight");
                         const GLint tintLoc = glGetUniformLocation(modelShaderProgram, "u_Tint");
                         try {
@@ -10169,6 +10560,8 @@ int main(int argc, char** argv) {
                         glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
                         glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
                         glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                        glUniform4fv(glGetUniformLocation(modelShaderProgram, "u_ClipPlane"), 1, glm::value_ptr(noClip));
+                        glDisable(GL_CLIP_DISTANCE0);
                         g_Mirrors.end();
                         if (cullWas) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
                         // back to this camera
@@ -10176,6 +10569,7 @@ int main(int argc, char** argv) {
                         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
                         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
                         glUniform3f(glGetUniformLocation(shaderProgram, "u_CameraPos"), camWorld.x, camWorld.y, camWorld.z);
+                        glUniform4fv(glGetUniformLocation(shaderProgram, "u_ClipPlane"), 1, glm::value_ptr(noClip));
                         g_Mirrors.composite(proj * view, g_TextureArrayID);
                         glEnable(GL_BLEND);
                         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -10241,6 +10635,51 @@ int main(int argc, char** argv) {
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_SSR"), 0);
                     glEnable(GL_BLEND);
                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                }
+
+                // Outline boxes mods asked for (engine.set_outline): solid where they're in view, and
+                // faintly through whatever is in front of them, so a selection can always be found
+                if (!g_Outlines.empty()) {
+                    static GLuint olVAO = 0, olVBO = 0;
+                    if (olVAO == 0) {
+                        const float e[] = {   // the 12 edges of a unit cube (0..1)
+                            0,0,0, 1,0,0,  1,0,0, 1,1,0,  1,1,0, 0,1,0,  0,1,0, 0,0,0,
+                            0,0,1, 1,0,1,  1,0,1, 1,1,1,  1,1,1, 0,1,1,  0,1,1, 0,0,1,
+                            0,0,0, 0,0,1,  1,0,0, 1,0,1,  1,1,0, 1,1,1,  0,1,0, 0,1,1 };
+                        glGenVertexArrays(1, &olVAO);
+                        glGenBuffers(1, &olVBO);
+                        glBindVertexArray(olVAO);
+                        glBindBuffer(GL_ARRAY_BUFFER, olVBO);
+                        glBufferData(GL_ARRAY_BUFFER, sizeof(e), e, GL_STATIC_DRAW);
+                        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+                        glEnableVertexAttribArray(0);
+                        glBindVertexArray(0);
+                    }
+                    glUseProgram(wireframeProgram);
+                    glUniformMatrix4fv(glGetUniformLocation(wireframeProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+                    glUniformMatrix4fv(glGetUniformLocation(wireframeProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                    const GLint olModel = glGetUniformLocation(wireframeProgram, "model");
+                    const GLint olColor = glGetUniformLocation(wireframeProgram, "u_Color");
+                    glDisable(GL_CULL_FACE);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);
+                    glLineWidth(2.0f);
+                    glBindVertexArray(olVAO);
+                    for (int pass = 0; pass < 2; ++pass) {
+                        if (pass == 0) glDisable(GL_DEPTH_TEST); else { glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); }
+                        for (const auto& [key, b] : g_Outlines) {
+                            glm::mat4 m = glm::translate(glm::mat4(1.0f), b.mn - glm::vec3(0.004f));
+                            m = glm::scale(m, b.mx - b.mn + glm::vec3(0.008f));   // (a hair bigger: never inside the blocks' faces)
+                            glUniformMatrix4fv(olModel, 1, GL_FALSE, glm::value_ptr(m));
+                            glUniform4f(olColor, b.color.r, b.color.g, b.color.b, pass == 0 ? b.color.a * 0.3f : b.color.a);
+                            glDrawArrays(GL_LINES, 0, 24);
+                        }
+                    }
+                    glBindVertexArray(0);
+                    glEnable(GL_DEPTH_TEST);
+                    glDepthFunc(GL_LESS);
+                    glDepthMask(GL_TRUE);
                 }
 
                 if (isCursorDisabled && (!g_ChatSystem || !g_ChatSystem->isOpen) && rayResult.hit) {
@@ -10850,7 +11289,7 @@ int main(int argc, char** argv) {
         }
 
         // Closing the window (or Quit Game) while playing saves the world first
-        if (g_CurrentGameState == GameState::PLAYING) { world.finishFalling(); saveCurrentWorld(); }
+        if (g_CurrentGameState == GameState::PLAYING) { world.finishFalling(); world.finishMoves(); saveCurrentWorld(); }
         g_Client.disconnect();
         g_Server.stop("The host closed the game");
         g_DimWorlds.unloadAll();       // (before the generator their chunks come from goes)

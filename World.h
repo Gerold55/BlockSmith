@@ -18,6 +18,7 @@
 #include <vector>
 #include <sol/sol.hpp>
 #include "ChunkData.h"
+#include "Region.h"
 #include "Types.h"
 
 struct PairHash {
@@ -90,6 +91,53 @@ public:
         for (int y = loc.y + 1; y < CHUNK_HEIGHT; ++y) if (getBlockAt(glm::ivec3(loc.x, y, loc.z)) != 0) return false;
         return true;
     }
+    // ---------------- Regions (Region.h, StructureAPI.h): boxes of blocks ----------------
+    // Corners are inclusive and may be given in any order. Every chunk in the box must be loaded.
+    bool regionLoaded(const glm::ivec3& a, const glm::ivec3& b) const;
+    bool readRegion(const glm::ivec3& a, const glm::ivec3& b, Region& out, std::string& why) const;
+    // Writes a region with its lowest corner at `origin` (blocks, metadata and text). withAir =
+    // false leaves what's there where the region has air. Returns how many blocks changed.
+    size_t writeRegion(const Region& r, const glm::ivec3& origin, bool withAir);
+
+    // Moving a box of blocks, seen moving: the blocks leave the world, glide `offset` blocks in
+    // `seconds` as one piece (drawn by the game, main.cpp), then are placed there (air too: what
+    // was in the way is replaced, as with any copy). Where the world runs; a server tells its
+    // players (takeMoveStarts / takeMoveEnds) and their games show it too (addMoveVisual).
+    static constexpr size_t kMaxMoveCells = 262144;     // (a 64 x 64 x 64 box)
+    static constexpr size_t kMaxMoves = 16;             // moving at once
+    uint32_t startMove(const glm::ivec3& a, const glm::ivec3& b, const glm::ivec3& offset, float seconds, std::string& why);
+    struct MoveStart { uint32_t id; glm::ivec3 from; glm::ivec3 offset; float seconds; Region region; };
+    std::vector<MoveStart> takeMoveStarts() { std::vector<MoveStart> out; out.swap(m_moveStarts); return out; }
+    std::vector<uint32_t> takeMoveEnds() { std::vector<uint32_t> out; out.swap(m_moveEnds); return out; }
+    // Moves that have been placed since the last call (for mods' callbacks: StructureAPI.h)
+    std::vector<uint32_t> takeMovesDone() { std::vector<uint32_t> out; out.swap(m_movesDone); return out; }
+    // (remote worlds) a move the server started: shown moving, never placed; ended by endMoveVisual
+    void addMoveVisual(uint32_t id, const glm::ivec3& from, const glm::ivec3& offset, float seconds, Region region);
+    void endMoveVisual(uint32_t id);
+    // Places every move still under way at once (before saving a world that's being closed)
+    void finishMoves();
+    // What's moving now, to draw: where its lowest corner is this moment, its blocks, and the
+    // light around where it started (a box one block bigger on every side, x-major like Region)
+    struct MoveView {
+        uint32_t id;
+        glm::vec3 corner;
+        glm::ivec3 from;
+        const Region* region;
+        const std::vector<uint16_t>* light;
+    };
+    std::vector<MoveView> movingRegions() const;
+    bool isMoving() const { return !m_moves.empty(); }
+    // Whether a block is where a move under way started or is going (its own blocks, not an edit)
+    bool isInMove(const glm::ivec3& p) const {
+        for (const auto& m : m_moves) {
+            for (const glm::ivec3& c : { m.from, m.from + m.offset }) {
+                const glm::ivec3 d = p - c;
+                if (d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < m.region.size.x && d.y < m.region.size.y && d.z < m.region.size.z) return true;
+            }
+        }
+        return false;
+    }
+
     // ---------------- Light (Light.h) ----------------
     // The game turns this on; the dedicated server leaves it off (it never draws anything).
     void setLighting(bool on);
@@ -349,6 +397,24 @@ private:
     void landFalling(const FallingBlock& f, int cellY);
     bool canFallInto(const glm::ivec3& p) const;
     void markLightTouched();
+
+    // Moving regions
+    struct MovingRegion {
+        uint32_t id;
+        glm::ivec3 from, offset;
+        float seconds;
+        double startedAt;              // (steady clock seconds)
+        Region region;
+        std::vector<uint16_t> light;   // around where it started (MoveView::light)
+        bool visualOnly;               // a remote world's copy: shown, never placed
+    };
+    std::vector<MovingRegion> m_moves;
+    std::vector<MoveStart> m_moveStarts;
+    std::vector<uint32_t> m_moveEnds, m_movesDone;
+    uint32_t m_nextMoveId = 1;
+    void updateMoves();
+    void placeMove(const MovingRegion& m);
+    std::vector<uint16_t> sampleLight(const glm::ivec3& mn, const glm::ivec3& size) const;
 
     // Saving
     std::string m_saveDir;

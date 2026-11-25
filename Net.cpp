@@ -94,6 +94,11 @@ enum Msg : uint8_t {
                       // game drops its chunks and gets this dimension's
     S_PLAYER_DIM = 88,// u16 id, str dimension   which dimension another player is in (you only see
                       // the ones in yours)
+    S_MOVE_START = 90,// u32 id, i32 x y z (from), i32 dx dy dz (offset), f32 seconds, i32 sx sy sz,
+                      // u16 palette count, { str block }, u32 runs, { u8 palette, u8 meta, u32 count }
+                      // a box of blocks started moving (World::startMove): the game animates it;
+                      // the blocks leaving and arriving are ordinary S_BLOCKS changes
+    S_MOVE_END = 91,  // u32 id   that move has been placed (its blocks were sent just before)
     S_BLOCK_TEXT = 89,// i32 x y z, u8 has (0: none now), then BlockText (writeText)   a block's text changed
     S_MOD_MSG = 86,   // str channel, str data   a server mod's message to this game's mods (Lua:
                       // engine.send_to_player -> on_server_message). Text only, never run.
@@ -535,14 +540,18 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
     if (forEachWorld) {
         forEachWorld([&](const std::string& dim, World& w) {
             w.setRecordChanges(true);
+            sendMoveStarts(w.takeMoveStarts(), dim);     // (before the blocks leave: it lifts out)
             sendFallingStarts(w.takeFallingStarts(), dim);
             sendBlockChanges(w.takeBlockChanges(), dim);
             sendTextChanges(w, w.takeTextChanges(), dim);
+            sendMoveEnds(w.takeMoveEnds(), dim);          // (after they arrived: it settles in)
         });
     } else {
+        sendMoveStarts(m_world->takeMoveStarts(), std::string());
         sendFallingStarts(m_world->takeFallingStarts(), std::string());
         sendBlockChanges(m_world->takeBlockChanges(), std::string());
         sendTextChanges(*m_world, m_world->takeTextChanges(), std::string());
+        sendMoveEnds(m_world->takeMoveEnds(), std::string());
     }
 
     // 4. Chunks
@@ -1524,6 +1533,45 @@ void GameServer::sendBlockChanges(const std::vector<World::BlockChange>& changes
     }
 }
 
+void GameServer::sendMoveStarts(const std::vector<World::MoveStart>& starts, const std::string& dimension) {
+    for (const auto& m : starts) {
+        Writer w(S_MOVE_START);
+        w.u32(m.id);
+        w.i32(m.from.x); w.i32(m.from.y); w.i32(m.from.z);
+        w.i32(m.offset.x); w.i32(m.offset.y); w.i32(m.offset.z);
+        w.f32(m.seconds);
+        w.i32(m.region.size.x); w.i32(m.region.size.y); w.i32(m.region.size.z);
+        // the blocks by name (ids differ between games), the cells as runs
+        std::vector<int> pal(256, -1);
+        std::vector<uint8_t> names;
+        for (uint8_t id : m.region.ids) if (pal[id] < 0) { pal[id] = static_cast<int>(names.size()); names.push_back(id); }
+        w.u16(static_cast<uint16_t>(names.size()));
+        for (uint8_t id : names) w.str(blockName(id));
+        std::vector<std::tuple<uint8_t, uint8_t, uint32_t>> runs;
+        for (size_t i = 0; i < m.region.ids.size();) {
+            size_t j = i + 1;
+            while (j < m.region.ids.size() && m.region.ids[j] == m.region.ids[i] && m.region.metas[j] == m.region.metas[i]) ++j;
+            runs.emplace_back(static_cast<uint8_t>(pal[m.region.ids[i]]), m.region.metas[i], static_cast<uint32_t>(j - i));
+            i = j;
+        }
+        w.u32(static_cast<uint32_t>(runs.size()));
+        for (const auto& [p, meta, count] : runs) { w.u8(p); w.u8(meta); w.u32(count); }
+        for (auto& [id, c] : m_clients) {
+            if (c.joined && c.dimension == dimension) sendTo(c.peer, w);
+        }
+    }
+}
+
+void GameServer::sendMoveEnds(const std::vector<uint32_t>& ends, const std::string& dimension) {
+    for (uint32_t moveId : ends) {
+        Writer w(S_MOVE_END);
+        w.u32(moveId);
+        for (auto& [id, c] : m_clients) {
+            if (c.joined && c.dimension == dimension) sendTo(c.peer, w);
+        }
+    }
+}
+
 void GameServer::sendFallingStarts(const std::vector<World::FallingStart>& starts, const std::string& dimension) {
     if (starts.empty()) return;
     for (auto& [id, c] : m_clients) {
@@ -2088,6 +2136,43 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         std::cout << "[Client] Now in " << (name.empty() ? std::string(dims::kOverworld) : name) << std::endl;
         break;
     }
+    case S_MOVE_START: {
+        if (m_state != State::Joined) return;
+        const uint32_t moveId = r.u32();
+        const glm::ivec3 from = r.ivec3();
+        const glm::ivec3 offset = r.ivec3();
+        const float seconds = r.f32();
+        const glm::ivec3 size = r.ivec3();
+        if (!r.ok || size.x <= 0 || size.y <= 0 || size.z <= 0 || size.y > CHUNK_HEIGHT ||
+            static_cast<double>(size.x) * size.y * size.z > static_cast<double>(World::kMaxMoveCells)) break;
+        const uint16_t n = r.u16();
+        std::vector<uint8_t> pal;
+        for (uint16_t i = 0; i < n && r.ok; ++i) {
+            uint8_t id = 0;
+            const std::string name = r.str();
+            if (!blockIdFromName(name, id)) id = 0;     // (a block this game lacks: not drawn)
+            pal.push_back(id);
+        }
+        Region region;
+        region.resize(size);
+        const uint32_t runs = r.u32();
+        size_t at = 0;
+        for (uint32_t i = 0; i < runs && r.ok; ++i) {
+            const uint8_t p = r.u8(), meta = r.u8();
+            const uint32_t count = r.u32();
+            if (!r.ok || p >= pal.size() || count > region.cells() - at) { r.ok = false; break; }
+            for (uint32_t k = 0; k < count; ++k, ++at) { region.ids[at] = pal[p]; region.metas[at] = pal[p] ? meta : 0; }
+        }
+        if (!r.ok || at != region.cells()) break;
+        m_world->addMoveVisual(moveId, from, offset, seconds, std::move(region));
+        break;
+    }
+    case S_MOVE_END: {
+        if (m_state != State::Joined) return;
+        const uint32_t moveId = r.u32();
+        if (r.ok) m_world->endMoveVisual(moveId);
+        break;
+    }
     case S_BLOCK_TEXT: {
         if (m_state != State::Joined) return;
         const glm::ivec3 pos = r.ivec3();
@@ -2238,6 +2323,9 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
     case S_BLOCKS: {
         if (m_state != State::Joined) return;
         const uint16_t count = r.u16();
+        // A big change at once (a mod filling or copying a box, a build moving) isn't someone
+        // breaking blocks: no dust and sounds for each one. Nor for blocks a move takes or places.
+        const bool effects = count <= 32;
         for (uint16_t i = 0; i < count && r.ok; ++i) {
             const glm::ivec3 pos = r.ivec3();
             const std::string name = r.str();
@@ -2247,7 +2335,7 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
             if (!blockIdFromName(name, id)) id = 0;   // block we don't have -> air
             const uint8_t oldId = m_world->getBlockAt(pos);
             m_world->applyNetworkBlock(pos, id, meta);
-            if (onBlockChanged && oldId != id) onBlockChanged(pos, oldId, id);
+            if (effects && onBlockChanged && oldId != id && !m_world->isInMove(pos)) onBlockChanged(pos, oldId, id);
         }
         break;
     }

@@ -405,6 +405,8 @@ private:
     void sendBlockChanges(const std::vector<World::BlockChange>& changes, const std::string& dimension);
     void sendTextChanges(const World& world, const std::vector<glm::ivec3>& changes, const std::string& dimension);
     void sendFallingStarts(const std::vector<World::FallingStart>& starts, const std::string& dimension);
+    void sendMoveStarts(const std::vector<World::MoveStart>& starts, const std::string& dimension);
+    void sendMoveEnds(const std::vector<uint32_t>& ends, const std::string& dimension);
     void sendPositions();
     void broadcastChat(const std::string& text, const glm::vec3& color);
 

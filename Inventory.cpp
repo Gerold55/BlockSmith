@@ -7,6 +7,7 @@
 #include "Hotbar.h"
 #include "FontRenderer.h"
 #include "UiDraw.h"
+#include "TextureAnim.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -291,7 +292,7 @@ void drawTexturedQuad(const QuadCorner c[4], int layer, float r, float g, float 
     const float sw = s_ctx.W, sh = s_ctx.H;
     if (sw <= 0 || sh <= 0 || layer < 0 || g_TextureArrayID == 0) return;
 
-    float L = static_cast<float>(layer);
+    float L = static_cast<float>(animatedLayer(layer));   // (an animated picture: today's frame)
     float v[4][5];
     for (int i = 0; i < 4; ++i) {
         v[i][0] = (c[i].x / sw) * 2.0f - 1.0f;

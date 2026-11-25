@@ -174,7 +174,21 @@ bool blockNeedsTool(const BlockProperty& b) {
 // loaded through the function passed in.
 void registerBlockDefinition(const std::string& name, float r, float g, float b,
                              sol::object texObj, sol::object overlayObj,
-                             sol::optional<sol::table> propsTable, const TextureLoader& loadTextureToLayer) {
+                             sol::optional<sol::table> propsTable, const TextureLoader& loadPicture) {
+    // animation = { frame_time = 0.15 } (or just 0.15): the block's pictures are vertical strips of
+    // square frames (the top one first), each shown that long. main.cpp's loader reads the mark.
+    float animFrameTime = 0.0f;
+    if (propsTable) {
+        sol::object a = (*propsTable)["animation"];
+        if (a.is<double>()) animFrameTime = static_cast<float>(a.as<double>());
+        else if (a.is<sol::table>()) animFrameTime = a.as<sol::table>().get_or("frame_time", 0.1f);
+        else if (a.is<bool>() && a.as<bool>()) animFrameTime = 0.1f;
+        if (animFrameTime > 0.0f) animFrameTime = std::clamp(animFrameTime, 0.02f, 60.0f);
+    }
+    const auto loadTextureToLayer = [&](const std::string& file) {
+        if (animFrameTime <= 0.0f || file.empty()) return loadPicture(file);
+        return loadPicture(file + "\x1f" "anim=" + std::to_string(animFrameTime));
+    };
     if (r > 1.0f || g > 1.0f || b > 1.0f) {
         r = glm::clamp(r / 255.0f, 0.0f, 1.0f);
         g = glm::clamp(g / 255.0f, 0.0f, 1.0f);

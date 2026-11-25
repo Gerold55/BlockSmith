@@ -11,6 +11,7 @@
 
 #include "Dimensions.h"
 #include "World.h"
+#include "StructureAPI.h"
 #include "ChunkGenerator.h"
 #include <sol/sol.hpp>
 #include <filesystem>
@@ -95,6 +96,7 @@ public:
             }
             e.world->update(center, lua);
             e.world->updateFluids(dt);
+            structure::runMoveCallbacks(lua, *e.world);   // (moves placed: mods' on_done)
         }
         for (const auto& name : idle) unload(name);
     }
@@ -114,6 +116,8 @@ public:
         const auto it = m_worlds.find(name);
         if (it == m_worlds.end()) return;
         if (onUnloading) onUnloading(name, *it->second.world);
+        it->second.world->finishFalling();   // (nothing left in the air or on its way)
+        it->second.world->finishMoves();
         it->second.world->saveAll();
         std::cout << "[Dimension] Unloaded " << (name.empty() ? std::string(dims::kOverworld) : name) << std::endl;
         m_worlds.erase(it);

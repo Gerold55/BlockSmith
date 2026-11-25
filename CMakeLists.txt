@@ -127,6 +127,7 @@ target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
 add_executable(BlockSmith
     main.cpp
+    Region.cpp
     Diagnostics.cpp
     Player.cpp
     World.cpp
@@ -310,6 +311,7 @@ add_custom_target(blocksmith_buildinfo ALL
 
 add_executable(BlockSmithServer
     ServerMain.cpp
+    Region.cpp
     Diagnostics.cpp
     ChunkGenerator.cpp
     Fluids.cpp

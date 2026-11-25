@@ -4,7 +4,7 @@
 // Each frame the nearest mirror surface in view is picked (mirrors side by side on one wall,
 // facing the same way, are one surface). The scene is drawn a second time from the camera's
 // reflection in it, into a picture of its own (only the part of the screen the mirror covers),
-// with everything on the far side of the glass cut away. Then that picture is laid on the
+// with everything on the far side of the glass cut away (a clip plane: GL_CLIP_DISTANCE0). Then that picture is laid on the
 // mirror's glass: where the block's picture (the frame) is see-through.
 //
 // Other mirrors in view show plain silvered glass that frame (the shader's fallback). Nothing is
@@ -12,6 +12,7 @@
 
 #include <glad/glad.h>
 #include <glm/glm.hpp>
+#include <utility>
 #include <vector>
 
 class Mirrors {
@@ -36,9 +37,9 @@ public:
     // The reflection across the mirror (world space)
     glm::mat4 reflection() const;
     glm::vec3 reflect(const glm::vec3& p) const;
-    // proj with its near plane moved onto the mirror's surface (for the view `mirroredView`):
-    // nothing behind the glass is drawn into the reflection
-    glm::mat4 clippedProjection(const glm::mat4& proj, const glm::mat4& mirroredView) const;
+    // The plane that cuts away everything behind the glass while the reflection is drawn: for
+    // gl_ClipDistance[0] = dot(vec4(worldPos, 1), plane) in the world and model shaders
+    glm::vec4 clipPlane() const;
 
     // Draw the reflection between these two (into the mirror's own picture)
     void begin(const glm::vec3& clearColor);
@@ -54,6 +55,8 @@ private:
     bool ensureProgram();
 
     std::vector<Cell> m_chosen;
+    std::pair<int, int> m_lastKey{ 0, 0 };   // the surface live last frame (its facing, where its glass is)
+    bool m_hasLast = false;
     glm::vec4 m_plane{ 0.0f };
     int m_w = 0, m_h = 0;
     int m_rect[4] = { 0, 0, 0, 0 };      // x, y, w, h on the screen

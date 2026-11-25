@@ -866,12 +866,30 @@ local function hook_weather()
     end
     return true
 end
-if not hook_weather() then
-    -- the weather mod loads after this one: hook it on the first update
+-- The aurora mod (if it's on): now and then on a clear night, seen in the snowy biomes only
+local function hook_aurora()
+    if type(aurora) ~= "table" or not aurora.set_options then return false end
+    aurora.set_options({
+        chance = 0.12,                -- about one night in eight
+        where = function(x, _, z)
+            if type(x) ~= "number" or type(z) ~= "number" or x ~= x or z ~= z then return false end
+            local b = get_biome(floor(x), floor(z))
+            return b == "snowy_plains" or b == "snowy_taiga"
+        end,
+    })
+    return true
+end
+local weather_hooked, aurora_hooked = hook_weather(), hook_aurora()
+if not (weather_hooked and aurora_hooked) then
+    -- the weather and aurora mods load after this one: hook them on the first update
     local prev = on_update
     local done = false
     function on_update(...)
-        if not done then done = true; hook_weather() end
+        if not done then
+            done = true
+            if not weather_hooked then hook_weather() end
+            if not aurora_hooked then hook_aurora() end
+        end
         if prev then return prev(...) end
     end
 end

@@ -27,6 +27,7 @@
 #include "DimensionsLua.h"
 #include "BlockTextLua.h"
 #include "BlockStateLua.h"
+#include "StructureAPI.h"
 #include "DimensionWorlds.h"
 #include "Net.h"
 #include "Sha256.h"
@@ -1235,6 +1236,9 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
     };
 
     auto world = lua.create_named_table("world");
+    // Editing in boxes: copying, filling, moving builds (StructureAPI.h)
+    structure::install(lua, [&ctx]() { return ctx.here(); }, []() { return true; },
+                       [&ctx]() { return fs::path("schematics") / ctx.game.folder; });   // (every world of this game)
     world["get_falling_blocks"] = [&ctx](sol::this_state ts) {
         // world.get_falling_blocks() -> { { name, x, y, z }, ... }: sand, gravel... in the air now.
         // x, y, z: the block's bottom corner (y has a fraction while it falls)
@@ -2854,6 +2858,7 @@ int main(int argc, char** argv) {
         }
         server.update(spawnCenter, 0.0f, 0.0f, tickDt);
         world.updateFluids(tickDt);   // each fluid at its own speed (Fluids.h)
+        structure::runMoveCallbacks(lua, world);   // (moves placed: mods' on_done)
         // The other dimensions with players in them: loading around those players, fluids...
         // and the ones left empty a while are saved and unloaded
         std::map<std::string, std::vector<glm::vec3>> playersByDim;
@@ -2991,6 +2996,7 @@ int main(int argc, char** argv) {
     ctx.api.serverStopping();   // on_server_stop(): mods save what they keep
     ctx.api.flush();
     world.finishFalling();      // sand / gravel still in the air lands first, so none is lost
+    world.finishMoves();        // builds still moving are placed where they were going
     const int chunks = saveAll();
     server.stop("The server is shutting down");
     std::cout << "[Server] Saved " << chunks << " changed chunks. Bye!" << std::endl;

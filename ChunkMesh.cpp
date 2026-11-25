@@ -157,8 +157,10 @@ inline bool isCutout(const BlockProperty& p) {
 
 inline bool canWaterlog(const BlockProperty& p) {
     // Doors use their metadata for facing/open, not for "waterlogged"
-    // (doors and tanks use their metadata for other things: facing, how full)
+    // (doors, tanks and mirrors use their metadata for other things: facing, how full; a mirror
+    // facing east or west has bit 0 set, which isn't water)
     return (isPlantLike(p) || p.isTransparent) && !fluidOf(p.id) && p.pattern != "door" && p.pattern != "tank"
+        && p.pattern != "mirror"
         && !shape::isPartial(p);   // (slabs and stairs use bit 7: BlockShape.h)
 }
 // Does the block hold water: a waterlogged plant (bit 0) or slab / stairs (bit 7)?
