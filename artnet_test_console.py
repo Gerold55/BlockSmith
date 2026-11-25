@@ -1,6 +1,6 @@
 # Art-Net test console: sends DMX to the game so you can try Art-Net without lighting software.
 #   python tools/artnet_test_console.py [seconds]
-# In the game: Settings > Video > Network input = This computer, and the Art-Net client mod
+# In the game: Settings > Network > Network input = This computer, and the Art-Net client mod
 # (clientmods/artnet) switched on. Universe 0: channels 1-48 four 12-channel moving heads
 # (pan, pan fine, tilt, tilt fine, dimmer, strobe, red, green, blue, zoom, gobo, gobo spin)
 # sweeping in red with a gobo; 49-64 two 8-channel washes in green.

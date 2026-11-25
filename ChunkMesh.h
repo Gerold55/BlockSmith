@@ -4,6 +4,7 @@
 
 #include <glad/glad.h>
 #include <vector>
+#include <glm/glm.hpp>
 #include "Types.h"
 
 class ChunkData;
@@ -50,6 +51,10 @@ public:
     GLuint tintVAO = 0, tintVBO = 0;
     GLsizei tintVertexCount = 0;
 
+    // Mirrors in this chunk (MirrorShape.h): x, y, z inside the chunk, and the block's metadata.
+    // Updated with the mesh (when it reaches the GPU).
+    std::vector<glm::ivec4> mirrors;
+
     bool meshReadyForUpload = false;   // built on the CPU, not yet on the GPU
     bool everUploaded = false;         // has reached the GPU at least once
 
@@ -58,4 +63,5 @@ private:
     std::vector<Vertex> cpuTransparentVertices;
     std::vector<Vertex> cpuLiquidVertices;
     std::vector<Vertex> cpuTintVertices;
+    std::vector<glm::ivec4> cpuMirrors;
 };

@@ -9,13 +9,14 @@
 //       shape = "straight"|"inner_left"|"inner_right"|"outer_left"|"outer_right"   (stairs: the
 //               shape it has now), shape_auto = bool (true: worked out from the stairs around it)
 //       axis = "x"|"y"|"z"                                     (rotation = "axis": logs)
+//       facing = ..., mirror = true                            (mirrors: the way the glass faces)
 //       half = "bottom"|"top"|"double"                         (slabs)
 //       waterlogged = bool, can_waterlog = bool }
 //   engine.set_block_state(x, y, z, { facing = ..., upside_down = ..., shape = ..., axis = ...,
 //       half = ..., waterlogged = ... }) -> true   (only what's given changes; the block stays).
 //       shape = "auto" goes back to joining with the stairs around it.
-//   engine.rotate_block(x, y, z [, turns]) -> true: stairs a quarter turn clockwise seen from
-//       above (turns may be negative); logs lying down swap X and Z
+//   engine.rotate_block(x, y, z [, turns]) -> true: stairs and mirrors a quarter turn clockwise
+//       seen from above (turns may be negative); logs lying down swap X and Z
 //   engine.is_waterlogged(x, y, z), engine.can_waterlog(x, y, z),
 //   engine.set_waterlogged(x, y, z, bool) -> true if it changed
 //   engine.place_block(x, y, z, block [, state]) -> true: a block with a state at once
@@ -72,6 +73,12 @@ inline bool applyState(const BlockProperty& p, uint8_t& meta, const sol::table& 
             if (sh < 0) { err = "shape must be \"auto\", \"straight\", \"inner_left\", \"inner_right\", \"outer_left\" or \"outer_right\""; return false; }
             meta = static_cast<uint8_t>((meta & ~shape::kStairShapeMask) | (sh << shape::kStairShapeShift));
         }
+    } else if (p.pattern == "mirror") {
+        if (facing.valid() && facing.get_type() != sol::type::lua_nil) {
+            const int f = facingFrom(facing, -1);
+            if (f < 0 || f > 3) { err = "mirrors face north, east, south or west"; return false; }
+            meta = static_cast<uint8_t>((meta & ~3) | f);
+        }
     } else if (p.rotation == shape::kRotAxis) {
         if (axis.valid() && axis.get_type() != sol::type::lua_nil) {
             const int a = axisFrom(axis, -1);
@@ -120,6 +127,9 @@ inline void install(sol::table engine, std::function<World*()> worldNow) {
             const bool left = other == shape::turnLeft(meta & shape::kStairFacing);
             t["shape"] = kind == 1 ? (left ? "outer_left" : "outer_right") : kind == 2 ? (left ? "inner_left" : "inner_right") : "straight";
             t["shape_auto"] = (meta & shape::kStairShapeMask) == 0;
+        } else if (p.pattern == "mirror") {
+            t["facing"] = facingName(meta & 3);
+            t["mirror"] = true;
         } else if (p.rotation == shape::kRotAxis) {
             const int a = meta & 3;
             t["axis"] = a == 1 ? "x" : a == 2 ? "z" : "y";
@@ -160,7 +170,7 @@ inline void install(sol::table engine, std::function<World*()> worldNow) {
         const BlockProperty& p = reg.getBlock(id);
         uint8_t meta = w->getMetadataAt({x, y, z});
         const int turns = ((turnsIn.value_or(1) % 4) + 4) % 4;
-        if (shape::isStairs(p)) {
+        if (shape::isStairs(p) || p.pattern == "mirror") {
             meta = static_cast<uint8_t>((meta & ~3) | (((meta & 3) + turns) & 3));
         } else if (p.rotation == shape::kRotAxis) {
             const int a = meta & 3;

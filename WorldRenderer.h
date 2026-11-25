@@ -48,6 +48,10 @@ public:
     // world won't report them as changed by itself). Plain clear() keeps working as before.
     void clear(bool forceRebuild = false);
 
+    // Mirrors (MirrorShape.h) in the meshes within `radius` blocks of pos: x, y, z in the world
+    // and the block's metadata
+    void collectMirrors(const glm::vec3& pos, float radius, std::vector<glm::ivec4>& out) const;
+
     size_t meshCount() const { return m_meshes.size(); }
 
 private:

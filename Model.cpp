@@ -185,16 +185,20 @@ void AnimatedModel::draw(GLuint shaderProgram, const glm::mat4& worldTransform) 
     // without flipping it here too, the whole model came out as its mirror image - the right
     // arm on the left, turns and tilts the wrong way round. Mirroring flips which way the
     // triangles wind, so the front-face rule is swapped while drawing.
+    // (swapped from whatever it is now: drawn in a mirror's reflection (Mirrors.h) the rule is
+    // already turned round, and setting it outright showed the inside of the model's far side)
     const bool mirror = !isB3D;
+    GLint frontWas = GL_CCW;
+    glGetIntegerv(GL_FRONT_FACE, &frontWas);
     if (mirror) {
         root = glm::scale(root, glm::vec3(-1.0f, 1.0f, 1.0f));
-        glFrontFace(GL_CW);
+        glFrontFace(frontWas == GL_CW ? GL_CCW : GL_CW);
     }
     GLuint bound = texture != 0 ? texture : whiteTexture();
     for (const auto& rootBone : rootBones) {
         drawBoneRecursive(*this, rootBone, modelLoc, root, bound);
     }
-    if (mirror) glFrontFace(GL_CCW);
+    if (mirror) glFrontFace(static_cast<GLenum>(frontWas));
 }
 
 // ===========================================================================

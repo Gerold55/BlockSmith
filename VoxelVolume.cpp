@@ -30,7 +30,7 @@ void buildOpacity() {
                  p.lightEmit[0] + p.lightEmit[1] + p.lightEmit[2] == 0))
                 ? VoxelVolume::kWater : 255;
         }
-        else if (p.pattern == "plantlike" || p.pattern == "sign" || p.pattern == "wall_sign") o = 0;
+        else if (p.pattern == "plantlike" || p.pattern == "sign" || p.pattern == "wall_sign" || p.pattern == "mirror") o = 0;
         else if (p.pattern == "door") o = 0;                           // (a thin panel: let light past)
         else if (shape::isPartial(p)) o = 200;                         // slabs, stairs: mostly solid (201 waterlogged: fillColumn)
         else if (p.isCutout) o = VoxelVolume::kFoliage;                          // leaves: holes the light gets through

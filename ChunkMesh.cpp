@@ -10,6 +10,7 @@
 #include "Light.h"
 #include "DoorShape.h"
 #include "SignShape.h"
+#include "MirrorShape.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -308,6 +309,7 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
     cpuTransparentVertices.clear();
     cpuLiquidVertices.clear();
     cpuTintVertices.clear();
+    cpuMirrors.clear();
 
     auto& registry = BlockRegistry::getInstance();
     FluidRegistry::get().refresh();   // block ids by name: never stale
@@ -600,6 +602,64 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         }
     };
 
+    // Mirrors (pattern "mirror", MirrorShape.h): a thin panel against the back of the block. Its
+    // front is marked as glass (overlay layer -2): the shader shows the reflection where the
+    // picture is see-through, the picture (the frame) where it isn't. The edges and back are a
+    // thin strip of the picture.
+    auto emitMirror = [&](int x, int y, int z, const BlockProperty& prop) {
+        const uint8_t meta = data.getLocalMetadata(x, y, z);
+        const int facing = meta & 3;
+        const int front = facing == 0 ? 5 : facing == 1 ? 0 : facing == 2 ? 4 : 1;   // face index of the front
+        const int back = front ^ 1;
+        glm::vec3 mn, mx;
+        mirror::bounds(meta, mn, mx);
+        // mirrors carrying on beside it (the frame joins up; no edges between them)
+        const int joined = mirror::joinedSides(glm::ivec3(x, y, z), facing, [&](const glm::ivec3& p, int fc) {
+            const uint8_t id = data.getBlock(p.x, p.y, p.z);
+            return id != 0 && registry.getBlock(id).pattern == "mirror" && (data.getMetadata(p.x, p.y, p.z) & 3) == fc;
+        });
+        const glm::ivec3 nrm = mirror::normalOf(facing);
+        const glm::ivec3 rightDir(nrm.z, 0, -nrm.x);
+        for (int f = 0; f < 6; ++f) {
+            // (an edge against a joined mirror: hidden)
+            {
+                const glm::ivec3 fo(kFaceOffset[f][0], kFaceOffset[f][1], kFaceOffset[f][2]);
+                if (((joined & 1) && fo == -rightDir) || ((joined & 2) && fo == rightDir) ||
+                    ((joined & 4) && fo.y < 0) || ((joined & 8) && fo.y > 0)) continue;
+            }
+            const FaceDefinition& fp = prop.faces[f == front || f == back ? 4 : f];
+            int layer = fp.baseLayer;
+            if (layer < 0) layer = prop.faces[4].baseLayer;
+            if (layer < 0) continue;
+            const bool isFront = f == front;
+            // (the front carries the glass's colour, for where nothing is reflected)
+            const glm::vec3 col = isFront ? prop.mirrorGlass : prop.defaultTint;
+            const FaceStyle style{ col.r, col.g, col.b, static_cast<float>(layer),
+                                   isFront ? -2.0f - static_cast<float>(joined) : -1.0f,
+                                   isFront ? 0.0f : tintFlag(fp.tintBase), 0.0f, kFaceShading[f] };
+            float corners[4][3];
+            faceCorners(f, 0.0f, 0.0f, 0.0f, 1.0f, corners);
+            Vertex q[4];
+            for (int i = 0; i < 4; ++i) {
+                // the unit face squeezed onto the panel's box
+                const float px = corners[i][0] > 0.5f ? mx.x : mn.x;
+                const float py = corners[i][1] > 0.5f ? mx.y : mn.y;
+                const float pz = corners[i][2] > 0.5f ? mx.z : mn.z;
+                const float uvs[4][2] = { { 0, 1 }, { 1, 1 }, { 1, 0 }, { 0, 0 } };
+                float u = uvs[i][0], v = uvs[i][1];
+                if (!isFront && f != back) {
+                    // an edge: a thin strip from the picture's border
+                    if ((f == 2 || f == 3) && (facing == 0 || facing == 2)) v = v * (1.0f / 16.0f);
+                    else u = u * (1.0f / 16.0f);
+                }
+                q[i] = makeVertex(x + px, y + py, z + pz, u, v, style);
+            }
+            lightCell(q, 4, x, y, z);
+            pushQuad(cpuOpaqueVertices, q);
+        }
+        cpuMirrors.push_back(glm::ivec4(x, y, z, meta));
+    };
+
     // Tanks (pattern "tank"): the liquid inside first, as full as the metadata says (0..16),
     // drawn with the liquid block's own pictures; then the see-through shell around it. A spout
     // (tank.stream) also has a thin stream falling out of its bottom.
@@ -784,6 +844,10 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
                     emitTank(x, y, z, prop);
                     continue;
                 }
+                if (prop.pattern == "mirror") {
+                    emitMirror(x, y, z, prop);
+                    continue;
+                }
                 if (prop.pattern == "sign" || prop.pattern == "wall_sign") {
                     emitSign(x, y, z, prop, prop.pattern == "wall_sign");
                     continue;
@@ -831,6 +895,8 @@ void ChunkMesh::uploadMesh() {
     std::vector<Vertex>().swap(cpuTransparentVertices);
     std::vector<Vertex>().swap(cpuLiquidVertices);
     std::vector<Vertex>().swap(cpuTintVertices);
+    mirrors.swap(cpuMirrors);
+    cpuMirrors.clear();
 
     meshReadyForUpload = false;
     everUploaded = true;

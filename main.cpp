@@ -51,6 +51,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "WorldRenderer.h"
 #include "DimensionsLua.h"
 #include "SignShape.h"
+#include "MirrorShape.h"
+#include "Mirrors.h"
 #include "SignText.h"
 #include "BlockTextLua.h"
 #include "BlockStateLua.h"
@@ -160,6 +162,7 @@ GpuCaps g_GpuCaps;
 bool g_PlayerSettingsClick = false;
 int g_LightQuality = 0;
 bool g_BloomOn = false;
+bool g_MirrorsOn = true;     // Settings: Mirror Reflections (the player's choice only)
 bool g_FilmicOn = true;          // filmic exposure for Lighting Low/High (Settings; the player's choice)
 SceneCopy g_SceneCopy;           // the frame before water is drawn: water reflections (High)
 float g_BloomStrength = 0.6f, g_BloomThreshold = 0.75f;   // (a game can tune them: sky.set_bloom)
@@ -1118,6 +1121,73 @@ bool openActiveWorld(World& world, Player& player) {
     return true;
 }
 
+// ---- Reloading the mods while playing (/reload, engine.reload_mods, auto_reload_mods) -----------
+// The world is saved, every mod starts again from scratch (the same as when a world with other
+// mods opens), and the world opens again where you were. Only in a world that's yours: not on
+// someone else's server, and not while guests are on a LAN game you host.
+std::string g_ReloadNote;                 // said in chat once the world is open again
+extern GameServer g_Server;
+extern std::string g_LoadedGameFolder;
+bool requestModReload(std::string& why, const std::string& note) {
+    if (g_Reload.pending) { why = "Already reloading"; return false; }
+    if (g_Client.active()) { why = "You're on someone else's server: only its owner can reload its mods"; return false; }
+    if (g_Server.running() && g_Server.playerCount() > 1) { why = "Players are connected to your game: reload when they've left"; return false; }
+    if (g_CurrentGameState != GameState::PLAYING || g_ActiveWorldName.empty()) { why = "Not in a world"; return false; }
+    std::cout << "[Mods] Reloading the mods (" << note << ")" << std::endl;
+    g_Reload = ReloadRequest{ true, g_ActiveWorldName, g_LoadedGameFolder };
+    g_ReloadNote = "Mods reloaded (" + note + ")";
+    return true;
+}
+
+// Watches the mod folders while you play (settings.txt: auto_reload_mods = true): saving a mod's
+// Lua file, picture, sound or model reloads the mods by itself, once the files have stopped
+// changing (an editor saving several files counts once).
+std::vector<fs::path> modWatchRoots();
+void watchModFiles(double now) {
+    static int gen = -1;
+    static double nextScan = 0.0, changedAt = -1.0;
+    static uint64_t baseline = 0, pending = 0;
+    static std::string changedFile;
+    if (gen != g_SessionGeneration) { gen = g_SessionGeneration; baseline = 0; changedAt = -1.0; nextScan = 0.0; }
+    if (now < nextScan || g_Reload.pending) return;
+    nextScan = now + 1.0;
+    static const std::set<std::string> kExt = { ".lua", ".png", ".jpg", ".jpeg", ".ogg", ".wav", ".json", ".bbmodel", ".obj" };
+    uint64_t fp = 1469598103934665603ull;
+    std::string newest;
+    fs::file_time_type newestTime{};
+    bool haveNewest = false;        // (a default time isn't "long ago" on every compiler)
+    for (const fs::path& root : modWatchRoots()) {
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            const fs::path& p = it->path();
+            const std::string name = p.filename().string();
+            if (it->is_directory(ec)) {
+                if (name == "_storage" || name == "cache" || (!name.empty() && name[0] == '.')) it.disable_recursion_pending();
+                continue;
+            }
+            std::string ext = p.extension().string();
+            for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!kExt.count(ext) && name != "mod.conf") continue;
+            const auto t = it->last_write_time(ec);
+            if (ec) continue;
+            const uint64_t h = std::hash<std::string>{}(p.generic_string()) ^
+                               static_cast<uint64_t>(t.time_since_epoch().count());
+            fp = (fp ^ h) * 1099511628211ull;
+            if (!haveNewest || t > newestTime) { newestTime = t; newest = name; haveNewest = true; }
+        }
+    }
+    if (baseline == 0) { baseline = fp; return; }                       // (the files as the session found them)
+    if (fp == baseline) { changedAt = -1.0; return; }
+    if (changedAt < 0.0 || fp != pending) { changedAt = now; pending = fp; changedFile = newest; return; }
+    if (now - changedAt < 0.6) return;                                  // (still being saved)
+    baseline = fp;
+    std::string why;
+    if (!requestModReload(why, changedFile + " changed") && g_ChatSystem)
+        g_ChatSystem->addMessage("[Mods] " + changedFile + " changed, but can't reload: " + why, glm::vec3(1.0f, 0.8f, 0.4f));
+}
+
 // Switches to the loading screen; the world itself is opened from the main loop.
 std::string worldGame(const std::string& world);
 std::set<std::string> resolveGlobalMods(const std::string& game, const std::string& world);
@@ -1295,6 +1365,19 @@ std::vector<ModRoot> modRoots() {
     add("../../mods", "Global");
     add("games/" + g_LoadedGameFolder + "/mods", "Game: " + g_LoadedGameFolder);
     return roots;
+}
+
+// The folders auto_reload_mods watches: the mods folders, shared Lua libraries, client mods
+std::vector<fs::path> modWatchRoots() {
+    std::vector<fs::path> out;
+    for (const auto& r : modRoots()) out.push_back(r.path);
+    for (const std::string& rel : { std::string("lualib"), std::string("games/") + g_LoadedGameFolder + "/lualib",
+                                    std::string("clientmods") }) {
+        std::error_code ec;
+        if (fs::is_directory(rel, ec)) out.push_back(rel);
+        else if (fs::is_directory("../../" + rel, ec)) out.push_back("../../" + rel);
+    }
+    return out;
 }
 
 // key = value lines (mod.conf style)
@@ -3133,6 +3216,7 @@ const VideoSetting kVideoSettings[] = {
     { "light_quality",    0,   2, 1 },   // traced lighting (shadows of lamps and spotlights): 0 off, 1 low, 2 high
     { "bloom",            0,   1, 1 },   // bright things glow
     { "filmic",           0,   1, 1 },   // filmic exposure for Lighting Low/High (a film curve; the eye adjusts)
+    { "mirrors",          0,   1, 1 },   // mirror blocks reflect (Mirrors.h); off: plain silvered glass
     { "udp_input",        0,   2, 1 },   // network input for client mods: 0 off, 1 this computer only, 2 the network
     { "volume_master",    0, 100, 5 },
     { "volume_music",     0, 100, 5 },
@@ -3173,6 +3257,7 @@ int currentVideoSetting(const std::string& id) {
     if (id == "light_quality") return std::clamp(settingInt(id, 0), 0, g_GpuCaps.maxLightQuality);
     if (id == "bloom") return g_GpuCaps.bloom ? std::clamp(settingInt(id, 0), 0, 1) : 0;
     if (id == "udp_input") return std::clamp(settingInt(id, 0), 0, 2);
+    if (id == "mirrors") return std::clamp(settingInt(id, 1), 0, 1);
     if (id == "filmic") return g_GpuCaps.maxLightQuality > 0 ? std::clamp(settingInt(id, 1), 0, 1) : 0;
     if (id == "volume_music") return settingInt(id, 60);
     if (id.rfind("volume_", 0) == 0) return settingInt(id, 100);
@@ -3187,6 +3272,7 @@ void applyVideoSetting(const std::string& id, int value) {
     else if (id == "light_quality") g_LightQuality = std::clamp(value, 0, g_GpuCaps.maxLightQuality);
     else if (id == "bloom") g_BloomOn = value != 0 && g_GpuCaps.bloom;
     else if (id == "filmic") g_FilmicOn = value != 0;
+    else if (id == "mirrors") g_MirrorsOn = value != 0;
     else if (id == "udp_input") g_UdpInput.setMode(static_cast<UdpInput::Mode>(std::clamp(value, 0, 2)), udpInputPorts());
     else if (id.rfind("volume_", 0) == 0) g_Audio.setVolume(id.substr(7), value / 100.0f);   // master, music...
 }
@@ -3198,7 +3284,7 @@ bool setVideoSetting(const std::string& id, int value, std::string& error) {
     // Lighting and bloom are the player's own choice: only a click in their Settings changes them.
     // A game's or server's mods (which run in the player's game too) can't switch them on.
     // (network input opens a port: the player's choice only, too)
-    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "udp_input") && !g_PlayerSettingsClick) {
+    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "udp_input" || id == "mirrors") && !g_PlayerSettingsClick) {
         error = "Only the player can change this, in Settings";
         return false;
     }
@@ -3954,6 +4040,27 @@ void main() {
         }
 
         vec4 baseTex = texture(textureArray, vec3(animatedUV, BaseLayer));
+        // A mirror's front (MirrorShape.h, overlay layer -2): where its picture is see-through,
+        // silvered glass (the reflection is laid over it afterwards: Mirrors.h); the rest is its frame
+        if (OverlayLayer < -1.5) {
+            // (sides where another mirror carries on: the middle of the picture to the edge, so
+            // the frame goes round the group: -2 - those sides, MirrorShape.h)
+            int joined = int(-OverlayLayer - 2.0 + 0.5);
+            vec2 juv = TexCoord;
+            if ((joined & 1) != 0) juv.x = max(juv.x, 0.5);
+            if ((joined & 2) != 0) juv.x = min(juv.x, 0.5);
+            if ((joined & 4) != 0) juv.y = min(juv.y, 0.5);
+            if ((joined & 8) != 0) juv.y = max(juv.y, 0.5);
+            baseTex = texture(textureArray, vec3(juv, BaseLayer));
+            if (baseTex.a < 0.5) {
+                vec3 V = normalize(u_CameraPos - WorldPos);
+                float sheen = 0.5 + 0.5 * sin((WorldPos.x + WorldPos.z) * 1.7 + WorldPos.y * 0.9 + V.x * 2.0 + V.z * 2.0);
+                // (the glass's colour comes in the vertex colour: register_block's mirror.glass)
+                baseTex = vec4(min(TintColor * mix(1.05, 1.4, sheen * 0.6), vec3(1.0)), 1.0);
+            } else {
+                baseTex.a = 1.0;
+            }
+        }
         if (baseTex.a < 0.05) discard;
 
         vec3 baseRgb = (TintBase > 0.5) ? (baseTex.rgb * TintColor) : baseTex.rgb;
@@ -6933,6 +7040,32 @@ int main(int argc, char** argv) {
         engineTable["reset_keybinds"] = []() { resetKeybinds(); };
         engineTable["key_name"] = [](int key) { return keyName(key); };
 
+        // Menu preferences (the settings screen's "Advanced" switch, a remembered tab...), kept in
+        // settings.txt as ui_<key>. engine.get_ui_setting(key) -> string or nil;
+        // engine.set_ui_setting(key, value) (nil removes it). Keys: a-z, 0-9, _ (up to 32);
+        // values up to 64 printable characters. Only menu choices: nothing the game runs on.
+        auto uiKeyOk = [](const std::string& k) {
+            if (k.empty() || k.size() > 32) return false;
+            for (char c : k) if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+            return true;
+        };
+        engineTable["get_ui_setting"] = [uiKeyOk](const std::string& key) -> sol::optional<std::string> {
+            if (!uiKeyOk(key)) return sol::nullopt;
+            const auto it = g_Settings.find("ui_" + key);
+            if (it == g_Settings.end()) return sol::nullopt;
+            return it->second;
+        };
+        engineTable["set_ui_setting"] = [uiKeyOk](const std::string& key, sol::optional<std::string> value) {
+            if (!uiKeyOk(key)) return false;
+            if (!value) { if (g_Settings.erase("ui_" + key)) saveSettings(); return true; }
+            if (value->size() > 64) return false;
+            for (char c : *value) if (c < 32 || c > 126 || c == '#' || c == '=') return false;   // (one line of settings.txt)
+            if (g_Settings["ui_" + key] == *value) return true;
+            g_Settings["ui_" + key] = *value;
+            saveSettings();
+            return true;
+        };
+
         // engine.get_video_settings() -> { { id, value, min, max, step }, ... }
         engineTable["get_video_settings"] = [&lua]() {
             sol::table t = lua.create_table();
@@ -6974,6 +7107,17 @@ int main(int argc, char** argv) {
                     e["note"] = std::string(g_GpuCaps.maxLightQuality <= 0
                         ? "Needs Lighting Low or High, which this graphics card can't run"
                         : "With Lighting Low or High: a film-like curve and exposure that adjusts to day and night");
+                }
+                if (std::string(s.id) == "mirrors") {
+                    sol::table opts = lua.create_table();
+                    for (int v = 0; v < 2; ++v) {
+                        sol::table o = lua.create_table();
+                        o["label"] = std::string(v ? "On" : "Off");
+                        o["value"] = v;
+                        opts[v + 1] = o;
+                    }
+                    e["options"] = opts;
+                    e["note"] = std::string("Mirrors show the room. Off: plain silvered glass (faster)");
                 }
                 if (std::string(s.id) == "light_quality" || std::string(s.id) == "bloom") {
                     const bool isLight = std::string(s.id) == "light_quality";
@@ -7640,6 +7784,14 @@ int main(int argc, char** argv) {
             g_ModToOwnServer.push_back({ channel, text });
             return true;
         };
+        // engine.reload_mods() -> true, or false + why: saves the world, starts every mod again
+        // from scratch and opens the world again where you were (a mod developer's "apply my
+        // changes"). Only in your own world, with nobody else connected.
+        engineTable["reload_mods"] = [](sol::this_state ts) -> std::tuple<bool, sol::object> {
+            std::string why;
+            if (requestModReload(why, "asked for")) return std::make_tuple(true, sol::make_object(ts, sol::lua_nil));
+            return std::make_tuple(false, sol::make_object(ts, why));
+        };
         // engine.send_chat(text) -> sends a chat message to everyone (multiplayer only). True if sent.
         engineTable["send_chat"] = [](const std::string& text) {
             if (g_Server.running()) { g_Server.sendChat(text); return true; }
@@ -7860,6 +8012,7 @@ int main(int argc, char** argv) {
             g_LightQuality = currentVideoSetting("light_quality");
             g_BloomOn = currentVideoSetting("bloom") != 0;
             g_FilmicOn = currentVideoSetting("filmic") != 0;
+            g_MirrorsOn = currentVideoSetting("mirrors") != 0;
         }
 
         // update_check = false in settings.txt turns the new-version check off; update_url points
@@ -8525,6 +8678,13 @@ int main(int argc, char** argv) {
             {
                 static std::string lastUpdateError;
                 g_UdpInput.poll();                      // (network input that arrived: before client mods read it)
+                if (g_CurrentGameState == GameState::PLAYING) {
+                    if (settingInt("auto_reload_mods", 0) != 0 || g_Settings["auto_reload_mods"] == "true") watchModFiles(glfwGetTime());
+                    if (!g_ReloadNote.empty() && g_ChatSystem && !g_Reload.pending) {
+                        g_ChatSystem->addMessage("[Mods] " + g_ReloadNote, glm::vec3(0.5f, 1.0f, 0.6f));
+                        g_ReloadNote.clear();
+                    }
+                }
                 sol::protected_function onUpdate = lua["on_update"];
                 if (onUpdate.valid()) {
                     sol::protected_function_result r = onUpdate(deltaTime);
@@ -9239,6 +9399,10 @@ int main(int argc, char** argv) {
                                                   : (clickN.y > 0 ? shape::kSlabBottom : upperHalf ? shape::kSlabTop : shape::kSlabBottom);
                                     } else if (shape::isStairs(placeProp)) {
                                         placeMeta = static_cast<uint8_t>(lookDir | (upperHalf && clickN.y <= 0 ? shape::kStairUpsideDown : 0));
+                                    } else if (placeProp.pattern == "mirror") {
+                                        // on a wall: the front faces out of it; on a floor or
+                                        // ceiling: toward the player (MirrorShape.h)
+                                        placeMeta = static_cast<uint8_t>(clickN.y == 0 ? mirror::facingOf(clickN) : (lookDir + 2) & 3);
                                     } else if (placeProp.rotation == shape::kRotAxis) {
                                         placeMeta = clickN.y != 0 ? 0 : clickN.x != 0 ? 1 : 2;      // along the face it went on
                                     }
@@ -9645,6 +9809,16 @@ int main(int argc, char** argv) {
                 // bobbing copy of the block, or a flat picture for items and plants. Mobs whose
                 // model isn't known here (a server-only mod) are a plain box the size of their hitbox.
                 const std::vector<EntityView> entityViews = currentEntityViews();
+                // Mobs drawn this frame, to draw again in a mirror (Mirrors.h)
+                struct MirrorMob {
+                    std::shared_ptr<AnimatedModel> model;
+                    std::shared_ptr<ModelAnimation> anim;
+                    float t;
+                    glm::mat4 m;
+                    glm::vec3 lit;
+                    bool hurt;
+                };
+                std::vector<MirrorMob> mirrorMobs;
                 {
                     static GLuint itemVao = 0, itemVbo = 0;
                     static std::vector<Vertex> verts;
@@ -9855,12 +10029,15 @@ int main(int argc, char** argv) {
                         if (vis == g_EntityVisuals.end() || !vis->second.model) continue;
                         AnimatedModel& model = *vis->second.model;
                         model.resetPose();
+                        std::shared_ptr<ModelAnimation> poseAnim;
+                        float poseT = 0.0f;
                         if (!v.anim.empty() && vis->second.anims) {
                             // the full name ("animation.cow.walk") or the short one ("walk"), like everywhere else
                             if (const auto a = vis->second.anims->get(v.anim)) {
                                 float t = static_cast<float>((now - look.animStart) * v.animSpeed);
                                 if (a->length > 0.0f) t = v.animLoop ? std::fmod(std::max(t, 0.0f), a->length) : std::min(t, a->length);
                                 a->apply(model, t);
+                                poseAnim = a; poseT = t;
                             }
                         }
                         // light where it stands (sunlight in caves is dark; torches light it)
@@ -9872,6 +10049,8 @@ int main(int argc, char** argv) {
                         m = glm::rotate(m, glm::radians(-v.yaw - 90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
                         m = glm::scale(m, glm::vec3(vis->second.scale));
                         model.draw(modelShaderProgram, m);
+                        // (again in a mirror, posed the same: Mirrors.h)
+                        mirrorMobs.push_back({ vis->second.model, poseAnim, poseT, m, lit, now < look.hurtUntil });
                     }
                     glUniform3f(localLight, 1.0f, 1.0f, 1.0f);
                     glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -9898,6 +10077,109 @@ int main(int argc, char** argv) {
                             }
                         }
                         it = g_EntityLooks.erase(it);
+                    }
+                }
+
+                // Mirrors (Mirrors.h): the nearest one in view gets the room reflected in it - the
+                // scene drawn again from the camera's reflection, then laid on its glass
+                {
+                    int fbw = 0, fbh = 0;
+                    glfwGetFramebufferSize(window, &fbw, &fbh);
+                    static std::vector<glm::ivec4> nearMirrors;
+                    static std::vector<Mirrors::Cell> mirrorCells;
+                    const glm::vec3 camWorld = glm::vec3(glm::inverse(view)[3]);
+                    worldRenderer.collectMirrors(camWorld, Mirrors::kRange, nearMirrors);
+                    mirrorCells.clear();
+                    auto& mreg = BlockRegistry::getInstance();
+                    for (const glm::ivec4& mc : nearMirrors) {
+                        const uint8_t id = world.getBlockAt(glm::ivec3(mc));
+                        if (id == 0 || mreg.getBlock(id).pattern != "mirror") continue;   // (gone since it was meshed)
+                        const int joined = mirror::joinedSides(glm::ivec3(mc), mc.w & 3, [&](const glm::ivec3& p, int fc) {
+                            const uint8_t nid = world.getBlockAt(p);
+                            return nid != 0 && mreg.getBlock(nid).pattern == "mirror" && (world.getMetadataAt(p) & 3) == fc;
+                        });
+                        const BlockProperty& mp = mreg.getBlock(id);
+                        mirrorCells.push_back({ glm::ivec3(mc), static_cast<uint8_t>(mc.w), mp.faces[4].baseLayer, joined,
+                                                mp.mirrorTint, mp.mirrorClarity, mp.mirrorGlass });
+                    }
+                    if (g_MirrorsOn && g_Mirrors.choose(mirrorCells, proj * view, camWorld, fbw, fbh)) {
+                        const glm::mat4 mview = view * g_Mirrors.reflection();
+                        const glm::mat4 mproj = g_Mirrors.clippedProjection(proj, mview);
+                        const glm::vec3 mcam = g_Mirrors.reflect(camWorld);
+                        const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+                        g_Mirrors.begin(clearCol);
+                        if (!skyHidden && dimType.showSky) g_Skybox->render(mview, proj, sunDir.y);
+                        if (dimType.showWeather && !skyHidden) g_Weather.drawSkyTint();
+                        // the blocks (solid, then see-through)
+                        glUseProgram(shaderProgram);
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(GL_TEXTURE_2D_ARRAY, g_TextureArrayID);
+                        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(mproj));
+                        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(mview));
+                        glUniform3f(glGetUniformLocation(shaderProgram, "u_CameraPos"), mcam.x, mcam.y, mcam.z);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_SSR"), 0);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_IsGUI"), 0);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_Unlit"), 0);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 1);
+                        glEnable(GL_DEPTH_TEST);
+                        glDepthFunc(GL_LESS);
+                        glEnable(GL_BLEND);
+                        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                        worldRenderer.render(shaderProgram, mproj * mview, mcam);
+                        glUseProgram(shaderProgram);
+                        glUniform1i(glGetUniformLocation(shaderProgram, "u_VoxelLight"), 0);
+                        glUniform1f(glGetUniformLocation(shaderProgram, "u_ChunkFade"), 1.0f);
+                        if (!otherPlayers.empty()) playerAvatars.render(otherPlayers, shaderProgram, mview, mproj);
+                        // models: you (in first person too - it's your reflection), models placed
+                        // by mods, mobs
+                        glUseProgram(modelShaderProgram);
+                        glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(mproj));
+                        glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(mview));
+                        const GLint localLight = glGetUniformLocation(modelShaderProgram, "u_LocalLight");
+                        const GLint tintLoc = glGetUniformLocation(modelShaderProgram, "u_Tint");
+                        try {
+                            sol::object modelObj = lua["g_PlayerModel"];
+                            if (modelObj.is<std::shared_ptr<AnimatedModel>>()) {
+                                auto pm = modelObj.as<std::shared_ptr<AnimatedModel>>();
+                                if (pm && pm->loaded) {
+                                    const glm::vec3 lit = modelLightAt(player.position + glm::vec3(0.0f, 1.0f, 0.0f));
+                                    glUniform3f(localLight, lit.r, lit.g, lit.b);
+                                    pm->draw(modelShaderProgram, modelMatrix);
+                                }
+                            }
+                        } catch (const std::exception&) {}
+                        for (const auto& [id, inst] : g_ModelInstances) {
+                            if (!inst.visible || !inst.model) continue;
+                            const glm::vec3 lit = modelLightAt(inst.position + glm::vec3(0.0f, 0.5f, 0.0f));
+                            glUniform3f(localLight, lit.r, lit.g, lit.b);
+                            glm::mat4 m = glm::translate(glm::mat4(1.0f), inst.position);
+                            m = glm::rotate(m, glm::radians(inst.yaw), glm::vec3(0.0f, 1.0f, 0.0f));
+                            m = glm::scale(m, glm::vec3(inst.scale));
+                            inst.model->draw(modelShaderProgram, m);
+                        }
+                        for (const MirrorMob& mm : mirrorMobs) {
+                            mm.model->resetPose();
+                            if (mm.anim) mm.anim->apply(*mm.model, mm.t);
+                            glUniform3f(localLight, mm.lit.r, mm.lit.g, mm.lit.b);
+                            if (mm.hurt) glUniform4f(tintLoc, 1.0f, 0.15f, 0.1f, 0.45f);
+                            else glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+                            mm.model->draw(modelShaderProgram, mm.m);
+                        }
+                        glUniform3f(localLight, 1.0f, 1.0f, 1.0f);
+                        glUniform4f(tintLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+                        glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+                        glUniformMatrix4fv(glGetUniformLocation(modelShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                        g_Mirrors.end();
+                        if (cullWas) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+                        // back to this camera
+                        glUseProgram(shaderProgram);
+                        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+                        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+                        glUniform3f(glGetUniformLocation(shaderProgram, "u_CameraPos"), camWorld.x, camWorld.y, camWorld.z);
+                        g_Mirrors.composite(proj * view, g_TextureArrayID);
+                        glEnable(GL_BLEND);
+                        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                        glEnable(GL_DEPTH_TEST);
                     }
                 }
 
@@ -9970,6 +10252,8 @@ int main(int argc, char** argv) {
                         const std::string& selPattern = selId ? BlockRegistry::getInstance().getBlock(selId).pattern : std::string();
                         if (selId != 0 && selPattern == "door") {
                             door::box(world.getMetadataAt(rayResult.blockPos), selMin, selMax);
+                        } else if (selId != 0 && selPattern == "mirror") {
+                            mirror::bounds(world.getMetadataAt(rayResult.blockPos), selMin, selMax);
                         } else if (selId != 0 && (selPattern == "sign" || selPattern == "wall_sign")) {
                             sign::bounds(selPattern == "wall_sign", world.getMetadataAt(rayResult.blockPos), selMin, selMax);
                         } else if (selId != 0 && shape::isPartial(BlockRegistry::getInstance().getBlock(selId))) {

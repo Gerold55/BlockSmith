@@ -149,6 +149,7 @@ if chat and chat.register_command then
     chat.register_command("kill", "/kill", "Die and respawn")
     chat.register_command("tp", "/tp <x y z>", "Teleport (~ = where you are)")
     chat.register_command("rain", "/rain", "Make it rain for a bit")
+    chat.register_command("reload", "/reload", "Reload every mod and reopen this world where you are (your own world)")
 end
 
 function on_chat_command(cmd, player, is_operator, reply)
@@ -189,6 +190,15 @@ function on_chat_command(cmd, player, is_operator, reply)
     end
 
     local own_world = not engine.is_authority or engine.is_authority()
+    if name == "reload" then
+        -- a mod developer's "apply my changes": the world is saved, every mod loads again from
+        -- its files, and the world opens again where you are
+        if not own_world then return false end      -- (a server's mods are its owner's to reload)
+        if not engine.reload_mods then reply("This game can't reload mods") return true end
+        local ok, why = engine.reload_mods()
+        reply(ok and "Reloading the mods..." or ("Can't reload: " .. tostring(why)))
+        return true
+    end
     if name == "gamerule" or name == "give" or name == "clear" or name == "kill" or name == "tp" or name == "teleport" then
         if not own_world then return false end      -- on a server: its own commands answer
         local a = {}

@@ -4,7 +4,7 @@
 // they mean (clientmods/artnet reads Art-Net DMX from lighting software, and passes it to the
 // server's mods with client.send_to_server). Game and server mods have no network access.
 //
-//   * Off unless the player turns it on (Settings > Video > Network input): "This computer"
+//   * Off unless the player turns it on (Settings > Network > Network input): "This computer"
 //     receives only from programs on the same PC (127.0.0.1); "Network" from any network card.
 //     Mods can't turn it on.
 //   * Only the ports the player allows (settings.txt: udp_ports = 6454, comma-separated; up to 4

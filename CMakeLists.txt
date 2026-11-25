@@ -145,6 +145,7 @@ add_executable(BlockSmith
     Model.cpp
     VoxelVolume.cpp
     Spotlights.cpp
+    Mirrors.cpp
     GpuCheck.cpp
     Bloom.cpp
     SunShafts.cpp

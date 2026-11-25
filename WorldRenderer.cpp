@@ -204,7 +204,8 @@ void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visi
     glGetIntegerv(GL_FRONT_FACE, &frontWas);
     glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
     glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
-    glFrontFace(GL_CCW);
+    // (counter-clockwise as set now: a mirror's reflection (Mirrors.h) has it the other way round)
+    glFrontFace(frontWas == GL_CW ? GL_CW : GL_CCW);
     glCullFace(GL_BACK);
     for (auto it = list.rbegin(); it != list.rend(); ++it) {
         if (it->mesh->liquidVertexCount > 0 && it->mesh->liquidVAO != 0) {
@@ -249,7 +250,8 @@ void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& l
     glGetIntegerv(GL_FRONT_FACE, &frontWas);
     glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
     glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
-    glFrontFace(GL_CCW);
+    // (counter-clockwise as set now: a mirror's reflection (Mirrors.h) has it the other way round)
+    glFrontFace(frontWas == GL_CW ? GL_CW : GL_CCW);
     glCullFace(GL_BACK);
     if (tintLoc >= 0) glUniform1i(tintLoc, 1);
     for (const auto& v : list) {
@@ -325,4 +327,22 @@ float WorldRenderer::areaReadyProgress(const World& world, const glm::vec3& pos,
         }
     }
     return total > 0 ? static_cast<float>(done) / static_cast<float>(total) : 1.0f;
+}
+
+void WorldRenderer::collectMirrors(const glm::vec3& pos, float radius, std::vector<glm::ivec4>& out) const {
+    out.clear();
+    const float r2 = radius * radius;
+    for (const auto& entry : m_meshes) {
+        const ChunkMesh* mesh = entry.second.get();
+        if (mesh->mirrors.empty()) continue;
+        const glm::vec3 o = originOf(entry.first);
+        // (the chunk's nearest point to pos is too far: none of its mirrors are near)
+        const glm::vec3 nearest = glm::clamp(pos, o, o + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_WIDTH));
+        if (glm::dot(nearest - pos, nearest - pos) > r2) continue;
+        for (const glm::ivec4& m : mesh->mirrors) {
+            const glm::ivec3 c(static_cast<int>(o.x) + m.x, m.y, static_cast<int>(o.z) + m.z);
+            const glm::vec3 d = glm::vec3(c) + glm::vec3(0.5f) - pos;
+            if (glm::dot(d, d) <= r2) out.push_back(glm::ivec4(c, m.w));
+        }
+    }
 }

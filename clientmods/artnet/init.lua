@@ -1,7 +1,7 @@
 -- Art-Net: DMX from your lighting software or console (QLC+, grandMA onPC, MagicQ, Lightkey, a
 -- desk with an Art-Net node...) into the game, passed on to the server's mods.
 --
---   1. Settings > Video > Network input: "This computer" (software on this PC) or "Network" (a
+--   1. Settings > Network > Network input: "This computer" (software on this PC) or "Network" (a
 --      desk or another PC). The port is Art-Net's, 6454 (settings.txt: udp_ports).
 --   2. Switch this client mod on (Mods screen).
 --   3. Point your software's Art-Net output at this PC (127.0.0.1 on the same PC).
@@ -159,7 +159,7 @@ client.register_chat_command("artnet", {
         end
         local st = client.udp_status()
         if not listening then
-            return false, "Not receiving: " .. tostring(why_not) .. ". Turn on Settings > Video > Network input (This computer, or Network for a desk or another PC)."
+            return false, "Not receiving: " .. tostring(why_not) .. ". Turn on Settings > Network > Network input (This computer, or Network for a desk or another PC)."
         end
         local list = {}
         for universe, u in pairs(universes) do

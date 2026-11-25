@@ -111,6 +111,11 @@ struct BlockProperty {
     // then holds both heights, in 16ths of the block: low 4 bits = where the lower one ends (1..15),
     // high 4 bits = where the upper one ends, minus 1 (so 0..15 = 1..16).
     std::string tankFluid2;
+    // --- A mirror (pattern "mirror", MirrorShape.h). register_block's mirror = true, or a table
+    //     { tint = "#rrggbb", clarity = 0..1, glass = "#rrggbb" } ---
+    glm::vec3 mirrorTint = glm::vec3(1.0f);                 // the reflection multiplied by this (bronze, smoked glass)
+    float mirrorClarity = 1.0f;                             // 1 = a clear reflection; less = misted, fading to the glass colour
+    glm::vec3 mirrorGlass = glm::vec3(0.62f, 0.67f, 0.72f); // the glass where nothing's reflected (far off, reflections off)
     // --- If this is a tool ---
     std::string toolType;         // "pickaxe", "axe", "shovel", "sword"... ("" = not a tool)
     float toolSpeed = 1.0f;       // how many times faster it digs blocks of its type

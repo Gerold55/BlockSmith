@@ -211,6 +211,24 @@ void registerBlockDefinition(const std::string& name, float r, float g, float b,
         }
         block.hasGravity    = props.get_or("gravity", false);
         block.pattern       = props.get_or("pattern", std::string("cube"));
+        // mirror = true (MirrorShape.h): a thin panel on the wall whose front reflects the room;
+        // the block's picture is its frame (see-through pixels are the glass)
+        {
+            const sol::object m = props["mirror"];
+            if ((m.is<bool>() && m.as<bool>()) || m.is<sol::table>()) block.pattern = "mirror";
+            if (m.is<sol::table>()) {
+                const sol::table t = m.as<sol::table>();
+                float c[3];
+                if (readColor(t["tint"], c)) block.mirrorTint = glm::vec3(c[0], c[1], c[2]);
+                if (readColor(t["glass"], c)) block.mirrorGlass = glm::vec3(c[0], c[1], c[2]);
+                const sol::optional<float> clarity = t["clarity"];
+                if (clarity) block.mirrorClarity = std::max(0.0f, std::min(1.0f, *clarity));
+            }
+        }
+        if (block.pattern == "mirror") {
+            block.isTransparent = true;
+            block.isWalkable = props.get_or("walkable", false);
+        }
         {
             // rotation = "axis" (BlockShape.h): a log, lying along the face it's put against
             const std::string rot = props.get_or("rotation", std::string());
