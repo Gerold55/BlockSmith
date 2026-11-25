@@ -433,11 +433,12 @@ inline sol::table installData(sol::state_view lua, bool quiet = false) {
         "to_text", [](const Region& r) { return r.toText(); });
 
     st["new"] = [](int sx, int sy, int sz) {
-        if (sx <= 0 || sy <= 0 || sz <= 0 || sy > CHUNK_HEIGHT ||
-            static_cast<double>(sx) * sy * sz > static_cast<double>(Region::kMaxCells))
-            throw sol::error("structure.new: a size from 1 to " + std::to_string(Region::kMaxCells) + " blocks");
+        const glm::ivec3 size(sx, sy, sz);
+        if (!Region::validSize(size))
+            throw sol::error("structure.new: x/z up to 4096, y up to 256, and at most " +
+                             std::to_string(Region::kMaxCells) + " blocks");
         Region r;
-        r.resize(glm::ivec3(sx, sy, sz));
+        r.resize(size);
         return r;
     };
     st["from_text"] = [](const std::string& text, sol::this_state ts) { return fromTextResult(ts, text); };
@@ -565,8 +566,9 @@ inline void install(sol::state_view lua, std::function<World*()> worldNow, std::
         mx.y = std::min(mx.y, CHUNK_HEIGHT - 1);
         if (mx.y < mn.y) return false;
         const glm::ivec3 s = mx - mn + glm::ivec3(1);
-        if (static_cast<double>(s.x) * s.y * s.z > static_cast<double>(kMaxEdit))
-            throw sol::error(std::string(what) + ": too big (" + std::to_string(kMaxEdit) + " blocks at most)");
+        if (!Region::validSize(s))
+            throw sol::error(std::string(what) + ": invalid or too big (x/z up to 4096, y up to 256, " +
+                             std::to_string(kMaxEdit) + " blocks at most)");
         if (!w->regionLoaded(mn, mx)) throw sol::error(std::string(what) + ": part of the box isn't loaded");
         return true;
     };
@@ -652,6 +654,7 @@ inline void install(sol::state_view lua, std::function<World*()> worldNow, std::
         sol::state_view lv(ts);
         const fs::path file = fileOf(name, "structure.save");
         if (authority && !authority()) return std::make_tuple(sol::make_object(lv, sol::lua_nil), sol::make_object(lv, std::string("only where the world runs")));
+        if (!r.valid()) return std::make_tuple(sol::make_object(lv, sol::lua_nil), sol::make_object(lv, std::string("invalid or oversized structure")));
         std::error_code ec;
         fs::create_directories(file.parent_path(), ec);
         const fs::path tmp = file.string() + ".tmp";

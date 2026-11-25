@@ -294,6 +294,20 @@ void World::rebuildLoadQueue() {
         }
     }
 
+    for (const auto& m : m_moves) {
+        if (m.visualOnly) continue;
+        const glm::ivec3 dst = m.from + m.offset;
+        const glm::ivec3 end = dst + m.region.size - glm::ivec3(1);
+        const int minX = floorDiv(dst.x, CHUNK_WIDTH), maxX = floorDiv(end.x, CHUNK_WIDTH);
+        const int minZ = floorDiv(dst.z, CHUNK_WIDTH), maxZ = floorDiv(end.z, CHUNK_WIDTH);
+        for (int cx = minX; cx <= maxX; ++cx)
+            for (int cz = minZ; cz <= maxZ; ++cz) {
+                const ChunkCoord c{ cx, cz };
+                if (chunks.find(c) == chunks.end() && seen.insert(c).second)
+                    m_loadQueue.push_back(c);
+            }
+    }
+
     auto nearest = [&centers](const ChunkCoord& c) {
         int best = INT_MAX;
         for (const auto& center : centers) best = std::min(best, chunkDist2(c, center.chunk));
@@ -525,6 +539,13 @@ bool World::wantedChunk(const ChunkCoord& c) const {
     if (isNear(m_playerChunk, m_renderDistance)) return true;
     for (const auto& center : m_extraCenters) {
         if (isNear(center.chunk, center.radius)) return true;
+    }
+    for (const auto& m : m_moves) {
+        if (m.visualOnly) continue;
+        const glm::ivec3 dst = m.from + m.offset;
+        const glm::ivec3 end = dst + m.region.size - glm::ivec3(1);
+        if (c.first >= floorDiv(dst.x, CHUNK_WIDTH) && c.first <= floorDiv(end.x, CHUNK_WIDTH) &&
+            c.second >= floorDiv(dst.z, CHUNK_WIDTH) && c.second <= floorDiv(end.z, CHUNK_WIDTH)) return true;
     }
     return false;
 }
@@ -1520,8 +1541,9 @@ bool World::readRegion(const glm::ivec3& a, const glm::ivec3& b, Region& out, st
     mx.y = std::min(mx.y, CHUNK_HEIGHT - 1);
     if (mx.y < mn.y) { why = "the box is above or below the world"; return false; }
     const glm::ivec3 size = mx - mn + glm::ivec3(1);
-    if (static_cast<size_t>(size.x) * size.y * size.z > Region::kMaxCells) {
-        why = "too big (" + std::to_string(Region::kMaxCells) + " blocks at most)";
+    if (!Region::validSize(size)) {
+        why = "invalid or too big (x/z up to 4096, y up to 256, " +
+              std::to_string(Region::kMaxCells) + " blocks at most)";
         return false;
     }
     if (!regionLoaded(mn, mx)) { why = "part of the box isn't loaded"; return false; }
@@ -1541,7 +1563,13 @@ bool World::readRegion(const glm::ivec3& a, const glm::ivec3& b, Region& out, st
     return true;
 }
 
-size_t World::writeRegion(const Region& r, const glm::ivec3& origin, bool withAir) {
+size_t World::writeRegion(const Region& r, const glm::ivec3& origin, bool withAir, bool* complete) {
+    if (complete) {
+        *complete = false;
+        if (!r.valid()) return 0;
+        const glm::ivec3 end = origin + r.size - glm::ivec3(1);
+        if (!regionLoaded(origin, end)) return 0;
+    }
     size_t changed = 0;
     for (int x = 0; x < r.size.x; ++x)
         for (int z = 0; z < r.size.z; ++z)
@@ -1551,7 +1579,10 @@ size_t World::writeRegion(const Region& r, const glm::ivec3& origin, bool withAi
                 const size_t i = r.index(x, y, z);
                 const uint8_t id = r.ids[i], meta = r.metas[i];
                 if (id == 0 && !withAir) continue;
-                if (!chunkAt(p)) continue;
+                if (!chunkAt(p)) {
+                    if (complete) return changed;
+                    continue;
+                }
                 const auto t = r.texts.find(static_cast<uint32_t>(i));
                 if (getBlockAt(p) != id || getMetadataAt(p) != meta) {
                     setBlockWithMetaAt(p, id, meta);
@@ -1560,6 +1591,7 @@ size_t World::writeRegion(const Region& r, const glm::ivec3& origin, bool withAi
                 if (t != r.texts.end()) setBlockTextAt(p, t->second);
                 else if (getBlockTextAt(p)) clearBlockTextAt(p);
             }
+    if (complete) *complete = true;
     return changed;
 }
 
@@ -1608,17 +1640,23 @@ uint32_t World::startMove(const glm::ivec3& a, const glm::ivec3& b, const glm::i
     air.resize(m.region.size);
     writeRegion(air, mn, true);
     if (m.seconds <= 0.0f) {
-        placeMove(m);
+        if (!placeMove(m)) m_moves.push_back(std::move(m));
         return m.id;
     }
     m_moves.push_back(std::move(m));
     return m_moves.back().id;
 }
 
-void World::placeMove(const MovingRegion& m) {
-    writeRegion(m.region, m.from + m.offset, true);
+bool World::placeMove(const MovingRegion& m) {
+    bool complete = false;
+    writeRegion(m.region, m.from + m.offset, true, &complete);
+    if (!complete) {
+        m_queueDirty = true;
+        return false;
+    }
     if (m_recordChanges) m_moveEnds.push_back(m.id);
     m_movesDone.push_back(m.id);
+    return true;
 }
 
 void World::updateMoves() {
@@ -1634,8 +1672,8 @@ void World::updateMoves() {
             continue;
         }
         if (t >= m.seconds) {
-            placeMove(m);
-            m_moves.erase(m_moves.begin() + i);
+            if (placeMove(m)) m_moves.erase(m_moves.begin() + i);
+            else ++i;
             continue;
         }
         ++i;
@@ -1643,15 +1681,22 @@ void World::updateMoves() {
 }
 
 void World::finishMoves() {
-    for (const auto& m : m_moves) if (!m.visualOnly) placeMove(m);
-    m_moves.clear();
+    for (size_t i = 0; i < m_moves.size();) {
+        if (m_moves[i].visualOnly || placeMove(m_moves[i])) m_moves.erase(m_moves.begin() + i);
+        else ++i;
+    }
 }
 
 void World::addMoveVisual(uint32_t id, const glm::ivec3& from, const glm::ivec3& offset, float seconds, Region region) {
-    if (region.cells() > kMaxMoveCells) return;
+    if (!Region::validSize(region.size) || region.cells() > kMaxMoveCells) return;
     for (const auto& m : m_moves) if (m.id == id) return;
     updateMoves();     // (drops copies whose end never came)
-    while (m_moves.size() >= kMaxMoves) m_moves.erase(m_moves.begin());
+    while (m_moves.size() >= kMaxMoves) {
+        const auto oldestVisual = std::find_if(m_moves.begin(), m_moves.end(),
+                                               [](const MovingRegion& m) { return m.visualOnly; });
+        if (oldestVisual == m_moves.end()) return;
+        m_moves.erase(oldestVisual);
+    }
     MovingRegion m;
     m.id = id;
     m.from = from;

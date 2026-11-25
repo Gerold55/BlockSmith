@@ -4,6 +4,7 @@
 #include "DoorShape.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -275,6 +276,7 @@ Region Region::flipped(char axis) const {
 }
 
 std::string Region::toText() const {
+    if (!valid()) throw std::invalid_argument("cannot serialize an invalid or oversized region");
     auto& reg = BlockRegistry::getInstance();
     // the blocks used, by name (air first), and the cells as runs of [palette, meta, count]
     std::vector<int> paletteOf(256, -1);
@@ -324,9 +326,14 @@ static bool fromJson(const std::string& text, Region& out, std::string& why, std
     if (!fmt || fmt->kind != JVal::Str || fmt->s != "blocksmith-region") { why = "not a region (\"format\": \"blocksmith-region\")"; return false; }
     const JVal* sz = root.get("size");
     if (!sz || sz->kind != JVal::Arr || sz->a.size() != 3) { why = "no size"; return false; }
+    auto validDimension = [](const JVal& v, int maximum) {
+        return v.kind == JVal::Num && std::isfinite(v.n) && v.n >= 1.0 && v.n <= maximum && std::floor(v.n) == v.n;
+    };
+    if (!validDimension(sz->a[0], Region::kMaxSizeX) ||
+        !validDimension(sz->a[1], Region::kMaxSizeY) ||
+        !validDimension(sz->a[2], Region::kMaxSizeZ)) { why = "too big (or no size)"; return false; }
     glm::ivec3 s(static_cast<int>(sz->a[0].n), static_cast<int>(sz->a[1].n), static_cast<int>(sz->a[2].n));
-    if (s.x <= 0 || s.y <= 0 || s.z <= 0 || s.x > 4096 || s.y > 256 || s.z > 4096 ||
-        static_cast<size_t>(s.x) * s.y * s.z > Region::kMaxCells) { why = "too big (or no size)"; return false; }
+    if (!Region::validSize(s)) { why = "too big (or no size)"; return false; }
     const JVal* pal = root.get("palette");
     if (!pal || pal->kind != JVal::Arr || pal->a.empty() || pal->a.size() > 256) { why = "bad palette"; return false; }
     auto& reg = BlockRegistry::getInstance();
@@ -392,8 +399,7 @@ bool Region::fromText(const std::string& text, Region& out, std::string& why, st
     if (!(in >> word >> version) || word != "BSREGION" || version != 1) { why = "not a region (it should start with BSREGION 1)"; return false; }
     glm::ivec3 s;
     if (!(in >> word >> s.x >> s.y >> s.z) || word != "size") { why = "no size"; return false; }
-    if (s.x <= 0 || s.y <= 0 || s.z <= 0 || s.x > 4096 || s.y > 256 || s.z > 4096 ||
-        static_cast<size_t>(s.x) * s.y * s.z > kMaxCells) { why = "too big (or no size)"; return false; }
+    if (!validSize(s)) { why = "too big (or no size)"; return false; }
     size_t n = 0;
     if (!(in >> word >> n) || word != "palette" || n == 0 || n > 256) { why = "bad palette"; return false; }
     auto& reg = BlockRegistry::getInstance();

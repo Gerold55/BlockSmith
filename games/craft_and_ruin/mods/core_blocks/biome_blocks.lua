@@ -21,7 +21,7 @@ engine.register_block("log_spruce", 1.0, 1.0, 1.0, {
 })
 
 -- Spruce Leaves (dark, coloured by the biome)
-engine.register_block("leaves_spruce", 60, 120, 70, "textures/cw_spruce_leaves.png", nil, {
+engine.register_block("leaves_spruce", 60, 120, 70, "textures/spruce_leaves.png", nil, {
     description = "Spruce Leaves",
     transparent = true,
     cutout      = true,

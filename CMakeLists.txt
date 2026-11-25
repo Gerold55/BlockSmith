@@ -19,7 +19,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-# main.cpp has thousands of sol2 bindings; MSVC needs /bigobj for that many sections
+# source/main.cpp has thousands of sol2 bindings; MSVC needs /bigobj for that many sections
 if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
 endif()
@@ -126,85 +126,87 @@ add_library(unofficial::stb ALIAS stb)
 target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
 add_executable(BlockSmith
-    main.cpp
-    Region.cpp
-    Diagnostics.cpp
-    Player.cpp
-    World.cpp
-    ChunkMesh.cpp
-    Block.cpp
-    Hotbar.cpp
-    PauseMenu.cpp
-    FontRenderer.cpp
-    ParticleSystem.cpp
-    Lighting.cpp
-    Lighting.h
-    Skybox.cpp
-    Skybox.h
-    CaveGenerator.cpp
-    CaveGenerator.h
-    Model.cpp
-    VoxelVolume.cpp
-    Spotlights.cpp
-    Mirrors.cpp
-    GpuCheck.cpp
-    Bloom.cpp
-    SunShafts.cpp
-    UdpInput.cpp
-    Model.h
-    ChatSystem.cpp
-    WebLink.cpp
-    WebLink.h
-    ChatSystem.h
-    MainMenu.cpp
-    MainMenu.h
-    Clouds.cpp
-    Clouds.h
-    Fog.h
-    Fog.cpp
-    Inventory.cpp
-    Inventory.h
-    WorldRenderer.cpp
-    WorldRenderer.h
-    ChunkData.cpp
-    ChunkData.h
-    Light.cpp
-    Light.h
-    FirstPerson.cpp
-    FirstPerson.h
-    ClientMods.cpp
-    ClientMods.h
-    ClientModRules.h
-    ChunkGenerator.cpp
-    ChunkGenerator.h
-    Fluids.cpp
-    Fluids.h
-    WeatherEffects.cpp
-    WeatherEffects.h
-    Firewall.cpp
-    Audio.cpp
-    Audio.h
-    StbVorbis.cpp
-    Net.cpp
-    Entities.cpp
-    BlockModifiers.cpp
-    BlockModifiers.h
-    Entities.h
-    EntityLua.h
-    Net.h
-    RemoteContent.cpp
-    RemoteContent.h
-    PlayerMovement.cpp
-    PlayerMovement.h
-    BlockDefs.cpp
-    BlockDefs.h
-    PlayerAvatars.cpp
-    PlayerAvatars.h
+    source/main.cpp
+    api/Region.cpp
+    source/Diagnostics.cpp
+    source/Player.cpp
+    source/World.cpp
+    source/ChunkMesh.cpp
+    source/Block.cpp
+    source/Hotbar.cpp
+    source/PauseMenu.cpp
+    source/FontRenderer.cpp
+    source/ParticleSystem.cpp
+    source/Lighting.cpp
+    source/Lighting.h
+    source/Skybox.cpp
+    source/Skybox.h
+    source/CaveGenerator.cpp
+    source/CaveGenerator.h
+    source/Model.cpp
+    source/VoxelVolume.cpp
+    source/Spotlights.cpp
+    api/Mirrors.cpp
+    source/GpuCheck.cpp
+    source/Bloom.cpp
+    source/SunShafts.cpp
+    source/UdpInput.cpp
+    source/Model.h
+    source/ChatSystem.cpp
+    source/WebLink.cpp
+    source/WebLink.h
+    source/ChatSystem.h
+    source/MainMenu.cpp
+    source/MainMenu.h
+    source/Clouds.cpp
+    source/Clouds.h
+    source/Fog.h
+    source/Fog.cpp
+    source/Inventory.cpp
+    source/Inventory.h
+    source/WorldRenderer.cpp
+    source/WorldRenderer.h
+    source/ChunkData.cpp
+    source/ChunkData.h
+    source/Light.cpp
+    source/Light.h
+    source/FirstPerson.cpp
+    source/FirstPerson.h
+    api/ClientMods.cpp
+    api/ClientMods.h
+    source/ClientModRules.h
+    source/ChunkGenerator.cpp
+    source/ChunkGenerator.h
+    api/Fluids.cpp
+    api/Fluids.h
+    source/WeatherEffects.cpp
+    source/WeatherEffects.h
+    source/Firewall.cpp
+    source/Audio.cpp
+    source/Audio.h
+    source/StbVorbis.cpp
+    source/Net.cpp
+    source/Entities.cpp
+    source/BlockModifiers.cpp
+    source/BlockModifiers.h
+    source/Entities.h
+    source/EntityLua.h
+    source/Net.h
+    source/RemoteContent.cpp
+    source/RemoteContent.h
+    source/PlayerMovement.cpp
+    source/PlayerMovement.h
+    source/BlockDefs.cpp
+    source/BlockDefs.h
+    source/PlayerAvatars.cpp
+    source/PlayerAvatars.h
     deps/glad.c
 )
 
 target_include_directories(BlockSmith PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/api
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )
@@ -310,25 +312,25 @@ add_custom_target(blocksmith_buildinfo ALL
     VERBATIM)
 
 add_executable(BlockSmithServer
-    ServerMain.cpp
-    Region.cpp
-    Diagnostics.cpp
-    ChunkGenerator.cpp
-    Fluids.cpp
-    World.cpp
-    ChunkData.cpp
-    Light.cpp
-    CaveGenerator.cpp
-    Block.cpp
-    BlockDefs.cpp
-    Net.cpp
-    Entities.cpp
-    BlockModifiers.cpp
-    BlockModifiers.h
-    Entities.h
-    EntityLua.h
-    RemoteContent.cpp
-    PlayerMovement.cpp
+    source/ServerMain.cpp
+    api/Region.cpp
+    source/Diagnostics.cpp
+    source/ChunkGenerator.cpp
+    api/Fluids.cpp
+    source/World.cpp
+    source/ChunkData.cpp
+    source/Light.cpp
+    source/CaveGenerator.cpp
+    source/Block.cpp
+    source/BlockDefs.cpp
+    source/Net.cpp
+    source/Entities.cpp
+    source/BlockModifiers.cpp
+    source/BlockModifiers.h
+    source/Entities.h
+    source/EntityLua.h
+    source/RemoteContent.cpp
+    source/PlayerMovement.cpp
 )
 
 if (WIN32)
@@ -339,6 +341,8 @@ add_dependencies(BlockSmithServer blocksmith_buildinfo)
 target_include_directories(BlockSmithServer PRIVATE
     ${BLOCKSMITH_GENERATED_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/api
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )

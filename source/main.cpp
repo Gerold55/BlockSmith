@@ -856,6 +856,7 @@ bool changeLocalDimension(const std::string& toIn, const glm::vec3& pos) {
     if (to == from) { g_PlayerInstance->position = pos; return true; }
 
     // 1. The dimension we leave: everything changed in it goes to disk
+    w->finishMoves();
     w->saveAll();
     if (!g_WorldDir.empty()) g_BlockMods.saveDimension(from, w->saveDirectory());
     // 2. The one we go to: if it was running in the background (guests there), it's saved and

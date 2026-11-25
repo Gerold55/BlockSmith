@@ -15,6 +15,20 @@ engine.register_block("stone", 1.0, 1.0, 1.0, "textures/cw_stone.png", nil, {
     behavior = "solid"
 })
 
+engine.register_block("cobble", 1.0, 1.0, 1.0, "textures/cw_cobblestone.png", nil, {
+    description = "Cobble",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("stonebricks", 1.0, 1.0, 1.0, "textures/stone_brick.png", nil, {
+    description = "Stone Bricks",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
 engine.register_block("dirt", 1.0, 1.0, 1.0, "textures/cw_dirt.png", nil, {
     description = "Dirt",
     transparent = false,
@@ -307,32 +321,62 @@ engine.register_block("flower_daisy", 1.0, 1.0, 1.0, "textures/cw_flower_daisy.p
 
 engine.register_block("flower_bluebell", 1.0, 1.0, 1.0, "textures/cw_flower_bluebell.png", nil, {
     description = "Bluebell",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_azure_bluet", 1.0, 1.0, 1.0, "textures/cw_flower_azure_bluet.png", nil, {
     description = "Azure Bluet",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_allium", 1.0, 1.0, 1.0, "textures/cw_flower_allium.png", nil, {
     description = "Allium",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_white", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_white.png", nil, {
     description = "White Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_red", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_red.png", nil, {
     description = "Red Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_pink", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_pink.png", nil, {
     description = "Pink Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 -- Load separate UI script

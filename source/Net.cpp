@@ -2143,8 +2143,8 @@ void GameClient::handlePacket(const uint8_t* data, size_t size) {
         const glm::ivec3 offset = r.ivec3();
         const float seconds = r.f32();
         const glm::ivec3 size = r.ivec3();
-        if (!r.ok || size.x <= 0 || size.y <= 0 || size.z <= 0 || size.y > CHUNK_HEIGHT ||
-            static_cast<double>(size.x) * size.y * size.z > static_cast<double>(World::kMaxMoveCells)) break;
+        if (!r.ok || !Region::validSize(size) ||
+            static_cast<size_t>(size.x) * static_cast<size_t>(size.y) * static_cast<size_t>(size.z) > World::kMaxMoveCells) break;
         const uint16_t n = r.u16();
         std::vector<uint8_t> pal;
         for (uint16_t i = 0; i < n && r.ok; ++i) {

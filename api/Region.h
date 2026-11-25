@@ -8,8 +8,10 @@
 // toText() names the blocks instead, so it can be loaded anywhere the same blocks exist.
 
 #include "ChunkData.h"     // BlockText
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
@@ -22,12 +24,24 @@ struct Region {
     // The most cells a region may have (a 160 x 160 x 160 box): enough for big builds, small
     // enough that nothing runs out of memory (2 bytes a cell: about 8 MB)
     static constexpr size_t kMaxCells = 4096000;
+    static constexpr int kMaxSizeX = 4096;
+    static constexpr int kMaxSizeY = 256;
+    static constexpr int kMaxSizeZ = 4096;
+
+    static bool validSize(const glm::ivec3& s) {
+        if (s.x <= 0 || s.y <= 0 || s.z <= 0 ||
+            s.x > kMaxSizeX || s.y > kMaxSizeY || s.z > kMaxSizeZ) return false;
+        const size_t xy = static_cast<size_t>(s.x) * static_cast<size_t>(s.y);
+        return xy <= kMaxCells && static_cast<size_t>(s.z) <= kMaxCells / xy;
+    }
 
     size_t cells() const { return static_cast<size_t>(size.x) * size.y * size.z; }
+    bool valid() const { return validSize(size) && ids.size() == cells() && metas.size() == cells(); }
     bool empty() const { return cells() == 0; }
     bool inside(int x, int y, int z) const { return x >= 0 && y >= 0 && z >= 0 && x < size.x && y < size.y && z < size.z; }
     size_t index(int x, int y, int z) const { return (static_cast<size_t>(x) * size.y + y) * size.z + z; }
     void resize(const glm::ivec3& s) {
+        if (!validSize(s)) throw std::invalid_argument("region size is invalid or too big");
         size = s;
         ids.assign(cells(), 0);
         metas.assign(cells(), 0);

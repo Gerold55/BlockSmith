@@ -97,7 +97,8 @@ public:
     bool readRegion(const glm::ivec3& a, const glm::ivec3& b, Region& out, std::string& why) const;
     // Writes a region with its lowest corner at `origin` (blocks, metadata and text). withAir =
     // false leaves what's there where the region has air. Returns how many blocks changed.
-    size_t writeRegion(const Region& r, const glm::ivec3& origin, bool withAir);
+    // Optional `complete` is true only if every required in-bounds write succeeded.
+    size_t writeRegion(const Region& r, const glm::ivec3& origin, bool withAir, bool* complete = nullptr);
 
     // Moving a box of blocks, seen moving: the blocks leave the world, glide `offset` blocks in
     // `seconds` as one piece (drawn by the game, main.cpp), then are placed there (air too: what
@@ -413,7 +414,7 @@ private:
     std::vector<uint32_t> m_moveEnds, m_movesDone;
     uint32_t m_nextMoveId = 1;
     void updateMoves();
-    void placeMove(const MovingRegion& m);
+    bool placeMove(const MovingRegion& m);
     std::vector<uint16_t> sampleLight(const glm::ivec3& mn, const glm::ivec3& size) const;
 
     // Saving
