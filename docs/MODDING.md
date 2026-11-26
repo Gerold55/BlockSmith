@@ -56,6 +56,12 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [C20. A rearrangeable inventory (drag and drop)](#c20-a-rearrangeable-inventory-drag-and-drop)
    - [C21. A laptop with its own desktop (windows)](#c21-a-laptop-with-its-own-desktop-windows)
    - [C22. A minigame HUD: timers, scoreboards and titles](#c22-a-minigame-hud-timers-scoreboards-and-titles)
+   - [C23. A new dimension with a portal](#c23-a-new-dimension-with-a-portal)
+   - [C24. Signs that greet players](#c24-signs-that-greet-players)
+   - [C25. A spotlight run from a lighting console (Art-Net)](#c25-a-spotlight-run-from-a-lighting-console-art-net)
+   - [C26. Mirrors](#c26-mirrors)
+   - [C27. Moving a build](#c27-moving-a-build)
+   - [C28. Animated blocks and items](#c28-animated-blocks-and-items)
 3. [Part 3: Reference](#part-3-reference)
    - [Function index](#function-index): every function and hook, A to Z per table
    - [1. Folders](#1-folders)
@@ -80,7 +86,8 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [19. Tips](#19-tips)
    - [20. Client mods](#20-client-mods)
    - [21. Online content](#21-online-content)
-   - [22. Glossary](#22-glossary)
+   - [22. Dimensions](#22-dimensions)
+   - [23. Glossary](#23-glossary)
 
 ---
 
@@ -118,7 +125,7 @@ A mod's code runs at two different times, and it matters which one you're in:
 <a id="which-mods-a-world-runs"></a>
 ### Which mods a world runs
 
-Like Luanti, each world has its own mod list; like Minecraft, a game sets the defaults for its worlds.
+Like Luanti, each world has its own mod list, and a game sets the defaults for its worlds.
 
 - **A game's own mods** (`games/<game>/mods/`) always run with that game.
 - **Mods in the `mods/` folder** run only where they're switched on:
@@ -299,7 +306,7 @@ You give only a **file name**, never a path.
 
 - **Pictures** (`.png`): at startup the engine indexes every PNG in the game's folder and in every mod folder, including subfolders, ignoring capitals. `"ruby_block.png"` works wherever that file is. Your own mod's folder is checked first.
 - **Sounds** (`.ogg` or 16-bit `.wav`): `"ruby_hit"` finds `ruby_hit.ogg` in your mod's folder or its `sounds/` folder, the game's `sounds/` folder, or `./sounds/`. Add `ruby_hit.1.ogg`, `ruby_hit.2.ogg`... and one is picked at random each time.
-- **Models** (`.b3d` from Luanti, or Bedrock `.json` from Blockbench) and **animations** (`.animation.json`): found in your mod's folder or its `models/` folder.
+- **Models** (`.bbmodel` straight from Blockbench, Bedrock `.json`, or `.b3d` from Luanti) and **animations** (`.animation.json`, or the ones saved in a `.bbmodel`): found in your mod's folder or its `models/` folder. Loaded after startup (from a command, say), every mod's folder is looked in too, your own first.
 - **Texture packs** replace any picture with one of the same file name.
 
 > **Name clashes:** if two mods both have `icon.png`, each finds its own while loading, but anything looked up later (like a HUD picture drawn every frame) could find the other one. Give files names only your mod uses: `ruby_icon.png`, not `icon.png`.
@@ -398,6 +405,15 @@ end
 4. **Check `lua_api.txt`.** If a function you're calling isn't listed there, your build doesn't have it. It also shows which hooks your mods define, which helps you find two mods fighting over one.
 5. **Something stopped working after you added a mod?** It's almost always an unchained hook. Search your mods for `function on_` and check each one keeps `previous`.
 
+<a id="reloading-mods"></a>**Seeing your changes without restarting.** Edit a mod's Lua file (or a picture, sound or model), then reload, and the world opens again with your changes, right where you were standing:
+
+- <a id="fn-engine-reload_mods"></a>Type **`/reload`** in chat, or call `engine.reload_mods()` from a mod (it returns `true`, or `false` and why).
+- **Automatically:** put `auto_reload_mods = true` in `settings.txt`. While you play, saving a file in the mods folders (`mods/`, the game's `mods/`, `lualib/`, `clientmods/`) reloads by itself, about a second after your editor finishes saving. Chat says which file changed.
+
+What happens: the world is saved, every mod starts again from scratch (a fresh Lua state, blocks, items, textures, sounds, models and entities, exactly as when the game starts), and the world opens again. Your position and everything saved with the world (blocks, [storage](#l8-mods-working-together-and-saving-data), entities) are kept; anything a mod only held in Lua variables starts over, as it would after a restart.
+
+It works in your own world: in singleplayer, or a LAN game you host while nobody else is connected. On someone else's server, the server's owner decides when its mods change. A [dedicated server](#17-multiplayer-and-servers) picks up changed mods when it restarts.
+
 Common error messages:
 
 | Message | What it usually means |
@@ -410,7 +426,7 @@ Common error messages:
 
 ## L10. Client mods: scripts for your own game
 
-Everything so far has been about **game mods**: they decide how the game works, and every player on a server needs the same ones. Some things aren't the game's business at all, though: a minimap, waypoints, a light-level display, a chat helper. In Minecraft you'd add those to your own copy of the game. BlockSmith has **client mods** for this, like Luanti's client-side mods (CSM).
+Everything so far has been about **game mods**: they decide how the game works, and every player on a server needs the same ones. Some things aren't the game's business at all, though: a minimap, waypoints, a light-level display, a chat helper. In many games you'd add those to your own copy of the game. BlockSmith has **client mods** for this, like Luanti's client-side mods (CSM).
 
 | | Game mods (`mods/`, `games/<game>/mods/`) | Client mods (`clientmods/`) |
 |---|---|---|
@@ -443,7 +459,7 @@ Open **Mods** on the title screen, find *hello* (marked *Client mod*), press **E
 - **A sandbox.** There's no `io`, no `os.execute` and no `require`. `client.dofile("file.lua")` loads files from the mod's own folder, while it loads. Saved data goes through `client.get_mod_storage()`.
 - **Mistakes are contained.** If a callback errors, that callback stops, a red line in chat says which mod and why, and everything else carries on.
 
-**The server decides.** Servers set four rules in `server.conf`, and your game keeps to them while you play there:
+**The server decides.** Servers set five rules in `server.conf`, and your game keeps to them while you play there:
 
 | Rule | Default | Meaning |
 |---|---|---|
@@ -451,6 +467,7 @@ Open **Mods** on the title screen, find *hello* (marked *Client mod*), press **E
 | `client_mods_chat` | `false` | they may send chat messages and commands for you (`client.send_chat_message`) |
 | `client_mods_players` | `true` | they may see other players' names and positions (`client.get_players`) |
 | `client_mods_block_range` | `64` | how far from you they can read blocks; 0 = any distance |
+| `client_mods_messages` | `true` | they may send messages to the server's mods (`client.send_to_server`), which check them like anything from a player's game |
 
 In singleplayer there are no limits. A LAN host has no limits either, and the friends who join get the host's `lan_client_mods...` settings (no limits unless changed). `client.get_rules()` tells your mod what's allowed right now. Plan for `nil`: when a block is out of range, `client.get_block` returns nil.
 
@@ -646,7 +663,7 @@ end
 **Things to know:**
 - `generate_chunk` runs on background threads. Use only `engine.get_block_id`, the `chunk` functions and maths there.
 - Chunks that were already generated keep what they had. Explore new land to see your ore.
-- Caves are carved *after* `generate_chunk`, so some ore ends up in cave walls, as in Minecraft.
+- Caves are carved *after* `generate_chunk`, so some ore ends up in cave walls.
 
 ## C3. A lamp you switch on and off
 
@@ -666,7 +683,7 @@ local SWITCH = { ruby_lamp = "ruby_lamp_on", ruby_lamp_on = "ruby_lamp" }
 local previous = on_right_click_block
 function on_right_click_block(x, y, z, block, held, sneaking, repeat_click, ...)
     local other = SWITCH[block]
-    -- Like Minecraft: sneak + right-click with a block in hand places against the lamp instead
+    -- Sneak + right-click with a block in hand places against the lamp instead
     local holding = held and held ~= "" and held ~= "air"
     if other and not (sneaking and holding) then
         if not repeat_click then                  -- one toggle per click, not every 0.2 s
@@ -700,7 +717,7 @@ end
 
 - **Food points:** 2 = one drumstick. A full bar is 20.
 - **Saturation:** how long it keeps you full. Leave it out for food × 0.6.
-- You can't eat when your hunger bar is full, as in Minecraft.
+- You can't eat when your hunger bar is full.
 
 ## C5. A tool
 
@@ -1050,7 +1067,7 @@ Try it with `/weather sandstorm`. The weather mod already sends the change to ev
 
 ## C14. A mob with a model and an animation
 
-A cow that wanders around, plays its walk animation, runs away when you hit it, and drops beef when it dies. Make the model and animation in Blockbench: export the model as *Bedrock Geometry* (`cow.geo.json`) and the animations with *Export Bedrock Animations* (`cow.animation.json`). Put both in your mod's `models/` folder and the skin in `textures/`. Build it facing north (-z), the way Blockbench starts a Bedrock entity.
+A cow that wanders around, plays its walk animation, runs away when you hit it, and drops beef when it dies. Make the model and animation in Blockbench: export the model as *Bedrock Geometry* (`cow.geo.json`) and the animations with *Export Bedrock Animations* (`cow.animation.json`). Put both in your mod's `models/` folder and the skin in `textures/`. (Or skip the exporting: put the `cow.bbmodel` Blockbench saves in `models/` and use `model = "cow.bbmodel", animations = "cow.bbmodel"` with no `texture`; its own picture is used.) Build it facing north (-z), the way Blockbench starts a Bedrock entity.
 
 ```lua
 entities.register("mymod:cow", {
@@ -1092,7 +1109,7 @@ entities.register_spawn({ name = "mymod:cow", on = { "grass" }, min_light = 9, s
 
 **Things to know:**
 - **Yaw** is in degrees. Yaw 0 faces +x (east), 90 faces +z (south).
-- **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, bumping into each other and into players (overlapping mobs are nudged apart, as in Minecraft), jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
+- **The engine does the hard parts:** finding a way round trees and walls (`wander`, `go_to`), gravity, bumping into blocks, bumping into each other and into players (overlapping mobs are nudged apart), jumping 1-block steps, floating in water, knockback, the red flash when hit, saving, and showing it to every player in multiplayer.
 - **Each cow animates on its own.** Animations play from when you set them, so cows walk out of step.
 - **Spawn one yourself:** `entities.spawn("mymod:cow", x, y, z)`.
 - The example `mobs` mod in the `mods/` folder has a full cow and a zombie (one that chases you and burns in the sun) to copy from. Everything is in [Reference §13a](#13a-mobs-and-other-entities).
@@ -1233,7 +1250,7 @@ Up to 16 point lights show at once, and they shine through walls. For lights tha
 
 ## C19. A client mod: light level and coordinates
 
-A small HUD that shows your coordinates and the light level where you stand, red when it's dark enough for monsters (7 or less, like Minecraft). Press **L** or type `.light` to show or hide it. It's a **client mod**: put it in `clientmods/lightlevel/init.lua`, then switch it on on the Mods screen. It works on any server that allows client mods, because it only reads and draws.
+A small HUD that shows your coordinates and the light level where you stand, red when it's dark enough for monsters (7 or less). Press **L** or type `.light` to show or hide it. It's a **client mod**: put it in `clientmods/lightlevel/init.lua`, then switch it on on the Mods screen. It works on any server that allows client mods, because it only reads and draws.
 
 ```lua
 local storage = client.get_mod_storage()
@@ -1576,6 +1593,335 @@ end
 - **Your own look:** every kind of piece is drawn by Lua you can replace or add to; see [14.8](#148-hud-pieces-from-the-server-hud).
 - **Deaths:** `on_player_death(name, reason)` comes from Craft & Ruin's survival mod (each player's game works out its own health and tells the server). Another game can do the same with [mod messages](#mod-messages-between-the-server-and-players-games).
 
+## C23. A new dimension with a portal
+
+A hot underground dimension, reached through an obsidian frame you light with a flint and steel, set up as a classic "underworld" portal: 4 seconds in the portal (at once in creative), 1 block there = 8 here, an existing portal nearby is used, otherwise one is built. Every one of those is a setting you can change ([22.4](#224-portals-portals)). Put this in a mod the server **and** its players have (it registers blocks).
+
+```lua
+-- mods/ashlands/init.lua
+dimensions.register("ashlands:depths", {
+    generate_chunk = function(chunk, cx, cz, seed)       -- runs on the generator threads
+        local rock = engine.get_block_id("basalt")
+        local lava = engine.get_block_id("lava")
+        for x = 0, 15 do
+            for z = 0, 15 do
+                local wx, wz = cx * 16 + x, cz * 16 + z
+                local floor_y = 40 + math.floor(math.sin(wx * 0.05) * 6 + math.cos(wz * 0.07) * 6)
+                for y = 0, floor_y do chunk:set_block(x, y, z, rock) end
+                for y = 31, 34 do if y > floor_y then chunk:set_block(x, y, z, lava) end end   -- lava seas
+                for y = 112, 127 do chunk:set_block(x, y, z, rock) end                        -- the roof
+            end
+        end
+    end,
+    has_skylight = false,   -- only lava and torches light it
+    has_ceiling = true,     -- no sky, no weather
+    ultrawarm = true,       -- (buckets should refuse water here: dimensions.get(...).ultrawarm)
+    natural = false,        -- beds and compasses don't work (your game decides what that means)
+    bed_works = false,
+    coordinate_scale = 8,   -- 1 block here = 8 in the overworld
+    ambient_light = 0.1,    -- never pitch black
+    logical_height = 112,   -- portals and teleports stay under the roof
+    fixed_time = 0.5,
+    effects = "nether",     -- no sun, moon, stars or clouds: only fog
+    fog_color = "#3a0c08",
+})
+
+-- The portal block: see-through, walk into it, glowing purple
+engine.register_block("ashlands:portal", 0.5, 0.2, 0.8, "ashlands_portal.png", nil,
+    { transparent = true, walkable = false, light = 11, light_color = { 0.6, 0.3, 1 } })
+
+portals.register("ashlands:portal", {
+    frame = "obsidian", block = "ashlands:portal",
+    from = "overworld", to = "ashlands:depths",
+    igniters = { "flint_and_steel" },   -- right-click the inside of a frame with it
+    delay = 4, creative_delay = 0,      -- 4 seconds in it (at once in creative)
+    cooldown = 0, mob_cooldown = 15,
+    -- (the rest are the defaults: 1:8 by the dimensions' coordinate_scale, the nearest portal
+    --  there or a new one built, frames 2x3 up to 21x21 standing either way)
+})
+
+-- Mobs: only these spawn there (the overworld's stay in the overworld)
+entities.register_spawn{ name = "ashlands:ember", on = { "basalt" }, max_light = 15,
+                         dimensions = { "ashlands:depths" } }
+
+-- A message when someone arrives
+local prev = on_player_change_dimension
+function on_player_change_dimension(name, from, to, ...)
+    if to == "ashlands:depths" then engine.message_player(name, "It's hot down here...") end
+    if prev then return prev(name, from, to, ...) end
+end
+```
+
+- Build a frame of obsidian 4 wide and 5 tall (or up to 23 x 23), stand back and use the flint and steel on the inside.
+- **Several players:** each is in their own dimension. Someone in the overworld doesn't see someone in the depths, and both worlds keep running. A dimension nobody is in is saved and unloaded after 30 seconds.
+- **Saving:** the dimension is saved in the world's folder (`saves/<world>/dimensions/ashlands_depths/`), and players come back in the dimension they left in.
+- **Dying** sends you back to the overworld's spawn (or your own spawn point), wherever you died.
+- More: [22. Dimensions](#22-dimensions).
+
+## C24. Signs that greet players
+
+Signs for your game, a dye that colours their text, and a welcome sign the server writes by itself at spawn. Put it in a mod the server **and** its players have.
+
+```lua
+-- mods/townsigns/init.lua
+signs.register("townsigns:sign", { texture = "planks_birch.png", description = "Birch Sign" })
+signs.register_style_item("townsigns:blue_ink", { color = "#1d4fb8" })
+
+-- No rude words: the server checks every player's text
+local banned = { "rude", "words" }
+function can_edit_text(name, x, y, z, side, lines)
+    for _, line in ipairs(lines) do
+        for _, w in ipairs(banned) do
+            if line:lower():find(w, 1, true) then return false, "Keep it friendly!" end
+        end
+    end
+end
+
+-- A sign at spawn, written by the server and waxed so nobody changes it
+local placed = false
+local prev = on_server_start
+function on_server_start(...)
+    if not placed then
+        placed = true
+        engine.set_block_meta(10, 70, 8, "townsigns:sign", 0)
+        engine.set_block_text(10, 70, 8, {
+            front = { lines = { "Welcome to", "Oakvale", "", "Be nice!" }, color = "#1d4fb8" },
+            waxed = true,
+        })
+    end
+    if prev then return prev(...) end
+end
+```
+
+- Players place the sign item on the ground or on a wall, and write on it in the screen that opens. Right-clicking a sign edits the side they're looking at; right-clicking with the blue ink colours that side.
+- `engine.get_block_text(x, y, z)` reads any sign: a shop mod can read prices from signs, a minigame can use them as buttons.
+
+## C25. A spotlight run from a lighting console (Art-Net)
+
+A light in the game run from real lighting control (QLC+, grandMA onPC, MagicQ, a desk with an Art-Net node), the same for every player on a server. Three pieces work together:
+
+1. **The player's lighting software** sends Art-Net (DMX over the network) to their own game.
+2. **A client mod** in that player's game receives it ([network input](#network-input)) and passes the channels on to the server's mods with [`client.send_to_server`](#fn-client-send_to_server).
+3. **The game mod**, where the world runs, checks who sent it and drives the spotlight in every player's game.
+
+Game and server mods never touch the network: only the player's own client mod receives anything, and only after the player turned **Network input** on in Settings.
+
+**The client mod** (`clientmods/my_artnet/init.lua`): reads Art-Net's DMX packets on port 6454 and sends universe 0's first six channels, when they change.
+
+```lua
+local PORT = 6454
+local listening = false
+local last_sent = ""
+
+client.register_on_join(function()
+    local why
+    listening, why = client.udp_listen(PORT)
+    if not listening then client.display_chat_message("Art-Net: " .. tostring(why)) end
+end)
+
+client.register_on_update(function(dt)
+    if not listening then return end
+    for _, p in ipairs(client.udp_receive(PORT)) do
+        local d = p.data
+        -- ArtDmx: "Art-Net\0", opcode 0x5000 (little-endian), ..., universe at 15-16,
+        -- length at 17-18 (big-endian), the channels from byte 19
+        if #d >= 24 and d:sub(1, 8) == "Art-Net\0" and d:byte(9) == 0x00 and d:byte(10) == 0x50 then
+            local universe = d:byte(15) | ((d:byte(16) & 0x7F) << 8)
+            if universe == 0 then
+                local v = { d:byte(19, 24) }               -- channels 1-6
+                local text = table.concat(v, ",")
+                if text ~= last_sent then
+                    last_sent = text
+                    client.send_to_server("mylights:dmx", text)
+                end
+            end
+        end
+    end
+end)
+```
+
+**The game mod**: where the world runs, it decides whose DMX to believe and passes it to every player's game; every game sets its spotlight from it.
+
+```lua
+-- where the world runs: one player at a time runs the lights (here: operators)
+local prev_msg = on_mod_message
+function on_mod_message(name, channel, data, ...)
+    if channel == "mylights:dmx" then
+        if not engine.is_player_operator(name) then return end
+        local v = {}
+        for n in tostring(data):gmatch("%d+") do v[#v + 1] = math.min(255, tonumber(n)) end
+        if #v == 6 then engine.send_to_all("mylights:look", table.concat(v, ",")) end
+        return
+    end
+    if prev_msg then return prev_msg(name, channel, data, ...) end
+end
+
+-- every player's game: the spotlight
+local spot
+local prev_srv = on_server_message
+function on_server_message(channel, data, ...)
+    if channel == "mylights:look" and lights then
+        local v = {}
+        for n in tostring(data):gmatch("%d+") do v[#v + 1] = tonumber(n) end
+        spot = spot or lights.add_spot{ x = 0.5, y = 80, z = 0.5, angle = 20, range = 40 }
+        lights.set(spot, {
+            pan = (v[1] / 255 - 0.5) * 540,        -- 540 degrees across the channel
+            tilt = -90 + v[2] / 255 * 180,         -- straight down .. straight up
+            dimmer = v[3] / 255,
+            color = { v[4] / 255, v[5] / 255, v[6] / 255 },
+        })
+        return
+    end
+    if prev_srv then return prev_srv(channel, data, ...) end
+end
+```
+
+In singleplayer it all happens in your own game: `client.send_to_server` reaches your world's `on_mod_message`, and `engine.send_to_all` your own `on_server_message`.
+
+**Going further:**
+- **Fine channels.** Consoles send pan and tilt as two channels each (coarse and fine) for smooth movement: `(coarse * 256 + fine) / 65535` gives 0..1.
+- **Being found.** Consoles discover nodes with ArtPoll packets (opcode `0x2000`). A client mod can answer with an ArtPollReply through [`client.udp_reply`](#fn-client-udp_reply), so the game shows up in the console's node list (on "Network").
+- **Limits.** A player's game may send 20 messages a second (4 KB each): about 15 a second, only when something changed, leaves room. Smooth movement between updates in each game (move a little toward the newest pan and tilt every frame).
+- **Trust.** What a player's game sends is a claim: decide where the world runs who may run the lights (an operator, whoever took control at a desk), and check every value.
+- **The patch.** Keep which universe and address each light reads with the world ([`engine.set_storage`](#fn-engine-set_storage)) and share it ([`engine.set_shared`](#fn-engine-set_shared)), so the client mod can send just those channels.
+- **Setting up the software:** on the same PC, send its Art-Net output to 127.0.0.1 and choose **This computer**; if the software also listens for Art-Net on that address, switch its input off, or both programs fight over the port. From a desk or another PC: **Network**, and send to this PC's address or broadcast (2.255.255.255 or 10.255.255.255).
+
+## C26. Mirrors
+
+Mirrors that reflect the room, the player included, made with the base mod's [`mirrors`](#mirrors) library. Register them in a mod the server **and** its players have, so both know the blocks.
+
+**A mirror in one line.** The library makes the item and the block, gives it a frame, and handles placing.
+
+```lua
+mirrors.register("mymod:mirror", { description = "Mirror" })    -- silver frame (frame = "thin")
+```
+
+**Ready-made frames and the look of the glass.**
+
+```lua
+mirrors.register("mymod:wood_mirror",   { frame = "wood", description = "Wooden Mirror" })
+mirrors.register("mymod:gold_mirror",   { frame = "gold", tint = "#f2cf98", description = "Bronze Mirror" })  -- a warm reflection
+mirrors.register("mymod:mirror_wall",   { frame = "none", description = "Mirror Wall" })                    -- frameless
+mirrors.register("mymod:misted_mirror", { frame = "thin", clarity = 0.45, glass = "#b4c2cc", description = "Misted Mirror" })
+mirrors.register("mymod:wall_only",     { frame = "wood", stand = false })                                 -- never on floors
+```
+
+- `tint` colours the reflection; `clarity` (1 clear .. 0 fogged over) fades it toward the `glass` colour.
+- Frameless mirrors side by side make one seamless mirror wall; framed ones join into one frame round the group.
+
+**Your own frame.** A 16×16 picture: the frame in the border, the middle fully see-through (see-through pixels are the glass). Use the picture directly, or register it by name so any mod can use it:
+
+```lua
+mirrors.register("mymod:stone_mirror", { frame = "mymod_stone_frame.png", inventory_image = "mymod_stone_mirror.png" })
+
+mirrors.register_frame("marble", { picture = "mymod_marble_frame.png", item = "mymod_marble_mirror.png" })
+mirrors.register("othermod:hall_mirror", { frame = "marble", description = "Hall Mirror" })
+```
+
+**Placing from a mod** (structures, a house that builds itself, a command). The facing is the way the glass looks:
+
+```lua
+mirrors.place(x, y, z, "mymod:mirror", "south")
+```
+
+**Reading and changing mirrors in the world.**
+
+```lua
+if mirrors.is_mirror(x, y, z) then
+    local facing = mirrors.get_facing(x, y, z)                       -- "north", "east", "south" or "west"
+    engine.rotate_block(x, y, z)                                      -- a quarter turn clockwise
+    engine.set_block_state(x, y, z, { facing = "east" })              -- or set it
+end
+```
+
+**Swapping one mirror for another** keeps where it hangs: a mirror that steams up, cracks, or is uncovered by a lever.
+
+```lua
+local function swap_mirror(x, y, z, to)
+    local facing = mirrors.get_facing(x, y, z)
+    if facing then engine.place_block(x, y, z, to, { facing = facing }) end
+end
+swap_mirror(x, y, z, "mymod:misted_mirror")    -- steamed up
+swap_mirror(x, y, z, "mymod:mirror")           -- clear again
+```
+
+- Players turn reflections off in Settings (Mirror Reflections) on slow computers; mirrors then show their glass colour. Mods can't change that setting, so pick a `glass` colour that looks right on its own.
+- Without the library: `engine.register_block(name, 1, 1, 1, "frame.png", nil, { mirror = { tint = ..., clarity = ..., glass = ... } })` ([mirrors](#mirrors)).
+
+## C27. Moving a build
+
+A drawbridge that rises and lowers when a lever is used, and a command that sends a house sliding to wherever you point. Put it in a mod the server **and** its players have.
+
+```lua
+-- mods/bridge/init.lua
+local BRIDGE = { { x = 10, y = 64, z = 0 }, { x = 12, y = 64, z = 8 } }   -- its two corners, lowered
+local raised = false
+
+engine.register_block("bridge:lever", 1, 1, 1, "lever.png", nil, { description = "Bridge Lever" })
+
+local prev = on_right_click_block
+function on_right_click_block(x, y, z, block, item, sneaking, rep, ...)
+    if block == "bridge:lever" and not rep then
+        if world.is_moving() then return true end                  -- (still going: wait)
+        local up = raised and -6 or 6                                -- six blocks up, or back down
+        local id, why = world.move_region(BRIDGE[1], BRIDGE[2], { x = 0, y = up, z = 0 }, {
+            seconds = 2.5,
+            on_done = function() chat.send(raised and "The bridge is up" or "The bridge is down") end,
+        })
+        if id then
+            raised = not raised
+            BRIDGE[1].y, BRIDGE[2].y = BRIDGE[1].y + up, BRIDGE[2].y + up   -- where it is now
+        else
+            chat.send("It won't move: " .. why)
+        end
+        return true
+    end
+    if prev then return prev(x, y, z, block, item, sneaking, rep, ...) end
+    return false
+end
+```
+
+- The lever runs where the world runs in singleplayer. On a server, have the lever's click send a [mod message](#fn-engine-send_to_server) and move the bridge in the server's `on_mod_message`, as the WorldEdit wand does. Every player sees it rise.
+- Keep the bridge's position with the world ([`engine.set_storage`](#fn-engine-set_storage)) so it's right after a restart.
+
+**A build you copy, turn and set down somewhere else:**
+
+```lua
+local house = world.read_region({ x = 0, y = 64, z = 0 }, { x = 8, y = 72, z = 10 })
+if house then
+    world.write_region(house:rotate(90), { x = 40, y = 64, z = 0 })     -- a turned copy
+    world.save_schematic("cottage", house)                               -- any world of this game can load it
+end
+local cottage = world.load_schematic("cottage")
+if cottage then world.write_region(cottage, { x = -20, y = 70, z = 5 }, { air = false }) end
+```
+
+## C28. Animated blocks and items
+
+A glowing crystal that pulses in the world and in the hotbar, and a coin item that spins in the inventory.
+
+**1.** Draw the frames one under another, top frame first. `mymod_crystal.png` is 16 wide and 64 tall: 4 frames. `mymod_coin.png` is 16x128: 8 frames of a coin turning.
+
+**2.** Register them with `animation`:
+
+```lua
+engine.register_block("mymod:crystal", 1, 1, 1, "mymod_crystal.png", nil, {
+    description = "Pulsing Crystal",
+    light = 10,
+    animation = { frame_time = 0.25 },
+})
+
+engine.register_block("mymod:coin", 1, 1, 1, "mymod_coin.png", nil, {
+    description = "Gold Coin",
+    inventory_image = "mymod_coin.png",   -- an item: its picture animates in the hotbar
+    animation = 0.08,                     -- (a number is the frame time)
+})
+```
+
+That's all: the engine plays them wherever they're drawn. To slow a frame down (the crystal resting dim between pulses), put it in the strip more than once. See [Animated pictures](#animated-pictures).
+
+---
+
 # Part 3: Reference
 
 Every function, grouped by what it's for. Each section is complete on its own, so you can jump straight in from the index.
@@ -1586,8 +1932,8 @@ Type in the search box (in `MODDING.html`) or use your browser's find (Ctrl+F) t
 
 Every function and hook, by table, each linking to where it's explained. `lua_api.txt` (written by the engine at startup) lists what your build has.
 
-**engine** (134)  
-[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_description`](#fn-engine-get_block_description) · [`engine.set_block_name_display`](#fn-engine-set_block_name_display) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.get_camera_mode`](#fn-engine-get_camera_mode) · [`engine.set_camera_mode`](#fn-engine-set_camera_mode) · [`engine.set_player_look`](#fn-engine-set_player_look) · [`engine.get_player_look`](#fn-engine-get_player_look) · [`engine.set_hud_visible`](#fn-engine-set_hud_visible) · [`engine.is_hud_visible`](#fn-engine-is_hud_visible) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.get_world_mods`](#fn-engine-get_world_mods) · [`engine.set_world_mod`](#fn-engine-set_world_mod) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.player_set_block`](#fn-engine-player_set_block) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.request_harvest`](#fn-engine-request_harvest) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.send_to_all`](#fn-engine-send_to_all) · [`engine.send_to_player`](#fn-engine-send_to_player) · [`engine.send_to_server`](#fn-engine-send_to_server) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_third_person_item`](#fn-engine-set_third_person_item) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
+**engine** (139)  
+[`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_description`](#fn-engine-get_block_description) · [`engine.set_block_name_display`](#fn-engine-set_block_name_display) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_block_text`](#fn-engine-get_block_text) · [`engine.set_block_text`](#fn-engine-set_block_text) · [`engine.edit_block_text`](#fn-engine-edit_block_text) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_ui_setting`](#fn-engine-get_ui_setting) · [`engine.set_ui_setting`](#fn-engine-set_ui_setting) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.get_camera_mode`](#fn-engine-get_camera_mode) · [`engine.set_camera_mode`](#fn-engine-set_camera_mode) · [`engine.set_player_look`](#fn-engine-set_player_look) · [`engine.get_player_look`](#fn-engine-get_player_look) · [`engine.set_hud_visible`](#fn-engine-set_hud_visible) · [`engine.is_hud_visible`](#fn-engine-is_hud_visible) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.get_world_mods`](#fn-engine-get_world_mods) · [`engine.set_world_mod`](#fn-engine-set_world_mod) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.player_set_block`](#fn-engine-player_set_block) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.reload_mods`](#fn-engine-reload_mods) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.request_harvest`](#fn-engine-request_harvest) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.send_to_all`](#fn-engine-send_to_all) · [`engine.send_to_player`](#fn-engine-send_to_player) · [`engine.send_to_server`](#fn-engine-send_to_server) · [`engine.set_player_dimension`](#fn-engine-set_player_dimension) · [`engine.get_player_dimension`](#fn-engine-get_player_dimension) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_third_person_item`](#fn-engine-set_third_person_item) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
 
 **remote** (8)  
 [`remote.check_url`](#fn-remote-check_url) · [`remote.fetch`](#fn-remote-fetch) · [`remote.get_cached`](#fn-remote-get_cached) · [`remote.is_available`](#fn-remote-is_available) · [`remote.null`](#fn-remote-null) · [`remote.refresh`](#fn-remote-refresh) · [`remote.unwatch`](#fn-remote-unwatch) · [`remote.watch`](#fn-remote-watch)
@@ -1604,6 +1950,18 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 **ui** (37)  
 [`ui.draw_block_icon`](#fn-ui-draw_block_icon) · [`ui.draw_button`](#fn-ui-draw_button) · [`ui.draw_circle`](#fn-ui-draw_circle) · [`ui.draw_gradient`](#fn-ui-draw_gradient) · [`ui.draw_image`](#fn-ui-draw_image) · [`ui.draw_line`](#fn-ui-draw_line) · [`ui.draw_pie`](#fn-ui-draw_pie) · [`ui.draw_polygon`](#fn-ui-draw_polygon) · [`ui.draw_rect`](#fn-ui-draw_rect) · [`ui.draw_rect_outline`](#fn-ui-draw_rect_outline) · [`ui.draw_ring`](#fn-ui-draw_ring) · [`ui.draw_rounded_rect`](#fn-ui-draw_rounded_rect) · [`ui.draw_server_icon`](#fn-ui-draw_server_icon) · [`ui.draw_text`](#fn-ui-draw_text) · [`ui.draw_triangle`](#fn-ui-draw_triangle) · [`ui.get_all_blocks`](#fn-ui-get_all_blocks) · [`ui.get_block_info`](#fn-ui-get_block_info) · [`ui.get_button_text_color`](#fn-ui-get_button_text_color) · [`ui.get_clipboard`](#fn-ui-get_clipboard) · [`ui.get_image_size`](#fn-ui-get_image_size) · [`ui.get_key_events`](#fn-ui-get_key_events) · [`ui.get_mouse`](#fn-ui-get_mouse) · [`ui.get_mouse_events`](#fn-ui-get_mouse_events) · [`ui.get_mouse_pos`](#fn-ui-get_mouse_pos) · [`ui.get_scroll`](#fn-ui-get_scroll) · [`ui.get_time`](#fn-ui-get_time) · [`ui.get_typed_text`](#fn-ui-get_typed_text) · [`ui.is_key_down`](#fn-ui-is_key_down) · [`ui.is_mouse_down`](#fn-ui-is_mouse_down) · [`ui.keys`](#fn-ui-keys) · [`ui.mods`](#fn-ui-mods) · [`ui.pop_clip`](#fn-ui-pop_clip) · [`ui.push_clip`](#fn-ui-push_clip) · [`ui.set_clipboard`](#fn-ui-set_clipboard) · [`ui.set_cursor`](#fn-ui-set_cursor) · [`ui.text_height`](#fn-ui-text_height) · [`ui.text_width`](#fn-ui-text_width)
 
+**dimensions** (8)  
+[`dimensions.register`](#fn-dimensions-register) · [`dimensions.get`](#fn-dimensions-get) · [`dimensions.list`](#fn-dimensions-get) · [`dimensions.exists`](#fn-dimensions-get) · [`dimensions.current`](#fn-dimensions-current) · [`dimensions.run_in`](#fn-dimensions-run_in) · [`dimensions.load_area`](#fn-dimensions-load_area) · [`portals.register`](#fn-portals-register)
+
+**signs** (9, mods/base/signs.lua)  
+[`signs.register_action`](#fn-signs-register_action) · [`signs.set_action`](#fn-signs-register_action) · [`signs.get_action`](#fn-signs-register_action) · [`signs.register`](#fn-signs-register) · [`signs.register_style_item`](#fn-signs-register) · [`signs.open_editor`](#fn-signs-register) · [`signs.is_sign`](#fn-signs-register) · [`signs.get_text`](#fn-signs-register) · [`signs.set_text`](#fn-signs-register)
+
+**mirrors** (5, mods/base/mirrors.lua)  
+[`mirrors.register`](#fn-mirrors-register) · [`mirrors.register_frame`](#fn-mirrors-register_frame) · [`mirrors.place`](#fn-mirrors-place) · [`mirrors.get_facing`](#fn-mirrors-get_facing) · [`mirrors.is_mirror`](#fn-mirrors-is_mirror)
+
+**aurora** (6, mods/aurora)  
+[`aurora.set_options`](#fn-aurora-set_options) · [`aurora.start`](#fn-aurora-start) · [`aurora.stop`](#fn-aurora-stop) · [`aurora.is_active`](#fn-aurora-is_active) · [`aurora.is_visible`](#fn-aurora-is_visible) · [`aurora.on_change`](#fn-aurora-on_change)
+
 **hud** (21, mods/base/hud.lua)  
 [`hud.actionbar`](#fn-hud-actionbar) · [`hud.bossbar`](#fn-hud-bossbar) · [`hud.clear`](#fn-hud-show) · [`hud.decode`](#fn-hud-encode) · [`hud.encode`](#fn-hud-encode) · [`hud.get`](#fn-hud-get) · [`hud.hide`](#fn-hud-hide) · [`hud.hide_here`](#fn-hud-show_here) · [`hud.image`](#fn-hud-image) · [`hud.is_visible`](#fn-hud-set_visible) · [`hud.list`](#fn-hud-get) · [`hud.register_type`](#fn-hud-register_type) · [`hud.set_visible`](#fn-hud-set_visible) · [`hud.show`](#fn-hud-show) · [`hud.show_here`](#fn-hud-show_here) · [`hud.shown`](#fn-hud-shown) · [`hud.sidebar`](#fn-hud-sidebar) · [`hud.style`](#fn-hud-style) · [`hud.text`](#fn-hud-text) · [`hud.timer`](#fn-hud-timer) · [`hud.title`](#fn-hud-title) · [`hud.update`](#fn-hud-update)
 
@@ -1616,8 +1974,13 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 **entities** (13, and the `self` functions)  
 [`entities.register`](#fn-entities-register) · [`entities.spawn`](#fn-entities-spawn) · [`entities.get`](#fn-entities-get) · [`entities.get_all`](#fn-entities-get) · [`entities.in_radius`](#fn-entities-in_radius) · [`entities.nearest_player`](#fn-entities-nearest_player) · [`entities.get_players`](#fn-entities-get_players) · [`entities.damage_player`](#fn-entities-damage_player) · [`entities.drop_item`](#fn-entities-drop_item) · [`entities.get_attack_damage`](#fn-entities-get_attack_damage) · [`entities.register_spawn`](#fn-entities-register_spawn) · [`entities.line_of_sight`](#fn-entities-line_of_sight) · [`entities.find_path`](#fn-entities-find_path) · [`self:go_to`](#fn-entity-go_to) · [`self:wander`](#fn-entity-wander) · [`self:path_state`](#fn-entity-path_state) · [`self:can_see`](#fn-entity-can_see) · [`self:find_land`](#fn-entity-find_land) · [`self:is_blocked`](#fn-entity-is_blocked) · [`self:walk`](#fn-entity-walk) · [`self:walk_to`](#fn-entity-walk_to) · [`self:set_animation`](#fn-entity-set_animation) · [`self:damage`](#fn-entity-damage) · [`self:get_pos`](#fn-entity-get_pos)
 
-**sky** (35)  
-[`sky.add_light`](#fn-sky-add_light) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.lightning_bolt`](#fn-sky-lightning_bolt) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
+**sky** (38)  
+[`world.read_region`](#fn-world-read_region) · [`world.write_region`](#fn-world-write_region) · [`world.fill`](#fn-world-fill) · [`world.replace`](#fn-world-replace) · [`world.count`](#fn-world-count) · [`world.move_region`](#fn-world-move_region) · [`world.is_moving`](#fn-world-is_moving) · [`world.new_region`](#fn-world-new_region) · [`world.region_from_text`](#fn-world-region_from_text) · [`world.save_schematic`](#fn-world-save_schematic) · [`world.load_schematic`](#fn-world-load_schematic) · [`world.list_schematics`](#fn-world-list_schematics) · [`world.delete_schematic`](#fn-world-delete_schematic) · [`engine.set_outline`](#fn-engine-set_outline) · [`engine.clear_outline`](#fn-engine-clear_outline)
+
+[`sky.add_light`](#fn-sky-add_light) · [`sky.set_bloom`](#fn-sky-set_bloom) · [`sky.get_bloom`](#fn-sky-get_bloom) · [`sky.set_sun_shafts`](#fn-sky-set_sun_shafts) · [`sky.add_time`](#fn-sky-add_time) · [`sky.flash`](#fn-sky-flash) · [`sky.lightning_bolt`](#fn-sky-lightning_bolt) · [`sky.get_clock`](#fn-sky-get_clock) · [`sky.get_day`](#fn-sky-get_day) · [`sky.get_day_length`](#fn-sky-get_day_length) · [`sky.get_light`](#fn-sky-get_light) · [`sky.get_moon_phase`](#fn-sky-get_moon_phase) · [`sky.get_precipitation`](#fn-sky-get_precipitation) · [`sky.get_rain_intensity`](#fn-sky-get_rain_intensity) · [`sky.get_stars`](#fn-sky-get_stars) · [`sky.set_aurora`](#fn-sky-set_aurora) · [`sky.get_aurora`](#fn-sky-get_aurora) · [`sky.get_time`](#fn-sky-get_time) · [`sky.get_time_speed`](#fn-sky-get_time_speed) · [`sky.move_light`](#fn-sky-move_light) · [`sky.remove_light`](#fn-sky-remove_light) · [`sky.reset`](#fn-sky-reset) · [`sky.set_ambient_color`](#fn-sky-set_ambient_color) · [`sky.set_ambient_intensity`](#fn-sky-set_ambient_intensity) · [`sky.set_block_light_strength`](#fn-sky-set_block_light_strength) · [`sky.set_brightness`](#fn-sky-set_brightness) · [`sky.set_day_length`](#fn-sky-set_day_length) · [`sky.set_fog_color`](#fn-sky-set_fog_color) · [`sky.set_held_light`](#fn-sky-set_held_light) · [`sky.set_light`](#fn-sky-set_light) · [`sky.set_min_light`](#fn-sky-set_min_light) · [`sky.set_moon_phase`](#fn-sky-set_moon_phase) · [`sky.set_moon_textures`](#fn-sky-set_moon_textures) · [`sky.set_precipitation`](#fn-sky-set_precipitation) · [`sky.set_rain_intensity`](#fn-sky-set_rain_intensity) · [`sky.set_sky_tint`](#fn-sky-set_sky_tint) · [`sky.set_stars`](#fn-sky-set_stars) · [`sky.set_sun_color`](#fn-sky-set_sun_color) · [`sky.set_sun_intensity`](#fn-sky-set_sun_intensity) · [`sky.set_time`](#fn-sky-set_time) · [`sky.set_time_speed`](#fn-sky-set_time_speed)
+
+**lights** (11, spotlights)  
+[`lights.add_spot`](#fn-lights-add_spot) · [`lights.set`](#fn-lights-set) · [`lights.get`](#fn-lights-get) · [`lights.aim`](#fn-lights-aim) · [`lights.remove`](#fn-lights-remove) · [`lights.list`](#fn-lights-list) · [`lights.clear`](#fn-lights-clear) · [`lights.set_haze`](#fn-lights-set_haze) · [`lights.get_haze`](#fn-lights-get_haze) · [`lights.get_quality`](#fn-lights-get_quality)
 
 **clouds** (9)  
 [`clouds.set_cell_size`](#fn-clouds-set_cell_size) · [`clouds.set_clump`](#fn-clouds-set_clump) · [`clouds.set_color`](#fn-clouds-set_color) · [`clouds.set_height`](#fn-clouds-set_height) · [`clouds.set_night_color`](#fn-clouds-set_night_color) · [`clouds.set_scroll_speed`](#fn-clouds-set_scroll_speed) · [`clouds.set_texture`](#fn-clouds-set_texture) · [`clouds.set_thickness`](#fn-clouds-set_thickness) · [`clouds.set_threshold`](#fn-clouds-set_threshold) · [`clouds.set_weather`](#fn-clouds-set_weather)
@@ -1643,8 +2006,8 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 **model, bone and animation objects** (12)  
 [`model:get_bone`](#fn-model-get_bone) · [`model:reset_pose`](#fn-model-reset_pose) · [`model:is_loaded`](#fn-model-is_loaded) · [`bone:get_rotation`](#fn-bone-get_rotation) · [`bone:set_position`](#fn-bone-set_position) · [`bone:set_rotation`](#fn-bone-set_rotation) · [`anims:get`](#fn-animationset-get) · [`anims:names`](#fn-animationset-names) · [`anim:apply`](#fn-animation-apply) · [`anim:get_length`](#fn-animation-get_length) · [`anim:get_name`](#fn-animation-get_name) · [`anim:is_looping`](#fn-animation-is_looping) · [`anim:set_loop`](#fn-animation-set_loop)
 
-**Hooks (functions you define)** (39)  
-[`can_edit_block`](#fn-hooks-can_edit_block) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`can_pick_up_item`](#fn-hooks-can_pick_up_item) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_player_drop`](#fn-hooks-on_player_drop) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_mod_message`](#fn-hooks-on_mod_message) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_death`](#fn-hooks-on_player_death) · [`on_player_harvest`](#fn-hooks-on_player_harvest) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_message`](#fn-hooks-on_server_message) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
+**Hooks (functions you define)** (42)  
+[`can_edit_block`](#fn-hooks-can_edit_block) · [`can_edit_text`](#fn-hooks-can_edit_text) · [`generate_chunk`](#fn-hooks-generate_chunk) · [`get_dig_time`](#fn-hooks-get_dig_time) · [`get_foliage_color`](#fn-hooks-get_foliage_color) · [`get_grass_color`](#fn-hooks-get_grass_color) · [`get_water_color`](#fn-hooks-get_water_color) · [`handle_inventory_click`](#fn-hooks-handle_inventory_click) · [`handle_inventory_key`](#fn-hooks-handle_inventory_key) · [`handle_inventory_scroll`](#fn-hooks-handle_inventory_scroll) · [`handle_pause_click`](#fn-hooks-handle_pause_click) · [`handle_settings_mouse`](#fn-hooks-handle_settings_mouse) · [`on_block_broken`](#fn-hooks-on_block_broken) · [`on_block_placed`](#fn-hooks-on_block_placed) · [`on_char_input`](#fn-hooks-on_char_input) · [`can_pick_up_item`](#fn-hooks-can_pick_up_item) · [`on_chat_command`](#fn-hooks-on_chat_command) · [`on_player_drop`](#fn-hooks-on_player_drop) · [`on_chat_complete`](#fn-hooks-on_chat_complete) · [`on_dig_block`](#fn-hooks-on_dig_block) · [`on_dimension_change`](#fn-hooks-on_dimension_change) · [`on_player_change_dimension`](#fn-hooks-on_player_change_dimension) · [`on_game_mode`](#fn-hooks-on_game_mode) · [`on_hotbar_full`](#fn-hooks-on_hotbar_full) · [`on_mod_message`](#fn-hooks-on_mod_message) · [`on_pick_block`](#fn-hooks-on_pick_block) · [`on_player_chat`](#fn-hooks-on_player_chat) · [`on_player_click`](#fn-hooks-on_player_click) · [`on_player_death`](#fn-hooks-on_player_death) · [`on_player_harvest`](#fn-hooks-on_player_harvest) · [`on_player_join`](#fn-hooks-on_player_join) · [`on_player_leave`](#fn-hooks-on_player_leave) · [`on_right_click_block`](#fn-hooks-on_right_click_block) · [`on_scroll_input`](#fn-hooks-on_scroll_input) · [`on_server_message`](#fn-hooks-on_server_message) · [`on_server_start`](#fn-hooks-on_server_start) · [`on_server_stop`](#fn-hooks-on_server_stop) · [`on_shared_changed`](#fn-hooks-on_shared_changed) · [`on_update`](#fn-hooks-on_update) · [`on_use_hoe`](#fn-hooks-on_use_hoe) · [`on_use_scythe`](#fn-hooks-on_use_scythe) · [`render_creative_inventory`](#fn-hooks-render_creative_inventory) · [`render_hud`](#fn-hooks-render_hud) · [`render_inventory`](#fn-hooks-render_inventory) · [`render_mods`](#fn-hooks-render_mods) · [`render_multiplayer`](#fn-hooks-render_multiplayer) · [`render_pause_menu`](#fn-hooks-render_pause_menu) · [`render_player_list`](#fn-hooks-render_player_list) · [`render_settings`](#fn-hooks-render_settings) · [`render_texture_packs`](#fn-hooks-render_texture_packs) · [`render_world_select`](#fn-hooks-render_world_select) · [`set_world_seed`](#fn-hooks-set_world_seed) · [`toggle_main_inventory`](#fn-hooks-toggle_main_inventory) · [`update_player_animation`](#fn-hooks-update_player_animation)
 
 **weather (mods/weather)** (11)  
 [`weather.get`](#fn-weather-get) · [`weather.get_def`](#fn-weather-get_def) · [`weather.is_cold`](#fn-weather-is_cold) · [`weather.is_cycling`](#fn-weather-is_cycling) · [`weather.list`](#fn-weather-list) · [`weather.on_change`](#fn-weather-on_change) · [`weather.on_lightning`](#fn-weather-on_lightning) · [`weather.register`](#fn-weather-register) · [`weather.set`](#fn-weather-set) · [`weather.set_cycle`](#fn-weather-set_cycle) · [`weather.time_left`](#fn-weather-time_left)
@@ -1688,11 +2051,15 @@ lualib/                         shared Lua modules for require() (json.lua, insp
 mods/                           global mods: loaded with any game, can be switched off
   buckets/
     mod.conf                    title, author, description, version, depends, optional_depends, required = true|false,
+                                image = preview image path relative to the mod (optional),
                                 remote_sources = https://... (online content, section 21)
+    preview.png                 optional image shown in the Mods screen
     init.lua                    if present, the ONLY file the engine runs (it loads the rest)
     textures/  models/
 texturepacks/
-  MyPack/pack.conf              any image with the same file name replaces a game texture
+  MyPack/pack.conf              title, author, description, image (optional path relative to the pack)
+  MyPack/preview.png            optional image shown in the texture pack picker
+                                any other image with a game's texture file name replaces it
 saves/<world>/                  worlds
 servers/<profile>/              dedicated server setups (engine.create_server_profile)
 ```
@@ -1794,12 +2161,17 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 | `selectable` | true | the crosshair can target and break it |
 | `transparent` | false | see-through; drawn blended (glass, water) |
 | `cutout` | false | see-through pixels cut out, no blending (leaves) |
-| `pattern` | `"cube"` | `"plantlike"` = two crossed pictures (flowers, grass) |
-| `gravity` | false | falls like sand: with nothing solid below, it drops smoothly (speeding up, as in Minecraft) and lands on the first solid block. It falls through air, fluids and things you walk through (grass, flowers, torches are crushed). See [`world.get_falling_blocks`](#fn-world-get_falling_blocks). |
+| `pattern` | `"cube"` | `"plantlike"` = two crossed pictures (flowers, grass); `"slab"`, `"stairs"` ([slabs and stairs](#slabs-and-stairs)); `"door"`, `"sign"`, `"wall_sign"` |
+| `rotation` | none | `"axis"`: a log, lying along the face it's put against ([logs](#turned-blocks)) |
+| `mirror` | false | a mirror: a thin panel on the wall whose front reflects the room, players included. The picture is its frame. `true`, or a table `{ tint, clarity, glass }` ([mirrors](#mirrors)) |
+| `waterloggable` | true | slabs and stairs can hold water; `false` stops it |
+| `stairs_connect` | true | stairs join into corners with the stairs around them; `false`: always straight unless a shape is set ([corners](#stair-corners)) |
+| `gravity` | false | falls like sand: with nothing solid below, it drops smoothly (speeding up as it falls) and lands on the first solid block. It falls through air, fluids and things you walk through (grass, flowers, torches are crushed). See [`world.get_falling_blocks`](#fn-world-get_falling_blocks). |
 | `tint` | false | tint all faces with r, g, b |
 | `in_creative` | true | listed in the creative inventory |
 | `description` | made from the name | the name players see, like Luanti's: `"Oak Log"`. It's shown above the hotbar for a moment when it's picked, in the inventory, and in `/give`'s answer. Without one, `log_oak` shows as "Log Oak". |
 | `inventory_image` | none | shows a flat picture in the inventory and hotbar. The block becomes an **item**: right-click never places it |
+| `animation` | none | the block's pictures are [animated](#animated-pictures): `{ frame_time = 0.15 }` (seconds each frame shows), or just `0.15` |
 | `pick` | the block itself | what [pick block](#pick-block) gives for this block, e.g. `"wheat_seeds"` for a crop, or `"ruby_lamp"` for a lit lamp |
 
 **Rules:**
@@ -1807,7 +2179,62 @@ engine.register_block(name, r, g, b, texture [, overlay [, properties]])
 - Registering the same name twice keeps its first id and updates its settings. The console says so.
 - Worlds save blocks by **name**, so the order you register them in doesn't matter.
 
-**Metadata:** each block has one extra byte, 0–255. Water uses it for its flow level. Plants use bit 1 to mean "waterlogged". Your blocks can use it for anything.
+**Metadata:** each block has one extra byte, 0–255. Water uses it for its flow level. Plants use bit 1 to mean "waterlogged". Slabs, stairs and logs keep their state in it (use [`engine.get_block_state`](#fn-engine-get_block_state) rather than the numbers). Your other blocks can use it for anything.
+
+<a id="animated-pictures"></a>### Animated pictures
+
+```lua
+engine.register_block("mymod:lava_lamp", 1, 1, 1, "mymod_lava_lamp.png", nil, {
+    description = "Lava Lamp",
+    animation = { frame_time = 0.2 },   -- each frame shows for 0.2 seconds
+})
+```
+
+An animated picture is a **vertical strip of square frames**, the top one first: four 16x16 frames make a 16x64 picture. With `animation` set, every picture the block has plays through its frames, over and over: its faces (one picture, or `top`, `bottom` and `sides`), its overlay and its `inventory_image`.
+
+- It plays **everywhere the block is drawn**: placed in the world, in the hotbar and inventory icons, in the player's hand, as a dropped item, and while falling or being moved.
+- All blocks with the same `frame_time` stay in step, and every player sees the same frame at the same time (the clock is the game's, not the block's).
+- From 2 to 64 frames. A picture that isn't a strip (as tall as it is wide) just doesn't animate.
+- Without `animation`, a strip shows its top frame only. So the same picture can be used still by one block and animated by another.
+- Texture packs can replace a strip with their own: give it the same number of frames.
+- Each frame takes a place in the texture list (1024 places, or fewer on old graphics cards, which the console reports when they run out). Long strips on many blocks use them up quickly.
+
+`frame_time` is from 0.02 to 60 seconds. To show frames for different lengths of time, repeat a frame in the strip.
+
+<a id="slabs-and-stairs"></a>### Slabs, stairs and logs
+
+```lua
+engine.register_block("mymod:oak_slab", 1, 1, 1, "oak_planks.png", nil, { pattern = "slab", description = "Oak Slab" })
+engine.register_block("mymod:oak_stairs", 1, 1, 1, "oak_planks.png", nil, { pattern = "stairs", description = "Oak Stairs" })
+engine.register_block("mymod:oak_log", 1, 1, 1, { top = "log_top.png", bottom = "log_top.png", sides = "log.png" }, nil, { rotation = "axis" })
+```
+
+That's all a game needs. The engine draws them, players and mobs collide with their real shape (and step up onto them without jumping), the crosshair outline fits them, and placing works like this:
+
+- **Slabs** go on the bottom or top half of a block: the bottom half when put on a block's top or on the lower half of its side, the top half when put under a block or on the upper half of its side. A second slab of the same kind put on a slab's open side, or into its cell, makes a **double slab** (a full block, which drops two).
+- **Stairs** face the way the player looks, so you walk up them going forward. Put under a block or on the upper half of a side, they're **upside down**. Stairs that meet another flight at a right angle join into an **inner or outer corner** by themselves ([corners](#stair-corners)).
+- <a id="turned-blocks"></a>**Logs** (`rotation = "axis"`) stand upright, or lie along X or Z: along the face they were put against. Their `top` and `bottom` pictures are the ends, and turn with them.
+- In the inventory, hotbar and hand slabs and stairs show in their shape (a bottom slab, a flight of stairs).
+
+<a id="stair-corners"></a>**Stair corners.** A stair's shape is one of `"straight"`, `"inner_left"`, `"inner_right"`, `"outer_left"` and `"outer_right"`. Left and right are as you walk up it (looking the way it faces): an outer left corner keeps only the left quarter of the step, and an inner left corner adds the front-left quarter. By default it's worked out from the stairs around it each time they change:
+- **outer**: the stair behind it (on its step side) faces left or right of it, and doesn't just continue a flight beside it;
+- **inner**: the stair in front of it faces left or right of it, likewise.
+
+Build with that and corners take care of themselves. To choose one yourself (a structure, a roof edge, a corner the automatic rule doesn't make), set it: `engine.set_block_state(x, y, z, { shape = "outer_left" })`. A set shape stays whatever is built around it; `shape = "auto"` goes back to joining. `engine.get_block_state` says the shape it has now and `shape_auto` (whether it's worked out). Stairs registered with `stairs_connect = false` never join by themselves (only a set shape turns them).
+
+<a id="waterlogging"></a>**Waterlogging.** Slabs and stairs can hold water. A slab or stairs placed into a water source holds it; a water bucket used on one fills it, and an empty bucket takes the water back (the `buckets` mods do this). The water in it is a **source**: it flows out sideways like any source, but not down through a solid bottom (a bottom slab, upright stairs), and breaking the block leaves the water behind. Lava touching it reacts as with water but never replaces the block. A double slab is a full block and holds none. `waterloggable = false` turns this off for a block.
+
+<a id="fn-engine-get_block_state"></a><a id="fn-engine-set_block_state"></a><a id="fn-engine-place_block"></a><a id="fn-engine-rotate_block"></a><a id="fn-engine-is_waterlogged"></a><a id="fn-engine-can_waterlog"></a><a id="fn-engine-set_waterlogged"></a>
+| function | |
+|---|---|
+| `engine.get_block_state(x, y, z)` | `{ block, facing, upside_down, shape, shape_auto, axis, half, waterlogged, can_waterlog }` (only the fields that block has), or nil for air. Stairs: `facing` `"north"`, `"east"`, `"south"` or `"west"`, `upside_down`, `shape` ([corners](#stair-corners)). Logs: `axis` `"x"`, `"y"` or `"z"`. Slabs: `half` `"bottom"`, `"top"` or `"double"`. Mirrors: `facing`, `mirror = true`. |
+| `engine.set_block_state(x, y, z, state)` | changes only the fields given: `engine.set_block_state(x, y, z, { facing = "east", shape = "inner_right", waterlogged = true })`. A field the block can't have is an error. |
+| `engine.place_block(x, y, z, block [, state])` | a block with its state in one change: `engine.place_block(x, y, z, "mymod:oak_stairs", { facing = "north", upside_down = true })` |
+| `engine.rotate_block(x, y, z [, turns])` | stairs and mirrors: a quarter turn clockwise seen from above (negative turns go the other way; a set shape turns with them); a log lying down swaps X and Z. False for a block that doesn't turn. |
+| `engine.is_waterlogged(x, y, z)`, `engine.can_waterlog(x, y, z)` | |
+| `engine.set_waterlogged(x, y, z, bool)` | true if it changed |
+
+They work where the world runs and in a player's game (a joined player's changes go to the server like any edit). A player placing a block sets its state for you; use these for world generation, structures and tools (a wrench that turns blocks: `engine.rotate_block`).
 
 ### Doors
 
@@ -1835,6 +2262,107 @@ doors.register("door_birch", {
 
 The mod sets these with `engine.set_block_meta`, so any mod can make door-like blocks such as trapdoors, gates or shutters the same way.
 
+### Signs and block text
+
+<a id="fn-signs-register"></a>The base mod's **`signs`** library gives any game signs: placed on the top of a block they stand on a post, turned toward the player in 16 steps; placed on a side they hang on the wall. Each has text on its **front and back**, written in a small screen that opens when it's placed, or when a sign is right-clicked (the side you're looking at). Sneak to place a block against a sign instead.
+
+```lua
+signs.register("mymod:oak_sign", {
+    texture = "oak_planks.png",           -- the board and post
+    inventory_image = "oak_sign.png",     -- the item (default: the texture)
+    description = "Oak Sign",
+    -- optional: lines = 4, max_chars = 20, edit_on_place = true, hardness, tool
+})
+
+-- Items that style a sign when used on it (one is used up outside creative)
+signs.register_style_item("mymod:blue_dye", { color = "#1d4fb8" })
+signs.register_style_item("mymod:glow_ink", { glowing = true })   -- full brightness, with an outline
+signs.register_style_item("mymod:wax", { waxed = true })          -- nobody can edit it any more
+```
+
+<a id="clickable-signs"></a>**Clickable signs** (servers: rules, teleports, warps, a shop's "buy" sign). An operator types a `/sign` command, then right-clicks a sign to give it that action; anyone who right-clicks it afterwards runs it. The sign keeps whatever is written on it, so write what it does ("Spawn", "Rules"). Clicks are checked where the world runs (near the sign, really a sign, not too fast), and the action runs there, never in a player's game.
+
+| command | the sign then |
+|---|---|
+| `/sign message <text>` | tells them the text in chat (`|` starts a new line) |
+| `/sign show <title> \| <line> \| <line>...` | opens a window with the text: rules, help, a map key |
+| `/sign teleport <x> <y> <z> [dimension]` | teleports them (to another dimension too) |
+| `/sign warp <name>` | sends them to a warp made with `/sign setwarp <name>` (where you stand); `/sign delwarp <name>`, `/sign warps` |
+| `/sign <action> <args>` | any action a mod registered |
+| `/sign clear`, `/sign info`, `/sign edit`, `/sign cancel` | then click a sign: remove its action, say what it is, write on it (an action sign doesn't open the editor otherwise) |
+
+<a id="fn-signs-register_action"></a>Mods add actions, where the world runs. `run` gets the player's name, the text after the action's name, and where the sign is; a string it returns is told to the player:
+
+```lua
+signs.register_action("heal", { description = "Heal fully", usage = "",
+    run = function(player, args, pos)
+        survival.set_health(player, 20)        -- (your game's own function)
+        return "You feel better"
+    end })
+-- set or read a sign's action from code (a structure with ready-made signs)
+signs.set_action(x, y, z, "warp", "market")    -- (nil removes it); signs.get_action(x, y, z) -> action, args
+```
+
+Actions are kept with the world and removed when the sign is broken. Only operators can give signs actions (in singleplayer, you are one).
+
+`signs.register` makes two blocks: `mymod:oak_sign` (standing, the item) and `mymod:oak_sign_wall` (on a wall; it drops the item). A sign whose block underneath, or wall behind, is broken drops as its item. Other functions: `signs.open_editor(x, y, z [, side])` (opens the screen for this game's player), `signs.is_sign(block)`, `signs.get_text` / `signs.set_text`.
+
+<a id="fn-engine-get_block_text"></a>**Block text in the engine.** Any block can hold text; signs are one use (labels, gravestones, a lectern's page). It's saved with the chunk, sent to players with it, and removed when the block there changes. A block that players may write on is registered with `text = true` (sign patterns have it).
+
+| function / hook | |
+|---|---|
+| `engine.get_block_text(x, y, z)` | `{ front = { lines = {...}, color = "#rrggbb", glowing = bool }, back = {...}, waxed = bool }`, or nil |
+| <a id="fn-engine-set_block_text"></a>`engine.set_block_text(x, y, z, text)` | where the world runs: sets it (any block, any text: a mod's own labels); `nil` removes it. Fields left out keep what's there. |
+| <a id="fn-engine-edit_block_text"></a>`engine.edit_block_text(x, y, z, side, lines)` | this game's player writes `lines` on `"front"` or `"back"`. On a server it's sent there and checked: within reach, a block with `text = true`, not waxed, then `can_edit_text`. |
+| <a id="fn-hooks-can_edit_text"></a>`can_edit_text(name, x, y, z, side, lines)` | where the world runs, before a player's text is written: `false[, reason]` refuses (the reason is shown to them), a table of lines writes those instead (a word filter), nothing allows it |
+
+Up to 8 lines a side, 96 bytes a line. Text is drawn by the engine on blocks with `pattern = "sign"` (standing; metadata 0..15 = its turn in steps of 22.5°, 0 facing south) or `"wall_sign"` (metadata 0..3 = the way the front faces: north, east, south, west), centred and squeezed to fit, lit like the block (glowing text at full brightness).
+
+<a id="mirrors"></a><a id="fn-mirrors-register"></a>### Mirrors
+
+Any game can have mirrors that show the room reflected, the player included. The quickest way is the base mod's **`mirrors`** library: one call makes the item, its frame, and placing.
+
+```lua
+mirrors.register("mymod:mirror", { frame = "wood", description = "Mirror" })
+```
+
+| option | default | meaning |
+|---|---|---|
+| `frame` | `"thin"` | a ready-made frame: `"thin"` (silver), `"wood"`, `"gold"`, `"none"` (frameless); a frame your mod added with `mirrors.register_frame`; or a picture of your own, `"myframe.png"` (below) |
+| `description` | `"Mirror"` | the name players see |
+| `inventory_image` | the frame's | its picture in the hotbar and inventory |
+| `tint` | none | colours the reflection: `"#f2cf98"` a warm bronze mirror, `"#8a9098"` smoked glass |
+| `clarity` | 1 | how clearly it reflects: 1 clear, 0.5 misted, 0 fogged over completely (shows only the glass colour) |
+| `glass` | `"#9eabb8"` | the glass's own colour: what shows where nothing is reflected, and what a misted mirror fades to |
+| `stand` | true | `false`: only on walls (not on floors and ceilings) |
+| `hardness`, `tool`, `sounds`, `light`, `walkable`, `in_creative` | | as for any block |
+
+**Placing.** On the side of a block, a mirror hangs on that wall, facing out. On a floor or ceiling, it stands facing the player (unless `stand = false`).
+
+<a id="fn-mirrors-place"></a><a id="fn-mirrors-get_facing"></a><a id="fn-mirrors-is_mirror"></a><a id="fn-mirrors-register_frame"></a><a id="fn-mirrors-get"></a>
+| function | |
+|---|---|
+| `mirrors.register(name, def)` | a mirror item and block (above); returns `def` |
+| `mirrors.register_frame(id, { picture = "...png", item = "...png" })` | a frame other mods can use by name: `frame = id`. `item` is the hotbar picture for mirrors with it. |
+| `mirrors.place(x, y, z, name [, facing])` | puts one in the world, the glass looking `"north"`, `"east"`, `"south"` (default) or `"west"`. Where the world runs: world generation, structures, commands. |
+| `mirrors.get_facing(x, y, z)` | the way the mirror there looks, or nil if there's none |
+| `mirrors.is_mirror(x, y, z)` | true if there's a mirror there (any kind, also ones made with `register_block`) |
+| `mirrors.get(name)` | the definition given to `mirrors.register`, or nil |
+| `mirrors.registered`, `mirrors.frames` | every mirror registered (name -> definition), every frame (id -> `{ picture, item }`) |
+
+Mirrors also work with the [block state functions](#slabs-and-stairs): `engine.get_block_state` gives `facing` and `mirror = true`; `engine.set_block_state(x, y, z, { facing = "east" })`, `engine.place_block(x, y, z, name, { facing = "west" })` and `engine.rotate_block` (a quarter turn clockwise seen from above) turn one.
+
+**How a mirror looks:**
+- **Shape.** A thin panel (1/16 of a block) against the back of its cell, like a picture on a wall. You can walk up to it; `walkable = true` makes the cell solid instead.
+- **The picture is the frame.** Where the picture is see-through (alpha under half), there's glass; where it's drawn, there's frame. A 16×16 picture with a 2-pixel border and an empty middle gives a framed mirror; an empty picture, a frameless one. Anything drawn in the middle (a crack, a sticker) sits on the glass.
+- **Mirrors side by side are one mirror.** Mirrors next to each other on the same wall, facing the same way, make one big mirror, and their frames join up: on a side where another mirror carries on, the middle of the picture is stretched to the edge, so the frame goes round the whole group instead of around every block.
+- **What it reflects.** The world (blocks, water and glass), the sky, the player looking into it (in first person too: it's their reflection), other players, mobs and models. Not reflected: particles, clouds, and the hand and held item of first person.
+- **Which mirror is live.** The mirror you're looking at reflects: the one in the middle of the screen, otherwise the one covering most of it, within 40 blocks. Other mirrors in view at the same time (on another wall) show plain glass in their `glass` colour, as does the live one's reflection of them. Mirrors out of view or further away cost nothing.
+- **Cost.** While a live mirror is in view, the scene is drawn a second time, but only the part of the screen the mirror covers. It works on any graphics card and with every Lighting setting.
+- **The player's choice.** Settings > Video > **Mirror Reflections** (On by default; listed with **Advanced** on) turns reflections off on slow computers: mirrors then show plain glass. Like Lighting and Bloom, only the player can change it (`engine.set_video_setting("mirrors", ...)` is refused for mods).
+
+**Without the library.** The engine's part is the block option `mirror`: `engine.register_block(name, 1, 1, 1, "frame.png", nil, { mirror = true })`, or `mirror = { tint = "#f2cf98", clarity = 0.8, glass = "#9eabb8" }`. A block like that is placed by hand the same way (on a wall facing out, on a floor facing the player), as long as it has no `inventory_image` (which makes a block an item that's never placed: the library gives its mirrors a picture and places them itself). Its metadata 0..3 is the way the front faces: 0 north (-Z), 1 east (+X), 2 south (+Z), 3 west (-X), the same as wall signs.
+
 ## 4. Changing the world
 
 | function | |
@@ -1856,7 +2384,7 @@ The mod sets these with `engine.set_block_meta`, so any mod can make door-like b
 
 There are three ways, and all of them run only where the world is decided: singleplayer, the game when hosting, and the dedicated server. Everyone else just sees the blocks change.
 
-<a id="fn-engine-register_random_tick"></a>**Random ticks (Minecraft's way): the smoothest.** Every game tick (20 a second), the engine picks 3 random blocks in every 16×16×16 section of the chunks near players. If a picked block is a kind with a random tick, its action runs. On average each block is picked about every 68 seconds. Because the work is spread evenly over every tick, grass creeps outwards a block at a time and crops grow steadily, rather than everything changing at once every few seconds. This is how Minecraft's grass, crops, saplings, leaves and ice work. The `randomTickSpeed` game rule (3 by default, 0 = off) sets how many blocks are picked: `/gamerule randomTickSpeed 10` makes everything grow about three times faster.
+<a id="fn-engine-register_random_tick"></a>**Random ticks: the smoothest.** Every game tick (20 a second), the engine picks 3 random blocks in every 16×16×16 section of the chunks near players. If a picked block is a kind with a random tick, its action runs. On average each block is picked about every 68 seconds. Because the work is spread evenly over every tick, grass creeps outwards a block at a time and crops grow steadily, rather than everything changing at once every few seconds. This is how grass, crops, saplings, leaves and ice are best done. The `randomTickSpeed` game rule (3 by default, 0 = off) sets how many blocks are picked: `/gamerule randomTickSpeed 10` makes everything grow about three times faster.
 
 ```lua
 engine.register_random_tick({
@@ -1865,7 +2393,7 @@ engine.register_random_tick({
     action = function(x, y, z, name, meta)
         if engine.is_opaque(x, y + 1, z) then engine.set_block(x, y, z, "dirt") return end   -- covered
         if engine.get_light_level(x, y + 1, z) < 9 then return end
-        for _ = 1, 4 do                                       -- Minecraft: 4 tries nearby
+        for _ = 1, 4 do                                       -- 4 tries nearby
             local tx, ty, tz = x + math.random(-1, 1), y + math.random(-3, 1), z + math.random(-1, 1)
             if engine.get_block_name(tx, ty, tz) == "dirt" and not engine.is_opaque(tx, ty + 1, tz) then
                 engine.set_block(tx, ty, tz, "grass")
@@ -1911,11 +2439,81 @@ engine.register_lbm({
 })
 ```
 
-Craft & Ruin's `grass` mod (`games/craft_and_ruin/mods/grass`) is Minecraft's grass, on a random tick:
+Craft & Ruin's `grass` mod (`games/craft_and_ruin/mods/grass`) spreads grass on a random tick:
 - a grass block with something solid (or water, or lava) on top turns back to dirt;
 - with light 9 or more above it, it tries 4 random spots nearby (one block each way, from 3 below to 1 above), and dirt there with an open top and light 4 or more becomes grass.
 
 On a dedicated server, which keeps no light, `engine.get_light_level` is open sky (sunlight for the time of day) or dark under cover.
+
+<a id="regions"></a>### Editing in boxes: regions, filling, moving builds
+
+<a id="fn-world-read_region"></a><a id="fn-world-write_region"></a><a id="fn-world-fill"></a><a id="fn-world-replace"></a><a id="fn-world-count"></a><a id="fn-world-move_region"></a><a id="fn-world-is_moving"></a><a id="fn-world-new_region"></a><a id="fn-world-region_from_text"></a>
+Whole boxes of blocks at once: copy a build, write it somewhere else, fill, replace, and **move a build while everyone watches it glide there**. Positions are tables, `{ x = 1, y = 2, z = 3 }` or `{ 1, 2, 3 }`. A box's two corners are included and can be in any order, and every chunk in it must be loaded. These run where the world runs (singleplayer, the host, the server); a joined player's game asks its server through a mod, as the [WorldEdit mod](#worldedit) does.
+
+| function | |
+|---|---|
+| `world.read_region(p1, p2)` | a **region**: the blocks, their states and sign text. `nil, why` if part isn't loaded or it's too big (4,096,000 blocks at most) |
+| `world.write_region(region, pos [, { air = true }])` | writes it with its lowest corner at `pos`; returns how many blocks changed. `air = false` leaves what's there where the region has air |
+| `world.fill(p1, p2, block [, meta])` | fills the box; `"air"` clears it. Returns how many changed |
+| `world.replace(p1, p2, from, to [, meta])` | one block for another in the box |
+| `world.count(p1, p2 [, block])` | every block but air, or just that one |
+| `world.move_region(p1, p2, offset [, { seconds = 1.5, on_done = function(id) end }])` | moves the box by `offset` (whole blocks). Returns an id, or `nil, why` |
+| `world.is_moving([id])` | any move (or that one) still under way |
+| `world.new_region(sx, sy, sz)` | an empty region (air) to fill with `region:set` |
+| `world.region_from_text(text)` | a region from `region:to_text()`: `region`, or `nil, why`; third, a list of blocks this game doesn't have (they become air) |
+
+**Moving a build, seen moving.** `world.move_region` lifts the blocks out and glides them as one piece, drawn exactly as they look in the world (doors, slabs, plants, glass and all), easing in and out. Then it sets them down at the new place, replacing what was there. Every player in that world sees the same thing. On a server the movement is sent once, and each player's game draws it. The blocks leaving and arriving are ordinary block changes, so nothing is lost if a player joins halfway. Up to 262,144 blocks (64 × 64 × 64) per move and 16 moves at once; moves can't overlap. `seconds = 0` moves it at once. When it's placed, its `on_done(id)` runs, and so does the hook `on_region_moved(id)`. A world that's closed or saved mid-move places it first. Players and mobs standing on a moving build aren't carried along.
+
+<a id="fn-region"></a>**Regions** (what `read_region` gives):
+
+| method | |
+|---|---|
+| `region:size()` | `sx, sy, sz` |
+| `region:get(x, y, z)` | `block, meta` (0-based, inside the region) |
+| `region:set(x, y, z, block [, meta])` | |
+| `region:count([block])` | |
+| `region:rotate(degrees)` | a new region, turned clockwise seen from above (90, 180, 270, -90...). Stairs, doors, signs, mirrors and logs turn with it |
+| `region:flip("x" \| "y" \| "z")` | a new region, mirrored. Stair corners and door hinges swap sides; `"y"` turns slabs and stairs over |
+| `region:copy()` | |
+| `region:to_text()` | JSON you can save (the schematic format below). **Data only**: loading it never runs anything |
+
+<a id="fn-world-save_schematic"></a><a id="fn-world-load_schematic"></a><a id="fn-world-list_schematics"></a><a id="fn-world-delete_schematic"></a>**Schematics: builds shared between worlds.** A region saved as a schematic is a file every world of the same game can load: a **JSON file**, `schematics/<game>/<name>.json`, next to the mods folder (on a dedicated server, next to where it runs). Copy a file to another player's same folder to give them the build; other tools can read and write it too:
+
+```json
+{
+  "format": "blocksmith-region", "version": 1,
+  "size": [5, 5, 5],
+  "palette": ["air", "terracotta_red", "planks_birch"],
+  "cells": [[1, 0, 5], [0, 0, 3], ...],
+  "texts": [{ "cell": 12, "waxed": false, "front": { "color": "#000000", "glowing": false, "lines": ["Hello"] }, "back": { ... } }]
+}
+```
+
+`palette` names the blocks (so ids never matter: a block another game calls the same loads the same). `cells` are runs of `[palette index, metadata, how many]` through the box in x, then y, then z order: cell (x, y, z) is number `(x * sy + y) * sz + z`. `region:to_text()` gives the same JSON, and `world.region_from_text` reads it. Names are letters, numbers, `_` and `-` (up to 40).
+
+| function | |
+|---|---|
+| `world.save_schematic(name, region)` | `true`, or `nil, why` (replaces one with that name) |
+| `world.load_schematic(name)` | `region`, or `nil, why`; third, the blocks this game lacks |
+| `world.list_schematics()` | `{ name, ... }`, sorted |
+| `world.delete_schematic(name)` | `true` if there was one |
+
+<a id="fn-engine-set_outline"></a><a id="fn-engine-clear_outline"></a><a id="fn-engine-clear_outlines"></a>**Outline boxes.** `engine.set_outline(key, p1, p2 [, color])` draws an outline round the blocks from `p1` to `p2` in this game, faintly visible through walls: a selection, a plot, a build site. `color` is `"#rrggbb"` or `{ r, g, b [, a] }` (0..1), default white. Setting a key again moves it; up to 64 at once. `engine.clear_outline(key)`, `engine.clear_outlines()`. They're only drawn in the game that sets them: a server mod sends its players what to draw ([mod messages](#fn-engine-send_to_player)).
+
+<a id="worldedit"></a>**The WorldEdit mod** (`mods/worldedit`, switch it on for your game) is all of this for players, in the style of Luanti's WorldEdit. **Creative mode only**, and on a server operators only. Select a box with the **WorldEdit Wand** (in the creative inventory: right-click a block for corner 1, sneak + right-click for corner 2), or `//pos1` and `//pos2` where you stand; the selection shows as a yellow outline.
+
+| command | |
+|---|---|
+| `//pos1`, `//pos2`, `//sel`, `//desel` | corners, what's selected, clear it |
+| `//set <block>`, `//replace <from> <to>`, `//count [block]` | |
+| `//copy`, `//cut`, `//paste` | paste goes where you stand, as it was to you when you copied |
+| `//move <n> <up\|down\|north\|south\|east\|west>` or `//move <dx> <dy> <dz>` | moves it, seen moving; the selection follows |
+| `//stack <times> <direction>` | copies in a row |
+| `//rotate <90\|180\|270>`, `//flip <x\|y\|z>` | turns or mirrors it where it stands |
+| `//undo`, `//redo` | 10 steps each, per player |
+| `//save <name>`, `//load <name>`, `//schematics`, `//delschem <name>` | schematics every world of this game shares |
+
+<a id="fn-worldedit-register_command"></a><a id="fn-worldedit-get_selection"></a><a id="fn-worldedit-set_selection"></a>Other mods: `worldedit.get_selection(name)` → `p1, p2`, `worldedit.set_selection(name, p1, p2)`, and `worldedit.register_command(name, { params, description, func = function(player, args, reply) end })` adds a `//name` command (run where the world runs, with the same checks).
 
 ## 5. World generation
 
@@ -1982,9 +2580,9 @@ on the world list, and a dedicated server stops with the error in its console. S
 
 ### Caves
 
-After `generate_chunk`, the engine carves Minecraft-style caves into stone, dirt and other solid ground:
+After `generate_chunk`, the engine carves caves into stone, dirt and other solid ground:
 
-- **Tunnels:** Minecraft's classic winding caves. They wander, change width, split into branches and open into round rooms. Some climb to the surface as cave entrances, and the dirt at the mouth turns to grass.
+- **Tunnels:** classic winding caves. They wander, change width, split into branches and open into round rooms. Some climb to the surface as cave entrances, and the dirt at the mouth turns to grass.
 - **Ravines:** rare, deep, narrow canyons with jagged walls.
 - **Caverns:** big open caves deep down, with stone pillars.
 - **Noodles:** thin twisty tunnels in some regions.
@@ -2011,7 +2609,7 @@ Put these in a mod that both the game and the server load (any game mod is), so 
 
 ### Biome colours (grass and leaves)
 
-Grass and leaves can change colour from place to place, like Minecraft. Define these in your mapgen; they return `r, g, b` (0–255):
+Grass and leaves can change colour from place to place. Define these in your mapgen; they return `r, g, b` (0–255):
 
 <a id="fn-hooks-get_foliage_color"></a><a id="fn-hooks-get_grass_color"></a>
 ```lua
@@ -2048,8 +2646,8 @@ end)
 <a id="fn-engine-give_item"></a>`engine.give_item(name [, count])` adds items to the hotbar and returns false if they didn't fit. `mods/buckets` is a complete example.
 
 Older hooks still work:
-- <a id="fn-hooks-on_right_click_block"></a>`on_right_click_block(x, y, z, block, held_item, sneaking, repeat)`: return true to stop placing. `sneaking` is true while the player holds Sneak; like Minecraft, a block you can use, such as a door, should then let the held block be placed against it. `repeat` is true when the call comes from holding the button rather than a new click (see below).
-- <a id="fn-engine-set_place_repeat"></a>**Holding right-click** keeps placing blocks and using items, every 0.2 s like Minecraft. `engine.set_place_repeat(seconds)` changes the interval (0 = one per click). Item uses get `pointed.repeat_click` and `pointed.sneaking` too (`repeat` is a Lua keyword, so `pointed.repeat` can't be written; `pointed["repeat"]` is the same value). While sneaking, players don't walk off edges, so they can stand at the edge of a block and keep building out from it.
+- <a id="fn-hooks-on_right_click_block"></a>`on_right_click_block(x, y, z, block, held_item, sneaking, repeat)`: return true to stop placing. `sneaking` is true while the player holds Sneak; a block you can use, such as a door, should then let the held block be placed against it. `repeat` is true when the call comes from holding the button rather than a new click (see below).
+- <a id="fn-engine-set_place_repeat"></a>**Holding right-click** keeps placing blocks and using items, every 0.2 s. `engine.set_place_repeat(seconds)` changes the interval (0 = one per click). Item uses get `pointed.repeat_click` and `pointed.sneaking` too (`repeat` is a Lua keyword, so `pointed.repeat` can't be written; `pointed["repeat"]` is the same value). While sneaking, players don't walk off edges, so they can stand at the edge of a block and keep building out from it.
 - <a id="fn-hooks-on_block_broken"></a>`on_block_broken(x, y, z, block, meta, player)`: a player broke a block, in creative or survival. It runs after the block is gone; `meta` is what its metadata was (on a server: 0). `player` is who did it. The doors mod uses it to remove the other half.
 - <a id="fn-hooks-on_block_placed"></a>`on_block_placed(x, y, z, block, player)`: a player placed a block. To stop players changing blocks somewhere, use [`can_edit_block`](#fn-hooks-can_edit_block).
 
@@ -2057,7 +2655,7 @@ Both run where the world is decided too: in singleplayer, for every player's edi
 
 <a id="fn-leafdecay-on_decay"></a>**Leaf decay** (the `leafdecay` mod): when a tree is cut down, its leaves fade away over the next few seconds. A leaf stays while a log is within 6 steps of it through other leaves, and leaves a player placed never decay. You can change `leafdecay.settings.distance` and `leafdecay.settings.delay`, or which blocks count with `leafdecay.is_leaves` and `leafdecay.is_log`. `leafdecay.on_decay(function(x, y, z, leaves) end)` runs when a leaf goes.
 
-Leaves break instantly by hand. Like Minecraft, broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with `tool_type = "shears"`). Change the drops with `leafdecay.register_drops("leaves_oak", { { item = "sapling_oak", chance = 0.05 }, { item = "stick", chance = 0.02, min = 1, max = 2 } })`. Decaying leaves give their drops to the player if they're within 32 blocks.
+Leaves break instantly by hand. Broken or decaying leaves can drop a sapling (5%), 1–2 sticks (2%), and from oak leaves an apple (0.5%), but only items the game has. The leaves themselves drop only with shears (a tool with `tool_type = "shears"`). Change the drops with `leafdecay.register_drops("leaves_oak", { { item = "sapling_oak", chance = 0.05 }, { item = "stick", chance = 0.02, min = 1, max = 2 } })`. Decaying leaves give their drops to the player if they're within 32 blocks.
 
 <a id="farming"></a>### Farming: hoes, crops and the scythe
 
@@ -2081,15 +2679,15 @@ function on_player_harvest(name, item, x, y, z)
 end
 ```
 
-Craft & Ruin's `farming` mod is Minecraft's farming:
+Craft & Ruin's `farming` mod:
 - **Tilling:** a hoe (wooden or stone) right-clicked on grass or dirt with air above makes farmland.
 - **Farmland:** it's wet (darker) with water within 4 blocks and dries out without. Bare dry farmland turns back to dirt, and jumping or falling onto farmland tramples it to dirt.
 - **Seeds:** they plant only on farmland. You get them by breaking tall grass (1 in 8).
-- **Growing:** crops grow on [random ticks](#abm) with Minecraft's formula. They grow faster on wet farmland and in fields, need light 9 or more, and pop off if the farmland under them goes.
+- **Growing:** crops grow on [random ticks](#abm), a stage at a time. They grow faster on wet farmland and in fields, need light 9 or more, and pop off if the farmland under them goes.
 - **Harvesting by hand:** breaking a ripe crop gives its harvest (wheat: 1 wheat and 0–3 seeds); an unripe one gives its seed back.
 - **The scythe:** left-click a ripe crop and the scythe reaps every ripe crop in the 3×3 patch around it, then replants them. Each one keeps back a seed from its harvest to go back in the ground. On anything else the scythe is an ordinary tool. On a server, the server does the reaping. Spawn protection and `can_edit_block` are checked for each crop, and a crop you may not touch stays ripe and gives nothing. A reap's harvest is dropped as one batch. If the world can't take an item yet (it's at its entity limit), the item waits and is dropped again every second until it arrives. Items that were already dropped are never given twice.
 - **Recipes:**
-  - wooden and stone hoes are Minecraft's shape;
+  - wooden and stone hoes have the classic hoe shape;
   - the scythe is 3 stone across the top, with a stick under the right end and one in the middle of the bottom row;
   - bread is 3 wheat in a row (5 food).
 - **Creative:** everything is in the "Farming" tab.
@@ -2109,7 +2707,7 @@ The last stage is the ripe one. It grows the same way as wheat. `farming.is_crop
 
 ## 7. Fluids
 
-Any fluid (lava, molten metal, oil) flows like Minecraft water, with its own spread distance, speed, reactions and bucket:
+Any fluid (lava, molten metal, oil) flows like water, with its own spread distance, speed, reactions and bucket:
 
 <a id="fn-engine-register_fluid"></a><a id="fn-engine-register_fluid_reaction"></a>
 ```lua
@@ -2143,7 +2741,7 @@ engine.register_block("mymod:vat_water", 1, 1, 1, "vat.png", nil, {
 engine.set_block_meta(x, y, z, "mymod:vat_water", 8)    -- half full
 ```
 
-The box's picture is cut to size like Minecraft's non-cube blocks, and see-through pixels show the liquid. Give the block one entry per liquid ("vat_water", "vat_lava"...) and change block and metadata together with `engine.set_block_meta`. On the server, block and metadata are saved and sent like any other block.
+The box's picture is cut to size like other non-cube blocks, and see-through pixels show the liquid. Give the block one entry per liquid ("vat_water", "vat_lava"...) and change block and metadata together with `engine.set_block_meta`. On the server, block and metadata are saved and sent like any other block.
 
 <a id="fn-block-tank-layers"></a>**Two liquids in one block (layers):** with `fluid2`, the block shows `fluid` at the bottom and `fluid2` on top of it. The metadata then holds both heights, in 16ths of the block:
 - the low 4 bits are where the lower liquid ends (1 to 15);
@@ -2229,7 +2827,7 @@ The same hook runs in server mods, where `player` is who pressed Tab (in the gam
 
 ## 9. Sky, weather, fog, clouds, underwater
 
-**Weather** is decided entirely in Lua by `mods/weather`. It's Minecraft-like by default: long clear spells, rain, thunderstorms, and snow where your game says it's cold. The engine only draws what that mod asks for:
+**Weather** is decided entirely in Lua by `mods/weather`. By default: long clear spells, rain, thunderstorms, and snow where your game says it's cold. The engine only draws what that mod asks for:
 
 | function | |
 |---|---|
@@ -2259,8 +2857,33 @@ weather.is_cold = function(x, z) return my_temperature(x, z) < 0.25 end   -- rai
 
 The `/weather [type [seconds]] | list | cycle on|off` command works in singleplayer and for operators on servers.
 
+<a id="aurora"></a><a id="fn-aurora-set_options"></a><a id="fn-aurora-start"></a><a id="fn-aurora-stop"></a><a id="fn-aurora-is_active"></a><a id="fn-aurora-is_visible"></a><a id="fn-aurora-on_change"></a>**Aurora nights** come from `mods/aurora` (switch it on for your game). Now and then a night has an aurora; whoever runs the world decides which nights, so every player on a server sees the same one, and each player's game shows it where your game says it can be seen, under a clear sky. Your game tunes it, like `weather.register`:
+
+```lua
+aurora.set_options({
+    chance = 0.12,                               -- the chance a night has one (0..1)
+    where = function(x, y, z)                    -- where it can be seen (default: everywhere)
+        local b = get_biome(math.floor(x), math.floor(z))
+        return b == "snowy_plains" or b == "snowy_taiga"
+    end,
+    strength = { 0.7, 1.3 },                     -- picked each aurora night
+    palettes = { { "#4cf2d1", "#8c57ff" }, { "#59ff7a", "#a24cff" } },   -- one picked each night
+    speed = 1, size = 1, direction = 0,          -- as for sky.set_aurora
+    style = "smooth", pixels = 80,               -- as for sky.set_aurora ("pixel": square sky pixels)
+    haze = 1, light = 1,                         -- the glow round it in the sky, and on the land
+    fade = 20,                                   -- seconds to fade in and out (walking into or out of `where` too)
+    hidden_by = { "cloudy", "rain", "thunder", "snow", "blizzard" },     -- weathers whose clouds hide it
+})
+aurora.start([palette]) / aurora.stop()          -- tonight (where the world runs); by day: the coming night
+aurora.is_active()                               -- is tonight an aurora night
+aurora.is_visible()                              -- is it showing in this game now
+aurora.on_change(function(active) end)
+```
+
+`/aurora` says whether tonight has one; operators can use `/aurora on [palette]` and `/aurora off`. A night is decided once, at dusk, and kept if the world is reloaded. Craft & Ruin's terrain sets `where` to its snowy biomes, about one night in eight.
+
 **Sky:**
-- <a id="fn-sky-get_time"></a><a id="fn-sky-set_time"></a>**The time of day.** `sky.get_time()` goes from 0 to 1 over a whole day: `0.25` midnight, `0.5` sunrise, `0.75` midday, `0` sunset. `sky.set_time(t [, forward])` jumps there and the clock keeps running; with `forward = true` it goes on to the *next* time it's `t` (so the day count goes up, like Minecraft's `/time set`).
+- <a id="fn-sky-get_time"></a><a id="fn-sky-set_time"></a>**The time of day.** `sky.get_time()` goes from 0 to 1 over a whole day: `0.25` midnight, `0.5` sunrise, `0.75` midday, `0` sunset. `sky.set_time(t [, forward])` jumps there and the clock keeps running; with `forward = true` it goes on to the *next* time it's `t` (so the day count goes up, like `/time set`).
   - <a id="fn-sky-get_day"></a><a id="fn-sky-get_clock"></a>`sky.get_day()`: days since the world began (0 is the first; it goes up at midnight). `sky.get_clock()`: the time as `"07:15"`.
   - <a id="fn-sky-add_time"></a>`sky.add_time(hours)` moves the clock on (or back).
   - <a id="fn-sky-set_time_speed"></a><a id="fn-sky-get_time_speed"></a>`sky.set_time_speed(x)` / `get_time_speed()`: 1 normal, 2 twice as fast, 0 stops time.
@@ -2271,6 +2894,28 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
   In chat: `/time` (what time and day it is), `/time set day|noon|night|midnight|sunrise|sunset|<hh:mm>`, `/time add <hours>`, `/time speed <x>`. On a dedicated server these go to the server (operators only); its console has the same `time` command.
 - <a id="fn-sky-get_moon_phase"></a><a id="fn-sky-set_moon_phase"></a><a id="fn-sky-set_moon_textures"></a>`sky.set_moon_phase(n)` / `get_moon_phase()`, `sky.set_moon_textures({ ... })`
 - <a id="fn-sky-set_stars"></a><a id="fn-sky-get_stars"></a>`sky.set_stars(density [, brightness])` / `get_stars()`: how starry the night is. `density` 0–1 (default 0.06), `brightness` 0 = no stars (default 0.9). Stars are fixed, steady dots that fade in at dusk.
+- <a id="fn-sky-set_aurora"></a><a id="fn-sky-get_aurora"></a>**Aurora.** `sky.set_aurora(def)` puts an aurora in this game's sky, drawn the way the real thing looks: thin, see-through sheets of light hanging high over the land like curtains - a ring of them all round the sky, folding in and out, and a ribbon curling overhead. A sheet seen face on is a faint veil; where it folds and is seen edge on it glows bright, and where sheets overlap they add up. Fine streaks run up through them, shimmering slowly, and their lower edge wanders up and down. Each glows in the low colour at its bright lower edge and fades up into the high colour (teal below, violet above, by default). Like the real thing it gives off light: a soft haze glows in the sky round the curtains, and the land below, wherever it's open to the sky (snow most of all), is faintly lit in its colour, with every Lighting setting. Caves and roofed rooms stay dark. `style = "pixel"` draws it on square sky pixels in a few flat steps of colour instead, for a pixel-art sky. Like the rest of `sky.*` it's what each player's own game shows, so mods decide when and where (the [aurora mod](#aurora) is one way). Every field is optional; one left out keeps what's set:
+
+  ```lua
+  sky.set_aurora({
+      strength = 1,                         -- 0 = none .. 1 strong (up to 2)
+      fade = 20,                            -- seconds to get there (default 0: at once)
+      colors = { "#4cf2d1", "#8c57ff" },    -- the bottom of the curtains, the top ("#rrggbb" or {r, g, b})
+      speed = 1,                            -- how fast it ripples (0 = still)
+      size = 1,                             -- how big its folds are
+      direction = 0,                        -- turns it round the sky (compass degrees: where the overhead ribbon heads)
+      night_only = true,                    -- false: by day too (a strange dimension's sky)
+      style = "smooth",                     -- "smooth" (the default), or "pixel": square sky pixels and
+                                            -- flat steps of colour, for a pixel-art sky
+      pixels = 80,                          -- the pixel style's grid: sky pixels across 90 degrees
+      haze = 1,                             -- the soft glow it spreads into the sky round it (0 = none, up to 3)
+      light = 1,                            -- how much it lights the land below (0 = none, up to 3)
+  })
+  sky.set_aurora(0)                         -- a number is short for { strength = n }: off
+  local a = sky.get_aurora()                -- the same fields, and `shown`: the strength on screen mid-fade
+  ```
+
+  With `night_only` it fades out at dawn and back in at dusk by itself. The weather's sky tint covers it (clouds hide it), and it's in mirrors too. It isn't saved: mods set it again when a world loads.
 - <a id="fn-engine-set_moon_texture"></a><a id="fn-engine-set_sun_texture"></a>`engine.set_sun_texture(path)`, `engine.set_moon_texture(path)`
 - <a id="fn-sky-set_ambient_color"></a><a id="fn-sky-set_fog_color"></a><a id="fn-sky-set_sun_color"></a>`sky.set_sun_color(r,g,b)`, `set_ambient_color(r,g,b)`, `set_fog_color(r,g,b)`
 - <a id="fn-sky-set_ambient_intensity"></a><a id="fn-sky-set_sun_intensity"></a>`sky.set_sun_intensity(v)`, `set_ambient_intensity(v)`
@@ -2305,7 +2950,7 @@ The `/weather [type [seconds]] | list | cycle on|off` command works in singlepla
 - <a id="fn-underwater-set_full_depth"></a><a id="fn-underwater-set_visibility"></a>`underwater.set_visibility(shallow_blocks, deep_blocks)`, `set_full_depth(blocks)`
 - <a id="fn-underwater-set_fade"></a><a id="fn-underwater-set_tint_strength"></a>`underwater.set_fade(in_seconds, out_seconds)`, `set_tint_strength(0..1)`. The tint colours everything like the water, however close, so a small pool looks underwater too. The fog only shows on things far away. The default strength is 0.42.
 
-<a id="particles"></a>**Particles** (Minecraft style). The engine makes these on its own:
+<a id="particles"></a>**Particles**. The engine makes these on its own:
 - **Blocks:** bits when a block breaks (also when another player breaks one), and chips flying off the face you're digging.
 - **Movement:** dust kicked up while sprinting, and a puff when you land from a fall (more the harder you land).
 - **Water:** a splash when you drop in, and bubbles while your head is under.
@@ -2333,18 +2978,18 @@ particles.spawn{
 
 <a id="fn-particles-add_spawner"></a><a id="fn-particles-remove_spawner"></a>`particles.add_spawner{ ... }` keeps making them: the same fields, plus `rate` (per second), `time` (seconds, 0 means until removed), `follow_player`, and `life` and `size` as `{ min, max }`. It returns an id for `particles.remove_spawner(id)`.
 
-<a id="fn-particles-register_ambient"></a>`particles.register_ambient{ nodenames = { "mymod:candle" }, action = function(x, y, z, block) ... end }` is Minecraft's "animate tick". Each frame, random blocks near the player are looked at, roughly 3 times a second for each block within 16. For the listed kinds, `action` runs and can spawn particles (a candle's flame, a cauldron's bubbles). Use `math.random` in it to make effects rarer.
+<a id="fn-particles-register_ambient"></a>`particles.register_ambient{ nodenames = { "mymod:candle" }, action = function(x, y, z, block) ... end }` is an "animate tick". Each frame, random blocks near the player are looked at, roughly 3 times a second for each block within 16. For the listed kinds, `action` runs and can spawn particles (a candle's flame, a cauldron's bubbles). Use `math.random` in it to make effects rarer.
 
 <a id="fn-particle_effects"></a>Ready-made effects from `core_blocks/particles.lua`: `particle_effects.hearts(x, y, z)`, `.happy`, `.smoke`, `.flame`, `.notes`, `.sparks`.
 
 <a id="fn-hooks-get_water_color"></a>Define `get_water_color(x, z)` to return `{ r, g, b, deep_r, deep_g, deep_b }` per place, for example by biome.
 
-<a id="fn-engine-is_third_person"></a><a id="fn-engine-set_fov"></a><a id="fn-engine-get_camera_mode"></a><a id="fn-engine-set_camera_mode"></a>**Camera:** `engine.set_fov(degrees)`, `engine.is_third_person()` (true behind or in front). F5 cycles like Minecraft: first person, then behind the player, then in front of them looking back (no crosshair in that view). `engine.get_camera_mode()` returns `"first"`, `"back"` or `"front"`. `engine.set_camera_mode(mode)` switches to one of those and returns false for any other name.
-<a id="fn-engine-set_player_look"></a><a id="fn-engine-get_player_look"></a><a id="fn-engine-set_hud_visible"></a><a id="fn-engine-is_hud_visible"></a>`engine.set_player_look(yaw, pitch)` turns the player's view, in degrees: yaw −90 looks north (−Z), 0 east (+X); pitch 90 is straight up, kept within ±89.9. `engine.get_player_look()` returns `yaw, pitch`. **F1** hides the HUD, crosshair and hand for screenshots, like Minecraft. `engine.set_hud_visible(on)` and `engine.is_hud_visible()` do the same from a mod.
+<a id="fn-engine-is_third_person"></a><a id="fn-engine-set_fov"></a><a id="fn-engine-get_camera_mode"></a><a id="fn-engine-set_camera_mode"></a>**Camera:** `engine.set_fov(degrees)`, `engine.is_third_person()` (true behind or in front). F5 cycles: first person, then behind the player, then in front of them looking back (no crosshair in that view). `engine.get_camera_mode()` returns `"first"`, `"back"` or `"front"`. `engine.set_camera_mode(mode)` switches to one of those and returns false for any other name.
+<a id="fn-engine-set_player_look"></a><a id="fn-engine-get_player_look"></a><a id="fn-engine-set_hud_visible"></a><a id="fn-engine-is_hud_visible"></a>`engine.set_player_look(yaw, pitch)` turns the player's view, in degrees: yaw −90 looks north (−Z), 0 east (+X); pitch 90 is straight up, kept within ±89.9. `engine.get_player_look()` returns `yaw, pitch`. **F1** hides the HUD, crosshair and hand for screenshots. `engine.set_hud_visible(on)` and `engine.is_hud_visible()` do the same from a mod.
 
 ## 10. Light
 
-The engine has Minecraft-style block light, with colour. Every block space holds four light levels from 0 to 15: **sunlight**, and **red**, **green** and **blue** block light.
+The engine has block light, with colour. Every block space holds four light levels from 0 to 15: **sunlight**, and **red**, **green** and **blue** block light.
 
 - **Sunlight** comes straight down from the sky at full strength, then spreads sideways into caves and under overhangs, losing 1 per block. It follows the time of day and the weather (`sky.set_light`).
 - **Block light** spreads out from light sources the same way, each colour on its own. A red lamp and a blue lamp side by side make purple where their light meets. A torch fades from white-yellow to orange, because its blue runs out first.
@@ -2383,7 +3028,7 @@ engine.register_block("murky_water", 1, 1, 1, "murky.png", nil, {
 | `light_color` | Colour of `light`: `{ r, g, b }` (0–255 or 0–1) or `"#rrggbb"`. Default white. |
 | `light_filter` | Colour of light let through, for stained glass: `{ r, g, b }`. Default `{ 1, 1, 1 }`. |
 | `tint_view` | Looking through the block tints everything behind it in its picture's colour, like stained glass. Blocks, water, mobs and the sky are all tinted, at any time of day, and several panes in a row multiply. On by default for a see-through (`transparent`) block with a `light_filter`; `tint_view = false` turns it off and `true` turns it on without a filter. How strong the tint is depends on how opaque the picture is: a half-transparent picture tints fully, and white or fully clear pixels let everything through. Light passing through is only coloured by `light_filter`; sunlight isn't coloured. |
-| `light_absorb` | Light lost per block passing through, like Minecraft's light opacity. Sunlight going straight down loses only this; sideways, at least 1 is always lost. Default 1 for water, other fluids and leaves (sunlight reaches about 15 blocks deep), otherwise 0. Set `0` for crystal-clear water. |
+| `light_absorb` | Light lost per block passing through (the block's light opacity). Sunlight going straight down loses only this; sideways, at least 1 is always lost. Default 1 for water, other fluids and leaves (sunlight reaches about 15 blocks deep), otherwise 0. Set `0` for crystal-clear water. |
 
 **Which blocks stop light:** solid, non-transparent blocks with `pattern = "cube"`. Transparent blocks, cutout blocks (leaves), plants, fluids, doors and models let light through.
 
@@ -2392,7 +3037,7 @@ engine.register_block("murky_water", 1, 1, 1, "murky.png", nil, {
 ### Reading light
 
 - <a id="fn-engine-get_light"></a>`engine.get_light(x, y, z)` returns `sun, red, green, blue` (0–15 each), the light stored at that block.
-- <a id="fn-engine-get_light_level"></a>`engine.get_light_level(x, y, z)` returns 0–15: how bright it is there right now. It takes the brightest of the block light and the sunlight, with sunlight 11 lower at night, like Minecraft. Use it for mob spawning, crops and so on:
+- <a id="fn-engine-get_light_level"></a>`engine.get_light_level(x, y, z)` returns 0–15: how bright it is there right now. It takes the brightest of the block light and the sunlight, with sunlight 11 lower at night. Use it for mob spawning, crops and so on:
 
 ```lua
 if engine.get_light_level(x, y + 1, z) <= 7 then spawn_zombie(x, y + 1, z) end
@@ -2400,7 +3045,7 @@ if engine.get_light_level(x, y + 1, z) <= 7 then spawn_zombie(x, y + 1, z) end
 
 ### How light looks
 
-- <a id="fn-sky-set_brightness"></a>`sky.set_brightness(v)`: 0 = moody (dark nights and caves), 1 = bright, like Minecraft's brightness slider. Default 0.35. This is the *game's* brightness. Players also have a **Brightness** slider (Settings > Video & Sound, saved as `brightness` in settings.txt): in the middle ("Default") they see exactly the game's look; to the left it goes down to fully moody; to the right it lifts the final light the way Minecraft's brightness does, so caves and nights get brighter too (a pitch-black cave is about 28% lit at "Bright", a night about 73%), while daylight stays the same. So a dark, spooky game can set a low value, and a player who finds it too dark can still brighten it.
+- <a id="fn-sky-set_brightness"></a>`sky.set_brightness(v)`: 0 = moody (dark nights and caves), 1 = bright, like a brightness slider. Default 0.35. This is the *game's* brightness. Players also have a **Brightness** slider (Settings > Video & Sound, saved as `brightness` in settings.txt): in the middle ("Default") they see exactly the game's look; to the left it goes down to fully moody; to the right it lifts the final light, so caves and nights get brighter too (a pitch-black cave is about 28% lit at "Bright", a night about 73%), while daylight stays the same. So a dark, spooky game can set a low value, and a player who finds it too dark can still brighten it.
 - <a id="fn-sky-set_min_light"></a>`sky.set_min_light(v)`: the darkest anything gets, 0–1. Default 0.02; 0 makes sealed caves pitch black.
 - <a id="fn-sky-set_block_light_strength"></a>`sky.set_block_light_strength(v)`: how strong light sources look (default 1; 1.3 for a cosier game, 0.7 for horror).
 - <a id="fn-engine-set_ambient_occlusion"></a><a id="fn-engine-set_smooth_lighting"></a>`engine.set_smooth_lighting(on)`, `engine.set_ambient_occlusion(on)`: both on by default. Changing one redraws every chunk.
@@ -2414,11 +3059,113 @@ Lights that aren't a block (a glowing mob, a magic spell, a lightning bolt) are 
 - <a id="fn-sky-remove_light"></a>`sky.remove_light(id)` removes it. Ids never change while other lights come and go.
 - <a id="fn-sky-set_held_light"></a>`sky.set_held_light(on)`: holding a light source in the hotbar lights up around the player as they walk (on by default).
 
-Point lights shine through walls, so keep them small, and use blocks for lights that stay put.
+With the player's **Lighting** setting on Low or High, point lights cast shadows: a wall between a light and a surface keeps the light off it ([traced lighting](#traced-lighting)). With it Off they shine through walls, so keep them small either way, and use blocks for lights that stay put.
+
+<a id="spotlights"></a>### Spotlights
+
+Stage lights for any mod: a light with a position, a direction, a colour and a beam. It lights the blocks inside its cone (and things drawn like blocks: dropped items, falling blocks), casts shadows, can project a picture (a **gobo**), and shows as a **beam** in the air when there's haze. Beams stop at blocks. Models (mobs, players) aren't lit by spotlights yet.
+
+<a id="fn-lights-add_spot"></a><a id="fn-lights-set"></a><a id="fn-lights-get"></a><a id="fn-lights-aim"></a><a id="fn-lights-remove"></a><a id="fn-lights-list"></a><a id="fn-lights-clear"></a>
+```lua
+local spot = lights.add_spot{
+    x = 10.5, y = 72, z = 4.5,        -- where the lamp is
+    color = "#ff3030",                -- or { 1, 0.2, 0.2 } or { 255, 50, 50 }
+    angle = 25, softness = 0.3,       -- beam width (degrees) and how soft its edge is
+    range = 30, intensity = 2,        -- how far it reaches, how bright
+    gobo = "my_gobo_star.png", gobo_spin = 30,
+}
+lights.aim(spot, 10, 64, -6)          -- point it at a place (sets pan and tilt)
+lights.set(spot, { dimmer = 0.5, strobe = 8 })    -- change anything, any time
+lights.set_haze(0.6)                  -- how much beams show in the air
+```
+
+| field | default | |
+|---|---|---|
+| `x`, `y`, `z` | 0 | where the lamp is |
+| `pan`, `tilt` | 0, -90 | which way it points, in degrees: pan 0 is north (-z), 90 east (+x); tilt 0 is level, -90 straight down, 90 straight up |
+| `color` | white | `"#rrggbb"`, or `{ r, g, b }` as 0–1 or 0–255 |
+| `dimmer` | 1 | 0–1 |
+| `intensity` | 1 | brightness; above 1 for strong lights |
+| `angle` | 30 | the beam's full width in degrees (1–170) |
+| `softness` | 0.25 | 0 = a hard edge, 1 = fading all the way from the centre |
+| `range` | 32 | how far it reaches, in blocks (up to 256) |
+| `beam` | 1 | how strongly its beam shows in the air (times the haze); 0 = no beam, only the light |
+| `strobe` | 0 | flashes a second (0 = steady, up to 30) |
+| `gobo` | none | a picture the light shines through: white lets light through, black blocks it. Any PNG from your mod, like a block texture; `false` removes it |
+| `gobo_rotation`, `gobo_spin` | 0 | the gobo's turn (degrees) and how fast it spins (degrees a second) |
+| `shadows` | true | `false`: this light shines through blocks (cheaper) |
+
+- `lights.add_spot(fields)` returns an id. `lights.set(id, fields)` changes only the fields given and returns false for an unknown id. `lights.get(id)` returns them (and `has_gobo`).
+- `lights.aim(id, x, y, z)` turns it toward a point. `lights.remove(id)`, `lights.list()` (the ids), `lights.clear()`.
+- <a id="fn-lights-set_haze"></a><a id="fn-lights-get_haze"></a>`lights.set_haze(amount [, color])`: haze in the air (0 = none, default 0.35, up to 4), which is what makes beams visible. `lights.get_haze()` returns amount, colour.
+- Up to **16** spotlights are drawn at once: the brightest ones near the camera. Add as many as you like; the far and dim ones wait their turn.
+- Spotlights belong to the player's game (like `sky.add_light`). A mod that runs in every player's game shows the same lights to everyone: keep the lights' settings where the world runs and share them ([`engine.set_shared`](#fn-engine-set_shared)), so every game makes the same ones.
+
+<a id="traced-lighting"></a>### Traced lighting: shadows, sunlight through leaves, sun shafts
+
+With **Lighting** on Low or High (the player's choice, in Settings), light finds its way to each surface the way a path is found through the world: block by block. A ray goes from the surface toward the light, through the blocks in between, and each block it passes takes some of the light. That's how spotlights, point lights and the sun get real shadows.
+
+| block | how much light it stops |
+|---|---|
+| full solid blocks | all of it |
+| slabs, stairs | most of it |
+| leaves and other cut-out blocks (`cutout = true`) | they have gaps: rays get through some and not others, so sunlight comes through a tree in spots |
+| clear glass (`transparent`) | very little; coloured glass (`light_filter`) more |
+| water | a little each block (deep water is dim and blue) |
+| lava and other glowing or thick liquids | all of it |
+| plants, signs, doors | none |
+
+- **The sun.** Trees, walls and roofs cast shadows at the sun's angle, long in the morning and evening. Under trees the shade is broken up by sun spots where light gets between the leaves. Leaves themselves glow a little with the sun behind them, the way real leaves do. Plants (grass, flowers) are lit like the ground they stand on.
+- **How the light adds up.** Each surface gets warm sunlight if it faces the sun and a ray reaches it, the sky's soft bluish light (less in corners, crevices and under overhangs), a little sunlight bounced off the ground, moonlight at night, and the light of torches and lamps. These are added as real amounts of light, brighter than a screen can show, and then brought to the screen like a camera does (see Filmic below). So shade is a cool sky blue, never black, and caves stay dark. The sky is drawn a little deeper with Lighting Low or High, so it sits right with the land, with a soft glow around the sun (none with Lighting Off).
+- **The moon.** At night the moon casts slight, soft shadows the same way: strongest under a full moon high in the sky, none at new moon, weaker in rain, and none in a dimension without a moon. The edges are soft, as moonlight's are.
+- <a id="fn-sky-set_sun_shafts"></a>**Sun shafts (High only).** Where sunlight gets past leaves and edges, the air glows a little: beams of light between the trees, strongest when looking toward the sun. They fade in rain and when the sun is low. `sky.set_sun_shafts(strength)` sets how strong they are for your game (0 = none, default 0.5, up to 2).
+- **Water.** The ground under water shows **caustics**, the moving net of light that ripples focus onto a pool floor, fading with depth, and light gets bluer and dimmer the deeper it goes. When you swim, the water around you is only as bright as the light that reaches it: darker the deeper you are, and much darker at dusk and at night. On the surface, small moving waves catch the sun (and the moon) in glints, and the water reflects more the flatter you look across it: the sky in that direction, and on **High** the world itself (trees, hills, a bridge across the river), found by following the reflected ray across the picture. From under the water, the whole surface overhead is see-through (the sky and anything above show through it, tinted by the water, less clearly the deeper you are) and shimmers all over with the light coming down through the moving waves. On High, beams of sunlight reach down through the water wherever it gets past whatever's above.
+- **Filmic** (the player's choice, Settings > Video > Filmic Look with **Advanced** on, on by default). With Lighting Low or High, the light is brought to the screen through a film-like curve (deep shadows, bright highlights that roll off softly instead of clipping), and exposure adjusts like an eye: up a little at night so moonlit land is still readable (dark, and fading toward a cool blue-grey the way colours do by moonlight; torchlit places keep their colour), and set for torchlight when the camera is in a cave or a closed room. Off: a flatter, gentler curve with less contrast. It doesn't change anything with Lighting Off.
+- **How far.** Light is traced through the blocks within about 64 blocks of the camera, the whole height of the world (mountain tops and deep caves included). Shadows fade out before that edge, so there's no hard line; past it, open sky means sunlit. The blocks around the camera are refreshed as it moves, and land that has just come into range isn't shaded until its blocks are in (never by the blocks that were there before).
+- Nothing to do in a mod: blocks are traced by what they are. Register blocks with the right `transparent`, `cutout` and `light_filter` and they behave.
+
+<a id="bloom"></a>### Bloom
+
+<a id="fn-sky-set_bloom"></a><a id="fn-sky-get_bloom"></a>With **Bloom** on (the player's choice, in Settings), bright things glow into their surroundings: lamps, spotlights and beams, lava, sunlit snow, glints on water. The glow is built at several sizes and added together, so it has a tight bright core and a wide soft halo, like light in a camera lens, and it's blended so it brightens without washing anything out to flat white. Only things nearer than the fog glow, so bright fog and sky in the distance don't wash the view out.
+
+- `sky.set_bloom(strength [, threshold])`: how much it glows (0–2, default 0.6) and how bright something must be to glow (0–1, default 0.75). A neon city might use 1.2 and 0.6; a gloomy game 0.3 and 0.85.
+- `sky.get_bloom()` returns on (the player has it on), strength, threshold.
+- It only changes how bloom looks for players who turned it on. It never turns it on.
+
+<a id="lighting-quality"></a>### Lighting quality and the graphics card check
+
+Players choose in **Settings > Video > Lighting**:
+
+| setting | what it does |
+|---|---|
+| Lighting: Off | the standard look (the default): light as it always was, no traced shadows; point lights and spotlights shine through blocks; beams don't stop at walls |
+| Lighting: Low | the realistic light above (the player turns it on): traced shadows for spotlights, point lights, the sun and moon (shorter rays), sky light that's less in corners, sun spots through leaves, caustics and glints on water; beams stop at walls |
+| Lighting: High | longer rays, shadows inside beams, sun shafts, light beams in water, and water that reflects the world |
+| Filmic Look: Off / On | how Low and High light is brought to the screen (above) |
+| Bloom: Off / On | the glow above |
+| Mirror Reflections: Off / On | mirrors reflect the room ([mirrors](#mirrors)); off: plain glass |
+
+<a id="fn-lights-get_quality"></a>**Protecting players' computers.** When the game starts, it checks the graphics card:
+- With no graphics driver (the computer draws in software), Lighting and Bloom aren't available.
+- Otherwise it runs a short test of the tracing on the card itself, the worst case (four spotlights and the sun on every pixel), and times it. Cards fast enough get High; a bit slower, Low only; slower still, Off only. It goes by speed, never by brand: NVIDIA, AMD and Intel cards are all judged the same way.
+- What a card can't run is **greyed out** in Settings, with the reason shown when the player points at it or clicks it. The engine refuses it however it's asked.
+- `gpu_check = off` in `settings.txt` skips the test and allows everything, for players who know their card can take it.
+
+**The player's choice, never a mod's.** Lighting, Filmic Look and Bloom change only when the player clicks them in Settings. `engine.set_video_setting("light_quality", ...)`, `("filmic", ...)` and `("bloom", ...)` are refused for mods, in singleplayer and on servers alike: a server's mods can't switch them on for players who join. So:
+- Make your game look right with Lighting **Off**; traced lighting, filmic and bloom are extras on top.
+- **Fog and sky match** in every setting: far-off land fades into the colour of the sky behind it (orange toward a sunset, dusky blue the other way), so there's no grey wall or hard edge where the loaded world ends. Clouds, rain, snow and storms grey the fog exactly as they grey the sky (the weather's sky tint, drawn firmly: a flat overcast grey, not a pale glow at the horizon), so under a storm far-off land fades into dark grey, not blue. Under water, the sky is what you see through the surface overhead. A game's own fog colour (§9) still applies under water and in dimensions with their own sky.
+- `lights.get_quality()` returns `"off"`, `"low"` or `"high"`, if you want to go easy on lights where it's off (fewer spotlights, `shadows = false`).
+
+<a id="shaders"></a>### Shaders
+
+The shaders (the programs the graphics card runs to draw the world) are the engine's own. Mods don't write shader code; they control what the shaders do through the functions in this section and §9: spotlights, haze, gobos, bloom, sun shafts, fog, sky and light colours. That's deliberate:
+- **It works on every computer.** The engine's shaders are tested to run on any graphics card that has OpenGL 3.3, and the lighting check above keeps the heavy parts off cards that can't take them. Shader code from a mod could look fine on its author's card and fail, or overload, someone else's.
+- **Same on every card.** The tracing is plain shader work, not one company's ray-tracing hardware, so it runs the same on NVIDIA, AMD and Intel, and your mod uses the same `lights.*` functions everywhere. If the engine one day draws with hardware ray tracing, these functions stay the same and mods get it for free.
+- **The engine controls rendering.** Nothing a mod (or a server's mod) sends can run code on a player's graphics card.
 
 ## 11. Survival: health, hunger, digging
 
-The engine has the mechanics; **`mods/survival`** has Minecraft's rules, and a game can tune or replace them:
+The engine has the mechanics; **`mods/survival`** has the rules (health, hunger, armour, digging), and a game can tune or replace them:
 - 10 hearts and 10 hunger (with saturation)
 - fall damage, drowning (with air bubbles) and lava damage
 - regeneration and starvation
@@ -2443,7 +3190,7 @@ The engine has the mechanics; **`mods/survival`** has Minecraft's rules, and a g
 ```lua
 engine.register_block("iron_pickaxe", 1, 1, 1, "iron_pickaxe.png", nil,
     { inventory_image = "iron_pickaxe.png", tool_type = "pickaxe", tool_speed = 6 })
-engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
+engine.override_block("grass", { drops = "dirt" })           -- dug grass gives dirt
 ```
 
 **Hooks:**
@@ -2453,7 +3200,7 @@ engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
 
 **Player functions:**
 - <a id="fn-engine-get_player_state"></a>`engine.get_player_state()` gives position, velocity, `on_ground`, `sprinting`, `sneaking`, `jumping`, `flying`, and `feet_fluid` / `head_fluid`.
-- **Flying (creative):** like Minecraft, double-tap Jump to fly. Jump rises, Sneak sinks, Sprint flies faster (21.6 blocks/s instead of 10.9), and landing or double-tapping again stops it. <a id="fn-engine-is_flying"></a><a id="fn-engine-set_flying"></a><a id="fn-engine-set_fly_allowed"></a>`engine.is_flying()`, `engine.set_flying(on)` (false outside creative) and `engine.set_fly_allowed(false)` (no flying, e.g. on a parkour map; `true` allows it again). On a server, only players in creative mode can fly: the server ignores flying from anyone else.
+- **Flying (creative):** double-tap Jump to fly. Jump rises, Sneak sinks, Sprint flies faster (21.6 blocks/s instead of 10.9), and landing or double-tapping again stops it. <a id="fn-engine-is_flying"></a><a id="fn-engine-set_flying"></a><a id="fn-engine-set_fly_allowed"></a>`engine.is_flying()`, `engine.set_flying(on)` (false outside creative) and `engine.set_fly_allowed(false)` (no flying, e.g. on a parkour map; `true` allows it again). On a server, only players in creative mode can fly: the server ignores flying from anyone else.
 - <a id="fn-engine-set_player_controls"></a>`engine.set_player_controls{ move, jump, sprint, sneak }` blocks keys. Prediction and the server stay in sync.
 - <a id="fn-engine-add_player_velocity"></a><a id="fn-engine-set_player_position"></a>`engine.set_player_position(x, y, z)`, `engine.add_player_velocity(...)`.
 - <a id="fn-engine-respawn_player"></a>`engine.respawn_player(x, y, z)`. On a server, the server's spawn is used.
@@ -2477,7 +3224,7 @@ engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
 - <a id="fn-engine-set_inventory_open"></a>`engine.set_inventory_open(bool)` closes it from Lua.
 - <a id="fn-hooks-on_hotbar_full"></a>`on_hotbar_full(item, count)` takes items that don't fit in the hotbar.
 
-<a id="fn-survival-inventory-add"></a>The survival mod has a complete Minecraft-style one, drawn on the game's inventory picture (`survival_inventory.png`, or `inventory.png` to use your own). It has 8 equipment slots, a 2×2 crafting grid with its output, a bin, 27 storage slots and the hotbar, with click, right-click and shift-click. Other mods can use `survival.inventory.add(item, count)` (returns how many didn't fit), <a id="fn-survival-inventory-get"></a><a id="fn-survival-inventory-set"></a><a id="fn-survival-inventory-clear"></a><a id="fn-survival-inventory-size"></a><a id="fn-survival-inventory-is_open"></a>`get(i)`, `set(i, item, count)`, `clear()`, `size()` and `is_open()`. <a id="fn-survival-inventory-pick"></a>`survival.inventory.pick(item)` puts an item from the inventory in the player's hand, by the pick block rules below (returns false if they don't have it).
+<a id="fn-survival-inventory-add"></a>The survival mod has a complete one, drawn on the game's inventory picture (`survival_inventory.png`, or `inventory.png` to use your own). It has 8 equipment slots, a 2×2 crafting grid with its output, a bin, 27 storage slots and the hotbar, with click, right-click and shift-click. Other mods can use `survival.inventory.add(item, count)` (returns how many didn't fit), <a id="fn-survival-inventory-get"></a><a id="fn-survival-inventory-set"></a><a id="fn-survival-inventory-clear"></a><a id="fn-survival-inventory-size"></a><a id="fn-survival-inventory-is_open"></a>`get(i)`, `set(i, item, count)`, `clear()`, `size()` and `is_open()`. <a id="fn-survival-inventory-pick"></a>`survival.inventory.pick(item)` puts an item from the inventory in the player's hand, by the pick block rules below (returns false if they don't have it).
 
 <a id="fn-engine-set_dig_crack_texture"></a>**The crack picture:** `engine.set_dig_crack_texture(file [, stages])` takes a vertical strip of squares. Leave out `stages` to count them from the picture. A game's `crack_anylength.png`, Luanti's name for it, is used automatically.
 
@@ -2489,7 +3236,7 @@ engine.override_block("grass", { drops = "dirt" })           -- like Minecraft
 - <a id="fn-survival-on_damage"></a><a id="fn-survival-on_death"></a><a id="fn-survival-on_respawn"></a>`survival.on_damage`, `on_death`, `on_respawn`
 - <a id="fn-survival-set_mode"></a><a id="fn-survival-settings"></a>`survival.set_mode`, and `survival.settings` (max health, fall distance, keep inventory, lava damage...)
 - <a id="fn-survival-get_hp"></a><a id="fn-survival-get_food"></a><a id="fn-survival-get_air"></a><a id="fn-survival-is_dead"></a><a id="fn-survival-get_mode"></a>`survival.get_hp()`, `get_food()`, `get_air()`, `is_dead()`, `get_mode()`: read the player's state
-- <a id="fn-survival-set_armor"></a><a id="fn-survival-get_armor"></a>`survival.set_armor(points)`, `get_armor()`: armour points for an armour mod; each point blocks 4% of damage, like Minecraft
+- <a id="fn-survival-set_armor"></a><a id="fn-survival-get_armor"></a>`survival.set_armor(points)`, `get_armor()`: armour points for an armour mod; each point blocks 4% of damage
 - <a id="fn-survival-respawn"></a>`survival.respawn()`: bring the player back at the world's spawn
 - <a id="fn-survival-register_craft"></a>`survival.register_craft({ output = "planks", count = 4, recipe = { { "log_oak" } } })`: a crafting recipe (rows of item names; mirrored shapes match too). Recipes up to 2×2 work in the inventory; anything up to 3×3 needs a workbench. Use `type = "shapeless", recipe = { "a", "b" }` for any arrangement. Shift-clicking the output crafts as many as possible.
 - <a id="fn-survival-register_workbench"></a>`survival.register_workbench("my_table")`: right-clicking that block opens the 3×3 crafting screen (`survival_workbench.png`, or `workbench_gui.png` to use your own). Craft & Ruin's `workbench` is made from 4 planks. Sneak + right-click with a block in hand places it against the workbench instead.
@@ -2536,7 +3283,7 @@ On a dedicated server, `sound.*` does nothing; each player's game plays its own 
 
 <a id="fn-engine-add_model"></a><a id="fn-engine-load_model"></a><a id="fn-engine-move_model"></a><a id="fn-engine-remove_model"></a><a id="fn-engine-set_model_visible"></a>
 ```lua
-local cow = engine.load_model("cow.b3d" [, "cow.png" [, scale]])   -- .b3d (Luanti) or .json (Bedrock)
+local cow = engine.load_model("cow.bbmodel" [, "cow.png" [, scale]])   -- .bbmodel, .json (Bedrock) or .b3d (Luanti)
 local id = engine.add_model(cow, x, y, z [, yaw [, scale]])          -- x, y, z = feet
 engine.move_model(id, x, y, z [, yaw])
 engine.set_model_visible(id, bool)
@@ -2544,6 +3291,7 @@ engine.remove_model(id)
 ```
 
 - **Units:** `yaw` is in degrees; 0 faces +x (east) and 90 faces +z.
+- **Texture:** for a `.bbmodel`, leave it out to use the picture saved inside the file. Give one to use another (a different skin on the same model): it replaces the file's first picture.
 - **One pose per model:** every copy placed with `add_model` shares the loaded model's pose. Load the model again for copies that animate separately.
 
 **Moving bones:**
@@ -2556,6 +3304,29 @@ engine.remove_model(id)
 - <a id="fn-bone-set_position"></a>`bone:set_position(x, y, z)`: an offset from where the model file puts the bone, in the model's own coordinates, so the model's scale applies to it. For a Blockbench/Bedrock `.json` model, 1 is one block (its cubes' pixels are already divided by 16). For a `.b3d` model it's the file's units, shrunk by the model's scale (0.1 by default, so 10 units = 1 block). `model:reset_pose()` sets it back to 0; the file's own positions are never lost.
 - <a id="fn-model-reset_pose"></a>`model:reset_pose()` puts every bone back to the model file's pose.
 - <a id="fn-model-is_loaded"></a>`model:is_loaded()` is false when the file was missing or couldn't be read. `engine.load_model` still returns a model then, which draws nothing, so check this before relying on it. `g_PlayerModel` is the model drawn as the player in third person (F5). If it's nil or not loaded, the console says so once: `[Player] Third person: no player model to draw: ...`.
+
+<a id="bbmodel"></a>**Blockbench files (`.bbmodel`).** The file Blockbench saves (*File > Save Model*) loads as it is, with no exporting. Its pictures and animations come with it:
+
+```lua
+local cow = engine.load_model("cow.bbmodel")          -- shapes and pictures
+local anims = engine.load_animations("cow.bbmodel")   -- the animations saved in it
+```
+
+- **What's read:**
+  - cubes, at any angle, with box UV or per-face UV, inflate, mirrored UV and faces turned 90/180/270;
+  - groups, which become bones, named as in Blockbench's outliner (two groups with the same name: the second gets `_2`);
+  - free-form mesh elements, with triangles and four-sided faces;
+  - several pictures per model, each face drawn with its own.
+- **What's skipped:** locators and null objects, and faces made see-through in Blockbench (they're not drawn). Cubes outside any group go in a bone called `bb_main`, as Blockbench's export does.
+- **Pictures** saved inside the file are read as pictures only: PNG, at most 4096 pixels a side and 8 MB. A picture that isn't inside the file (saved as a link to a file) is looked for by its file name, like any other model picture, so put it in your mod's `textures/` folder. If it can't be found, its faces use the first picture.
+- **Animations:**
+  - keyframes are `linear`, `catmullrom`, `step` or `bezier` (Blockbench's curves, handles and all);
+  - *Loop* loops, *Hold on last frame* and *Play once* stop at the end;
+  - the animation's length is the one set in Blockbench;
+  - sound, particle and instruction keyframes are skipped.
+- **Java block models** made in Blockbench are moved so the middle of the block is where the model stands.
+- It looks and moves exactly as the same model does exported as `.geo.json` and `.animation.json`, so you can switch between them.
+- `mods/model_showcase` tries all of this: `/models` puts a player model and a test model in front of you, and `/models test` checks the import.
 
 <a id="fn-hooks-on_update"></a><a id="fn-hooks-update_player_animation"></a>Use `on_update(dt)` to move them every frame. The player model is the global `g_PlayerModel`, and the engine calls `update_player_animation(dt, is_moving, pitch)`.
 
@@ -2572,7 +3343,7 @@ In first person the engine shows what you're holding at the bottom of the screen
 
 ### Animations
 
-The engine plays **Bedrock / Blockbench animation files** (`.animation.json`): export from Blockbench with *File > Export > Export Bedrock Animations*. Put them in your mod's folder or its `models/` folder.
+The engine plays **Bedrock / Blockbench animation files** (`.animation.json`): export from Blockbench with *File > Export > Export Bedrock Animations*. It also plays the animations saved in a **`.bbmodel`** (`engine.load_animations("mob.bbmodel")`, see [Blockbench files](#bbmodel)). Put them in your mod's folder or its `models/` folder.
 
 <a id="fn-engine-load_animations"></a><a id="fn-animation-apply"></a><a id="fn-animation-set_loop"></a><a id="fn-animationset-get"></a><a id="fn-animationset-names"></a>
 ```lua
@@ -2590,7 +3361,7 @@ function on_update(dt)
 end
 ```
 
-- **What's supported:** rotation (degrees), position (pixels, 16 per block) and scale per bone, as a constant or keyframes. Keyframes can be `linear`, `catmullrom` (smooth) or `step`, with `pre`/`post` values.
+- **What's supported:** rotation (degrees), position (pixels, 16 per block) and scale per bone, as a constant or keyframes. Keyframes can be `linear`, `catmullrom` (smooth) or `step`, with `pre`/`post` values (and `bezier`, from a `.bbmodel`).
 - **Blending:** call `reset_pose()`, then `apply` each animation with a weight. For example idle at `1 - w` and walk at `w`, raising `w` while moving, gives smooth starts and stops.
 - **Molang** (expressions like `"math.sin(query.anim_time * 360) * 20"`) isn't supported yet. Those values count as 0, and the console says so. Use keyframes instead.
 - <a id="fn-animation-get_length"></a><a id="fn-animation-is_looping"></a><a id="fn-animation-get_name"></a>`walk:get_length()`, `is_looping()` and `get_name()` tell you about an animation.
@@ -2742,11 +3513,11 @@ entities.register_spawn({
 
 The game rule `doMobSpawning` (`/gamerule doMobSpawning false`) turns natural spawning off. On a dedicated server, which keeps no light data, spawning uses the same light as `engine.get_light_level` there. Under open sky that's sunlight for the time of day; under anything solid it's dark. `sky = true` means nothing solid is overhead. So monsters spawn in caves and under cover, and animals only in the open.
 
-**Where they stop.** An entity more than 128 blocks from every player, or in a chunk that isn't loaded, waits where it is: no physics, no `on_step`. Ones with `despawn = true` are removed when no player is within 128 blocks, or sometimes after 30 seconds with nobody within 32, like Minecraft's monsters. Those are never saved. Everything else is saved with the world (`entities.txt` in its folder) and comes back with `on_spawn(self, saved)`. If a mod isn't loaded, its entities are kept in the file untouched until it is.
+**Where they stop.** An entity more than 128 blocks from every player, or in a chunk that isn't loaded, waits where it is: no physics, no `on_step`. Ones with `despawn = true` are removed when no player is within 128 blocks, or sometimes after 30 seconds with nobody within 32, as monsters usually do. Those are never saved. Everything else is saved with the world (`entities.txt` in its folder) and comes back with `on_spawn(self, saved)`. If a mod isn't loaded, its entities are kept in the file untouched until it is.
 
 <a id="dropped-items"></a>**Dropped items.** Blocks dug in survival pop out as items, and so do mobs' `drops`. They bob and spin, join into stacks, and a player picks them up by walking over them. If your inventory is full they stay on the ground, and they disappear after 5 minutes.
 
-Players drop things the way they do in Minecraft:
+How players drop things:
 - **Q** (Settings > Controls, "Drop Item") throws one of what's in your hand the way you're looking. **Ctrl+Q** throws the whole stack. Holding Q keeps dropping.
 - In an inventory screen, **clicking outside the window** while holding a stack drops it: left click the whole stack, right click one. This works in both the survival and the creative inventory.
 - **When you die**, everything you carried scatters on the ground, unless `keepInventory` is on (Craft & Ruin's survival mod keeps it by default).
@@ -3343,7 +4114,7 @@ Slots are numbered from 1:
 
 ### Pick block
 
-Press the **middle mouse button** on a block to put it in your hand, like Minecraft. Players can move it to another key or mouse button in Settings > Controls (**Pick Block**).
+Press the **middle mouse button** on a block to put it in your hand. Players can move it to another key or mouse button in Settings > Controls (**Pick Block**).
 
 - **Creative:** if the block is in the hotbar, that slot is selected. If not, it goes into the selected slot when that's empty, else the next empty slot (which is then selected), else it replaces what's in the selected slot.
 - **Survival** (the survival mod): if the block is in the hotbar, that slot is selected. If it's in your inventory, it moves into the hotbar the same way, and whatever it replaces goes back into the inventory. If you don't have one, nothing happens.
@@ -3492,13 +4263,13 @@ What you'll do most, and the command for it. Type them in the server window, or 
 | save, reload the lists, stop | `save`, `reload`, `stop` |
 | is everything all right? | `tps`, `diag` |
 
-**Protecting the spawn.** `spawn_protection = 16` (the default): blocks within 16 of the spawn can only be changed by operators (level 1 or more). It only works once there's an operator, as in Minecraft.
+**Protecting the spawn.** `spawn_protection = 16` (the default): blocks within 16 of the spawn can only be changed by operators (level 1 or more). It only works once there's an operator.
 
 **Protecting names.** A player who joins with a password (Settings > Player) owns that name on your server: nobody can use it without the password. `require_password = true` makes everyone do it. Passwords never leave the player's PC: the server keeps a per-server proof, not the password.
 
 ### 17c. Server commands
 
-Commands work like Minecraft's: typed in the server console (no slash), or in chat by players with `/` in front.
+Commands are typed in the server console (no slash), or in chat by players with `/` in front.
 
 **Who may use what: operator levels.** `op <name> [1-4]` makes someone an operator. Without a level they get `op_level` from `server.conf` (default 4). The levels are stored in `ops.txt` and listed by `ops`. The console can do everything.
 
@@ -3546,7 +4317,7 @@ An operator can't give a higher level than their own. Mods' commands get `is_ope
 | `doMobSpawning` | true | mobs appear by themselves ([§13a](#entity-spawning)) |
 | `randomTickSpeed` | 3 | blocks picked per 16×16×16 section per tick ([random ticks](#abm)): how fast grass spreads and crops grow. 0 = never |
 
-The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too. `/give` works the way Minecraft's does: `/give @s core_blocks:basalt 64`. Who to give to (`@s`, `@p` or your own name) can be left out, and the item is its name (`basalt`) or its full name (`core_blocks:basalt`, the grey name you see when pointing at it). Any `something:` in front works, so `minecraft:stone` gives stone.
+The survival mod follows them. Your mods can too: a rule's value is the shared value `"gamerule.<name>"`, so `engine.get_shared("gamerule.keepInventory")` is `"true"`, `"false"`, or `""` (not set: use your own default). In singleplayer, `/gamerule` in chat does the same for your world, and `/give`, `/clear`, `/kill` and `/tp` work there too. `/give` takes a target and an item: `/give @s core_blocks:basalt 64`. Who to give to (`@s`, `@p` or your own name) can be left out, and the item is its name (`basalt`) or its full name (`core_blocks:basalt`, the grey name you see when pointing at it). Any `something:` in front works, so `othergame:stone` gives stone.
 
 <a id="fn-hooks-on_server_action"></a>**`give`, `clear` and `kill` happen in the player's game**, where inventories and health live: the server asks, and the game does it. A mod can do these its own way with `on_server_action(action, a, b)`, returning `true` when it has. `action` is `"give"` (`a` = item, `b` = count), `"clear"` or `"kill"` (`a` = the reason shown on the death screen). The survival mod uses it to kill with its death screen and to clear its inventory too. Chain it like other hooks.
 
@@ -3768,14 +4539,14 @@ end
 - <a id="fn-engine-list_servers"></a><a id="fn-engine-save_servers"></a>`engine.list_servers`, `save_servers`: the saved server list, `{ { name, address, pinned }, ... }` (`servers.txt`). `pinned = true` keeps a server at the top of the Multiplayer list.
 - <a id="fn-engine-get_player_name"></a><a id="fn-engine-has_player_password"></a><a id="fn-engine-set_player_name"></a><a id="fn-engine-set_player_password"></a>`engine.get_player_name`, `set_player_name`, `set_player_password`, `has_player_password`
 - <a id="fn-engine-cancel_join"></a><a id="fn-engine-is_scanning_lan"></a>`engine.cancel_join` stops connecting; `engine.is_scanning_lan` is true while looking for LAN games
-- <a id="fn-engine-get_server_settings"></a><a id="fn-engine-has_server_icon"></a><a id="fn-engine-set_server_setting"></a>`engine.get_server_settings`, `set_server_setting` (Settings > Server: description, max players, port), `has_server_icon`
+- <a id="fn-engine-get_server_settings"></a><a id="fn-engine-has_server_icon"></a><a id="fn-engine-set_server_setting"></a>`engine.get_server_settings`, `set_server_setting` (Settings > Network: description, max players, port), `has_server_icon`
 - <a id="fn-engine-allow_firewall"></a>`engine.allow_firewall()` asks Windows again to let other PCs connect (for a "friends can't join" button). Returns `ok, status`: `true, "allowed"` (always, off Windows), `false, "failed"`, or `false, "pending"` when Windows is still applying it; the game records the result itself when it finishes, and asking again meanwhile starts nothing new
 
 ## 18. Engine screens and settings
 
 ### Creative inventory: tabs for your mod
 
-<a id="fn-creative-register_tab"></a>Like mods in Minecraft, a mod can give its blocks and items **a tab of their own** in the creative inventory's sidebar. Mods' tabs go under the built-in ones (All Items, Tools, Blocks...), below a line. One line in your mod's `init.lua` is enough:
+<a id="fn-creative-register_tab"></a>A mod can give its blocks and items **a tab of their own** in the creative inventory's sidebar. Mods' tabs go under the built-in ones (All Items, Tools, Blocks...), below a line. One line in your mod's `init.lua` is enough:
 ```lua
 creative.register_tab{ name = "Gems", icon = "ruby" }    -- every block and item THIS mod registers
 ```
@@ -3814,8 +4585,8 @@ A game styles the title screen with files in its `menu/` folder (`games/<game>/m
 | File | What it is |
 |---|---|
 | `header.png` | The title picture, drawn at its own proportions (otherwise the game's title in big gold text) |
-| `panorama_0.png` … `panorama_5.png` | Optional: six square pictures taken from one spot, turning slowly behind the title screen like Minecraft's panorama. In order: 0 front (north, −Z), 1 right, 2 back, 3 left, 4 up, 5 down. Each is a 90° view, as the game's camera sees it with `engine.set_fov(90)` in a square window and `engine.set_player_look(yaw, pitch)` at yaws −90, 0, 90, 180 (pitch 0), then −90 with pitch 89.9 (up) and −90 with pitch −89.9 (down). All six or none. Without them the engine draws its own landscape. |
-| `splashes.txt` | Optional: short lines, one per line (`#` starts a comment, 80 characters at most). One is picked at random and pulses in yellow under the title picture, like Minecraft's splash text. |
+| `panorama_0.png` … `panorama_5.png` | Optional: six square pictures taken from one spot, turning slowly behind the title screen. In order: 0 front (north, −Z), 1 right, 2 back, 3 left, 4 up, 5 down. Each is a 90° view, as the game's camera sees it with `engine.set_fov(90)` in a square window and `engine.set_player_look(yaw, pitch)` at yaws −90, 0, 90, 180 (pitch 0), then −90 with pitch 89.9 (up) and −90 with pitch −89.9 (down). All six or none. Without them the engine draws its own landscape. |
+| `splashes.txt` | Optional: short lines, one per line (`#` starts a comment, 80 characters at most). One is picked at random and pulses in yellow under the title picture (a splash text). |
 | `icon.png` | The game's icon in the top bar |
 | `button.png` | The picture for every button (otherwise plain grey boxes) |
 | `button_hover.png` | Optional: the button under the mouse. Without it, `button.png` lights up. |
@@ -3846,6 +4617,7 @@ button_text_hover_color = #ffffa0
 Mostly used by the base mod's menus. You'll only need these to replace those menus:
 - <a id="fn-engine-create_world"></a><a id="fn-engine-delete_world"></a><a id="fn-engine-get_active_world"></a><a id="fn-engine-get_game_info"></a><a id="fn-engine-get_worlds"></a><a id="fn-engine-list_worlds"></a><a id="fn-engine-play_world"></a><a id="fn-engine-save_world"></a><a id="fn-engine-set_active_world"></a><a id="fn-engine-start_game"></a><a id="fn-engine-take_world_error"></a>**Worlds:** `engine.list_worlds`, `create_world`, `play_world`, `delete_world`, `save_world`, `get_game_info`, and the older `get_worlds`, `get_active_world`, `set_active_world`, `start_game`. `engine.play_world(name)` returns `true`, or `false` and why not: the name isn't a world folder in `saves/`, the selected game isn't installed, or the world was made with another game than the selected one. It doesn't have to be the game that's loaded: playing a world whose game or mods differ from the loaded ones reloads the mods for it first, behind the loading screen. `engine.take_world_error()` returns why the last world was closed or couldn't be opened (for example, its world generator failed), once, else `nil`; the world list shows it. Each `engine.list_worlds()` entry is `{ name, seed, game_mode, played, has_thumbnail }`, newest first: `played` reads like "2 hours ago", and `has_thumbnail` says the world has a picture. The engine takes that picture (`saves/<world>/thumbnail.png`, 320x180) from the game view whenever you pause, every five minutes while you play, and a few seconds after a world without one is opened; `ui.world_thumbnail(name)` returns it for `ui.draw_image` (or `nil`), and picks up a newer one by itself.
 - <a id="fn-engine-get_keybinds"></a><a id="fn-engine-get_video_settings"></a><a id="fn-engine-key_name"></a><a id="fn-engine-reset_keybinds"></a><a id="fn-engine-set_keybind"></a><a id="fn-engine-set_video_setting"></a>**Settings:** `engine.get_keybinds`, `set_keybind`, `reset_keybinds`, `key_name`, `get_video_settings`, `set_video_setting`
+- <a id="fn-engine-get_ui_setting"></a><a id="fn-engine-set_ui_setting"></a>**Menu preferences:** `engine.get_ui_setting(key)` (a string, or nil) and `engine.set_ui_setting(key, value)` (nil removes it) keep a menu's own choices between sessions, in `settings.txt` as `ui_<key>`. Keys are `a-z`, `0-9` and `_` (up to 32); values up to 64 printable characters. The Settings screen keeps its **Advanced** switch here (`settings_advanced`): off, each tab lists only the settings most players use, and a line at the bottom shows how many more there are.
   - <a id="fn-hooks-handle_settings_mouse"></a>**Mouse buttons as controls:** keybinds store a mouse button as `1000 + button` (1002 = middle, 1003 and up = side buttons). `engine.key_name(1002)` returns `"Middle Mouse"`. Movement, jump, sneak, sprint and pick block can use mouse buttons, but not left or right, which dig and place. The engine calls `handle_settings_mouse(code)` when a mouse button is pressed on the Settings screen. Return true to use the press (the base settings menu binds it to the control waiting for a key).
 - <a id="fn-engine-back_to_title"></a><a id="fn-engine-close_settings"></a><a id="fn-engine-is_in_game"></a><a id="fn-engine-is_paused"></a><a id="fn-engine-open_settings"></a><a id="fn-engine-pause"></a><a id="fn-engine-quit"></a><a id="fn-engine-quit_to_menu"></a><a id="fn-engine-resume"></a>**Game flow:** `engine.open_settings`, `close_settings`, `pause`, `resume`, `is_paused`, `is_in_game`, `quit_to_menu`, `back_to_title`, `quit`
 - <a id="fn-engine-get_texture_pack"></a><a id="fn-engine-list_mods"></a><a id="fn-engine-list_texture_packs"></a><a id="fn-engine-open_mods_folder"></a><a id="fn-engine-open_texture_packs_folder"></a><a id="fn-engine-set_mod_enabled"></a><a id="fn-engine-set_texture_pack"></a>**Mods and texture packs:** `engine.list_mods`, `set_mod_enabled`, `open_mods_folder`, `list_texture_packs`, `set_texture_pack`, `get_texture_pack`, `open_texture_packs_folder`. For a `mods/` folder mod, `enabled` and `set_mod_enabled(id, on)` are the selected game's default for its worlds ([which mods a world runs](#which-mods-a-world-runs)).
@@ -3899,11 +4671,33 @@ Scripts in `clientmods/<name>/init.lua` that run only in the player's own game. 
 - <a id="fn-client-get_hotbar_slot"></a>`client.get_hotbar_slot(i)` returns name, count; <a id="fn-client-get_active_slot"></a>`client.get_active_slot()`; <a id="fn-client-get_hotbar_size"></a>`client.get_hotbar_size()`.
 - <a id="fn-client-get_time"></a>`client.get_time()` returns the time of day (0–1, as `sky.get_time`). <a id="fn-client-key_name"></a>`client.key_name(code)` returns a key's name.
 - <a id="fn-client-get_players"></a>`client.get_players()` returns other players `{ name, x, y, z, yaw }`. It's empty if the server doesn't allow it.
-- <a id="fn-client-get_server_info"></a>`client.get_server_info()` returns `{ mode, address, world }`. <a id="fn-client-get_rules"></a>`client.get_rules()` returns `{ allowed, chat, players, block_range }`.
+- <a id="fn-client-get_server_info"></a>`client.get_server_info()` returns `{ mode, address, world }`. <a id="fn-client-get_rules"></a>`client.get_rules()` returns `{ allowed, chat, players, block_range, messages }`.
 
 **Chat:**
 - <a id="fn-client-display_chat_message"></a>`client.display_chat_message(text [, r, g, b])` shows a line in your own chat (nobody else sees it).
 - <a id="fn-client-send_chat_message"></a>`client.send_chat_message(text)` sends chat, or a `/command`, as if you typed it. It returns false when the server doesn't allow it.
+
+**Talking to the server's mods:**
+- <a id="fn-client-send_to_server"></a>`client.send_to_server(channel, data)` → `true`, or `false, why`: a message to the server's mods, like [`engine.send_to_server`](#fn-engine-send_to_server) from a game mod. They get it in [`on_mod_message`](#fn-hooks-on_mod_message), from this player, and check it like anything else a player's game sends. The same channel names and limits (4 KB, 20 a second); only if the server allows it (`client_mods_messages`). In singleplayer it reaches your own world's mods.
+
+<a id="network-input"></a>**Network input** (data from other programs: lighting software's Art-Net, a stream deck, a sensor...). Off until the player turns it on in **Settings > Network > Network input** (shown with **Advanced** on):
+
+| choice | |
+|---|---|
+| Off (the default) | nothing can be received |
+| This computer | only from programs on the same PC (127.0.0.1) |
+| Network | from any network card: other devices and PCs. The system may ask to let the game through the firewall. |
+
+Only on the ports the player allows: `udp_ports = 6454` in `settings.txt` (comma-separated; 6454, Art-Net's, unless changed). Up to 4 at once. Mods can't turn it on, choose other ports, or reach the network any other way, and game mods and servers have no network input at all.
+
+| function | |
+|---|---|
+| <a id="fn-client-udp_listen"></a>`client.udp_listen(port)` | starts receiving UDP packets on that port: `true`, or `false, why` (off, a port the player doesn't allow, in use by another program) |
+| <a id="fn-client-udp_receive"></a>`client.udp_receive(port [, max])` | the packets that came since the last call, oldest first: `{ { data, from, port, time }, ... }`. `data` is the packet's bytes as a string (read it with `string.byte`); `from` and `port` are the sender's address and port. At most 256 are kept per port; older ones are dropped if nobody reads them. |
+| <a id="fn-client-udp_reply"></a>`client.udp_reply(port, address, to_port, data)` | sends a packet back, for protocols that answer "who's there?": only to an address that sent this port a packet in the last 10 seconds, at most 1472 bytes and 20 a second. `true`, or `false, why`. |
+| <a id="fn-client-udp_status"></a>`client.udp_status()` | `{ mode = "off" \| "local" \| "network", ports = { allowed }, listening = { ports }, received, error }` |
+
+Packets are only ever data: nothing in them is run.
 
 **Your mod:**
 - <a id="fn-client-get_mod_storage"></a>`client.get_mod_storage()`, called while your mod loads, returns storage kept between sessions: `s:get(key)`, `s:set(key, value)` (nil removes), `s:get_string`, `s:get_int`, `s:get_float`, `s:get_keys()`. Values are text.
@@ -3918,12 +4712,13 @@ client_mods = true                 # false: players' client mods don't run here
 client_mods_chat = false           # may they send chat and commands for the player?
 client_mods_players = true         # may they see other players?
 client_mods_block_range = 64       # how far they can read blocks (0 = any distance)
+client_mods_messages = true        # may they send messages to this server's mods (client.send_to_server)?
 ```
 For a LAN game, the host's `settings.txt` can set the same keys with `lan_` in front (`lan_client_mods_chat = false`...). A game mod running on the server can also change the rules with `engine.set_shared("engine:client_mods", "allowed=1;chat=0;players=1;range=32")`.
 
 ## 21. Online content
 
-Mods can show content that lives online, on **GitHub** (raw files or GitHub Pages) or on sites the player approved: news, changelogs, server lists, pictures, sounds. You change the file on GitHub and every player sees the new version, **without a new mod download**. It's the same idea as Minecraft's news feed, or the in-game websites of some Minecraft mods.
+Mods can show content that lives online, on **GitHub** (raw files or GitHub Pages) or on sites the player approved: news, changelogs, server lists, pictures, sounds. You change the file on GitHub and every player sees the new version, **without a new mod download**. It's the same idea as an in-game news feed.
 
 **It's data only.** The engine never runs anything it downloads. Mods get JSON as Lua tables, text as strings, pictures to draw with `ui.draw_image`, and sounds to play with `sound.play`. Your mod's own code decides what to do with them.
 
@@ -4016,7 +4811,133 @@ The engine treats everything online as untrusted:
 
 `remote.*` isn't available to client mods or world generation.
 
-## 22. Glossary
+## 22. Dimensions
+
+A world has the **overworld** and any number of other dimensions that mods register. They work however your game likes: low gravity, its own respawn rules, staying loaded, any sky. Each is a world of its own: its own chunks, terrain generator, light, sky and mobs. Players go between them, and different players can be in different dimensions at the same time. The dimensions belong to the world: everyone on it shares them, and they're saved inside it.
+
+### 22.1 Registering a dimension
+
+<a id="fn-dimensions-register"></a>`dimensions.register(name, def)`, in a mod's main file (it runs in every Lua: the game's, the server's, and the world generator threads'). The name is `"yourmod:name"` (lower case, digits, `_`). Everything in `def` is optional:
+
+| field | default | what it does |
+|---|---|---|
+| `generate_chunk(chunk, cx, cz, seed)` | an empty void | builds a new chunk, like the overworld's [`generate_chunk`](#fn-hooks-generate_chunk). Runs on the generator threads. |
+| `has_skylight` | `true` | sunlight lights it. `false`: only blocks give light (lava, torches). |
+| `has_ceiling` | `false` | a roof over everything: no weather is drawn |
+| `ultrawarm` | `false` | water shouldn't exist here (it boils away). The engine reports it; your bucket mod refuses water when `dimensions.get(dimensions.current()).ultrawarm`. |
+| `natural` | `true` | compasses, clocks and sleeping work normally. Your game reads it. |
+| `bed_works`, `respawn_anchor_works` | `true`, `false` | whether beds / respawn anchors set a spawn point here (your game reads them) |
+| `coordinate_scale` | `1` | how far one block here is in overworld blocks. Portals scale by it: 8 means 1 block here = 8 in the overworld. |
+| `ambient_light` | `0` | the darkest it gets (0..1). 0.1 is like the Nether. |
+| `logical_height` | `256` | portals and teleports stay below this |
+| `fixed_time` | none | the sky stays at this time of day (0..1) |
+| `effects` | `"overworld"` | how the sky looks: `"overworld"` (sun, moon, stars, clouds, weather), `"nether"` (no sky, only fog), `"end"` (a dark sky) |
+| `fog_color`, `sky_color` | | `"#rrggbb"` or `{ r, g, b }`: the fog, and the sky for `"end"` |
+| `caves` | `false` | the engine's cave carver runs here (the overworld's caves) |
+| `terrain_version` | `0` | like the overworld's [`terrain_version`](#fn-hooks-set_world_seed): raise it when the terrain changes, and untouched old chunks are made again |
+| `gravity` | `1` | times the overworld's gravity, for players and mobs: `0.4` is floaty, `2` heavy, `0` none |
+| `respawn` | `"overworld"` | where players who die here respawn: `"overworld"`, `"here"` (this dimension's `spawn`), or another dimension's name |
+| `spawn` | `{ x = 0.5, y = 80, z = 0.5 }` | where players arrive when no position is given (`set_player_dimension` without x, y, z; respawning here; portals with `destination = "spawn"`) |
+| `unload_after` | `30` | seconds with nobody in it before it's saved and unloaded. `-1`: it stays loaded. |
+| `sky` | from `effects` | `{ sky = true, sun = true, moon = true, clouds = true, weather = true }`: what's drawn overhead, each on its own. `effects` sets them all (on for `"overworld"`, off for `"nether"` and `"end"`); with `has_ceiling`, weather is off unless `weather_under_ceiling = true`. |
+| anything else | | yours: `dimensions.get(name)` returns every field you gave, for your own mods' rules (`hostile = true`, `music = "..."`) |
+
+- <a id="fn-dimensions-get"></a>`dimensions.get(name)` → its settings as a table (`nil` if there's no such dimension); `dimensions.list()` → every name, `"overworld"` first; `dimensions.exists(name)`.
+
+### 22.2 Where code runs
+
+Everything the engine runs for a player, a block or a mob runs **in its dimension**: [`engine.set_block`](#fn-engine-set_block), `get_block_name`, `get_metadata`, fluids and the rest act on that dimension's world. `on_block_placed` from a player in another dimension, a mob's `on_step` there, an ABM there: all of them change that dimension: code acts where it runs.
+
+| function | |
+|---|---|
+| <a id="fn-dimensions-current"></a>`dimensions.current()` | the dimension this code runs in (`"overworld"` or `"mod:name"`) |
+| <a id="fn-dimensions-run_in"></a>`dimensions.run_in(dimension, fn, ...)` → fn's first result | runs `fn` with world functions acting in that dimension (it's loaded first if nobody's there) |
+| <a id="fn-dimensions-load_area"></a>`dimensions.load_area(dimension, x, z [, radius])` → true | loads (or generates) the chunks within `radius` blocks (16; at most 64) of x, z, now: for reading or building somewhere nobody is |
+
+On the server, `on_update` runs in the overworld; in a player's own game, in that player's dimension.
+
+### 22.3 Players
+
+Where the world runs (the server; singleplayer and the host):
+
+| function / hook | |
+|---|---|
+| <a id="fn-engine-set_player_dimension"></a>`engine.set_player_dimension(name, dimension, x, y, z)` → true | sends a player to a dimension, at x, y, z there. Their game shows a fresh world: its chunks arrive like when joining. |
+| <a id="fn-engine-get_player_dimension"></a>`engine.get_player_dimension(name)` | `"overworld"` / `"mod:name"`, or `nil` if they aren't online. `engine.get_online_players()` and `get_player_info` have `dimension` too. |
+| <a id="fn-hooks-on_player_change_dimension"></a>`on_player_change_dimension(name, from, to)` | after a player went to another dimension (runs in `to`) |
+
+In a player's own game: <a id="fn-hooks-on_dimension_change"></a>`on_dimension_change(to, from)` runs when their player is in another dimension (change the music, the HUD...), and `dimensions.current()` says where they are.
+
+**How it works:**
+- Players only see the players and mobs in their own dimension. The player list still shows everyone.
+- Each loaded dimension runs on its own: fluids, falling blocks, block modifiers, random ticks and mobs. A dimension nobody is in (and no mod has asked for) is saved and unloaded 30 seconds later, and waits, frozen, until someone comes back.
+- A player's dimension is saved with them, so they come back where they left: `world.dat` in singleplayer, `players/<name>.txt` on a server.
+- Respawning (`engine.respawn_player(x, y, z [, dimension])`, the server's `/respawn`): a saved spawn point first (it may end with a dimension name, like a respawn anchor's), else where the dimension you died in sends you: its `respawn` (the overworld unless it says otherwise).
+- Mobs: `entities.register_spawn{ ..., dimensions = { "mod:name" } }` (or `"*"`). Without it, a mob spawns only in the overworld. `self:get_dimension()` and `self:set_dimension(dim, x, y, z)` move one between dimensions.
+
+### 22.4 Portals (`portals`)
+
+<a id="fn-portals-register"></a>`mods/base/portals.lua` is an API for any portal you can think of. Nothing is fixed: the frame, which way it faces, where it takes you, whether it links to a portal at the other end, how long you stand in it, who may use it. Each is a setting or your own function. Only `block`, `from` and `to` are needed:
+
+```lua
+-- An underworld portal: lit obsidian frames, 4 seconds in, 1:8, linked or built at the other end
+portals.register("mymod:portal", {
+    frame = "obsidian", block = "mymod:portal",
+    from = "overworld", to = "mymod:depths",          -- (mymod:depths has coordinate_scale = 8)
+    igniters = { "flint_and_steel" },
+    delay = 4, creative_delay = 0, cooldown = 0, mob_cooldown = 15,
+})
+
+-- A flat pad: stand on it for a second, arrive at the sky's spawn. One way, players only.
+portals.register("mymod:sky_pad", {
+    frame = "basalt", block = "mymod:pad", orientations = { "y" },
+    min_size = { 3, 3 }, max_size = { 3, 3 },
+    from = "overworld", to = "mymod:sky", one_way = true,
+    destination = "spawn", arrive = "exact", delay = 1, mobs = false,
+    can_use = function(name, trip) return engine.get_storage("boss_beaten:" .. name) == "yes" end,
+})
+
+-- A doorway made by code (no frame): the same place in a mirror world, at once
+portals.register("mymod:mirror", { block = "mymod:door", from = "overworld", to = "mymod:mirror",
+                                   destination = "same", min_size = { 1, 2 } })
+portals.create("mymod:mirror", "overworld", 100, 64, 20, "x", 1, 2)
+```
+
+| setting | default | |
+|---|---|---|
+| `block` | (needed) | the portal block. Register it `transparent = true, walkable = false`. Its metadata is which way it faces: 0 along x, 1 along z, 2 flat. |
+| `from`, `to` | (needed) | the two dimensions. `one_way = true`: it only goes from `from` to `to`. |
+| `frame` | none | a block name or a list: what a frame is made of. Without one, portals only exist where your code makes them. |
+| `orientations` | `{ "x", "z" }` | standing along x or z, and/or `"y"`: flat on the ground (you stand on it) |
+| `min_size`, `max_size` | `{ 2, 3 }`, `{ 21, 21 }` | the inside, `{ width, height }`. A frame's corners may be left out. |
+| `igniters` | none | items that light a frame when used on its inside |
+| `delay`, `creative_delay` | `0`, `delay` | seconds standing in it before it takes you |
+| `cooldown` | `1` | seconds after a trip before any portal takes that player again |
+| `step_out` | `true` | you have to leave the portal you arrive in before it works |
+| `destination` | `"scaled"` | where the trip aims: `"scaled"` (your x, z × the dimensions' `coordinate_scale`, or the portal's own `scale`), `"same"`, `"spawn"` (the other dimension's `spawn`), or `function(trip) return x, y, z end` |
+| `arrive` | `"find_or_build"` | `"find_or_build"`: a portal of this kind near the aim, else a new one; `"find"`: one near it, else the aim itself; `"exact"`: the aim; or `function(trip) return x, y, z end` |
+| `search_radius` | `"scaled"` | how far to look: a number, or `"scaled"` (128 ÷ the target's `coordinate_scale`, at least 16) |
+| `build`, `build_radius` | `true`, `16` | the built-in builder: a frame (of the first frame block, the smallest size) on solid ground within `build_radius`, facing the way you came, else on a platform (y between 70 and `logical_height - 10`). Or `false`, or `function(trip)` that makes one and returns it (`portals.create` helps). |
+| `mobs`, `mob_cooldown` | `true`, `15` | whether mobs go through, and how often each may |
+| `can_use(name, trip)` | | `false` refuses it (`name` is nil for a mob) |
+| `on_travel(name, trip)` | | after a player went through |
+
+A `trip` is `{ name = the portal kind, player, entity, from, to, x, y, z (where it started), axis, aim_x, aim_y, aim_z }`: your `destination`, `arrive`, `build` and `can_use` functions get it.
+
+| function | |
+|---|---|
+| `portals.register(name, def)` | a kind of portal |
+| `portals.light(x, y, z [, name])` → true | lights a frame around x, y, z (where the world runs; in `dimensions.current()`) |
+| `portals.create(name, dimension, x, y, z [, axis, w, h])` → shape | makes a portal by code, with its frame if the kind has one; x, y, z is its first inside block |
+| `portals.remove(dimension, x, y, z)` | removes the portal with a block there |
+| `portals.shape_at(name, x, y, z [, axis])` → shape | the inside of a frame of that kind there, or nil |
+| `portals.find(dimension, x, y, z, radius [, name])` → shape | the nearest portal there (checked to still be there) |
+| `portals.list(dimension)` | every portal in a dimension (`{ x, y, z, axis, w, h, name }`) |
+| `portals.travel(player, name)` → true | sends a player through now |
+
+Hook: `on_portal_travel(player, from, to, kind)`. Breaking a frame block or portal block breaks the portal (once its frame isn't whole). Each world's portals are kept in its mod storage, so linking survives restarts.
+
+## 23. Glossary
 
 | Word | Meaning |
 |---|---|

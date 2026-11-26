@@ -30,6 +30,8 @@ end
 loadScript("fog.lua")           -- fog settings
 loadScript("chat.lua")          -- chat commands
 loadScript("hud.lua")           -- HUD pieces servers and mods show: timers, scoreboards, titles...
+loadScript("portals.lua")       -- portals between dimensions
+loadScript("signs.lua")         -- signs: standing and wall signs with text on both sides
 loadScript("mods_menu.lua")     -- mods menu
 loadScript("texture_packs.lua") -- texture pack picker
 loadScript("settings_menu.lua") -- settings (controls, video)
@@ -38,3 +40,4 @@ loadScript("multiplayer.lua")
 loadScript("pause_menu.lua")  
 loadScript("player_list.lua")  
 loadScript("server_manager.lua")  
+loadScript("mirrors.lua")  

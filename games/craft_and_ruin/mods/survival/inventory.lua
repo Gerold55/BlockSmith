@@ -873,3 +873,29 @@ for _, wood in ipairs(woods) do
         survival.register_craft({ output = "stick", count = 4, recipe = { { planks }, { planks } } })
     end
 end
+
+-- Slabs, stairs and signs (at a workbench): 3 in a row -> 6 slabs, 6 as a staircase -> 4 stairs,
+-- 6 planks over a stick -> 3 signs. Only for the ones this game has.
+for _, wood in ipairs(woods) do
+    local planks = has("planks_" .. wood) and ("planks_" .. wood) or (has(wood .. "_planks") and (wood .. "_planks"))
+    if planks and has("slab_" .. wood) then
+        survival.register_craft({ output = "slab_" .. wood, count = 6, recipe = { { planks, planks, planks } } })
+    end
+    if planks and has("stairs_" .. wood) then
+        survival.register_craft({ output = "stairs_" .. wood, count = 4,
+            recipe = { { planks, "", "" }, { planks, planks, "" }, { planks, planks, planks } } })
+    end
+    if planks and has("sign_" .. wood) and has("stick") then
+        survival.register_craft({ output = "sign_" .. wood, count = 3,
+            recipe = { { planks, planks, planks }, { planks, planks, planks }, { "", "stick", "" } } })
+    end
+end
+for _, stone in ipairs({ "stone", "andesite" }) do
+    if has(stone) and has("slab_" .. stone) then
+        survival.register_craft({ output = "slab_" .. stone, count = 6, recipe = { { stone, stone, stone } } })
+    end
+    if has(stone) and has("stairs_" .. stone) then
+        survival.register_craft({ output = "stairs_" .. stone, count = 4,
+            recipe = { { stone, "", "" }, { stone, stone, "" }, { stone, stone, stone } } })
+    end
+end

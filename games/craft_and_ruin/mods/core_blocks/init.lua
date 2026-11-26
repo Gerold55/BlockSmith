@@ -15,6 +15,20 @@ engine.register_block("stone", 1.0, 1.0, 1.0, "textures/cw_stone.png", nil, {
     behavior = "solid"
 })
 
+engine.register_block("cobble", 1.0, 1.0, 1.0, "textures/cw_cobblestone.png", nil, {
+    description = "Cobble",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("stonebricks", 1.0, 1.0, 1.0, "textures/stone_brick.png", nil, {
+    description = "Stone Bricks",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
 engine.register_block("dirt", 1.0, 1.0, 1.0, "textures/cw_dirt.png", nil, {
     description = "Dirt",
     transparent = false,
@@ -51,6 +65,7 @@ engine.register_block("log_oak", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_oak_log_top.png",
     sides  = "textures/cw_oak_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Oak Log",
     transparent = false,
     walkable = true,
@@ -73,6 +88,7 @@ engine.register_block("log_birch", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_birch_log_top.png",
     sides  = "textures/cw_birch_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Birch Log",
     transparent = false,
     walkable = true,
@@ -131,11 +147,19 @@ engine.register_block("stick", 1.0, 1.0, 1.0, "textures/stick.png", nil, {
 -- --- Saplings (leaves sometimes drop them; plant them like flowers) ---
 engine.register_block("sapling_oak", 1.0, 1.0, 1.0, "textures/sapling_oak.png", nil, {
     description = "Oak Sapling",
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+    transparent = true, 
+    walkable = false, 
+    selectable = true, 
+    pattern = "plantlike", 
+    tint = false
 })
 engine.register_block("sapling_birch", 1.0, 1.0, 1.0, "textures/sapling_birch.png", nil, {
     description = "Birch Sapling",
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+    transparent = true, 
+    walkable = false, 
+    selectable = true, 
+    pattern = "plantlike", 
+    tint = false
 })
 
 -- --- Workbench: right-click it to craft on a 3x3 grid (survival mod) ---
@@ -305,32 +329,62 @@ engine.register_block("flower_daisy", 1.0, 1.0, 1.0, "textures/cw_flower_daisy.p
 
 engine.register_block("flower_bluebell", 1.0, 1.0, 1.0, "textures/cw_flower_bluebell.png", nil, {
     description = "Bluebell",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_azure_bluet", 1.0, 1.0, 1.0, "textures/cw_flower_azure_bluet.png", nil, {
     description = "Azure Bluet",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_allium", 1.0, 1.0, 1.0, "textures/cw_flower_allium.png", nil, {
     description = "Allium",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_white", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_white.png", nil, {
     description = "White Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_red", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_red.png", nil, {
     description = "Red Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 engine.register_block("flower_tulip_pink", 1.0, 1.0, 1.0, "textures/cw_flower_tulip_pink.png", nil, {
     description = "Pink Tulip",
-    transparent = true, walkable = false, selectable = true, gravity = false, pattern = "plantlike", tint = false
+    transparent = true, 
+	walkable = false, 
+	selectable = true, 
+	gravity = false, 
+	pattern = "plantlike", 
+	tint = false
 })
 
 -- Load separate UI script
@@ -341,3 +395,7 @@ dofile(g_CurrentModPath .. "/leafdecay.lua")
 dofile(g_CurrentModPath .. "/particles.lua")
 -- Biome blocks: spruce, jungle and acacia trees, snow and ice, terracotta and red sand
 dofile(g_CurrentModPath .. "/biome_blocks.lua")
+-- Slabs, stairs and signs
+dofile(g_CurrentModPath .. "/building_blocks.lua")
+-- Random ticks: grass spreading and dying. World-generator Lua states have no random-tick API.
+if engine.register_random_tick then dofile(g_CurrentModPath .. "/abm.lua") end

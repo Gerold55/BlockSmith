@@ -13,6 +13,7 @@ engine.register_block("log_spruce", 1.0, 1.0, 1.0, {
     bottom = "textures/cw_spruce_log_top.png",
     sides  = "textures/cw_spruce_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Spruce Log",
     transparent = false,
     walkable = true,
@@ -20,7 +21,7 @@ engine.register_block("log_spruce", 1.0, 1.0, 1.0, {
 })
 
 -- Spruce Leaves (dark, coloured by the biome)
-engine.register_block("leaves_spruce", 60, 120, 70, "spruce_leaves.png", nil, {
+engine.register_block("leaves_spruce", 60, 120, 70, "textures/spruce_leaves.png", nil, {
     description = "Spruce Leaves",
     transparent = true,
     cutout      = true,
@@ -37,6 +38,7 @@ engine.register_block("log_jungle", 1.0, 1.0, 1.0, {
     bottom = "textures/log_jungle_top.png",
     sides  = "textures/log_jungle.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Jungle Log",
     transparent = false,
     walkable = true,
@@ -61,6 +63,7 @@ engine.register_block("log_acacia", 1.0, 1.0, 1.0, {
     bottom = "textures/acacia_log_top.png",
     sides  = "textures/acacia_log.png"
 }, nil, {
+    rotation = "axis",           -- lies along the face it is put against
     description = "Acacia Log",
     transparent = false,
     walkable = true,
@@ -89,23 +92,34 @@ engine.register_block("snow_block", 1.0, 1.0, 1.0, "textures/snow.png", nil, {
     tool = "shovel"
 })
 
--- Snowy Grass Block (grass under snow: drops dirt when dug, like Minecraft)
+-- Snowy Grass block: keep its snowy texture colors unchanged across biomes.
 engine.register_block("snowy_grass", 1.0, 1.0, 1.0, {
     top    = "textures/snow.png",
     bottom = "textures/cw_dirt.png",
-    sides  = "textures/snowy_grass_side.png"
-}, nil, {
+    sides  = "textures/cw_dirt.png"
+}, {
+    sides  = "textures/snow_grass_side_overlay.png"
+}, {
     description = "Snowy Grass Block",
     transparent = false,
     walkable = true,
     behavior = "solid",
-    hardness = 0.6,
-    tool = "shovel",
-    drops = "dirt"
+	hardness = 0.6,
+    tint = false,
+	tool = "shovel",
+    drops = "dirt",
+
+    -- Sounds the engine plays by itself
+    sounds = {
+        footstep = { name = "default_dirt_footstep", gain = 0.45, pitch = 1.1 },  -- walking / landing on it
+        dig      = { name = "default_dirt_dig",      gain = 0.6 },               -- each hit while digging (survival)
+        dug      = { name = "default_dirt_dug",      gain = 0.9 },               -- when it breaks
+        place    = { name = "default_place",         gain = 0.8 },               -- when it's placed
+    },
 })
 
 -- Ice (frozen lakes and rivers: see-through, tints the light passing through it)
-engine.register_block("ice", 0.8, 0.9, 1.0, "textures/ice.png", nil, {
+engine.register_block("ice", 1.0, 1.0, 1.0, "textures/ice.png", nil, {
     description = "Ice",
     transparent = true,
     walkable = true,
@@ -136,7 +150,7 @@ engine.register_block("coarse_dirt", 1.0, 1.0, 1.0, "textures/coarse_dirt.png", 
 })
 
 -- Dead Bush (cross-plane plantlike pattern without biome tinting)
-engine.register_block("dead_bush", 1.0, 1.0, 1.0, "textures/dead_bush.png", nil, {
+engine.register_block("dead_bush", 1.0, 1.0, 1.0, "textures/dry_shrub.png", nil, {
     description = "Dead Bush",
     transparent = true,
     walkable = false,

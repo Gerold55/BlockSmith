@@ -4,7 +4,8 @@
 --   Controls - click a key, then press the new one (a key or a mouse button). Escape cancels.
 --              Keys used by more than one control are outlined in red.
 --   Video    - Field of View, Render Distance, Brightness (sliders), VSync (a switch),
---              Main Hand (Left / Right). Applied straight away.
+--              Main Hand (Left / Right), lighting options which also control BlockSmith Shaders.
+--              Applied straight away.
 --   Sound    - the volumes (sliders).
 --   Player   - your name (used in multiplayer and chat) and the password that protects it on
 --              servers. Click the box, type, press Enter.
@@ -111,8 +112,8 @@ local TABS = {
       desc = "How loud each kind of sound is." },
     { id = "player",   label = "Player",   title = "Player",
       desc = "Your name in chat and multiplayer, and the password that protects it." },
-    { id = "server",   label = "Server",   title = "Server",
-      desc = "What other players see when you host a game." },
+    { id = "server",   label = "Network",  title = "Network",
+      desc = "Hosting a game, and network input for client mods." },
 }
 
 local LABELS = {
@@ -121,11 +122,25 @@ local LABELS = {
     vsync           = "VSync",
     main_hand       = "Main Hand",
     brightness      = "Brightness",
+    light_quality   = "Lighting",
+    bloom           = "Bloom",
+    filmic          = "Filmic Look",
+    mirrors         = "Mirror Reflections",
+    udp_input       = "Network input (client mods)",
     volume_master   = "Master Volume",
     volume_music    = "Music",
     volume_effects  = "Blocks & Effects",
     volume_ambient  = "Weather & Ambience",
 }
+
+-- Settings most players never need, shown only with "Advanced" on (the switch in the sidebar,
+-- remembered in settings.txt). The rest is what everyone uses.
+local ADVANCED = {
+    vsync = true, bloom = true, filmic = true, mirrors = true,     -- Video
+    volume_ambient = true,                                         -- Sound
+    port = true, udp_input = true,                                 -- Network
+}
+local ADVANCED_CONTROL_SECTIONS = { Hotbar = true, Other = true }
 
 -- Which section each control is listed under (in this order)
 local CONTROL_SECTIONS = {
@@ -156,6 +171,7 @@ end
 
 local state = {
     tab = "controls",
+    advanced = false,     -- showing advanced settings too
     binds = {},
     video = {},
     sound = {},
@@ -256,10 +272,13 @@ end
 -- ===========================================================================
 
 local function refresh()
+    state.advanced = engine.get_ui_setting ~= nil and engine.get_ui_setting("settings_advanced") == "1"
     state.binds = (engine and engine.get_keybinds and engine.get_keybinds()) or {}
     state.video, state.sound = {}, {}
     for _, s in ipairs((engine and engine.get_video_settings and engine.get_video_settings()) or {}) do
-        if s.id:find("^volume_") then state.sound[#state.sound + 1] = s else state.video[#state.video + 1] = s end
+        if s.id:find("^volume_") then state.sound[#state.sound + 1] = s
+        elseif s.id == "udp_input" then state.udp_input = s           -- (listed under Network)
+        else state.video[#state.video + 1] = s end
     end
     -- Text items: kind = "text", value, max (length), allowed (pattern for one character)
     state.player = {
@@ -284,8 +303,15 @@ end
 -- The list for the open category: section headings and rows, in order
 local function entries()
     local out = {}
-    local function section(title) out[#out + 1] = { section = title } end
-    local function row(item) out[#out + 1] = { item = item } end
+    -- (a heading is only shown once something under it is: a section of advanced settings
+    -- disappears whole when they're hidden)
+    local pending, hidden, sectionAdvanced = nil, 0, false
+    local function section(title) pending = title; sectionAdvanced = ADVANCED_CONTROL_SECTIONS[title] == true and state.tab == "controls" end
+    local function row(item)
+        if not state.advanced and (sectionAdvanced or ADVANCED[item.id]) then hidden = hidden + 1; return end
+        if pending then out[#out + 1] = { section = pending }; pending = nil end
+        out[#out + 1] = { item = item }
+    end
     if state.tab == "controls" then
         local used = {}
         for _, sec in ipairs(CONTROL_SECTIONS) do
@@ -307,7 +333,17 @@ local function entries()
         end
     elseif state.tab == "video" then
         section("Display")
-        for _, s in ipairs(state.video) do if s.id ~= "main_hand" then row(s) end end
+        local lighting = {
+            light_quality = true, bloom = true, filmic = true, mirrors = true,
+        }
+        for _, s in ipairs(state.video) do if s.id ~= "main_hand" and not lighting[s.id] then row(s) end end
+        local any = false
+        for _, s in ipairs(state.video) do
+            if lighting[s.id] then
+                if not any then section("Lighting"); any = true end
+                row(s)
+            end
+        end
         for _, s in ipairs(state.video) do
             if s.id == "main_hand" then section("Hand"); row(s) end
         end
@@ -320,8 +356,17 @@ local function entries()
     elseif state.tab == "server" then
         section("Hosting")
         for _, s in ipairs(state.server) do row(s) end
+        if state.udp_input then section("Client mods"); row(state.udp_input) end
     end
+    -- what's hidden: one line that shows it
+    if hidden > 0 then out[#out + 1] = { more = hidden } end
     return out
+end
+
+local function set_advanced(on)
+    state.advanced = on
+    if not on then state.waiting = nil end
+    if engine.set_ui_setting then engine.set_ui_setting("settings_advanced", on and "1" or "0") end
 end
 
 -- How many controls use each key (to highlight duplicates)
@@ -338,7 +383,7 @@ local function set_value(item, value)
         if value == "" then return true end   -- empty = keep the current password
         return engine.set_player_password(value)
     end
-    if state.tab == "server" then return engine.set_server_setting(item.id, tostring(value)) end
+    if state.tab == "server" and item.id ~= "udp_input" then return engine.set_server_setting(item.id, tostring(value)) end
     return engine.set_video_setting(item.id, value)
 end
 
@@ -378,6 +423,8 @@ local function layout(W, H)
         ny = ny + (Theme.nav_h + 2) * S
     end
     L.done = { x = L.cardX + 10 * S, y = L.cardY + L.cardH - 30 * S, w = L.sideW - 20 * S, h = 20 * S, label = "Done" }
+    -- "Advanced": the whole row is the switch
+    L.adv = { x = L.cardX + 6 * S, y = L.done.y - 26 * S, w = L.sideW - 12 * S, h = 20 * S }
 
     -- Content: a header, the list, a status line
     L.cx = L.cardX + L.sideW
@@ -444,6 +491,20 @@ local function widget(L, item, ry, rh)
         return { kind = "segments", x = right - 2 * w, y = cy, w = 2 * w, h = ch, seg = w,
                  options = { { "Left", 1 }, { "Right", 0 } } }
     end
+    -- Choices the engine lists (lighting, bloom, visual effects): buttons; unsupported ones are
+    -- greyed out (opt[3]) and say why when clicked
+    if item.options then
+        -- every choice as wide as the longest label needs (so "This computer" fits), at least 46
+        local w = 46 * S
+        local opts = {}
+        for i, o in ipairs(item.options) do
+            opts[i] = { o.label, o.value, o.disabled }
+            w = math.max(w, text_width(o.label, L.fs * 0.85) + 24 * S)
+        end
+        -- (never wider than 60% of the row: the setting's name needs the rest)
+        w = math.min(w, math.floor(L.listW * 0.6 / #opts))
+        return { kind = "segments", x = right - #opts * w, y = cy, w = #opts * w, h = ch, seg = w, options = opts }
+    end
     local valueW = 46 * S
     local w = Theme.slider_w * S
     return { kind = "slider", x = right - valueW - w, y = cy, w = w, h = ch, valueX = right - valueW + 8 * S, valueW = valueW - 8 * S }
@@ -496,11 +557,17 @@ local function draw_list(L, mx, my)
     local S, fs = L.S, L.fs
     local shown, list, maxScroll = visible(L)
     local counts = key_counts()
+    state.hover_note = nil            -- (set again below while over a row with a note)
     local _, _, left_down = ui.get_mouse()
 
     for _, v in ipairs(shown) do
         local e, ry, rh = v.e, v.y, v.h
-        if e.section then
+        if e.more then
+            local hov = inside(mx, my, L.listX, ry, L.listW, rh)
+            if hov then box(L.listX, ry, L.listW, rh, S, C.row_hover) end
+            local t = e.more .. (e.more == 1 and " more setting" or " more settings") .. " - Show advanced"
+            text_mid(fit(t, L.listW - 16 * S, fs * 0.85), L.listX + 8 * S, ry, rh, fs * 0.85, hov and C.text or C.detail, false, S)
+        elseif e.section then
             local sfs = fs * 0.72
             text(string.upper(e.section), L.listX + 8 * S, ry + rh - text_height(sfs) - 4 * S, sfs, C.section, false, S)
             rect(L.listX + 8 * S + text_width(string.upper(e.section), sfs) + 6 * S, ry + rh - 4 * S - text_height(sfs) / 2,
@@ -542,11 +609,14 @@ local function draw_list(L, mx, my)
                 for i, opt in ipairs(wdg.options) do
                     local sx = wdg.x + (i - 1) * wdg.seg
                     local sel = item.value == opt[2]
+                    local off = opt[3]                       -- not available on this computer
                     if sel then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, C.accent)
-                    elseif inside(mx, my, sx, wdg.y, wdg.seg, wdg.h) then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, { 1, 1, 1, 0.08 }) end
+                    elseif not off and inside(mx, my, sx, wdg.y, wdg.seg, wdg.h) then box(sx + 2 * S, wdg.y + 2 * S, wdg.seg - 4 * S, wdg.h - 4 * S, S, { 1, 1, 1, 0.08 }) end
                     text_mid(opt[1], sx + (wdg.seg - text_width(opt[1], fs * 0.85)) / 2, wdg.y, wdg.h, fs * 0.85,
-                             sel and C.accent_text or C.text, false, S)
+                             sel and C.accent_text or (off and C.disabled or C.text), false, S)
                 end
+                -- why some choices are greyed out, next to them
+                if item.note and inside(mx, my, L.listX, ry, L.listW, rh) then state.hover_note = item.note end
             elseif wdg.kind == "slider" then
                 -- dragging: follow the mouse while the button is held
                 if state.dragging == item.id then
@@ -645,6 +715,19 @@ function render_settings(W, H)
         icon(n.id, n.x + 9 * S, n.y + math.floor((n.h - is) / 2), is, active and C.accent or col)
         text_mid(n.label, n.x + 9 * S + is + 7 * S, n.y, n.h, fs, col, false, S)
     end
+    local advHover
+    do  -- the Advanced switch
+        local a = L.adv
+        local hov = inside(mx, my, a.x, a.y, a.w, a.h)
+        advHover = hov
+        if hov then box(a.x, a.y, a.w, a.h, S, C.nav_hover) end
+        text_mid("Advanced", a.x + 9 * S, a.y, a.h, fs * 0.9, hov and C.text or C.detail, false, S)
+        local sw, sh = 26 * S, 13 * S
+        local sx, sy = a.x + a.w - 9 * S - sw, a.y + math.floor((a.h - sh) / 2)
+        box(sx, sy, sw, sh, 3 * S, state.advanced and C.accent or { 1, 1, 1, hov and 0.22 or 0.14 })
+        local k = sh - 4 * S
+        box(state.advanced and (sx + sw - 2 * S - k) or (sx + 2 * S), sy + 2 * S, k, k, 2 * S, C.knob)
+    end
     draw_primary(L.done, mx, my, S, fs)
 
     -- Content header
@@ -654,18 +737,20 @@ function render_settings(W, H)
     local descW = L.cw - 2 * L.pad - (L.reset and (L.reset.w + 8 * S) or 0)
     local desc = tab.desc
     if state.tab == "server" then
-        desc = (engine.has_server_icon and engine.has_server_icon()) and "What players see when you host. Your server_icon.png is used as its icon."
-            or "What players see when you host. Add server_icon.png for an icon."
+        desc = (engine.has_server_icon and engine.has_server_icon()) and "Hosting a game (your server_icon.png is its icon), and network input for client mods."
+            or "Hosting a game (add server_icon.png for an icon), and network input for client mods."
     end
     text(fit(desc, descW, fs * 0.72), L.cx + L.pad, L.headerY + text_height(fs * 1.1) + 5 * S, fs * 0.72, C.detail, false, S)
     if L.reset then draw_secondary(L.reset, mx, my, S, fs) end
     rect(L.cx + L.pad - 6 * S, L.dividerY, L.cw - 2 * L.pad + 12 * S, 1, C.divider)
 
     draw_list(L, mx, my)
+    if advHover then state.hover_note = "Show every setting. Off: just the ones most players use." end
 
     -- Status line: what to do now, or what went wrong
     local note, color = nil, C.detail
     if state.message then note, color = state.message, C.error
+    elseif state.hover_note then note, color = state.hover_note, C.detail
     elseif state.waiting then note, color = "Press a key or mouse button for this control. Escape cancels.", C.waiting
     elseif state.editing then note, color = "Type, then press Enter. Escape cancels.", C.waiting
     elseif state.tab == "server" then note = "Description colours: {gold}text  {#ff8800}text  {b}bold{/b}  {n} starts a 2nd line"
@@ -698,6 +783,11 @@ function handle_settings_click(mx, my, W, H)
     for _, n in ipairs(L.nav) do
         if inside(mx, my, n.x, n.y, n.w, n.h) then settings_set_tab(n.id); return true end
     end
+    if inside(mx, my, L.adv.x, L.adv.y, L.adv.w, L.adv.h) then
+        set_advanced(not state.advanced)
+        state.scroll = 0
+        return true
+    end
     if inside(mx, my, L.done.x, L.done.y, L.done.w, L.done.h) then
         state.waiting = nil
         engine.close_settings()
@@ -711,6 +801,10 @@ function handle_settings_click(mx, my, W, H)
     end
 
     for _, v in ipairs((visible(L))) do
+        if v.e.more and inside(mx, my, L.listX, v.y, L.listW, v.h) then
+            set_advanced(true)
+            return true
+        end
         local item = v.e.item
         if item then
             local w = widget(L, item, v.y, v.h)
@@ -732,6 +826,10 @@ function handle_settings_click(mx, my, W, H)
                 return true
             elseif hit and w.kind == "segments" then
                 local i = clamp(math.floor((mx - w.x) / w.seg) + 1, 1, #w.options)
+                if w.options[i][3] then                  -- greyed out: say why instead
+                    state.message = item.note or "Not available on this computer"
+                    return true
+                end
                 local ok, err = set_value(item, w.options[i][2])
                 if ok == false then state.message = err end
                 refresh()

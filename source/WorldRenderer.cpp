@@ -1,0 +1,348 @@
+#include "WorldRenderer.h"
+#include "ChunkMesh.h"
+#include "ChunkData.h"
+#include "Types.h"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <algorithm>
+#include <cmath>
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+constexpr float kChunkFadeSeconds = 0.6f;   // how long a new chunk takes to fully appear
+
+float elapsedMs(Clock::time_point start) {
+    return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
+}
+
+inline int floorDiv(int a, int b) {
+    int q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
+    return q;
+}
+
+int chunkDist2(const World::ChunkCoord& a, const World::ChunkCoord& b) {
+    const int dx = a.first - b.first;
+    const int dz = a.second - b.second;
+    return dx * dx + dz * dz;
+}
+
+glm::vec3 originOf(const World::ChunkCoord& c) {
+    return glm::vec3(static_cast<float>(c.first * CHUNK_WIDTH), 0.0f,
+                     static_cast<float>(c.second * CHUNK_WIDTH));
+}
+
+// Gribb-Hartmann frustum extraction from a combined projection * view matrix.
+struct Frustum {
+    glm::vec4 planes[6];
+};
+
+Frustum makeFrustum(const glm::mat4& m) {
+    const glm::vec4 row0(m[0][0], m[1][0], m[2][0], m[3][0]);
+    const glm::vec4 row1(m[0][1], m[1][1], m[2][1], m[3][1]);
+    const glm::vec4 row2(m[0][2], m[1][2], m[2][2], m[3][2]);
+    const glm::vec4 row3(m[0][3], m[1][3], m[2][3], m[3][3]);
+
+    Frustum f;
+    f.planes[0] = row3 + row0;  // left
+    f.planes[1] = row3 - row0;  // right
+    f.planes[2] = row3 + row1;  // bottom
+    f.planes[3] = row3 - row1;  // top
+    f.planes[4] = row3 + row2;  // near
+    f.planes[5] = row3 - row2;  // far
+    for (auto& p : f.planes) {
+        const float len = glm::length(glm::vec3(p));
+        if (len > 0.0f) p /= len;
+    }
+    return f;
+}
+
+bool boxInFrustum(const Frustum& f, const glm::vec3& boxMin, const glm::vec3& boxMax) {
+    for (const auto& p : f.planes) {
+        const glm::vec3 n(p);
+        const glm::vec3 positive(n.x >= 0.0f ? boxMax.x : boxMin.x,
+                                 n.y >= 0.0f ? boxMax.y : boxMin.y,
+                                 n.z >= 0.0f ? boxMax.z : boxMin.z);
+        if (glm::dot(n, positive) + p.w < 0.0f) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+WorldRenderer::WorldRenderer() = default;
+WorldRenderer::~WorldRenderer() = default;
+
+void WorldRenderer::clear(bool forceRebuild) {
+    m_meshes.clear();
+    m_needsMesh.clear();
+    m_needsUpload.clear();
+    m_firstUpload.clear();
+    m_forceRebuild = forceRebuild;
+    m_visible.clear();
+}
+
+void WorldRenderer::update(World& world, const glm::vec3& playerPos) {
+    // World was reset (new world / quit to menu): drop everything we had.
+    if (world.resetCount() != m_seenResetCount) {
+        m_seenResetCount = world.resetCount();
+        clear();
+    }
+
+    // clear(true): mesh every chunk that's still loaded again (nothing else would ask for it)
+    if (m_forceRebuild) {
+        m_forceRebuild = false;
+        for (const auto& entry : world.chunks) m_needsMesh.insert(entry.first);
+    }
+
+    for (const ChunkCoord& c : world.takeUnloadedChunks()) {
+        m_meshes.erase(c);
+        m_needsMesh.erase(c);
+        m_needsUpload.erase(c);
+        m_firstUpload.erase(c);
+    }
+    for (const ChunkCoord& c : world.takeDirtyChunks()) {
+        m_needsMesh.insert(c);
+    }
+
+    rebuildMeshes(world, playerPos);
+    uploadMeshes();
+}
+
+// Rebuilds meshes nearest-first until the mesh budget runs out.
+void WorldRenderer::rebuildMeshes(const World& world, const glm::vec3& playerPos) {
+    if (m_needsMesh.empty()) return;
+
+    const ChunkCoord p{floorDiv(static_cast<int>(std::floor(playerPos.x)), CHUNK_WIDTH),
+                       floorDiv(static_cast<int>(std::floor(playerPos.z)), CHUNK_WIDTH)};
+    std::vector<ChunkCoord> order(m_needsMesh.begin(), m_needsMesh.end());
+    std::sort(order.begin(), order.end(), [p](const ChunkCoord& a, const ChunkCoord& b) {
+        return chunkDist2(a, p) < chunkDist2(b, p);
+    });
+
+    const auto start = Clock::now();
+    for (const ChunkCoord& c : order) {
+        m_needsMesh.erase(c);
+        const ChunkData* data = world.chunkData(c);
+        if (!data) {                       // unloaded meanwhile
+            m_meshes.erase(c);
+            continue;
+        }
+        auto& mesh = m_meshes[c];
+        if (!mesh) mesh = std::make_unique<ChunkMesh>();
+        mesh->generateMeshData(*data);
+        m_needsUpload.insert(c);
+        m_meshed.push_back(c);
+        if (elapsedMs(start) >= m_meshBudgetMs) break;
+    }
+}
+
+void WorldRenderer::uploadMeshes() {
+    const auto start = Clock::now();
+    for (auto it = m_needsUpload.begin(); it != m_needsUpload.end();) {
+        if (elapsedMs(start) >= m_uploadBudgetMs) break;
+        auto mIt = m_meshes.find(*it);
+        if (mIt != m_meshes.end() && mIt->second->meshReadyForUpload) {
+            mIt->second->uploadMesh();
+            // Start the fade-in the first time this chunk's mesh reaches the GPU.
+            m_firstUpload.emplace(*it, Clock::now());
+        }
+        it = m_needsUpload.erase(it);
+    }
+}
+
+// 0 at the moment a chunk first appears, rising to 1 over kChunkFadeSeconds.
+float WorldRenderer::chunkFade(const ChunkCoord& c) const {
+    const auto it = m_firstUpload.find(c);
+    if (it == m_firstUpload.end()) return 1.0f;
+    return std::clamp(elapsedMs(it->second) / (kChunkFadeSeconds * 1000.0f), 0.0f, 1.0f);
+}
+
+namespace {
+void setChunkUniforms(GLint modelLoc, GLint fadeLoc, const glm::vec3& origin, float fade) {
+    const glm::mat4 model = glm::translate(glm::mat4(1.0f), origin);
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+    glUniform1f(fadeLoc, fade);
+}
+} // namespace
+
+// Opaque pass nearest-first (early depth rejection)
+void WorldRenderer::drawOpaque(GLuint shaderProgram, std::vector<Visible>& list) const {
+    std::sort(list.begin(), list.end(),
+              [](const Visible& a, const Visible& b) { return a.dist2 < b.dist2; });
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    for (const Visible& v : list) {
+        if (v.mesh->opaqueVertexCount > 0 && v.mesh->opaqueVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, v.origin, v.fade);
+            v.mesh->drawOpaque();
+        }
+    }
+}
+
+// Transparent pass farthest-first, blended, not writing depth (list sorted nearest-first).
+// Faces turned away are culled: the faces inside a chunk aren't sorted, so without it a block's
+// far side (an ice block's bottom, lit from below) could be drawn after its near side and cover
+// it - ice came out dark, with bright strips where the near face showed past the far one.
+// Liquids are meshed with both sides (ChunkMesh), so their surface still shows from underwater.
+// Liquids go first (every chunk), then the other see-through blocks: the faces aren't sorted by
+// depth, so water drawn after the ice on top of it covered the ice in lines and patches.
+void WorldRenderer::drawTransparent(GLuint shaderProgram, const std::vector<Visible>& list) const {
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+    GLint frontWas = GL_CCW, cullModeWas = GL_BACK;
+    glGetIntegerv(GL_FRONT_FACE, &frontWas);
+    glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
+    glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
+    // (counter-clockwise as set now: a mirror's reflection (Mirrors.h) has it the other way round)
+    glFrontFace(frontWas == GL_CW ? GL_CW : GL_CCW);
+    glCullFace(GL_BACK);
+    for (auto it = list.rbegin(); it != list.rend(); ++it) {
+        if (it->mesh->liquidVertexCount > 0 && it->mesh->liquidVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, it->origin, it->fade);
+            it->mesh->drawLiquid();
+        }
+    }
+    for (auto it = list.rbegin(); it != list.rend(); ++it) {
+        if (it->mesh->transparentVertexCount > 0 && it->mesh->transparentVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, it->origin, it->fade);
+            it->mesh->drawTransparent();
+        }
+    }
+    if (!cullWas) glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(frontWas));
+    glCullFace(static_cast<GLenum>(cullModeWas));
+    glDepthMask(GL_TRUE);
+}
+
+// Tinting glass (BlockProperty::tintView): its faces drawn with multiply blending - the shader's
+// u_TintPass gives each pixel the glass's colour as a filter (white where it's clear) - so the
+// world, mobs and sky seen through it take its colour, at any time of day. Several blocks in a
+// row multiply, like real glass.
+//  - Only the faces turned toward you filter (back faces culled): light passes through a block
+//    once, not once at the face it enters and again at the one it leaves. With both, ice and
+//    tinted glass came out twice as dark, and darker still in stripes where faces overlapped.
+//  - Drawn before the see-through blocks themselves (renderTransparent), so the glass's own
+//    surface (and the water under ice) isn't darkened by its own filter.
+void WorldRenderer::drawTint(GLuint shaderProgram, const std::vector<Visible>& list) const {
+    bool any = false;
+    for (const auto& v : list) if (v.mesh->tintVertexCount > 0) { any = true; break; }
+    if (!any) return;
+    const GLint modelLoc = glGetUniformLocation(shaderProgram, "model");
+    const GLint fadeLoc  = glGetUniformLocation(shaderProgram, "u_ChunkFade");
+    const GLint tintLoc  = glGetUniformLocation(shaderProgram, "u_TintPass");
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_DST_COLOR, GL_ZERO);              // result = what's there x the glass colour
+    const GLboolean cullWas = glIsEnabled(GL_CULL_FACE);
+    GLint frontWas = GL_CCW, cullModeWas = GL_BACK;
+    glGetIntegerv(GL_FRONT_FACE, &frontWas);
+    glGetIntegerv(GL_CULL_FACE_MODE, &cullModeWas);
+    glEnable(GL_CULL_FACE);                          // chunk faces are wound counter-clockwise outside
+    // (counter-clockwise as set now: a mirror's reflection (Mirrors.h) has it the other way round)
+    glFrontFace(frontWas == GL_CW ? GL_CW : GL_CCW);
+    glCullFace(GL_BACK);
+    if (tintLoc >= 0) glUniform1i(tintLoc, 1);
+    for (const auto& v : list) {
+        if (v.mesh->tintVertexCount > 0 && v.mesh->tintVAO != 0) {
+            setChunkUniforms(modelLoc, fadeLoc, v.origin, v.fade);
+            v.mesh->drawTint();
+        }
+    }
+    if (tintLoc >= 0) glUniform1i(tintLoc, 0);
+    if (!cullWas) glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(frontWas));
+    glCullFace(static_cast<GLenum>(cullModeWas));
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_TRUE);
+}
+
+void WorldRenderer::drawList(GLuint shaderProgram, std::vector<Visible>& list) const {
+    drawOpaque(shaderProgram, list);
+    drawTint(shaderProgram, list);          // (before the glass itself: see drawTint)
+    drawTransparent(shaderProgram, list);
+}
+
+void WorldRenderer::collectVisible(const glm::mat4& viewProj, const glm::vec3& eye, std::vector<Visible>& list) {
+    const Frustum frustum = makeFrustum(viewProj);
+    list.clear();
+    list.reserve(m_meshes.size());
+    for (const auto& entry : m_meshes) {
+        ChunkMesh* mesh = entry.second.get();
+        if (mesh->opaqueVertexCount == 0 && mesh->transparentVertexCount == 0 && mesh->liquidVertexCount == 0) continue;
+
+        const glm::vec3 boxMin = originOf(entry.first);
+        const glm::vec3 boxMax = boxMin + glm::vec3(static_cast<float>(CHUNK_WIDTH),
+                                                    static_cast<float>(CHUNK_HEIGHT),
+                                                    static_cast<float>(CHUNK_WIDTH));
+        if (!boxInFrustum(frustum, boxMin, boxMax)) continue;
+
+        const glm::vec3 d = (boxMin + boxMax) * 0.5f - eye;
+        list.push_back(Visible{mesh, boxMin, glm::dot(d, d), chunkFade(entry.first)});
+    }
+}
+
+void WorldRenderer::render(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye) {
+    std::vector<Visible> list;
+    collectVisible(viewProj, eye, list);
+    drawList(shaderProgram, list);
+}
+
+void WorldRenderer::renderOpaque(GLuint shaderProgram, const glm::mat4& viewProj, const glm::vec3& eye) {
+    collectVisible(viewProj, eye, m_visible);
+    drawOpaque(shaderProgram, m_visible);
+}
+
+void WorldRenderer::renderTransparent(GLuint shaderProgram) {
+    drawTint(shaderProgram, m_visible);     // (before the glass itself: see drawTint)
+    drawTransparent(shaderProgram, m_visible);
+    m_visible.clear();     // (meshes may be thrown away before the next frame)
+}
+
+float WorldRenderer::areaReadyProgress(const World& world, const glm::vec3& pos, int radius) const {
+    const int pcx = floorDiv(static_cast<int>(std::floor(pos.x)), CHUNK_WIDTH);
+    const int pcz = floorDiv(static_cast<int>(std::floor(pos.z)), CHUNK_WIDTH);
+
+    int total = 0, done = 0;
+    for (int dx = -radius; dx <= radius; ++dx) {
+        for (int dz = -radius; dz <= radius; ++dz) {
+            ++total;
+            const ChunkCoord c{pcx + dx, pcz + dz};
+            if (!world.chunkData(c)) continue;                    // not generated yet
+            if (m_needsMesh.count(c) || m_needsUpload.count(c)) continue;
+            const auto it = m_meshes.find(c);
+            if (it == m_meshes.end() || !it->second->everUploaded) continue;
+            ++done;
+        }
+    }
+    return total > 0 ? static_cast<float>(done) / static_cast<float>(total) : 1.0f;
+}
+
+void WorldRenderer::collectMirrors(const glm::vec3& pos, float radius, std::vector<glm::ivec4>& out) const {
+    out.clear();
+    const float r2 = radius * radius;
+    for (const auto& entry : m_meshes) {
+        const ChunkMesh* mesh = entry.second.get();
+        if (mesh->mirrors.empty()) continue;
+        const glm::vec3 o = originOf(entry.first);
+        // (the chunk's nearest point to pos is too far: none of its mirrors are near)
+        const glm::vec3 nearest = glm::clamp(pos, o, o + glm::vec3(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_WIDTH));
+        if (glm::dot(nearest - pos, nearest - pos) > r2) continue;
+        for (const glm::ivec4& m : mesh->mirrors) {
+            const glm::ivec3 c(static_cast<int>(o.x) + m.x, m.y, static_cast<int>(o.z) + m.z);
+            const glm::vec3 d = glm::vec3(c) + glm::vec3(0.5f) - pos;
+            if (glm::dot(d, d) <= r2) out.push_back(glm::ivec4(c, m.w));
+        }
+    }
+}

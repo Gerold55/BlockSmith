@@ -23,10 +23,9 @@
 
 local world_seed = 1337
 
--- Which version of the terrain this makes. Raise it whenever the terrain changes (heights,
--- biomes, rivers...): when a world is opened, its saved chunks that nobody built in and that
--- an older version made are generated again, so old terrain doesn't stand next to new as
--- steps and pits. Chunks anyone built in are always kept as they are.
+-- Which version of the terrain this makes. Raise it when saved, unedited chunks should be
+-- regenerated; leave it unchanged for updates intended to affect only newly generated chunks.
+-- Chunks anyone built in are always kept as they are.
 --   1: the first biome generator        2: terrain shaped every 4 blocks and blended (smoother)
 --   3: flowers in Minecraft-style patches (far fewer)
 terrain_version = 3
@@ -54,22 +53,16 @@ end
 -- Noise
 -- ---------------------------------------------------------------------------
 
--- Terrain noise hash (sine-based): only for the smooth shapes
+-- Seeded coordinate hash used by smooth noise and discrete placement.
 function get_rand(x, z, seed_offset)
     local val = sin((x + world_seed * 0.1) * 12.9898 + (z + world_seed * 0.1) * 78.233 + seed_offset) * 43758.5453
     return val - floor(val)
 end
 
--- Placement hash (integer arithmetic: no bands or repeating rows), for anything per block
-local HASH_M = 2147483647
+-- Mix coordinates nonlinearly before thresholding, or placement forms diagonal bands.
 function hash_rand(x, z, salt)
-    local seed_term = ((world_seed % HASH_M) * 48271) % HASH_M
-    local s = floor(salt * 100 + 0.5) % HASH_M
-    local h = (floor(x) * 73856093 + floor(z) * 19349663 + s * 83492791 + seed_term) % HASH_M
-    h = (h * 16807) % HASH_M
-    h = (h * 16807) % HASH_M
-    h = (h * 16807) % HASH_M
-    return h / HASH_M
+    local salt_offset = floor(salt * 100 + 0.5) * 0.618033988749895
+    return get_rand(floor(x), floor(z), salt_offset)
 end
 
 local function fade(t) return t * t * t * (t * (t * 6.0 - 15.0) + 10.0) end
@@ -367,22 +360,22 @@ local function biome_of(col, x, z)
     if col.vd < 1.6 then return "basalt_hills" end
     if col.c < -0.04 and y <= SEA + 1 and col.mountain < 0.2 and col.bad < 0.4 then return "beach" end
     if col.mountain > 0.55 and y > 92 then return "mountains" end
-    if col.bad > 0.5 then return "badlands" end
+    if col.bad > 0.4 then return "badlands" end
     if col.swamp > 0.5 then return "swamp" end
     local t, h = col.t_eff, col.hum
-    if t < 0.27 then
-        return (h > 0.48) and "snowy_taiga" or "snowy_plains"
-    elseif t < 0.38 then
-        return (h > 0.42) and "taiga" or "plains"
-    elseif t > 0.62 then
-        if h < 0.40 then return "desert" end
-        if h > 0.60 then return "jungle" end
+    if t < 0.29 then
+        return (h > 0.45) and "snowy_taiga" or "snowy_plains"
+    elseif t < 0.40 then
+        return (h > 0.40) and "taiga" or "plains"
+    elseif t > 0.60 then
+        if h < 0.45 then return "desert" end
+        if h > 0.56 then return "jungle" end
         return "savanna"
-    elseif t > 0.56 and h < 0.45 then
+    elseif t > 0.54 and h < 0.48 then
         return "savanna"
     else
-        if h > 0.50 then
-            return (octave_noise2d(x, z, 1, 0.5, 0.01, 31.0) > 0.62) and "birch_forest" or "forest"
+        if h > 0.46 then
+            return (octave_noise2d(x, z, 1, 0.5, 0.0035, 31.0) > 0.62) and "birch_forest" or "forest"
         end
         return "plains"
     end
@@ -828,9 +821,9 @@ print("[Mapgen] Craft & Ruin biomes: plains, forests, taiga, snow, hills, mounta
 -- ===========================================================================
 local GRASS = {
     plains = { 145, 189, 89 }, forest = { 121, 192, 90 }, birch_forest = { 136, 187, 103 },
-    taiga = { 134, 183, 131 }, snowy_taiga = { 128, 180, 151 }, snowy_plains = { 128, 180, 151 },
+    taiga = { 134, 183, 117 }, snowy_taiga = { 128, 180, 126 }, snowy_plains = { 128, 180, 126 },
     savanna = { 191, 183, 85 }, desert = { 191, 183, 85 }, badlands = { 144, 129, 77 },
-    jungle = { 89, 201, 60 }, swamp = { 106, 112, 57 }, mountains = { 138, 182, 137 },
+    jungle = { 89, 201, 60 }, swamp = { 106, 112, 57 }, mountains = { 138, 182, 124 },
     basalt_hills = { 120, 126, 86 },
     beach = { 145, 189, 89 }, ocean = { 142, 185, 113 }, river = { 142, 185, 113 },
 }
@@ -866,12 +859,30 @@ local function hook_weather()
     end
     return true
 end
-if not hook_weather() then
-    -- the weather mod loads after this one: hook it on the first update
+-- The aurora mod (if it's on): now and then on a clear night, seen in the snowy biomes only
+local function hook_aurora()
+    if type(aurora) ~= "table" or not aurora.set_options then return false end
+    aurora.set_options({
+        chance = 0.12,                -- about one night in eight
+        where = function(x, _, z)
+            if type(x) ~= "number" or type(z) ~= "number" or x ~= x or z ~= z then return false end
+            local b = get_biome(floor(x), floor(z))
+            return b == "snowy_plains" or b == "snowy_taiga"
+        end,
+    })
+    return true
+end
+local weather_hooked, aurora_hooked = hook_weather(), hook_aurora()
+if not (weather_hooked and aurora_hooked) then
+    -- the weather and aurora mods load after this one: hook them on the first update
     local prev = on_update
     local done = false
     function on_update(...)
-        if not done then done = true; hook_weather() end
+        if not done then
+            done = true
+            if not weather_hooked then hook_weather() end
+            if not aurora_hooked then hook_aurora() end
+        end
         if prev then return prev(...) end
     end
 end

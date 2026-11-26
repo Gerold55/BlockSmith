@@ -1,13 +1,25 @@
 # 3.24+: the ENet and OpenAL downloads below use FetchContent's DOWNLOAD_EXTRACT_TIMESTAMP (new
 # in 3.24), and FindLua knows Lua 5.4. Visual Studio 2022 and current vcpkg ship a newer CMake.
 cmake_minimum_required(VERSION 3.24)
+
+# Release by default. Visual Studio / Xcode (several configurations in one build folder): Release
+# is listed first, so the IDE starts on it - but `cmake --build` still needs `--config Release`
+# (without it, CMake builds Debug there). Ninja / Makefiles: CMAKE_BUILD_TYPE is Release unless
+# you say otherwise (-DCMAKE_BUILD_TYPE=Debug). Applies to a new build folder (these are cached).
+if (NOT DEFINED CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_CONFIGURATION_TYPES "Release;RelWithDebInfo;Debug;MinSizeRel" CACHE STRING "Build configurations (Release first)")
+endif()
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release, Debug, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+
 project(BlockSmith C CXX)   # the BlockSmith engine
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-# main.cpp has thousands of sol2 bindings; MSVC needs /bigobj for that many sections
+# source/main.cpp has thousands of sol2 bindings; MSVC needs /bigobj for that many sections
 if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
 endif()
@@ -114,77 +126,88 @@ add_library(unofficial::stb ALIAS stb)
 target_include_directories(stb INTERFACE "${CMAKE_CURRENT_LIST_DIR}/libs")
 
 add_executable(BlockSmith
-    main.cpp
-    Diagnostics.cpp
-    Player.cpp
-    World.cpp
-    ChunkMesh.cpp
-    Block.cpp
-    Hotbar.cpp
-    PauseMenu.cpp
-    FontRenderer.cpp
-    ParticleSystem.cpp
-    Lighting.cpp
-    Lighting.h
-    Skybox.cpp
-    Skybox.h
-    CaveGenerator.cpp
-    CaveGenerator.h
-    Model.cpp
-    Model.h
-    ChatSystem.cpp
-    WebLink.cpp
-    WebLink.h
-    ChatSystem.h
-    MainMenu.cpp
-    MainMenu.h
-    Clouds.cpp
-    Clouds.h
-    Fog.h
-    Fog.cpp
-    Inventory.cpp
-    Inventory.h
-    WorldRenderer.cpp
-    WorldRenderer.h
-    ChunkData.cpp
-    ChunkData.h
-    Light.cpp
-    Light.h
-    FirstPerson.cpp
-    FirstPerson.h
-    ClientMods.cpp
-    ClientMods.h
-    ClientModRules.h
-    ChunkGenerator.cpp
-    ChunkGenerator.h
-    Fluids.cpp
-    Fluids.h
-    WeatherEffects.cpp
-    WeatherEffects.h
-    Firewall.cpp
-    Audio.cpp
-    Audio.h
-    StbVorbis.cpp
-    Net.cpp
-    Entities.cpp
-    BlockModifiers.cpp
-    BlockModifiers.h
-    Entities.h
-    EntityLua.h
-    Net.h
-    RemoteContent.cpp
-    RemoteContent.h
-    PlayerMovement.cpp
-    PlayerMovement.h
-    BlockDefs.cpp
-    BlockDefs.h
-    PlayerAvatars.cpp
-    PlayerAvatars.h
+    source/main.cpp
+    api/Region.cpp
+    source/Diagnostics.cpp
+    source/Player.cpp
+    source/World.cpp
+    source/ChunkMesh.cpp
+    source/Block.cpp
+    source/Hotbar.cpp
+    source/PauseMenu.cpp
+    source/FontRenderer.cpp
+    source/ParticleSystem.cpp
+    source/Lighting.cpp
+    source/Lighting.h
+    source/Skybox.cpp
+    source/Skybox.h
+    source/CaveGenerator.cpp
+    source/CaveGenerator.h
+    source/Model.cpp
+    source/VoxelVolume.cpp
+    source/Spotlights.cpp
+    api/Mirrors.cpp
+    source/GpuCheck.cpp
+    source/Bloom.cpp
+    source/BlockSmithShaders.cpp
+    source/SunShafts.cpp
+    source/UdpInput.cpp
+    source/Model.h
+    source/ChatSystem.cpp
+    source/WebLink.cpp
+    source/WebLink.h
+    source/ChatSystem.h
+    source/MainMenu.cpp
+    source/MainMenu.h
+    source/Clouds.cpp
+    source/Clouds.h
+    source/Fog.h
+    source/Fog.cpp
+    source/Inventory.cpp
+    source/Inventory.h
+    source/WorldRenderer.cpp
+    source/WorldRenderer.h
+    source/ChunkData.cpp
+    source/ChunkData.h
+    source/Light.cpp
+    source/Light.h
+    source/FirstPerson.cpp
+    source/FirstPerson.h
+    api/ClientMods.cpp
+    api/ClientMods.h
+    source/ClientModRules.h
+    source/ChunkGenerator.cpp
+    source/ChunkGenerator.h
+    api/Fluids.cpp
+    api/Fluids.h
+    source/WeatherEffects.cpp
+    source/WeatherEffects.h
+    source/Firewall.cpp
+    source/Audio.cpp
+    source/Audio.h
+    source/StbVorbis.cpp
+    source/Net.cpp
+    source/Entities.cpp
+    source/BlockModifiers.cpp
+    source/BlockModifiers.h
+    source/Entities.h
+    source/EntityLua.h
+    source/Net.h
+    source/RemoteContent.cpp
+    source/RemoteContent.h
+    source/PlayerMovement.cpp
+    source/PlayerMovement.h
+    source/BlockDefs.cpp
+    source/BlockDefs.h
+    source/PlayerAvatars.cpp
+    source/PlayerAvatars.h
     deps/glad.c
 )
 
 target_include_directories(BlockSmith PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/api
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )
@@ -222,13 +245,6 @@ if (TARGET unofficial::lua::lua)
     target_link_libraries(BlockSmith PRIVATE unofficial::lua::lua)
 else()
     target_link_libraries(BlockSmith PRIVATE ${LUA_LIBRARY})
-endif()
-
-if (NOT WIN32)
-    find_library(EXECINFO_LIBRARY execinfo)
-    if (EXECINFO_LIBRARY)
-        target_link_libraries(BlockSmith PRIVATE ${EXECINFO_LIBRARY})
-    endif()
 endif()
 
 endif()   # NOT BLOCKSMITH_SERVER_ONLY (the game)
@@ -297,24 +313,25 @@ add_custom_target(blocksmith_buildinfo ALL
     VERBATIM)
 
 add_executable(BlockSmithServer
-    ServerMain.cpp
-    Diagnostics.cpp
-    ChunkGenerator.cpp
-    Fluids.cpp
-    World.cpp
-    ChunkData.cpp
-    Light.cpp
-    CaveGenerator.cpp
-    Block.cpp
-    BlockDefs.cpp
-    Net.cpp
-    Entities.cpp
-    BlockModifiers.cpp
-    BlockModifiers.h
-    Entities.h
-    EntityLua.h
-    RemoteContent.cpp
-    PlayerMovement.cpp
+    source/ServerMain.cpp
+    api/Region.cpp
+    source/Diagnostics.cpp
+    source/ChunkGenerator.cpp
+    api/Fluids.cpp
+    source/World.cpp
+    source/ChunkData.cpp
+    source/Light.cpp
+    source/CaveGenerator.cpp
+    source/Block.cpp
+    source/BlockDefs.cpp
+    source/Net.cpp
+    source/Entities.cpp
+    source/BlockModifiers.cpp
+    source/BlockModifiers.h
+    source/Entities.h
+    source/EntityLua.h
+    source/RemoteContent.cpp
+    source/PlayerMovement.cpp
 )
 
 if (WIN32)
@@ -325,6 +342,8 @@ add_dependencies(BlockSmithServer blocksmith_buildinfo)
 target_include_directories(BlockSmithServer PRIVATE
     ${BLOCKSMITH_GENERATED_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/api
     ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${enet_SOURCE_DIR}/include
 )
@@ -343,11 +362,6 @@ endif()
 if (NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(BlockSmithServer PRIVATE Threads::Threads)
-
-    find_library(EXECINFO_LIBRARY execinfo)
-    if (EXECINFO_LIBRARY)
-        target_link_libraries(BlockSmithServer PRIVATE ${EXECINFO_LIBRARY})
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -430,4 +444,14 @@ else()
     else()
         message(STATUS "BlockSmith: libcurl not found - online mod content (remote.*) is disabled in this build")
     endif()
+endif()
+
+# Windows: <windows.h> defines min() and max() as macros, which breaks std::max / glm::max in
+# any file that ends up including it (through GLFW, the console code...). NOMINMAX turns them off.
+if (WIN32)
+    foreach(_bs_target BlockSmith BlockSmithServer)
+        if (TARGET ${_bs_target})
+            target_compile_definitions(${_bs_target} PRIVATE NOMINMAX)
+        endif()
+    endforeach()
 endif()
