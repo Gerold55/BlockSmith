@@ -63,6 +63,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "UdpInput.h"
 #include "GpuCheck.h"
 #include "Bloom.h"
+#include "BlockSmithShaders.h"
 #include "SunShafts.h"
 #include "SceneCopy.h"
 #include "DimensionWorlds.h"
@@ -159,8 +160,8 @@ Spotlights g_Spotlights;
 // What the graphics card can take (GpuCheck.h, at startup) and the lighting the player chose:
 // quality 0 off (no traced shadows), 1 low, 2 high; bloom on/off (Bloom.h)
 GpuCaps g_GpuCaps;
-// True only while the Settings screen handles the player's own mouse click: lighting and bloom
-// are the player's choice, never a mod's or a server's (setVideoSetting refuses them otherwise)
+// True only while the Settings screen handles the player's own mouse click: lighting and visual
+// effects are the player's choice, never a mod's or a server's (setVideoSetting refuses them).
 bool g_PlayerSettingsClick = false;
 int g_LightQuality = 0;
 bool g_BloomOn = false;
@@ -200,6 +201,7 @@ bool g_FilmicOn = true;          // filmic exposure for Lighting Low/High (Setti
 SceneCopy g_SceneCopy;           // the frame before water is drawn: water reflections (High)
 float g_BloomStrength = 0.6f, g_BloomThreshold = 0.75f;   // (a game can tune them: sky.set_bloom)
 Bloom g_Bloom;
+BlockSmithShaders g_BlockSmithShaders;
 // Sun shafts in the air (SunShafts.h; lighting quality High), and how strong a game wants them
 SunShafts g_SunShafts;
 float g_SunShaftStrength = 0.5f;
@@ -845,7 +847,7 @@ World* apiWorld() {
 extern GameServer g_Server;
 extern ServerLuaApi g_ServerApi;
 std::string playerName();
-bool changeLocalDimension(const std::string& toIn, const glm::vec3& pos) {
+bool changeLocalDimension(sol::state& lua, const std::string& toIn, const glm::vec3& pos) {
     World* w = g_WorldInstance;
     if (!w || !g_PlayerInstance || g_Client.active()) return false;
     const std::string to = DimensionWorlds::norm(toIn);
@@ -857,6 +859,7 @@ bool changeLocalDimension(const std::string& toIn, const glm::vec3& pos) {
 
     // 1. The dimension we leave: everything changed in it goes to disk
     w->finishMoves();
+    structure::runMoveCallbacks(lua, *w);
     w->saveAll();
     if (!g_WorldDir.empty()) g_BlockMods.saveDimension(from, w->saveDirectory());
     // 2. The one we go to: if it was running in the background (guests there), it's saved and
@@ -1526,7 +1529,7 @@ bool modIsEnabled(const fs::path& rootFolder, const std::string& id) {
 
 struct ModInfo {
     std::string id;           // folder or file name
-    std::string title, author, description, version, depends;
+    std::string title, author, description, version, depends, image;
     std::string source;       // Global / Game: x
     std::string path;
     std::string status;       // "loaded", "error", "not_loaded", "disabled"
@@ -1537,6 +1540,8 @@ struct ModInfo {
     bool required = false;    // can't be switched off
     bool restartNeeded = false;
 };
+
+std::string resolvePreviewImage(const fs::path& folder, const std::string& configured);
 
 // Fills status/error from what happened when the files were run at startup.
 void applyLoadStatus(ModInfo& m, const std::vector<fs::path>& files) {
@@ -1578,6 +1583,7 @@ std::vector<ModInfo> listInstalledMods() {
             if (entry.is_directory()) {
                 m.isFolder = true;
                 m.id = entry.path().filename().string();
+                m.image = resolvePreviewImage(entry.path(), "");
                 for (const auto& f : fs::recursive_directory_iterator(entry.path(), ec)) {
                     if (f.is_regular_file() && f.path().extension() == ".lua") files.push_back(f.path());
                 }
@@ -1591,6 +1597,7 @@ std::vector<ModInfo> listInstalledMods() {
                     m.description = kv["description"];
                     m.version = kv["version"];
                     m.depends = kv["depends"];
+                    m.image = resolvePreviewImage(entry.path(), kv["image"]);
                 }
             } else if (entry.is_regular_file() && entry.path().extension() == ".lua") {
                 m.id = entry.path().filename().string();
@@ -1902,6 +1909,22 @@ bool isSafeFolderName(const std::string& name) {
     return !name.empty() && name != "." && name != ".." &&
            name.find('/') == std::string::npos && name.find('\\') == std::string::npos &&
            name.find(':') == std::string::npos && name.find("..") == std::string::npos;
+}
+
+std::string resolvePreviewImage(const fs::path& folder, const std::string& configured) {
+    const fs::path relative = configured.empty() ? fs::path("preview.png") : fs::path(configured);
+    if (relative.is_absolute() || relative.has_root_name()) return "";
+    for (const auto& part : relative) if (part == "..") return "";
+
+    std::error_code ec;
+    const fs::path root = fs::weakly_canonical(folder, ec);
+    if (ec) return "";
+    const fs::path image = fs::weakly_canonical(folder / relative, ec);
+    if (ec || !fs::is_regular_file(image, ec) || ec) return "";
+    const fs::path withinFolder = image.lexically_relative(root);
+    if (withinFolder.empty() || withinFolder.is_absolute()) return "";
+    for (const auto& part : withinFolder) if (part == "..") return "";
+    return image.string();
 }
 
 // The file in `pack` that replaces `requested`, or "".
@@ -2223,7 +2246,7 @@ std::string readActiveTexturePack() {
 }
 
 struct TexturePackInfo {
-    std::string id, title, author, description, path;
+    std::string id, title, author, description, path, image;
     int images = 0;      // image files in the pack
     int replaces = 0;    // how many of the game's textures it replaces
 };
@@ -2246,6 +2269,7 @@ std::vector<TexturePackInfo> listTexturePacks() {
         TexturePackInfo p;
         p.id = entry.path().filename().string();
         p.path = entry.path().string();
+        p.image = resolvePreviewImage(entry.path(), "");
 
         const fs::path conf = entry.path() / "pack.conf";
         if (fs::exists(conf, ec)) {
@@ -2253,6 +2277,7 @@ std::vector<TexturePackInfo> listTexturePacks() {
             p.title = kv.count("title") ? kv["title"] : kv["name"];
             p.author = kv["author"];
             p.description = kv["description"];
+            p.image = resolvePreviewImage(entry.path(), kv["image"]);
         }
         if (p.title.empty()) p.title = p.id;
 
@@ -3324,7 +3349,7 @@ const VideoSetting kVideoSettings[] = {
     { "vsync",            0,   1, 1 },
     { "main_hand",        0,   1, 1 },   // 0 = right, 1 = left (left-handed players)
     { "brightness",       0, 100, 5 },   // 0 = moody, 50 = the game's own, 100 = bright (Minecraft's gamma)
-    { "light_quality",    0,   2, 1 },   // traced lighting (shadows of lamps and spotlights): 0 off, 1 low, 2 high
+    { "light_quality",    0,   2, 1 },   // traced lighting and BlockSmith Shaders: 0 off, 1 low, 2 high
     { "bloom",            0,   1, 1 },   // bright things glow
     { "filmic",           0,   1, 1 },   // filmic exposure for Lighting Low/High (a film curve; the eye adjusts)
     { "mirrors",          0,   1, 1 },   // mirror blocks reflect (Mirrors.h); off: plain silvered glass
@@ -3392,10 +3417,11 @@ bool setVideoSetting(const std::string& id, int value, std::string& error) {
     const VideoSetting* s = findVideoSetting(id);
     if (!s) { error = "Unknown setting."; return false; }
     value = std::clamp(value, s->minV, s->maxV);
-    // Lighting and bloom are the player's own choice: only a click in their Settings changes them.
+    // Lighting and visual effects are the player's own choice: only a click in their Settings changes them.
     // A game's or server's mods (which run in the player's game too) can't switch them on.
     // (network input opens a port: the player's choice only, too)
-    if ((id == "light_quality" || id == "bloom" || id == "filmic" || id == "udp_input" || id == "mirrors") && !g_PlayerSettingsClick) {
+    if ((id == "light_quality" || id == "bloom" || id == "filmic" ||
+         id == "udp_input" || id == "mirrors") && !g_PlayerSettingsClick) {
         error = "Only the player can change this, in Settings";
         return false;
     }
@@ -4049,6 +4075,8 @@ uniform float u_Gamma;            // the player's Brightness slider above "Defau
 uniform vec3  u_CameraPos;        // (spotlights: which way a face looks)
 uniform int   u_TraceSteps;       // shadow rays' longest walk through the blocks (lighting quality)
 uniform int   u_SunSteps;         // the sun's shadow rays (0 = the sun isn't traced)
+uniform float u_ShadowFadeStart;
+uniform float u_ShadowFadeEnd;
 uniform vec3  u_MoonDir;          // toward the moon
 uniform float u_MoonShadow;       // how much the moon's shadows show (0 = none: day, new moon, rain)
 uniform int   u_Filmic;           // 1 = filmic exposure (Settings: the eye adjusts, a film curve)
@@ -4263,7 +4291,7 @@ void main() {
         float sunUp = smoothstep(-0.02, 0.10, sd.y);
         float dayAmt = smoothstep(-0.18, 0.25, sd.y);
         float sky = lightCurve(L.x);                       // open to the sky here (0 deep underground)
-        float near_ = 1.0 - smoothstep(44.0, 58.0, length(WorldPos - u_CameraPos));
+        float near_ = 1.0 - smoothstep(u_ShadowFadeStart, u_ShadowFadeEnd, length(WorldPos - u_CameraPos));
         // (blocks here not traced yet - just joined, or just came into range: lit like far-off
         // land until they are, instead of flashing bright and then darkening)
         bool ready = voxColumnReady(ivec3(floor(WorldPos)));
@@ -4335,31 +4363,20 @@ void main() {
         shadedColor = finalColor.rgb * LightIntensity * currentSunLightColor;
     } else {
         vec4 L = (u_VoxelLight == 1) ? VoxelLight : u_FallbackLight;
-        // Sunlight follows the time of day and the weather (sky.set_light); block light doesn't
-        // How much daylight: a smooth curve, so it dims gradually through sunset (about 55% just
-        // after the sun sets) down to a moody but readable night
-        float daylight = mix(0.40f, 1.0f, smoothstep(-0.22f, 0.32f, u_SunDir.y));
-        vec3 sunPart = lightCurve(L.x) * daylight * currentSunLightColor * u_WeatherLight;
-        // In daylight, faces turned toward the sun are a little brighter and warmer, faces turned
-        // away a little cooler: you can tell where the sun is, even without traced shadows
-        {
-            float faceSun = dot(faceN, normalize(u_SunDir));
-            float dayAmt = smoothstep(0.0f, 0.25f, u_SunDir.y) * clamp(L.x * 1.5f, 0.0f, 1.0f);
-            sunPart *= 1.0f + dayAmt * (faceSun > 0.0f ? 0.08f : 0.06f) * faceSun;
-            sunPart *= mix(vec3(1.0f), faceSun > 0.0f ? vec3(1.03f, 1.0f, 0.95f) : vec3(0.96f, 0.98f, 1.04f),
-                           dayAmt * abs(faceSun));
-        }
+        // Classic block lighting: daylight is neutral, and the face shading is already
+        // in LightIntensity, so only the sky's overall level changes with time and weather.
+        float daylight = mix(0.35f, 1.0f, smoothstep(-0.22f, 0.32f, u_SunDir.y));
+        vec3 sunPart = vec3(lightCurve(L.x) * daylight * u_WeatherLight);
         vec3 blockPart = vec3(lightCurve(L.y), lightCurve(L.z), lightCurve(L.w)) * u_BlockLightScale;
-        // Flames are alive: block light flickers very slightly
-        blockPart *= 1.0f + 0.025f * (sin(u_Time * 9.1f) + sin(u_Time * 13.7f + 1.3f)) * 0.5f;
-        // Screen blend: torches still show at dusk, and coloured lights mix
-        vec3 lightAmount = vec3(1.0f) - (vec3(1.0f) - sunPart) * (vec3(1.0f) - min(blockPart, vec3(1.0f)));
+        // Minecraft-style light levels: use the brighter of sky and block light.
+        vec3 lightAmount = max(sunPart, min(blockPart, vec3(1.0f)));
         // The player's brightness (gamma), as in Minecraft: on the FINAL light, so dark caves
         // and nights come up too. The darkest anything gets rises a little (2% -> 8% at full),
         // then the whole range is lifted with Minecraft's curve: a pitch-black cave ends up
         // about 28% lit at "Bright", while daylight barely changes.
         // an aurora's glow, on whatever is open to the sky
         lightAmount += u_AuroraLight * lightCurve(L.x) * (0.6f + 0.4f * max(faceN.y, 0.0f));
+        lightAmount *= 0.90f;  // slightly lower exposure for a less washed-out default look
         lightAmount = max(lightAmount, vec3(mix(u_MinLight, max(u_MinLight, 0.08f), u_Gamma)));
         vec3 inv = vec3(1.0f) - clamp(lightAmount, 0.0f, 1.0f);
         lightAmount = mix(lightAmount, vec3(1.0f) - inv * inv * inv * inv, u_Gamma);
@@ -4429,7 +4446,7 @@ void main() {
                                     1.0,
                                     0.05 * sin(wp.y * 1.9 + t * 1.1) + 0.035 * sin((wp.x - wp.y) * 3.3 + t * 2.3) +
                                     0.02 * sin(wp.y * 4.7 + wp.x * 1.3 + t * 2.9)));
-            float near_ = 1.0 - smoothstep(44.0, 58.0, length(WorldPos - u_CameraPos));
+            float near_ = 1.0 - smoothstep(u_ShadowFadeStart, u_ShadowFadeEnd, length(WorldPos - u_CameraPos));
             if (faceN.y > 0.0) {
                 float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
                 vec3 R = reflect(-V, n);
@@ -6481,8 +6498,8 @@ int main(int argc, char** argv) {
             return true;
         };
         // Dimensions: this game's player moves here; anyone else asks the server we're hosting
-        g_ServerApi.changeDimension = [](const std::string& name, const std::string& d, const glm::vec3& pos) {
-            if (name == playerName() && !g_Client.active()) return changeLocalDimension(d, pos);
+        g_ServerApi.changeDimension = [&lua](const std::string& name, const std::string& d, const glm::vec3& pos) {
+            if (name == playerName() && !g_Client.active()) return changeLocalDimension(lua, d, pos);
             return g_Server.running() && g_Server.setPlayerDimension(name, d, pos);
         };
         g_ServerApi.loadArea = [&lua](const std::string& d, int x, int z, int radius) {
@@ -6992,8 +7009,8 @@ int main(int argc, char** argv) {
         // moves you to its spawn instead (the coordinates are ignored).
         // Like Minecraft, respawning is in the overworld (wherever you died), unless `dimension`
         // says otherwise (a respawn anchor's): engine.respawn_player(x, y, z [, dimension])
-        engineTable["respawn_player"] = [](sol::optional<float> x, sol::optional<float> y, sol::optional<float> z,
-                                           sol::optional<std::string> dimension) {
+        engineTable["respawn_player"] = [&lua](sol::optional<float> x, sol::optional<float> y, sol::optional<float> z,
+                                               sol::optional<std::string> dimension) {
             if (g_Client.state() == GameClient::State::Joined) { g_Client.sendCommand("respawn"); return true; }
             if (!g_PlayerInstance || !x || !y || !z) return false;
             // the dimension: the one given, else where the dimension we died in sends us (its
@@ -7005,7 +7022,7 @@ int main(int argc, char** argv) {
                 d = dims::respawnDimension(g_WorldInstance->dimension());
                 if (!d.empty()) at = dims::Registry::get().type(d).spawn;
             }
-            if (g_WorldInstance && g_WorldInstance->dimension() != d) return changeLocalDimension(d, at);
+            if (g_WorldInstance && g_WorldInstance->dimension() != d) return changeLocalDimension(lua, d, at);
             if (!dimension && !d.empty()) { g_PlayerInstance->position = at; g_PlayerInstance->velocity = glm::vec3(0.0f); return true; }
             g_PlayerInstance->position = glm::vec3(*x, *y, *z);
             g_PlayerInstance->velocity = glm::vec3(0.0f);
@@ -7326,7 +7343,7 @@ int main(int argc, char** argv) {
         engineTable["clear_outline"] = [](const std::string& key) { g_Outlines.erase(key); };
         engineTable["clear_outlines"] = []() { g_Outlines.clear(); };
 
-        // engine.get_video_settings() -> { { id, value, min, max, step }, ... }
+        // engine.get_video_settings() -> { { id, value, min, max, step, options, note }, ... }
         engineTable["get_video_settings"] = [&lua]() {
             sol::table t = lua.create_table();
             int idx = 1;
@@ -7395,6 +7412,11 @@ int main(int argc, char** argv) {
                     e["options"] = opts;
                     const std::string& why = isLight ? g_GpuCaps.lightReason : g_GpuCaps.bloomReason;
                     if (!why.empty()) e["note"] = why;
+                    if (isLight) {
+                        std::string note = "Low/High enables BlockSmith Shaders and traced shadows.";
+                        if (!why.empty()) note = why + " " + note;
+                        e["note"] = note;
+                    }
                 }
                 t[idx++] = e;
             }
@@ -8060,7 +8082,7 @@ int main(int argc, char** argv) {
         };
 
         // ---- Mods screen (used by mods_menu.lua) ----
-        // engine.list_mods() -> { { id, title, author, description, version, depends,
+        // engine.list_mods() -> { { id, title, author, description, image, version, depends,
         //                           source, path, status, error, lua_files, is_folder }, ... }
         // status is "loaded", "error" or "not_loaded"
         engineTable["list_mods"] = [&lua]() {
@@ -8072,6 +8094,7 @@ int main(int argc, char** argv) {
                 e["title"] = m.title;
                 e["author"] = m.author;
                 e["description"] = m.description;
+                e["image"] = m.image;
                 e["version"] = m.version;
                 e["depends"] = m.depends;
                 e["source"] = m.source;
@@ -8093,6 +8116,7 @@ int main(int argc, char** argv) {
                     e["title"] = m.title;
                     e["author"] = m.author;
                     e["description"] = m.description;
+                    e["image"] = resolvePreviewImage(m.path, m.image);
                     e["version"] = m.version;
                     e["depends"] = m.depends;
                     e["source"] = std::string("Client mod");
@@ -8139,7 +8163,8 @@ int main(int argc, char** argv) {
         };
 
         // ---- Texture packs (used by texture_packs.lua) ----
-        // engine.list_texture_packs() -> { { id, title, author, description, path, images, replaces, active }, ... }
+        // engine.list_texture_packs() -> { { id, title, author, description, path, image, images,
+        //                                    replaces, active }, ... }
         //   The first entry is always the default textures (id = "").
         engineTable["list_texture_packs"] = [&lua]() {
             sol::table t = lua.create_table();
@@ -8151,6 +8176,7 @@ int main(int argc, char** argv) {
                 e["author"] = p.author;
                 e["description"] = p.description;
                 e["path"] = p.path;
+                e["image"] = p.image;
                 e["images"] = p.images;
                 e["replaces"] = p.replaces;
                 e["total"] = static_cast<int>(g_LayerSources.size() + g_StandardTextureSources.size());
@@ -10006,12 +10032,16 @@ int main(int argc, char** argv) {
                     const glm::vec3 camWorld = glm::vec3(glm::inverse(view)[3]);
                     // (lighting quality Off: the volume isn't kept up to date and nothing is traced)
                     const auto meshed = worldRenderer.takeMeshedChunks();
-                    if (g_LightQuality > 0) g_Voxels.update(world, camWorld, meshed);
+                    if (g_LightQuality > 0) g_Voxels.update(world, camWorld, meshed, g_LightQuality > 0);
                     else if (!meshed.empty()) g_Voxels.clear();   // (filled again when it's turned back on)
                     g_Voxels.bind(shaderProgram, 3, g_LightQuality > 0);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_TraceSteps"), g_LightQuality >= 2 ? 96 : 48);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_SunSteps"),
                                 g_LightQuality >= 2 ? 80 : g_LightQuality == 1 ? 40 : 0);
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_ShadowFadeStart"),
+                                g_LightQuality > 0 ? 80.0f : 44.0f);
+                    glUniform1f(glGetUniformLocation(shaderProgram, "u_ShadowFadeEnd"),
+                                g_LightQuality > 0 ? 96.0f : 58.0f);
                     glUniform1i(glGetUniformLocation(shaderProgram, "u_Filmic"), g_FilmicOn ? 1 : 0);
                     // (the reflection samplers live on their own units, even when unused: two
                     // sampler types may not share a unit)
@@ -10893,6 +10923,8 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                if (g_LightQuality > 0) g_BlockSmithShaders.apply(width, height, sunDir.y);
+
                 // ---------------- HUD ----------------
                 glDisable(GL_DEPTH_TEST);
                 // F1 hides all of this (the crosshair, hotbar and HUDs), like Minecraft
@@ -11089,6 +11121,50 @@ int main(int argc, char** argv) {
                     std::snprintf(pos, sizeof(pos), "XYZ: %.1f %.1f %.1f", player.position.x,
                                   player.position.y, player.position.z);
                     lines.push_back(pos);
+
+                    {
+                        const int bx = static_cast<int>(std::floor(player.position.x));
+                        const int bz = static_cast<int>(std::floor(player.position.z));
+                        static const sol::state* cachedLua = nullptr;
+                        static unsigned cachedReset = 0;
+                        static int cachedGeneration = -1;
+                        static std::string cachedDimension, cachedGame, cachedBiome = "unavailable";
+                        static int cachedX = 0, cachedZ = 0;
+                        static std::string lastBiomeError;
+                        static bool hasCache = false;
+                        if (!hasCache || cachedLua != &lua || cachedReset != world.resetCount() ||
+                            cachedGeneration != g_SessionGeneration ||
+                            cachedDimension != world.dimension() || cachedGame != g_ActiveGameFolder ||
+                            cachedX != bx || cachedZ != bz) {
+                            hasCache = true;
+                            cachedLua = &lua;
+                            cachedReset = world.resetCount();
+                            cachedGeneration = g_SessionGeneration;
+                            cachedDimension = world.dimension();
+                            cachedGame = g_ActiveGameFolder;
+                            cachedX = bx;
+                            cachedZ = bz;
+                            cachedBiome = "unavailable";
+                            sol::protected_function getBiome = lua["get_biome"];
+                            if (getBiome.valid()) {
+                                sol::protected_function_result result = getBiome(bx, bz);
+                                if (!result.valid()) {
+                                    sol::error err = result;
+                                    if (lastBiomeError != err.what()) {
+                                        lastBiomeError = err.what();
+                                        std::cerr << "[Debug] get_biome: " << lastBiomeError << std::endl;
+                                    }
+                                } else if (result.get_type() == sol::type::string) {
+                                    cachedBiome = result.get<std::string>();
+                                    lastBiomeError.clear();
+                                } else if (lastBiomeError != "get_biome returned a non-string value") {
+                                    lastBiomeError = "get_biome returned a non-string value";
+                                    std::cerr << "[Debug] " << lastBiomeError << std::endl;
+                                }
+                            }
+                        }
+                        lines.push_back("Biome: " + cachedBiome);
+                    }
 
                     // What the crosshair is on, straight from the world's block data
                     if (rayResult.hit) {

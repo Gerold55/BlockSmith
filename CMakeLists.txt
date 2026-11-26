@@ -149,6 +149,7 @@ add_executable(BlockSmith
     api/Mirrors.cpp
     source/GpuCheck.cpp
     source/Bloom.cpp
+    source/BlockSmithShaders.cpp
     source/SunShafts.cpp
     source/UdpInput.cpp
     source/Model.h

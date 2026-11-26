@@ -142,6 +142,19 @@ struct JParser {
     explicit JParser(const std::string& text) : t(text) {}
     void ws() { while (p < t.size() && std::isspace(static_cast<unsigned char>(t[p]))) ++p; }
     bool fail(const std::string& e) { if (err.empty()) err = e; return false; }
+    bool hex4(unsigned& cp) {
+        if (p + 4 > t.size()) return fail("bad string");
+        cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char h = t[p++];
+            const int digit = h >= '0' && h <= '9' ? h - '0' :
+                              h >= 'a' && h <= 'f' ? h - 'a' + 10 :
+                              h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+            if (digit < 0) return fail("bad string");
+            cp = cp * 16 + static_cast<unsigned>(digit);
+        }
+        return true;
+    }
     bool str(std::string& out) {
         if (p >= t.size() || t[p] != '"') return fail("a string expected");
         ++p;
@@ -153,15 +166,31 @@ struct JParser {
                 if (e == 'n') out += '\n'; else if (e == 't') out += '\t'; else if (e == 'r') out += '\r';
                 else if (e == 'b') out += '\b'; else if (e == 'f') out += '\f';
                 else if (e == 'u') {
-                    if (p + 4 > t.size()) return fail("bad string");
                     unsigned cp = 0;
-                    for (int i = 0; i < 4; ++i) {
-                        const char h = t[p++];
-                        cp = cp * 16 + (h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : 0);
+                    if (!hex4(cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (p + 2 > t.size() || t[p] != '\\' || t[p + 1] != 'u')
+                            return fail("unpaired high surrogate");
+                        p += 2;
+                        unsigned low = 0;
+                        if (!hex4(low)) return false;
+                        if (low < 0xDC00 || low > 0xDFFF) return fail("unpaired high surrogate");
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        return fail("unpaired low surrogate");
                     }
                     if (cp < 0x80) out += static_cast<char>(cp);
                     else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 63)); }
-                    else { out += static_cast<char>(0xE0 | (cp >> 12)); out += static_cast<char>(0x80 | ((cp >> 6) & 63)); out += static_cast<char>(0x80 | (cp & 63)); }
+                    else if (cp < 0x10000) {
+                        out += static_cast<char>(0xE0 | (cp >> 12));
+                        out += static_cast<char>(0x80 | ((cp >> 6) & 63));
+                        out += static_cast<char>(0x80 | (cp & 63));
+                    } else {
+                        out += static_cast<char>(0xF0 | (cp >> 18));
+                        out += static_cast<char>(0x80 | ((cp >> 12) & 63));
+                        out += static_cast<char>(0x80 | ((cp >> 6) & 63));
+                        out += static_cast<char>(0x80 | (cp & 63));
+                    }
                 } else out += e;
             } else out += c;
             if (out.size() > 1024) return fail("a string is too long");
@@ -351,6 +380,13 @@ static bool fromJson(const std::string& text, Region& out, std::string& why, std
     size_t at = 0;
     for (const auto& run : cells->a) {
         if (run.kind != JVal::Arr || run.a.size() != 3) { why = "bad cell run"; return false; }
+        for (const JVal& component : run.a) {
+            if (component.kind != JVal::Num || !std::isfinite(component.n) ||
+                std::floor(component.n) != component.n) {
+                why = "bad cell run";
+                return false;
+            }
+        }
         const double pi = run.a[0].n, mi = run.a[1].n, ci = run.a[2].n;
         if (pi < 0 || pi >= ids.size() || mi < 0 || mi > 255 || ci < 1 || ci > static_cast<double>(r.cells() - at)) { why = "bad cell run"; return false; }
         const uint8_t id = ids[static_cast<size_t>(pi)];

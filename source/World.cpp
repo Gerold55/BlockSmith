@@ -250,6 +250,8 @@ void World::ensureLuaSeeded(sol::state& lua) {
     if (!m_dimension.empty()) {
         // Another dimension: its generator gets the seed with each chunk, and its terrain
         // version is the one its dimensions.register gave (the overworld's hooks aren't its own)
+        CaveGenerator::setSeed(m_seed);
+        if (m_generator) CaveGenerator::prepare();
         m_terrainVersion = static_cast<uint16_t>(std::clamp(m_dimType.terrainVersion, 0, 65535));
         m_luaSeeded = true;
         return;

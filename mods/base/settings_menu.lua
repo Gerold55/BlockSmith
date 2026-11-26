@@ -4,7 +4,8 @@
 --   Controls - click a key, then press the new one (a key or a mouse button). Escape cancels.
 --              Keys used by more than one control are outlined in red.
 --   Video    - Field of View, Render Distance, Brightness (sliders), VSync (a switch),
---              Main Hand (Left / Right). Applied straight away.
+--              Main Hand (Left / Right), lighting options which also control BlockSmith Shaders.
+--              Applied straight away.
 --   Sound    - the volumes (sliders).
 --   Player   - your name (used in multiplayer and chat) and the password that protects it on
 --              servers. Click the box, type, press Enter.
@@ -332,7 +333,9 @@ local function entries()
         end
     elseif state.tab == "video" then
         section("Display")
-        local lighting = { light_quality = true, bloom = true, filmic = true, mirrors = true }
+        local lighting = {
+            light_quality = true, bloom = true, filmic = true, mirrors = true,
+        }
         for _, s in ipairs(state.video) do if s.id ~= "main_hand" and not lighting[s.id] then row(s) end end
         local any = false
         for _, s in ipairs(state.video) do
@@ -488,7 +491,7 @@ local function widget(L, item, ry, rh)
         return { kind = "segments", x = right - 2 * w, y = cy, w = 2 * w, h = ch, seg = w,
                  options = { { "Left", 1 }, { "Right", 0 } } }
     end
-    -- Choices the engine lists (lighting, bloom): buttons; ones this computer can't run are
+    -- Choices the engine lists (lighting, bloom, visual effects): buttons; unsupported ones are
     -- greyed out (opt[3]) and say why when clicked
     if item.options then
         -- every choice as wide as the longest label needs (so "This computer" fits), at least 46

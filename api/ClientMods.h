@@ -44,7 +44,8 @@ public:
 
     // ---- The Mods screen ----
     struct Info {
-        std::string name, title, author, description, version, depends, path;
+        std::string name, title, author, description, version, depends, path, image;
+        // image is the mod.conf path, relative to this mod folder.
         std::string status;          // "loaded", "error", "not_loaded" (switched on since startup), "disabled"
         std::string error;
         int luaFiles = 0;

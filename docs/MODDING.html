@@ -2239,11 +2239,15 @@ lualib/                         shared Lua modules for require() (json.lua, insp
 mods/                           global mods: loaded with any game, can be switched off
   buckets/
     mod.conf                    title, author, description, version, depends, optional_depends, required = true|false,
+                                image = preview image path relative to the mod (optional),
                                 remote_sources = https://... (online content, section 21)
+    preview.png                 optional image shown in the Mods screen
     init.lua                    if present, the ONLY file the engine runs (it loads the rest)
     textures/  models/
 texturepacks/
-  MyPack/pack.conf              any image with the same file name replaces a game texture
+  MyPack/pack.conf              title, author, description, image (optional path relative to the pack)
+  MyPack/preview.png            optional image shown in the texture pack picker
+                                any other image with a game's texture file name replaces it
 saves/&lt;world&gt;/                  worlds
 servers/&lt;profile&gt;/              dedicated server setups (engine.create_server_profile)
 </code></pre>

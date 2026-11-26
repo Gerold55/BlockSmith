@@ -4,10 +4,12 @@
 -- Everything here is editable.
 --
 -- A mod is either a folder (optionally with a mod.conf) or a loose .lua file.
--- mod.conf keys shown here:  title (or name), author, description, version, depends
+-- mod.conf keys shown here: title (or name), author, description, version, depends, image.
+-- Put a preview at preview.png in the mod folder, or set image = path/to/image.png relative to it.
 --
 -- Engine functions used:
 --   engine.list_mods()        -> { { id, title, author, description, version, depends,
+--                                    image,
 --                                    source, path, status, error, lua_files, is_folder,
 --                                    enabled, required, restart_needed, client }, ... }
 --                                client = true: one of the player's client mods (clientmods/,
@@ -90,6 +92,7 @@ local state = {
     scroll = 0,
     message = nil,      -- error from the last on/off click
 }
+local preview_sizes = {}
 
 -- ===========================================================================
 -- HELPERS
@@ -113,6 +116,25 @@ end
 local function text_height(scale)
     if ui.text_height then return ui.text_height(scale) end      -- capital letter height
     return Theme.font.char_h * scale
+end
+
+local function draw_preview(path, x, y, max_w, max_h, S)
+    if not path or path == "" or not ui.draw_image or not ui.get_image_size then return 0 end
+    local size = preview_sizes[path]
+    if size == nil then
+        local w, h = ui.get_image_size(path)
+        size = (w and h and w > 0 and h > 0) and { w = w, h = h } or false
+        preview_sizes[path] = size
+    end
+    if not size then return 0 end
+
+    local scale = math.min(max_w / size.w, max_h / size.h)
+    local w, h = size.w * scale, size.h * scale
+    local px, py = x + (max_w - w) / 2, y + (max_h - h) / 2
+    rect(x, y, max_w, max_h, C.outline)
+    rect(x + S, y + S, max_w - 2 * S, max_h - 2 * S, C.panel_bg)
+    ui.draw_image(path, px, py, w, h)
+    return max_h
 end
 
 -- `y` is the TOP of the text
@@ -338,11 +360,15 @@ local function draw_info(L, mx, my)
     local small = fs * 0.85
     local line_h = text_height(small) + Theme.line_gap * S
 
+    local previewW, previewH = math.min(128 * S, w * 0.42), 88 * S
+    local drawnH = draw_preview(m.image, x + w - previewW, y, previewW, previewH, S)
+
     -- Title + version
     local title = m.title
     if m.version ~= "" then title = title .. "  v" .. m.version end
-    text(fit(title, w, fs), x, y, fs, C.title, true, S)
-    y = y + text_height(fs) + 10 * S
+    local titleW = w - (drawnH > 0 and previewW + 8 * S or 0)
+    text(fit(title, titleW, fs), x, y, fs, C.title, true, S)
+    y = y + math.max(text_height(fs) + 10 * S, drawnH + 8 * S)
 
     -- Key / value rows. Values all start in the same column, after the longest label.
     local value_x = x + text_width("Depends on:", small) + 12 * S
@@ -397,6 +423,7 @@ end
 function on_mods_opened()
     state.scroll = 0
     state.message = nil
+    preview_sizes = {}
     refresh_mods()
 end
 

@@ -544,6 +544,7 @@ std::vector<ClientMods::Info> ClientMods::list() const {
         m.title = get("title").empty() ? m.name : get("title");
         m.author = get("author");
         m.description = get("description");
+        m.image = get("image");
         m.version = get("version");
         m.depends = get("depends");
         for (const auto& f : fs::recursive_directory_iterator(entry.path(), ec)) {

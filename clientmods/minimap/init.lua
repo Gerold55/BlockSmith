@@ -231,12 +231,19 @@ client.register_on_hud(function(W, H)
     end
 
     -- North marker and a line of text under the map
-    local ts = 0.3 * scale
-    ui.draw_text("N", mid - ui.text_width("N", ts) / 2, y0 + 2, ts, 1, 1, 1)
+    local markerTs = 0.3 * scale
+    local coordsTs = 0.8 * scale
+    ui.draw_text("N", mid - ui.text_width("N", markerTs) / 2, y0 + 2, markerTs, 1, 1, 1)
     local dir = DIRECTIONS[math.floor((((p.yaw or 0) % 360) + 22.5) / 45) % 8 + 1]
     local info = string.format("%d, %d, %d  %s", math.floor(p.x), math.floor(p.y), math.floor(p.z), dir)
-    ui.draw_rect(x0 - 3, y0 + size + 3, size + 6, ui.text_height(ts) + 8, 0, 0, 0, 0.55)
-    ui.draw_text(info, x0 + (size - ui.text_width(info, ts)) / 2, y0 + size + 7, ts, 1, 1, 1)
+    local infoWidth = ui.text_width(info, coordsTs)
+    local infoPanelWidth = math.max(size + 6, infoWidth + 12)
+    local infoPanelX = math.max(6, math.min(W - infoPanelWidth - 6, mid - infoPanelWidth / 2))
+    local infoPanelY = y0 + size + 8
+    local infoTextHeight = ui.text_height(coordsTs)
+    ui.draw_rect(infoPanelX, infoPanelY, infoPanelWidth, infoTextHeight + 12, 0, 0, 0, 0.55)
+    ui.draw_text(info, infoPanelX + (infoPanelWidth - infoWidth) / 2,
+                 infoPanelY + 4 + infoTextHeight, coordsTs, 1, 1, 1)
 end)
 
 print("minimap loaded: M to show/hide, .wp add <name> for waypoints")

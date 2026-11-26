@@ -67,12 +67,13 @@ void VoxelVolume::clear() {
 
 void VoxelVolume::markAll() {
     const int cx0 = floorDivV(m_origin.x, CHUNK_WIDTH), cz0 = floorDivV(m_origin.z, CHUNK_WIDTH);
-    const int n = kSize / CHUNK_WIDTH;
+    const int n = m_activeSize / CHUNK_WIDTH;
     for (int i = 0; i < n; ++i)
         for (int k = 0; k < n; ++k) m_dirty.insert({ cx0 + i, cz0 + k });
 }
 
-void VoxelVolume::update(const World& world, const glm::vec3& camera, const std::vector<std::pair<int, int>>& changed) {
+void VoxelVolume::update(const World& world, const glm::vec3& camera, const std::vector<std::pair<int, int>>& changed,
+                         bool extendedRange) {
     if (!m_tex) {
         m_cells.assign(static_cast<size_t>(kSize) * kHeight * kSize, 0);
         glGenTextures(1, &m_tex);
@@ -91,24 +92,29 @@ void VoxelVolume::update(const World& world, const glm::vec3& camera, const std:
     // Where the volume is: centred on the camera across (on chunk lines); the whole height
     const int cx = floorDivV(static_cast<int>(std::floor(camera.x)), CHUNK_WIDTH) * CHUNK_WIDTH;
     const int cz = floorDivV(static_cast<int>(std::floor(camera.z)), CHUNK_WIDTH) * CHUNK_WIDTH;
-    const glm::ivec3 want(cx - kSize / 2, 0, cz - kSize / 2);
+    const int desiredSize = extendedRange ? kSize : kStandardSize;
+    const int previousSize = m_activeSize;
+    const glm::ivec3 want(cx - desiredSize / 2, 0, cz - desiredSize / 2);
     if (!m_haveOrigin) {
         // the first time: every column
+        m_activeSize = desiredSize;
         m_origin = want;
         m_haveOrigin = true;
         m_dirty.clear();
         markAll();
-    } else if (want != m_origin) {
+    } else if (want != m_origin || desiredSize != m_activeSize) {
         // moved sideways: the columns that came into range
         const glm::ivec3 old = m_origin;
+        m_activeSize = desiredSize;
         m_origin = want;
-        const int n = kSize / CHUNK_WIDTH;
+        const int oldN = previousSize / CHUNK_WIDTH;
+        const int n = m_activeSize / CHUNK_WIDTH;
         const int ox0 = floorDivV(old.x, CHUNK_WIDTH), oz0 = floorDivV(old.z, CHUNK_WIDTH);
         const int nx0 = floorDivV(m_origin.x, CHUNK_WIDTH), nz0 = floorDivV(m_origin.z, CHUNK_WIDTH);
         for (int i = 0; i < n; ++i)
             for (int k = 0; k < n; ++k) {
                 const int x = nx0 + i, z = nz0 + k;
-                if (x < ox0 || x >= ox0 + n || z < oz0 || z >= oz0 + n) m_dirty.insert({ x, z });
+                if (x < ox0 || x >= ox0 + oldN || z < oz0 || z >= oz0 + oldN) m_dirty.insert({ x, z });
             }
         // (columns that left the range are dropped)
         for (auto it = m_dirty.begin(); it != m_dirty.end();) {
@@ -144,12 +150,12 @@ void VoxelVolume::update(const World& world, const glm::vec3& camera, const std:
 void VoxelVolume::fillColumn(const World& world, int ccx, int ccz) {
     const ChunkData* data = world.chunkData({ ccx, ccz });
     if (!data) return;
-    const int n = kSize / CHUNK_WIDTH;
+    const int n = m_activeSize / CHUNK_WIDTH;
     const int nx0 = floorDivV(m_origin.x, CHUNK_WIDTH), nz0 = floorDivV(m_origin.z, CHUNK_WIDTH);
     if (ccx < nx0 || ccx >= nx0 + n || ccz < nz0 || ccz >= nz0 + n) return;
     const int baseX = ccx * CHUNK_WIDTH, baseZ = ccz * CHUNK_WIDTH;
     const int tx0 = baseX & (kSize - 1), tz0 = baseZ & (kSize - 1);
-    // the texture's layout is x + y*S + z*S*S, each world cell at (cell & 127)
+    // the texture's layout is x + y*S + z*S*S, each world cell at (cell & 255)
     for (int lz = 0; lz < CHUNK_WIDTH; ++lz) {
         for (int wy = 0; wy < kHeight; ++wy) {
             uint8_t* row = &m_cells[static_cast<size_t>(tx0) + static_cast<size_t>(wy) * kSize +
@@ -183,17 +189,17 @@ void VoxelVolume::bind(GLuint program, int unit, bool enabled) const {
     glActiveTexture(GL_TEXTURE0);
     glUniform1i(glGetUniformLocation(program, "u_Voxels"), unit);
     glUniform3i(glGetUniformLocation(program, "u_VoxOrigin"), m_origin.x, m_origin.y, m_origin.z);
+    glUniform1i(glGetUniformLocation(program, "u_VoxSize"), m_activeSize);
     glUniform1i(glGetUniformLocation(program, "u_VoxEnabled"), (enabled && m_tex && m_haveOrigin) ? 1 : 0);
     // Which chunk columns hold the blocks that are there now (not ones waiting to be filled)
-    GLint valid[64];
-    const int n = kSize / CHUNK_WIDTH;
+    GLint valid[256] = {};
+    const int n = m_activeSize / CHUNK_WIDTH;
     const int nx0 = floorDivV(m_origin.x, CHUNK_WIDTH), nz0 = floorDivV(m_origin.z, CHUNK_WIDTH);
-    for (int i = 0; i < 64; ++i) valid[i] = 0;
     for (int i = 0; i < n; ++i)
         for (int k = 0; k < n; ++k) {
             const int cx = nx0 + i, cz = nz0 + k;
             if (m_dirty.count({ cx, cz })) continue;
-            valid[(cx & 7) + (cz & 7) * 8] = 1;
+            valid[(cx & 15) + (cz & 15) * 16] = 1;
         }
-    glUniform1iv(glGetUniformLocation(program, "u_VoxColValid"), 64, valid);
+    glUniform1iv(glGetUniformLocation(program, "u_VoxColValid"), 256, valid);
 }

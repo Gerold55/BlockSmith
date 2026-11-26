@@ -4,11 +4,10 @@
 // path is walked through the grid), and whatever it passes through dims it. That's how
 // spotlights and lamps cast exact shadows, and beams stop at walls (Spotlights.h).
 //
-//   128 x 256 x 128 cells (the world's whole height, so mountain tops and deep caves are always
-//   in it), one byte each: how much light a block stops (0 = none, 255 = all). Across, the
-//   volume wraps around (cell & 127), so when the camera moves only the chunk columns that come
-//   into range are filled - a few per frame - and chunks that change are refilled when they're
-//   meshed again. Unloaded places count as empty.
+//   256 x 256 x 256 cells (the world's whole height, so mountain tops and deep caves are always
+//   in it), one byte each: how much light a block stops (0 = none, 255 = all). The active area
+//   is 128 blocks wide normally and 256 with traced lighting enabled, centered on the camera. Across,
+//   the volume wraps around (cell & 255), and only chunk columns that come into range are filled.
 
 #include "World.h"
 #include <glad/glad.h>
@@ -20,7 +19,8 @@
 
 class VoxelVolume {
 public:
-    static constexpr int kSize = 128;          // cells across, X and Z (a power of two: it wraps with & 127)
+    static constexpr int kSize = 256;          // backing texture size across X and Z (wraps with & 255)
+    static constexpr int kStandardSize = 128;  // Standard lighting keeps its existing range
     static constexpr int kHeight = CHUNK_HEIGHT;   // cells up: the whole world (256)
     // Leaves and other cut-out blocks are marked with this value: rays go through their gaps
     // (a 4x4x4 pattern of small cells in each block, about a third open), so sunlight comes
@@ -35,7 +35,8 @@ public:
 
     ~VoxelVolume();
     // The camera's position and the chunks whose blocks changed (re-meshed) since last time
-    void update(const World& world, const glm::vec3& camera, const std::vector<std::pair<int, int>>& changed);
+    void update(const World& world, const glm::vec3& camera, const std::vector<std::pair<int, int>>& changed,
+                bool extendedRange = false);
     // Binds the texture to `unit` and sets the shader's u_Voxels / u_VoxOrigin / u_VoxEnabled
     // (enabled = false: no tracing - the lighting quality setting is Off)
     void bind(GLuint program, int unit, bool enabled = true) const;
@@ -50,6 +51,7 @@ public:
 private:
     GLuint m_tex = 0;
     glm::ivec3 m_origin{ 0 };                  // the lowest cell inside (a multiple of 16 on X and Z; Y is 0)
+    int m_activeSize = kStandardSize;
     bool m_haveOrigin = false;
     std::vector<uint8_t> m_cells;              // mirror of the texture, in its (wrapped) layout
     std::set<std::pair<int, int>> m_dirty;     // chunk columns to fill
@@ -63,16 +65,17 @@ private:
 #define BLOCKSMITH_VOXEL_TRACE_GLSL R"(
 uniform sampler3D u_Voxels;
 uniform ivec3 u_VoxOrigin;
+uniform int u_VoxSize;
 uniform int u_VoxEnabled;
-uniform int u_VoxColValid[64];   // per chunk column (8 x 8, wrapped): 1 = filled for where it is now
+uniform int u_VoxColValid[256];  // per chunk column (16 x 16, wrapped): 1 = filled for where it is now
 float voxOpacity(ivec3 c) {
     if (u_VoxEnabled == 0) return 0.0;
     ivec3 r = c - u_VoxOrigin;
-    if (r.x < 0 || r.y < 0 || r.z < 0 || r.x >= 128 || r.y >= 256 || r.z >= 128) return 0.0;
+    if (r.x < 0 || r.y < 0 || r.z < 0 || r.x >= u_VoxSize || r.y >= 256 || r.z >= u_VoxSize) return 0.0;
     // a column that just came into range still holds the blocks from the far side it wrapped
     // from: empty until it's filled (otherwise that old terrain shades far-off land)
-    if (u_VoxColValid[((c.x >> 4) & 7) + ((c.z >> 4) & 7) * 8] == 0) return 0.0;
-    return texelFetch(u_Voxels, ivec3(c.x & 127, c.y, c.z & 127), 0).r;
+    if (u_VoxColValid[((c.x >> 4) & 15) + ((c.z >> 4) & 15) * 16] == 0) return 0.0;
+    return texelFetch(u_Voxels, ivec3(c.x & 255, c.y, c.z & 255), 0).r;
 }
 // 1 while lighting a leaf itself: other leaves let through their average (about half), not the
 // exact gaps - the gaps are for the dappled light on things below; on the leaves they'd be noise
@@ -100,7 +103,7 @@ float voxTransmittance(vec3 from, vec3 to, int maxSteps) {
         if (min(min(tMax.x, tMax.y), tMax.z) > len + 1.0) break;
         // left the volume: a straight ray doesn't come back, and nothing's known out there
         ivec3 r = cell - u_VoxOrigin;
-        if (r.x < -1 || r.y < -1 || r.z < -1 || r.x > 128 || r.y > 256 || r.z > 128) break;
+        if (r.x < -1 || r.y < -1 || r.z < -1 || r.x > u_VoxSize || r.y > 256 || r.z > u_VoxSize) break;
         float o = voxOpacity(cell);
         if (abs(o - 0.094118) < 0.002) o = 0.06;           // water: each block a little dimmer
         else if (abs(o - 0.788235) < 0.002) o = 0.784;     // waterlogged slab, stairs: as the block
@@ -121,8 +124,8 @@ float voxTransmittance(vec3 from, vec3 to, int maxSteps) {
 bool voxColumnReady(ivec3 c) {
     if (u_VoxEnabled == 0) return false;
     ivec3 r = c - u_VoxOrigin;
-    if (r.x < 0 || r.z < 0 || r.x >= 128 || r.z >= 128) return false;
-    return u_VoxColValid[((c.x >> 4) & 7) + ((c.z >> 4) & 7) * 8] != 0;
+    if (r.x < 0 || r.z < 0 || r.x >= u_VoxSize || r.z >= u_VoxSize) return false;
+    return u_VoxColValid[((c.x >> 4) & 15) + ((c.z >> 4) & 15) * 16] != 0;
 }
 // Is there water in this cell? (water, or a waterlogged slab or stairs)
 bool voxIsWater(ivec3 c) {

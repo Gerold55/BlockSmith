@@ -147,11 +147,19 @@ engine.register_block("stick", 1.0, 1.0, 1.0, "textures/stick.png", nil, {
 -- --- Saplings (leaves sometimes drop them; plant them like flowers) ---
 engine.register_block("sapling_oak", 1.0, 1.0, 1.0, "textures/sapling_oak.png", nil, {
     description = "Oak Sapling",
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+    transparent = true, 
+    walkable = false, 
+    selectable = true, 
+    pattern = "plantlike", 
+    tint = false
 })
 engine.register_block("sapling_birch", 1.0, 1.0, 1.0, "textures/sapling_birch.png", nil, {
     description = "Birch Sapling",
-    transparent = true, walkable = false, selectable = true, pattern = "plantlike", tint = false
+    transparent = true, 
+    walkable = false, 
+    selectable = true, 
+    pattern = "plantlike", 
+    tint = false
 })
 
 -- --- Workbench: right-click it to craft on a 3x3 grid (survival mod) ---
@@ -389,3 +397,5 @@ dofile(g_CurrentModPath .. "/particles.lua")
 dofile(g_CurrentModPath .. "/biome_blocks.lua")
 -- Slabs, stairs and signs
 dofile(g_CurrentModPath .. "/building_blocks.lua")
+-- Random ticks: grass spreading and dying. World-generator Lua states have no random-tick API.
+if engine.register_random_tick then dofile(g_CurrentModPath .. "/abm.lua") end
