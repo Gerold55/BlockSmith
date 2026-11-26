@@ -103,10 +103,16 @@ local state = {
     selected = nil,        -- the selected world's name
     scroll = 0,
     search = "",
-    focus = nil,           -- "search", "name" or "seed": where typing goes
+    focus = nil,           -- focused search, name, seed or superflat-layer field
     name = "New World",
     seed = "",
     game_mode = "survival",
+    mapgen_style = "normal",
+    flat_layers = {
+        { block = "grass", depth = "1" },
+        { block = "dirt", depth = "3" },
+        { block = "bedrock", depth = "1" },
+    },
     message = nil,
     game = nil,
     mods = nil,            -- the Mods dialog's list
@@ -293,10 +299,47 @@ local function open_create()
     te.reset("world:seed")
     state.message = nil
     state.game_mode = (has_game_modes() and survival.settings and survival.settings.default_mode) or "survival"
+    state.mapgen_style = "normal"
+    state.flat_layers = {
+        { block = "grass", depth = "1" },
+        { block = "dirt", depth = "3" },
+        { block = "bedrock", depth = "1" },
+    }
+end
+
+local function serialize_flat_layers()
+    if #state.flat_layers == 0 or #state.flat_layers > 8 then
+        return nil, "Superflat needs between 1 and 8 layers."
+    end
+    local encoded, total = {}, 0
+    for i, layer in ipairs(state.flat_layers) do
+        local block = layer.block:match("^%s*(.-)%s*$")
+        local depth = tonumber(layer.depth)
+        if block == "" or not block:match("^[%w_:%-%.]+$") then
+            return nil, "Layer " .. i .. " needs a valid block name."
+        end
+        if not depth or depth < 1 or depth > 256 or depth ~= math.floor(depth) then
+            return nil, "Layer " .. i .. " depth must be a whole number from 1 to 256."
+        end
+        local id = engine.get_block_id and engine.get_block_id(block)
+        if not id or id == 0 then
+            return nil, "Unknown block in layer " .. i .. ": " .. block
+        end
+        total = total + depth
+        if total > 256 then return nil, "Superflat layers cannot exceed 256 blocks total." end
+        encoded[#encoded + 1] = block .. ":" .. depth
+    end
+    return table.concat(encoded, ","), nil
 end
 
 local function create_and_play()
-    local options = has_game_modes() and { game_mode = state.game_mode } or nil
+    local options = has_game_modes() and { game_mode = state.game_mode } or {}
+    options.mapgen_style = state.mapgen_style
+    if state.mapgen_style == "superflat" then
+        local layers, err = serialize_flat_layers()
+        if not layers then state.message = err; return end
+        options.mapgen_layers = layers
+    end
     local folder, err = engine.create_world(state.name, state.seed, options)
     if not folder then state.message = err; return end
     state.dialog = nil
@@ -416,7 +459,15 @@ end
 
 local function create_layout(L, W, H)
     local S = L.S
-    local D = dialog_layout(L, W, H, 280, has_game_modes() and 214 or 168)
+    local game_modes = has_game_modes()
+    local superflat = state.mapgen_style == "superflat"
+    local height
+    if superflat then
+        height = (game_modes and 288 or 228) + #state.flat_layers * 22
+    else
+        height = game_modes and 252 or 194
+    end
+    local D = dialog_layout(L, W, H, 280, height)
     local x, w = D.x + 16 * S, D.w - 32 * S
     D.nameLabelY = D.y + 40 * S
     D.nameF = { x = x, y = D.nameLabelY + 12 * S, w = w, h = 18 * S }
@@ -426,6 +477,58 @@ local function create_layout(L, W, H)
         D.modeLabelY = D.seedF.y + 26 * S
         D.modes = { x = x, y = D.modeLabelY + 12 * S, w = w, h = 20 * S }
         D.modeTextY = D.modes.y + 24 * S
+    end
+    D.mapgenLabelY = D.modeTextY and (D.modeTextY + 6 * S) or (D.seedF.y + 26 * S)
+    D.mapgenButtons = {}
+    local mapgenW = (w - 4 * S) / 2
+    for i, choice in ipairs({ { "normal", "Game default" }, { "superflat", "Superflat" } }) do
+        local style, label = choice[1], choice[2]
+        D.mapgenButtons[i] = {
+            x = x + (i - 1) * (mapgenW + 4 * S), y = D.mapgenLabelY + 12 * S,
+            w = mapgenW, h = 20 * S, label = label,
+            kind = state.mapgen_style == style and "primary" or "secondary",
+            action = function()
+                state.mapgen_style = style
+                if style ~= "superflat" and state.focus and state.focus:match("^layer_") then
+                    state.focus = nil
+                end
+                state.message = nil
+            end,
+        }
+    end
+    if superflat then
+        D.layersLabelY = D.mapgenButtons[1].y + 22 * S
+        D.layerRows = {}
+        for i, layer in ipairs(state.flat_layers) do
+            local index = i
+            local y = D.layersLabelY + 12 * S + (i - 1) * 20 * S
+            local removeW, depthW = 20 * S, 42 * S
+            D.layerRows[i] = {
+                block = { x = x, y = y, w = w - depthW - removeW - 8 * S, h = 18 * S },
+                depth = { x = x + w - depthW - removeW - 4 * S, y = y, w = depthW, h = 18 * S },
+                remove = {
+                    x = x + w - removeW, y = y, w = removeW, h = 18 * S, label = "X",
+                    enabled = #state.flat_layers > 1,
+                    action = function()
+                        table.remove(state.flat_layers, index)
+                        state.focus = nil
+                        state.message = nil
+                    end,
+                },
+                value = layer,
+            }
+        end
+        local addY = D.layersLabelY + 12 * S + #state.flat_layers * 20 * S
+        D.addLayer = {
+            x = x, y = addY, w = 78 * S, h = 18 * S, label = "Add layer",
+            enabled = #state.flat_layers < 8,
+            action = function()
+                if #state.flat_layers < 8 then
+                    state.flat_layers[#state.flat_layers + 1] = { block = "dirt", depth = "1" }
+                end
+                state.message = nil
+            end,
+        }
     end
     local bw = math.floor((w - 8 * S) / 2)
     D.cancel = { x = x, y = D.y + D.h - 32 * S, w = bw, h = 20 * S, label = "Cancel",
@@ -616,6 +719,21 @@ local function draw_create(L, W, H, mx, my)
         end
         text(fit(MODE_INFO[state.game_mode].text, D.modes.w, fs * 0.66), D.modes.x, D.modeTextY, fs * 0.66, C.detail, false, S)
     end
+    text("World Type", D.mapgenButtons[1].x, D.mapgenLabelY, fs * 0.7, C.detail, false, S)
+    button(D.mapgenButtons[1], mx, my, S, fs * 0.75)
+    button(D.mapgenButtons[2], mx, my, S, fs * 0.75)
+    if D.layerRows then
+        text("Superflat layers (top to bottom)", D.layerRows[1].block.x, D.layersLabelY,
+            fs * 0.68, C.detail, false, S)
+        for i, row in ipairs(D.layerRows) do
+            local blockId = "world:flat:block:" .. i
+            local depthId = "world:flat:depth:" .. i
+            field(row.block, row.value.block, state.focus == "layer_block_" .. i, "Block name", blockId, S, fs * 0.68)
+            field(row.depth, row.value.depth, state.focus == "layer_depth_" .. i, "Depth", depthId, S, fs * 0.68)
+            button(row.remove, mx, my, S, fs * 0.65)
+        end
+        button(D.addLayer, mx, my, S, fs * 0.65)
+    end
     if state.message then
         text(fit(state.message, D.w - 32 * S, fs * 0.66), D.x + 16 * S, D.cancel.y - 14 * S, fs * 0.66, C.error, false, S)
     end
@@ -714,6 +832,14 @@ local function click_button(b, mx, my)
     return false
 end
 
+local function focused_layer_field()
+    if not state.focus then return nil end
+    local part, index = state.focus:match("^layer_(%a+)_(%d+)$")
+    index = tonumber(index)
+    if (part ~= "block" and part ~= "depth") or not index or not state.flat_layers[index] then return nil end
+    return part, index
+end
+
 function handle_world_select_click(mx, my, W, H)
     local L = layout(W, H)
     local S = L.S
@@ -725,6 +851,25 @@ function handle_world_select_click(mx, my, W, H)
         end
         if inside(mx, my, D.seedF.x, D.seedF.y, D.seedF.w, D.seedF.h) then
             state.focus = "seed"; te.focus("world:seed", state.seed, mx - (D.seedF.x + 5 * S), L.fs); return true
+        end
+        if click_button(D.mapgenButtons[1], mx, my) or click_button(D.mapgenButtons[2], mx, my) then return true end
+        if D.layerRows then
+            for i, row in ipairs(D.layerRows) do
+                if click_button(row.remove, mx, my) then return true end
+                if inside(mx, my, row.block.x, row.block.y, row.block.w, row.block.h) then
+                    state.focus = "layer_block_" .. i
+                    te.focus("world:flat:block:" .. i, row.value.block,
+                        mx - (row.block.x + 5 * S), L.fs * 0.68)
+                    return true
+                end
+                if inside(mx, my, row.depth.x, row.depth.y, row.depth.w, row.depth.h) then
+                    state.focus = "layer_depth_" .. i
+                    te.focus("world:flat:depth:" .. i, row.value.depth,
+                        mx - (row.depth.x + 5 * S), L.fs * 0.68)
+                    return true
+                end
+            end
+            if click_button(D.addLayer, mx, my) then return true end
         end
         if D.modes and inside(mx, my, D.modes.x, D.modes.y, D.modes.w, D.modes.h) then
             state.game_mode = (mx < D.modes.x + D.modes.w / 2) and "survival" or "creative"
@@ -817,6 +962,13 @@ function handle_world_select_key(key, action, mods)
             create_and_play()
         elseif state.focus == "name" or state.focus == "seed" then
             state[state.focus] = te.key("world:" .. state.focus, state[state.focus], key, action, mods)
+        else
+            local part, index = focused_layer_field()
+            if part then
+                local layer = state.flat_layers[index]
+                local id = "world:flat:" .. part .. ":" .. index
+                layer[part] = te.key(id, layer[part], key, action, mods)
+            end
         end
         return true
     end
@@ -846,6 +998,15 @@ function handle_world_select_char(codepoint, ch)
     if state.dialog == "create" and (state.focus == "name" or state.focus == "seed") then
         state[state.focus] = te.insert("world:" .. state.focus, state[state.focus], ch, 32)
         return true
+    end
+    if state.dialog == "create" then
+        local part, index = focused_layer_field()
+        if part then
+            local layer = state.flat_layers[index]
+            local id = "world:flat:" .. part .. ":" .. index
+            layer[part] = te.insert(id, layer[part], ch, part == "block" and 64 or 3)
+            return true
+        end
     end
     if not state.dialog and state.focus == "search" then
         state.search = te.insert("world:search", state.search, ch, 32)

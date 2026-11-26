@@ -589,7 +589,7 @@ local BIOMES = {
     snowy_plains = { trees = 0.0008, cover = 0.0, flowers = 0.0 },
     savanna      = { trees = 0.0035, cover = 0.45, flowers = 0.06 },
     jungle       = { trees = 0.060, cover = 0.45, flowers = 0.08 },
-    swamp        = { trees = 0.020, cover = 0.22, flowers = 0.12, flower = "flower_bluebell" },
+    swamp        = { trees = 0.024, cover = 0.18, flowers = 0.035 },
     desert       = { trees = 0, cover = 0.012, flowers = 0 },
     badlands     = { trees = 0, cover = 0.010, flowers = 0 },
     mountains    = { trees = 0.004, cover = 0.10, flowers = 0.06 },
@@ -635,7 +635,7 @@ function generate_chunk(chunk, chunk_x, chunk_z)
                 if frozen then top = b.snowy_grass; under = b.dirt end
             elseif biome == "badlands" then top, under, depth = b.red_sand, b.red_sand, 2
             elseif biome == "snowy_plains" or biome == "snowy_taiga" then top = b.snowy_grass
-            elseif biome == "savanna" and octave_noise2d(wx, wz, 1, 0.5, 0.12, 45.0) > 0.7 then top = b.coarse
+            elseif biome == "savanna" and octave_noise2d(wx, wz, 1, 0.5, 0.12, 45.0) > 0.88 then top = b.coarse
             elseif biome == "mountains" then
                 local snowline = 128 - (0.5 - col.temp) * 40
                 local rocky = octave_noise2d(wx, wz, 2, 0.5, 0.08, 43.0)
@@ -731,8 +731,9 @@ function generate_chunk(chunk, chunk_x, chunk_z)
                             chunk:set_block(lx, y + 2, lz, b.cattail_top ~= 0 and b.cattail_top or b.cattail)
                         end
                     end
-                    if col.swamp > 0.5 and b.lily ~= 0 and hash_rand(wx, wz, 12.7) < 0.06 then
-                        chunk:set_block(lx, SEA + 1, lz, b.lily)
+                    if col.swamp > 0.5 and b.lily ~= 0 and hash_rand(wx, wz, 12.7) < 0.09 then
+                        if chunk.set_block_with_meta then chunk:set_block_with_meta(lx, SEA, lz, b.lily, 1)
+                        else chunk:set_block(lx, SEA, lz, b.lily) end
                     end
                 end
             elseif lx >= 1 and lx <= 14 and lz >= 1 and lz <= 14 and y < 250 then

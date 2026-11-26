@@ -8,6 +8,7 @@
 #  endif
 #endif
 #include <enet/enet.h>
+#include <sodium.h>
 
 #include "Net.h"
 #include "Version.h"
@@ -19,11 +20,14 @@
 #include "BlockDefs.h"
 #include "Types.h"
 #include <algorithm>
+#include <array>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 
 // ===========================================================================
@@ -39,6 +43,8 @@
 namespace {
 
 enum Msg : uint8_t {
+    C_KEY_HELLO = 30, // u32 protocol, 32-byte ephemeral X25519 public key
+    S_KEY_HELLO = 31, // 32-byte ephemeral key, 32-byte identity key, 64-byte signature
     // client -> server
     C_HELLO   = 1,    // u32 protocol, str name, str game, u8 viewDistance, u8 hasPassword
                       // (no secret: the server answers with S_CHALLENGE)
@@ -209,11 +215,280 @@ struct Reader {
     glm::ivec3 ivec3() { const int x = i32(); const int y = i32(); const int z = i32(); return {x, y, z}; }
 };
 
-void sendTo(ENetPeer* peer, const Writer& w, bool reliable = true) {
+constexpr uint8_t kEncryptedPacket = 0xFF;
+constexpr uint8_t kEncryptedPacketVersion = 1;
+constexpr size_t kReplayWindowSize = 1024;
+using KxPublicKey = std::array<unsigned char, crypto_kx_PUBLICKEYBYTES>;
+using KxSecretKey = std::array<unsigned char, crypto_kx_SECRETKEYBYTES>;
+using SessionKey = std::array<unsigned char, crypto_kx_SESSIONKEYBYTES>;
+
+bool ensureSodium() {
+    static const bool initialized = sodium_init() >= 0;
+    return initialized;
+}
+
+struct ReplayWindow {
+    uint64_t highest = 0;
+    std::bitset<kReplayWindowSize> seen;
+
+    bool accept(uint64_t sequence) {
+        if (sequence == 0) return false;
+        if (sequence > highest) {
+            const uint64_t shift = sequence - highest;
+            if (shift >= kReplayWindowSize) seen.reset();
+            else seen <<= static_cast<size_t>(shift);
+            highest = sequence;
+            seen.set(0);
+            return true;
+        }
+        const uint64_t behind = highest - sequence;
+        if (behind >= kReplayWindowSize || seen.test(static_cast<size_t>(behind))) return false;
+        seen.set(static_cast<size_t>(behind));
+        return true;
+    }
+};
+
+struct SecurePeer {
+    bool serverRole = false;
+    bool established = false;
+    KxPublicKey localPublic{};
+    KxSecretKey localSecret{};
+    KxPublicKey remotePublic{};
+    SessionKey receiveKey{};
+    SessionKey sendKey{};
+    uint64_t sendSequence = 0;
+    ReplayWindow receiveWindow;
+};
+
+std::unordered_map<ENetPeer*, SecurePeer>& securePeers()
+{
+    static auto* peers =
+        new std::unordered_map<ENetPeer*, SecurePeer>();
+
+    return *peers;
+}
+
+void eraseSecurePeer(ENetPeer* peer)
+{
+    if (!peer)
+        return;
+
+    auto& peers = securePeers();
+
+    const auto it = peers.find(peer);
+    if (it == peers.end())
+        return;
+
+    sodium_memzero(
+        it->second.localSecret.data(),
+        it->second.localSecret.size());
+
+    sodium_memzero(
+        it->second.receiveKey.data(),
+        it->second.receiveKey.size());
+
+    sodium_memzero(
+        it->second.sendKey.data(),
+        it->second.sendKey.size());
+
+    peers.erase(it);
+}
+
+void sendRawTo(ENetPeer* peer, const uint8_t* data, size_t size, bool reliable) {
     if (!peer) return;
-    ENetPacket* pkt = enet_packet_create(w.d.data(), w.d.size(),
-                                         reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
-    enet_peer_send(peer, reliable ? 0 : 1, pkt);
+    ENetPacket* pkt = enet_packet_create(data, size, reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
+    if (!pkt) return;
+    if (enet_peer_send(peer, reliable ? 0 : 1, pkt) != 0) enet_packet_destroy(pkt);
+}
+
+void sendRawTo(ENetPeer* peer, const Writer& w, bool reliable = true) {
+    sendRawTo(peer, w.d.data(), w.d.size(), reliable);
+}
+
+void makeNonce(uint64_t sequence, unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES]) {
+    std::memset(nonce, 0, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+    for (int i = 0; i < 8; ++i) nonce[16 + i] = static_cast<unsigned char>(sequence >> (8 * i));
+}
+
+bool encryptPacket(SecurePeer& session, const Writer& w, std::vector<uint8_t>& frame) {
+    if (!session.established || session.sendSequence == std::numeric_limits<uint64_t>::max()) return false;
+    const uint64_t sequence = ++session.sendSequence;
+    frame.resize(10 + w.d.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    frame[0] = kEncryptedPacket;
+    frame[1] = kEncryptedPacketVersion;
+    for (int i = 0; i < 8; ++i) frame[2 + i] = static_cast<uint8_t>(sequence >> (8 * i));
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    makeNonce(sequence, nonce);
+    unsigned long long encryptedSize = 0;
+    const int result = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        frame.data() + 10, &encryptedSize, w.d.data(), static_cast<unsigned long long>(w.d.size()),
+        frame.data(), 10, nullptr, nonce, session.sendKey.data());
+    sodium_memzero(nonce, sizeof(nonce));
+    if (result != 0) return false;
+    frame.resize(10 + static_cast<size_t>(encryptedSize));
+    return true;
+}
+
+bool decryptPacket(SecurePeer& session, const uint8_t* data, size_t size,
+                   std::vector<uint8_t>& plain) {
+    constexpr size_t headerSize = 10;
+    if (!session.established || size < headerSize + crypto_aead_xchacha20poly1305_ietf_ABYTES ||
+        data[0] != kEncryptedPacket || data[1] != kEncryptedPacketVersion) return false;
+    uint64_t sequence = 0;
+    for (int i = 0; i < 8; ++i) sequence |= static_cast<uint64_t>(data[2 + i]) << (8 * i);
+    if (sequence == 0) return false;
+    plain.resize(size - headerSize - crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    makeNonce(sequence, nonce);
+    unsigned long long plainSize = 0;
+    const int result = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        plain.data(), &plainSize, nullptr, data + headerSize,
+        static_cast<unsigned long long>(size - headerSize), data, headerSize, nonce,
+        session.receiveKey.data());
+    sodium_memzero(nonce, sizeof(nonce));
+    if (result != 0 || plainSize == 0 || !session.receiveWindow.accept(sequence)) {
+        sodium_memzero(plain.data(), plain.size());
+        plain.clear();
+        return false;
+    }
+    plain.resize(static_cast<size_t>(plainSize));
+    return true;
+}
+
+std::vector<uint8_t> handshakeTranscript(const KxPublicKey& clientEphemeral,
+                                         const KxPublicKey& serverEphemeral,
+                                         const std::string& identityPublicKey) {
+    static const uint8_t domain[] = "BlockSmith ENet secure handshake v1";
+    std::vector<uint8_t> transcript(domain, domain + sizeof(domain));
+    const uint32_t version = net::kProtocolVersion;
+    for (int i = 0; i < 4; ++i) transcript.push_back(static_cast<uint8_t>(version >> (8 * i)));
+    transcript.insert(transcript.end(), clientEphemeral.begin(), clientEphemeral.end());
+    transcript.insert(transcript.end(), serverEphemeral.begin(), serverEphemeral.end());
+    transcript.insert(transcript.end(), identityPublicKey.begin(), identityPublicKey.end());
+    return transcript;
+}
+
+bool beginServerHandshake(ENetPeer* peer, const uint8_t* data, size_t size,
+                          const std::string& identityPublicKey,
+                          const std::string& identitySecretKey, std::string& error) {
+    if (size == 0 || data[0] != C_KEY_HELLO) return false;
+    const auto it = securePeers().find(peer);
+    if (it == securePeers().end() || !it->second.serverRole || it->second.established) {
+        error = "Unexpected encryption handshake";
+        return true;
+    }
+    if (!ensureSodium() || size != 1 + 4 + crypto_kx_PUBLICKEYBYTES ||
+        identityPublicKey.size() != crypto_sign_PUBLICKEYBYTES ||
+        identitySecretKey.size() != crypto_sign_SECRETKEYBYTES) {
+        error = "Invalid encryption handshake";
+        return true;
+    }
+    Reader reader(data, size);
+    reader.u8();
+    if (reader.u32() != net::kProtocolVersion) {
+        error = "This server requires a client with encrypted multiplayer support";
+        return true;
+    }
+    SecurePeer& session = it->second;
+    const auto clientPublic = reader.rest();
+    std::copy(clientPublic.begin(), clientPublic.end(), session.remotePublic.begin());
+    if (crypto_kx_keypair(session.localPublic.data(), session.localSecret.data()) != 0) {
+        error = "Could not create an encryption session";
+        return true;
+    }
+    const auto transcript = handshakeTranscript(session.remotePublic, session.localPublic, identityPublicKey);
+    std::array<unsigned char, crypto_sign_BYTES> signature{};
+    unsigned long long signatureSize = 0;
+    if (crypto_sign_detached(signature.data(), &signatureSize, transcript.data(),
+                             static_cast<unsigned long long>(transcript.size()),
+                             reinterpret_cast<const unsigned char*>(identitySecretKey.data())) != 0 ||
+        signatureSize != signature.size() ||
+        crypto_kx_server_session_keys(session.receiveKey.data(), session.sendKey.data(),
+                                      session.localPublic.data(), session.localSecret.data(),
+                                      session.remotePublic.data()) != 0) {
+        error = "Could not establish an encryption session";
+        return true;
+    }
+    Writer response(S_KEY_HELLO);
+    response.bytes(std::vector<uint8_t>(session.localPublic.begin(), session.localPublic.end()));
+    response.bytes(std::vector<uint8_t>(identityPublicKey.begin(), identityPublicKey.end()));
+    response.bytes(std::vector<uint8_t>(signature.begin(), signature.end()));
+    session.established = true;
+    sendRawTo(peer, response);
+    sodium_memzero(signature.data(), signature.size());
+    return true;
+}
+
+bool handleClientHandshake(ENetPeer* peer, const uint8_t* data, size_t size,
+                           const std::string& knownPublicKeyHex, std::string& serverPublicKeyHex,
+                           std::string& fingerprint, bool& identityChanged, std::string& error) {
+    identityChanged = false;
+    if (size == 0 || data[0] != S_KEY_HELLO) return false;
+    const auto it = securePeers().find(peer);
+    if (it == securePeers().end() || it->second.serverRole || it->second.established) {
+        error = "Unexpected encryption handshake";
+        return true;
+    }
+    constexpr size_t expectedSize = 1 + crypto_kx_PUBLICKEYBYTES +
+                                    crypto_sign_PUBLICKEYBYTES + crypto_sign_BYTES;
+    if (!ensureSodium() || size != expectedSize) {
+        error = "Invalid encryption handshake";
+        return true;
+    }
+    SecurePeer& session = it->second;
+    size_t offset = 1;
+    std::copy(data + offset, data + offset + session.remotePublic.size(), session.remotePublic.begin());
+    offset += session.remotePublic.size();
+    const std::string identityPublicKey(reinterpret_cast<const char*>(data + offset),
+                                        crypto_sign_PUBLICKEYBYTES);
+    offset += crypto_sign_PUBLICKEYBYTES;
+    const auto transcript = handshakeTranscript(session.localPublic, session.remotePublic, identityPublicKey);
+    if (crypto_sign_verify_detached(data + offset, transcript.data(),
+                                    static_cast<unsigned long long>(transcript.size()),
+                                    reinterpret_cast<const unsigned char*>(identityPublicKey.data())) != 0) {
+        error = "The server's encryption identity could not be verified";
+        return true;
+    }
+    serverPublicKeyHex = auth::toHex(identityPublicKey);
+    fingerprint = net::signingKeyFingerprint(serverPublicKeyHex);
+    if (!knownPublicKeyHex.empty()) {
+        const std::string knownPublicKey = auth::fromHex(knownPublicKeyHex);
+        if (knownPublicKey.size() != crypto_sign_PUBLICKEYBYTES ||
+            sodium_memcmp(knownPublicKey.data(), identityPublicKey.data(), identityPublicKey.size()) != 0) {
+            identityChanged = true;
+            error = "The server's encryption identity has changed (fingerprint " + fingerprint +
+                    "). Verify it with the server owner before updating the saved key.";
+            return true;
+        }
+    }
+    if (crypto_kx_client_session_keys(session.receiveKey.data(), session.sendKey.data(),
+                                      session.localPublic.data(), session.localSecret.data(),
+                                      session.remotePublic.data()) != 0) {
+        error = "Could not establish an encryption session";
+        return true;
+    }
+    session.established = !knownPublicKeyHex.empty();
+    return true;
+}
+
+void sendTo(ENetPeer* peer, const Writer& w, bool reliable = true) {
+    if (!peer || w.d.empty()) return;
+    const auto it = securePeers().find(peer);
+    if (it != securePeers().end() && it->second.established) {
+        std::vector<uint8_t> frame;
+        if (encryptPacket(it->second, w, frame)) sendRawTo(peer, frame.data(), frame.size(), reliable);
+        else {
+            std::cerr << "[Net] Could not protect an outgoing multiplayer packet; disconnecting" << std::endl;
+            enet_peer_disconnect_later(peer, 0);
+        }
+        return;
+    }
+    const uint8_t type = w.d[0];
+    if (type == S_STATUS) sendRawTo(peer, w, reliable);
+    else {
+        std::cerr << "[Net] Refused to send a multiplayer packet before encryption was established" << std::endl;
+        enet_peer_disconnect_later(peer, 0);
+    }
 }
 
 std::string blockName(uint8_t id) {
@@ -359,6 +634,64 @@ std::string net::passwordToken(const std::string& password) {
     return sha256Hex("craft-and-ruin-password:" + password);   // stays on the player's PC
 }
 
+bool net::generateSigningKeyPair(std::string& publicKeyHex, std::string& secretKeyHex) {
+    if (!ensureSodium()) return false;
+    std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> publicKey{};
+    std::array<unsigned char, crypto_sign_SECRETKEYBYTES> secretKey{};
+    if (crypto_sign_keypair(publicKey.data(), secretKey.data()) != 0) return false;
+    publicKeyHex = auth::toHex(std::string(reinterpret_cast<const char*>(publicKey.data()), publicKey.size()));
+    secretKeyHex = auth::toHex(std::string(reinterpret_cast<const char*>(secretKey.data()), secretKey.size()));
+    sodium_memzero(secretKey.data(), secretKey.size());
+    return true;
+}
+
+bool net::signingPublicKeyFromSecret(const std::string& secretKeyHex, std::string& publicKeyHex) {
+    if (!ensureSodium()) return false;
+    std::string secretKey = auth::fromHex(secretKeyHex);
+    if (secretKey.size() != crypto_sign_SECRETKEYBYTES) {
+        if (!secretKey.empty()) sodium_memzero(secretKey.data(), secretKey.size());
+        return false;
+    }
+    std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> publicKey{};
+    const bool success = crypto_sign_ed25519_sk_to_pk(
+        publicKey.data(), reinterpret_cast<const unsigned char*>(secretKey.data())) == 0;
+    sodium_memzero(secretKey.data(), secretKey.size());
+    if (!success) return false;
+    publicKeyHex = auth::toHex(std::string(reinterpret_cast<const char*>(publicKey.data()), publicKey.size()));
+    return true;
+}
+
+bool net::validSigningKeyPair(const std::string& publicKeyHex, const std::string& secretKeyHex) {
+    if (!ensureSodium()) return false;
+    const std::string publicKey = auth::fromHex(publicKeyHex);
+    std::string secretKey = auth::fromHex(secretKeyHex);
+    if (publicKey.size() != crypto_sign_PUBLICKEYBYTES ||
+        secretKey.size() != crypto_sign_SECRETKEYBYTES) {
+        if (!secretKey.empty()) sodium_memzero(secretKey.data(), secretKey.size());
+        return false;
+    }
+    std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> derived{};
+    const bool derivedOk = crypto_sign_ed25519_sk_to_pk(
+        derived.data(), reinterpret_cast<const unsigned char*>(secretKey.data())) == 0;
+    sodium_memzero(secretKey.data(), secretKey.size());
+    if (!derivedOk) return false;
+    return sodium_memcmp(derived.data(), publicKey.data(), derived.size()) == 0;
+}
+
+std::string net::signingKeyFingerprint(const std::string& publicKeyHex) {
+    if (!ensureSodium()) return "";
+    const std::string publicKey = auth::fromHex(publicKeyHex);
+    if (publicKey.size() != crypto_sign_PUBLICKEYBYTES) return "";
+    std::array<unsigned char, 20> fingerprint{};
+    crypto_generichash(fingerprint.data(), fingerprint.size(),
+                       reinterpret_cast<const unsigned char*>(publicKey.data()),
+                       publicKey.size(), nullptr, 0);
+    const std::string result = auth::toHex(std::string(reinterpret_cast<const char*>(fingerprint.data()),
+                                                        fingerprint.size()));
+    sodium_memzero(fingerprint.data(), fingerprint.size());
+    return result;
+}
+
 bool net::AuthProof::matches(const std::string& storedKey, const std::string& name) const {
     return auth::verify(storedKey, serverId, nonce, name, response);
 }
@@ -398,14 +731,34 @@ bool net::validPlayerName(const std::string& name) {
 // At program exit the World may already be gone, so only close the socket here
 // (call stop() first for a clean shutdown).
 GameServer::~GameServer() {
+    for (const auto& [id, c] : m_clients) eraseSecurePeer(c.peer);
     if (m_host) enet_host_destroy(m_host);
     if (m_lanSocket != -1) enet_socket_destroy(static_cast<ENetSocket>(m_lanSocket));
+    if (!m_signSecretKey.empty()) sodium_memzero(m_signSecretKey.data(), m_signSecretKey.size());
+}
+
+bool GameServer::setSecureIdentity(const std::string& publicKeyHex, const std::string& secretKeyHex) {
+    if (!net::validSigningKeyPair(publicKeyHex, secretKeyHex)) return false;
+    if (!m_signSecretKey.empty()) sodium_memzero(m_signSecretKey.data(), m_signSecretKey.size());
+    m_signPublicKey = auth::fromHex(publicKeyHex);
+    m_signSecretKey = auth::fromHex(secretKeyHex);
+    return true;
+}
+
+std::string GameServer::secureIdentityFingerprint() const {
+    return net::signingKeyFingerprint(auth::toHex(m_signPublicKey));
 }
 
 bool GameServer::start(World& world, uint16_t port, const std::string& gameFolder,
                        const std::string& hostName, std::string& error, bool hasHostPlayer) {
     if (running()) { error = "Already hosting"; return false; }
+    if (m_signPublicKey.size() != crypto_sign_PUBLICKEYBYTES ||
+        m_signSecretKey.size() != crypto_sign_SECRETKEYBYTES) {
+        error = "The server's encryption identity has not been configured";
+        return false;
+    }
     if (!ensureEnet()) { error = "Networking could not be started"; return false; }
+    if (!ensureSodium()) { error = "Secure networking could not be started"; return false; }
 
     ENetAddress addr;
     addr.host = ENET_HOST_ANY;
@@ -433,6 +786,7 @@ bool GameServer::start(World& world, uint16_t port, const std::string& gameFolde
     m_world->setRecordChanges(true);
     if (forEachWorld) forEachWorld([](const std::string&, World& w) { w.setRecordChanges(true); });
     std::cout << "[Server] Hosting on port " << port << std::endl;
+    std::cout << "[Server] Encryption fingerprint: " << secureIdentityFingerprint() << std::endl;
     return true;
 }
 
@@ -451,9 +805,11 @@ void GameServer::stop(const std::string& reason) {
     while (!m_clients.empty() && nowSeconds() < until && enet_host_service(m_host, &ev, 20) >= 0) {
         if (ev.type == ENET_EVENT_TYPE_RECEIVE) enet_packet_destroy(ev.packet);
         if (ev.type == ENET_EVENT_TYPE_DISCONNECT) {
+            eraseSecurePeer(ev.peer);
             if (Client* c = findByPeer(ev.peer)) m_clients.erase(c->id);
         }
     }
+    for (const auto& [id, c] : m_clients) eraseSecurePeer(c.peer);
     enet_host_destroy(m_host);
     m_host = nullptr;
     m_clients.clear();
@@ -508,13 +864,40 @@ void GameServer::update(const glm::vec3& hostPos, float hostYaw, float hostPitch
             ev.peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
             disableThrottle(ev.peer);
             m_clients[id] = std::move(c);
+            SecurePeer session;
+            session.serverRole = true;
+            securePeers()[ev.peer] = std::move(session);
             break;
         }
-        case ENET_EVENT_TYPE_RECEIVE:
-            if (Client* c = findByPeer(ev.peer)) handlePacket(*c, ev.packet->data, ev.packet->dataLength);
+        case ENET_EVENT_TYPE_RECEIVE: {
+            std::string handshakeError;
+            if (beginServerHandshake(ev.peer, ev.packet->data, ev.packet->dataLength,
+                                     m_signPublicKey, m_signSecretKey, handshakeError)) {
+                if (!handshakeError.empty()) {
+                    std::cerr << "[Net] Rejected encryption handshake: " << handshakeError << std::endl;
+                    enet_peer_disconnect_now(ev.peer, 0);
+                    eraseSecurePeer(ev.peer);
+                    if (Client* c = findByPeer(ev.peer)) dropClient(c->id);
+                }
+            } else {
+                std::vector<uint8_t> plain;
+                const auto secure = securePeers().find(ev.peer);
+                if (secure == securePeers().end() ||
+                    !decryptPacket(secure->second, ev.packet->data, ev.packet->dataLength, plain)) {
+                    std::cerr << "[Net] Rejected an unauthenticated multiplayer packet" << std::endl;
+                    enet_peer_disconnect_now(ev.peer, 0);
+                    eraseSecurePeer(ev.peer);
+                    if (Client* c = findByPeer(ev.peer)) dropClient(c->id);
+                } else if (Client* c = findByPeer(ev.peer)) {
+                    handlePacket(*c, plain.data(), plain.size());
+                    sodium_memzero(plain.data(), plain.size());
+                }
+            }
             enet_packet_destroy(ev.packet);
             break;
+        }
         case ENET_EVENT_TYPE_DISCONNECT:
+            eraseSecurePeer(ev.peer);
             if (Client* c = findByPeer(ev.peer)) dropClient(c->id);
             break;
         default:
@@ -1451,6 +1834,7 @@ void GameServer::kick(Client& c, const std::string& reason) {
 void GameServer::dropClient(uint16_t id) {
     auto it = m_clients.find(id);
     if (it == m_clients.end()) return;
+    eraseSecurePeer(it->second.peer);
     const bool wasJoined = it->second.joined;
     const std::string name = it->second.name;
     if (wasJoined && onLeave) {   // e.g. save where they were
@@ -1850,12 +2234,14 @@ std::vector<net::ChatLine> GameServer::takeChat() {
 // GameClient
 // ===========================================================================
 GameClient::~GameClient() {
+    eraseSecurePeer(m_peer);
     if (m_host) enet_host_destroy(m_host);
 }
 
 bool GameClient::connect(World& world, const std::string& address, const std::string& playerName,
                          const std::string& gameFolder, int viewDistance, std::string& error,
-                         const std::string& passwordToken, const std::string& knownServerId) {
+                         const std::string& passwordToken, const std::string& knownServerId,
+                         const std::string& knownServerKey) {
     disconnect();
     m_ended = false;
     m_endReason.clear();
@@ -1864,6 +2250,10 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
 
     if (!net::validPlayerName(playerName)) {
         error = "Pick a name first (1-16 letters, numbers, _ or -)";
+        return false;
+    }
+    if (!knownServerKey.empty() && auth::fromHex(knownServerKey).size() != crypto_sign_PUBLICKEYBYTES) {
+        error = "The saved encryption identity for this server is invalid";
         return false;
     }
     std::string hostText;
@@ -1896,7 +2286,12 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
     m_name = playerName;
     m_password = passwordToken;
     m_knownServerId = knownServerId;
+    m_knownServerKey = knownServerKey;
     m_serverId.clear();
+    m_serverKeyHex.clear();
+    m_serverFingerprint.clear();
+    m_serverIdentityPending = false;
+    m_serverIdentityChanged = false;
     m_game = gameFolder;
     m_viewDistance = std::clamp(viewDistance, 2, net::kMaxViewDistance);
     m_connectStarted = nowSeconds();
@@ -1910,7 +2305,13 @@ bool GameClient::connect(World& world, const std::string& address, const std::st
 }
 
 void GameClient::disconnect() {
-    if (!m_host) { m_state = State::Idle; return; }
+    if (!m_host) {
+        eraseSecurePeer(m_peer);
+        m_peer = nullptr;
+        m_state = State::Idle;
+        m_serverIdentityPending = false;
+        return;
+    }
     if (m_peer) {
         enet_peer_disconnect(m_peer, 0);
         ENetEvent ev;
@@ -1922,10 +2323,12 @@ void GameClient::disconnect() {
         }
         if (!done) enet_peer_reset(m_peer);
     }
+    eraseSecurePeer(m_peer);
     enet_host_destroy(m_host);
     m_host = nullptr;
     m_peer = nullptr;
     m_state = State::Idle;
+    m_serverIdentityPending = false;
     m_views.clear();
     m_entityViews.clear();
     m_entitySnaps.clear();
@@ -1939,12 +2342,14 @@ void GameClient::finish(const std::string& reason) {
     m_completeAsked.clear(); m_completeText.clear(); m_completeList.clear();
     m_completeHave = m_completeArrived = false;
     const bool wasJoined = m_state == State::Joined;
+    eraseSecurePeer(m_peer);
     if (m_host) {
         enet_host_destroy(m_host);
         m_host = nullptr;
         m_peer = nullptr;
     }
     m_state = State::Idle;
+    m_serverIdentityPending = false;
     m_views.clear();
     m_entityViews.clear();
     m_entitySnaps.clear();
@@ -1968,21 +2373,54 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
         switch (ev.type) {
         case ENET_EVENT_TYPE_CONNECT: {
             disableThrottle(m_peer);
-            Writer w(C_HELLO);
+            if (!ensureSodium()) {
+                m_kickReason = "Secure networking could not be started";
+                finish(m_kickReason);
+                return;
+            }
+            SecurePeer session;
+            if (crypto_kx_keypair(session.localPublic.data(), session.localSecret.data()) != 0) {
+                m_kickReason = "Could not create an encryption session";
+                finish(m_kickReason);
+                return;
+            }
+            securePeers()[m_peer] = std::move(session);
+            Writer w(C_KEY_HELLO);
             w.u32(net::kProtocolVersion);
-            w.str(m_name);
-            w.str(m_game);
-            w.u8(static_cast<uint8_t>(m_viewDistance));
-            w.u8(m_password.empty() ? 0 : 1);   // the password itself is never sent (S_CHALLENGE)
-            w.str(BLOCKSMITH_VERSION);           // last: older servers stop reading before it
-            w.u32(net::kMinProtocolVersion);     // ...and the oldest protocol we can still speak
-            sendTo(m_peer, w);
+            w.bytes(std::vector<uint8_t>(securePeers()[m_peer].localPublic.begin(),
+                                         securePeers()[m_peer].localPublic.end()));
+            sendRawTo(m_peer, w);
             break;
         }
-        case ENET_EVENT_TYPE_RECEIVE:
-            handlePacket(ev.packet->data, ev.packet->dataLength);
+        case ENET_EVENT_TYPE_RECEIVE: {
+            std::string handshakeError;
+            if (handleClientHandshake(m_peer, ev.packet->data, ev.packet->dataLength,
+                                      m_knownServerKey, m_serverKeyHex,
+                                      m_serverFingerprint, m_serverIdentityChanged, handshakeError)) {
+                enet_packet_destroy(ev.packet);
+                if (!handshakeError.empty()) {
+                    m_kickReason = handshakeError;
+                    finish(handshakeError);
+                    return;
+                }
+                m_serverIdentityPending = m_knownServerKey.empty();
+                if (!m_serverIdentityPending) sendHello();
+                break;
+            }
+            std::vector<uint8_t> plain;
+            const auto secure = securePeers().find(m_peer);
+            if (secure == securePeers().end() ||
+                !decryptPacket(secure->second, ev.packet->data, ev.packet->dataLength, plain)) {
+                enet_packet_destroy(ev.packet);
+                m_kickReason = "The server sent an unauthenticated or invalid multiplayer packet";
+                finish(m_kickReason);
+                return;
+            }
+            handlePacket(plain.data(), plain.size());
+            sodium_memzero(plain.data(), plain.size());
             enet_packet_destroy(ev.packet);
             break;
+        }
         case ENET_EVENT_TYPE_DISCONNECT:
             finish("Lost connection to the server");
             return;
@@ -1992,7 +2430,8 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
     }
     if (!m_host) return;
 
-    if (m_state == State::Connecting && nowSeconds() - m_connectStarted > kConnectTimeoutSec) {
+    if (m_state == State::Connecting && !m_serverIdentityPending &&
+        nowSeconds() - m_connectStarted > kConnectTimeoutSec) {
         finish("Timed out");
         return;
     }
@@ -2031,6 +2470,29 @@ void GameClient::update(const MoveState& local, float yaw, float pitch, float dt
         if (m_clockSynced) interpolateEntities(net::clockSeconds() + m_clockOffset - m_interpDelay);
     }
     if (m_host) enet_host_flush(m_host);
+}
+
+void GameClient::sendHello() {
+    if (!m_peer) return;
+    Writer w(C_HELLO);
+    w.u32(net::kProtocolVersion);
+    w.str(m_name);
+    w.str(m_game);
+    w.u8(static_cast<uint8_t>(m_viewDistance));
+    w.u8(m_password.empty() ? 0 : 1);
+    w.str(BLOCKSMITH_VERSION);
+    w.u32(net::kMinProtocolVersion);
+    sendTo(m_peer, w);
+}
+
+bool GameClient::acceptServerIdentity() {
+    if (!m_serverIdentityPending || !m_peer || m_serverKeyHex.empty()) return false;
+    const auto secure = securePeers().find(m_peer);
+    if (secure == securePeers().end() || secure->second.serverRole) return false;
+    secure->second.established = true;
+    m_serverIdentityPending = false;
+    sendHello();
+    return true;
 }
 
 void GameClient::sendEdits() {

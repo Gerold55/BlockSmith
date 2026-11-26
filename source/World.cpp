@@ -96,41 +96,6 @@ uint32_t get32(const std::vector<uint8_t>& d, size_t p) {
            (static_cast<uint32_t>(d[p + 2]) << 16) | (static_cast<uint32_t>(d[p + 3]) << 24);
 }
 
-// Procedural fallback used when the Lua mapgen is missing.
-void generateFallbackTerrain(ChunkData& chunk, int chunkX, int chunkZ, float seedPhase) {
-    auto& registry = BlockRegistry::getInstance();
-    auto idOr = [&registry](const char* name, uint8_t fallback) {
-        uint8_t id = registry.getBlockId(name);
-        return id != 0 ? id : fallback;
-    };
-    const uint8_t stoneId = idOr("stone", 2);
-    const uint8_t grassId = idOr("grass", 3);
-    const uint8_t dirtId  = idOr("dirt", 1);
-
-    for (int x = 0; x < CHUNK_WIDTH; ++x) {
-        for (int z = 0; z < CHUNK_WIDTH; ++z) {
-            const int worldX = chunkX * CHUNK_WIDTH + x;
-            const int worldZ = chunkZ * CHUNK_WIDTH + z;
-
-            const float h = std::sin(worldX * 0.1f + seedPhase) *
-                            std::cos(worldZ * 0.1f + seedPhase) * 5.0f;
-            const int surface = 55 + static_cast<int>(h);
-            const int top = std::min(surface, CHUNK_HEIGHT - 1);
-
-            // Caves are carved afterwards by CaveGenerator::carveChunk (see loadChunk)
-            for (int y = 0; y <= top; ++y) {
-                if (y == surface) {
-                    chunk.setBlock(x, y, z, grassId);
-                } else if (y > surface - 4) {
-                    chunk.setBlock(x, y, z, dirtId);
-                } else {
-                    chunk.setBlock(x, y, z, stoneId);
-                }
-            }
-        }
-    }
-}
-
 } // namespace
 
 World::World() : m_fluids(std::make_unique<FluidSimulator>(*this)) {
@@ -599,7 +564,7 @@ bool World::loadChunk(int chunkX, int chunkZ, sol::state& lua) {
         fromDisk = false;
     }
 
-    // 2. Otherwise generate it (Lua mapgen, or the C++ fallback).
+    // 2. Otherwise generate it with Lua mapgen; without one, the chunk remains empty.
     if (!fromDisk) {
         chunk = std::make_shared<ChunkData>();   // fresh, in case a broken file half-filled it
         generateNewChunk(*chunk, chunkX, chunkZ, &lua, m_seed, m_dimension, m_dimType.caves);
@@ -674,8 +639,6 @@ void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, 
                 sol::error err = result;
                 std::cerr << "[Mapgen Error]: " << err.what() << std::endl;
             }
-        } else {
-            generateFallbackTerrain(chunk, cx, cz, static_cast<float>(seed % 100000) * 0.001f);
         }
     } else if (lua) {
         // Another dimension: the generator its mod gave dimensions.register (kept by name in
@@ -693,8 +656,14 @@ void World::generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, 
         }
     }
     // Carve caves into the new terrain (seeded, so the same seed gives the same caves).
-    // Saved chunks skip this - their caves are already in the file.
-    if (caves) CaveGenerator::carveChunk(chunk, cx, cz);
+    // Explicit superflat worlds stay completely flat. Saved chunks skip this - their caves
+    // are already in the file.
+    bool disableCaves = false;
+    if ((dimension.empty() || dimension == "overworld") && lua) {
+        sol::object value = (*lua)["_basic_mapgen_disable_caves"];
+        disableCaves = value.get_type() == sol::type::boolean && value.as<bool>();
+    }
+    if (caves && !disableCaves) CaveGenerator::carveChunk(chunk, cx, cz);
     computeBiomeTint(chunk, cx, cz, lua);
 }
 

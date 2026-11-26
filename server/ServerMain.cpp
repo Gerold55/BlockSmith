@@ -16,6 +16,7 @@
 //   BlockSmithServer --list-games
 
 #include "World.h"
+#include "BasicMapgen.h"
 #include "Version.h"
 #include "UpdateCheck.h"
 #include "Diagnostics.h"
@@ -564,6 +565,43 @@ std::string loadOrCreateServerId(const fs::path& file) {
     return id;
 }
 
+bool loadOrCreateServerSigningKey(const fs::path& file, std::string& publicKey,
+                                 std::string& secretKey, std::string& error) {
+    if (fs::exists(file)) {
+        std::ifstream in(file);
+        std::getline(in, secretKey);
+        secretKey = trim(secretKey);
+        if (!in && secretKey.empty()) {
+            error = "Could not read the server encryption key " + file.string();
+            return false;
+        }
+        if (!net::signingPublicKeyFromSecret(secretKey, publicKey)) {
+            error = "The server encryption key is invalid: " + file.string() +
+                    " (restore the file or move it aside to create a new identity)";
+            return false;
+        }
+        return true;
+    }
+
+    if (!net::generateSigningKeyPair(publicKey, secretKey)) {
+        error = "Could not create the server encryption identity";
+        return false;
+    }
+    std::ofstream out(file, std::ios::trunc);
+    if (!out) {
+        error = "Could not write the server encryption key " + file.string();
+        return false;
+    }
+    out << secretKey << "\n";
+    if (!out) {
+        error = "Could not save the server encryption key " + file.string();
+        return false;
+    }
+    std::cout << "[Server] Created an encryption identity (" << file.string()
+              << "). Keep this file private and backed up." << std::endl;
+    return true;
+}
+
 // ===========================================================================
 // Mods available to a game (its own mods + the global mods/ folder)
 // ===========================================================================
@@ -945,6 +983,7 @@ struct ServerContext {
     std::vector<ModCommand> modCommands;      // chat.register_command (listed by help)
     // engine.get_storage / set_storage: the world's mod_storage.txt (same file as in the game)
     std::map<std::string, std::string> storage;
+    std::map<std::string, std::string> generatorStorage;
     bool storageDirty = false;
     ServerLuaApi api;
 };
@@ -1220,6 +1259,13 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         // block text (signs): get / set where the world runs; the server has no player of its own
         blocktext::install(engine, [&ctx]() { return ctx.here(); }, []() { return true; }, nullptr);
         blockstate::install(engine, [&ctx]() { return ctx.here(); });   // BlockStateLua.h
+    } else {
+        engine["get_storage"] = [&ctx](const std::string& key, sol::this_state ts) -> sol::object {
+            const auto it = ctx.generatorStorage.find(key);
+            if (it == ctx.generatorStorage.end()) return sol::make_object(ts, sol::lua_nil);
+            return sol::make_object(ts, it->second);
+        };
+        engine["set_storage"] = [](sol::variadic_args) {};
     }
     engine["get_player_name"] = [&ctx]() { return ctx.config->name; };
     engine["send_chat"] = [&ctx](const std::string& text) {
@@ -1329,6 +1375,7 @@ void setupLua(sol::state& lua, ServerContext& ctx, bool worker = false) {
         sky["set_day_length"] = [&ctx](double sec) { if (ctx.clock && std::isfinite(sec)) ctx.clock->secondsPerDay = std::clamp(sec, 10.0, 1.0e7); };
         sky["get_day_length"] = [&ctx]() { return ctx.clock ? ctx.clock->secondsPerDay : 1200.0; };
     }
+    basic_mapgen::installLuaApi(lua);
 }
 
 void printUsage() {
@@ -1692,6 +1739,8 @@ int main(int argc, char** argv) {
         }
     }
     if (failed) std::cerr << "[Mod] " << failed << " mod file(s) failed to load (see above)" << std::endl;
+    basic_mapgen::installSimpleMapgen(lua, true);
+    ctx.generatorStorage = ctx.storage;
     // The world's entities, now that the mods have registered their kinds
     {
         const int n = entityManager.load(worldDir.string());
@@ -1716,6 +1765,7 @@ int main(int argc, char** argv) {
             (*workerLua)["g_CurrentModPath"] = file.parent_path().string();
             try { workerLua->safe_script_file(file.string(), sol::script_pass_on_error); } catch (const std::exception&) {}
         }
+        basic_mapgen::installSimpleMapgen(*workerLua, false);
         diag::installLuaTraceback(workerLua->lua_state());   // from now on (generating chunks): with the Lua stack
         return workerLua;
     }, meta.seed);
@@ -1967,6 +2017,14 @@ int main(int argc, char** argv) {
         for (const auto& g : kGameRules) server.setShared(std::string("gamerule.") + g.name, ruleValue(g.name));
     };
     server.setServerId(loadOrCreateServerId(confDir / "server_id.txt"));   // passwords are bound to it
+    std::string signingPublicKey, signingSecretKey, signingKeyError;
+    if (!loadOrCreateServerSigningKey(confDir / "server_identity.key", signingPublicKey,
+                                      signingSecretKey, signingKeyError) ||
+        !server.setSecureIdentity(signingPublicKey, signingSecretKey)) {
+        std::cerr << "[Server] " << (signingKeyError.empty() ? "Invalid server encryption identity" : signingKeyError)
+                  << std::endl;
+        return 1;
+    }
     applyLiveSettings();
     std::string error;
     if (!server.start(world, static_cast<uint16_t>(config.port), config.game, config.name, error, false)) {

@@ -25,7 +25,7 @@
 class ChunkGenerator {
 public:
     // Builds a Lua state with the world generator (generate_chunk / set_world_seed) loaded.
-    // Called once on each worker thread. May return nullptr (then the built-in terrain is used).
+    // Called once on each worker thread. May return nullptr (then chunks stay empty).
     using LuaFactory = std::function<std::unique_ptr<sol::state>()>;
 
     struct Result {

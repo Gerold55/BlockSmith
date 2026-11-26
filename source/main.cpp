@@ -49,6 +49,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "Block.h"
 #include "ChunkData.h"
 #include "WorldRenderer.h"
+#include "BasicMapgen.h"
 #include "DimensionsLua.h"
 #include "SignShape.h"
 #include "MirrorShape.h"
@@ -94,7 +95,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "Fluids.h"
 #include "WeatherEffects.h"
 #include "Audio.h"
-#include "Firewall.h"
+#include "server/Firewall.h"
 #include "LuaSandbox.h"
 #include "UiDraw.h"
 #include "ServerLuaApi.h"
@@ -2471,22 +2472,62 @@ void loadSettings() {
     g_Settings = readConfFile(settingsFile());
 }
 
-void saveSettings() {
+bool saveSettings() {
     const fs::path file = settingsFile();
     const fs::path tmp = file.string() + ".tmp";
     {
         std::ofstream out(tmp, std::ios::trunc);
         if (!out) {
             std::cerr << "[Settings] Could not write " << file.string() << std::endl;
-            return;
+            return false;
         }
         out << "# Game settings. Edited from the Settings screen.\n";
         for (const auto& [k, v] : g_Settings) out << k << " = " << v << "\n";
+        if (!out) {
+            std::cerr << "[Settings] Could not finish writing " << file.string() << std::endl;
+            return false;
+        }
     }
     std::error_code ec;
     if (!replaceFile(tmp, file, ec)) {   // the old settings stay as they were
         std::cerr << "[Settings] Could not replace " << file.string() << ": " << ec.message() << std::endl;
+        return false;
     }
+    return true;
+}
+
+bool loadOrCreateHostSigningKey(std::string& publicKey, std::string& secretKey, std::string& error) {
+    const fs::path file = settingsFile().parent_path() / "host_server_identity.key";
+    if (fs::exists(file)) {
+        std::ifstream in(file);
+        std::getline(in, secretKey);
+        if (!in && secretKey.empty()) {
+            error = "Could not read the host encryption key " + file.string();
+            return false;
+        }
+        if (!net::signingPublicKeyFromSecret(secretKey, publicKey)) {
+            error = "The saved host encryption identity is invalid; restore host_server_identity.key or move it aside to create a new identity";
+            return false;
+        }
+        return true;
+    }
+    if (!net::generateSigningKeyPair(publicKey, secretKey)) {
+        error = "Could not create the host encryption identity";
+        return false;
+    }
+    std::ofstream out(file, std::ios::trunc);
+    if (!out) {
+        error = "Could not write the host encryption key " + file.string();
+        return false;
+    }
+    out << secretKey << "\n";
+    if (!out) {
+        error = "Could not save the host encryption key " + file.string();
+        return false;
+    }
+    std::cout << "[Server] Created an encryption identity (" << file.string()
+              << "). Keep this file private and backed up." << std::endl;
+    return true;
 }
 
 int settingInt(const std::string& name, int fallback) {
@@ -2888,7 +2929,8 @@ void installModSandbox(sol::state& lua) {
     luasandbox::installTimeLimitHook(lua);
 }
 
-std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFiles) {
+std::unique_ptr<sol::state> makeWorldGenLua(
+    const std::vector<fs::path>& modFiles, const std::unordered_map<std::string, std::string>& worldStorage) {
     auto lua = std::make_unique<sol::state>();
     lua->open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                         sol::lib::coroutine, sol::lib::utf8);
@@ -2913,6 +2955,13 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
     engine["get_block_name"] = [](sol::variadic_args) { return std::string("air"); };
     engine["is_server"] = []() { return false; };
     engine["is_world_generator"] = []() { return true; };
+    engine["get_storage"] = [worldStorage](const std::string& key, sol::this_state ts) -> sol::object {
+        const auto it = worldStorage.find(key);
+        if (it == worldStorage.end()) return sol::make_object(ts, sol::lua_nil);
+        return sol::make_object(ts, it->second);
+    };
+    engine["set_storage"] = [](sol::variadic_args) {};
+    basic_mapgen::installLuaApi(*lua);
     auto world = lua->create_named_table("world");
     world["get_caves_enabled"] = []() { return CaveGenerator::isEnabled(); };
     world["set_caves_enabled"] = [](sol::variadic_args) {};   // the main thread's setting wins
@@ -2925,6 +2974,7 @@ std::unique_ptr<sol::state> makeWorldGenLua(const std::vector<fs::path>& modFile
         // errors shown by the main thread (here, where only world generation works, they're noise)
         try { lua->safe_script_file(file.string(), sol::script_pass_on_error); } catch (const std::exception&) {}
     }
+    basic_mapgen::installSimpleMapgen(*lua, false);
     diag::installLuaTraceback(lua->lua_state());   // generating chunks: errors with their Lua stack
     return lua;
 }
@@ -7646,25 +7696,44 @@ int main(int argc, char** argv) {
             const std::string token = g_Settings.count("player_password_token") ? g_Settings["player_password_token"] : "";
             // The identity this server had last time (settings.txt server_id.<host:port>): the
             // password is only used to answer the server we joined before (Auth.h)
-            std::string knownId;
+            std::string knownId, knownServerKey;
             {
                 std::string host;
                 uint16_t port = 0;
                 if (net::parseAddress(address, host, port)) {
-                    const auto it = g_Settings.find("server_id." + host + ":" + std::to_string(port));
-                    if (it != g_Settings.end()) knownId = it->second;
+                    const std::string serverAddress = host + ":" + std::to_string(port);
+                    const auto id = g_Settings.find("server_id." + serverAddress);
+                    if (id != g_Settings.end()) knownId = id->second;
+                    const auto key = g_Settings.find("server_key." + serverAddress);
+                    if (key != g_Settings.end()) knownServerKey = key->second;
                 }
             }
-            if (!g_Client.connect(*g_WorldInstance, address, playerName(), g_LoadedGameFolder, view, error, token, knownId)) {
+            if (!g_Client.connect(*g_WorldInstance, address, playerName(), g_LoadedGameFolder,
+                                  view, error, token, knownId, knownServerKey)) {
                 return std::make_tuple(false, error);
             }
             return std::make_tuple(true, std::string());
+        };
+        engineTable["accept_server_identity"] = []() {
+            if (!g_Client.serverIdentityPending()) return false;
+            const std::string settingKey = "server_key." + g_Client.address();
+            const auto existing = g_Settings.find(settingKey);
+            const bool hadExisting = existing != g_Settings.end();
+            const std::string oldValue = hadExisting ? existing->second : std::string();
+            g_Settings[settingKey] = g_Client.serverPublicKeyHex();
+            if (!saveSettings()) {
+                if (hadExisting) g_Settings[settingKey] = oldValue;
+                else g_Settings.erase(settingKey);
+                return false;
+            }
+            if (!g_Client.acceptServerIdentity()) return false;
+            return true;
         };
         engineTable["cancel_join"] = []() {
             if (g_Client.active()) g_Client.disconnect();
             g_NetError.clear();
         };
-        // engine.get_connection_status() -> { state = "idle"|"connecting"|"joined", address, error }
+        // engine.get_connection_status() -> { state, address, error, trust_pending, fingerprint }
         engineTable["get_connection_status"] = [&lua]() {
             sol::table t = lua.create_table();
             const auto st = g_Client.state();
@@ -7672,6 +7741,9 @@ int main(int argc, char** argv) {
                        : st == GameClient::State::Connecting ? "connecting" : "idle";
             t["address"] = g_Client.address();
             if (!g_NetError.empty()) t["error"] = g_NetError;
+            t["trust_pending"] = g_Client.serverIdentityPending();
+            t["identity_changed"] = g_Client.serverIdentityChanged();
+            t["fingerprint"] = g_Client.serverFingerprint();
             return t;
         };
         // engine.host_game([port]) -> true, or false + error   (opens the current world to others)
@@ -7696,6 +7768,13 @@ int main(int argc, char** argv) {
                 saveSettings();
             }
             g_Server.setServerId(g_Settings["lan_server_id"]);
+            std::string signingPublicKey, signingSecretKey, signingKeyError;
+            if (!loadOrCreateHostSigningKey(signingPublicKey, signingSecretKey, signingKeyError)) {
+                return std::make_tuple(false, signingKeyError);
+            }
+            if (!g_Server.setSecureIdentity(signingPublicKey, signingSecretKey)) {
+                return std::make_tuple(false, std::string("Could not load the server encryption identity"));
+            }
             if (!g_Server.start(*g_WorldInstance, static_cast<uint16_t>(p), g_LoadedGameFolder, playerName(), error)) {
                 return std::make_tuple(false, error);
             }
@@ -7786,7 +7865,7 @@ int main(int argc, char** argv) {
             g_Server.stop();
             if (g_ChatSystem) g_ChatSystem->addMessage("Stopped hosting", glm::vec3(1.0f, 1.0f, 0.4f));
         };
-        // engine.get_network_info() -> { hosting, joined, port, players, address }
+        // engine.get_network_info() -> { hosting, joined, port, players, address, fingerprint }
         engineTable["get_network_info"] = [&lua]() {
             sol::table t = lua.create_table();
             t["hosting"] = g_Server.running();
@@ -7795,6 +7874,7 @@ int main(int argc, char** argv) {
             t["players"] = g_Server.running() ? g_Server.playerCount()
                          : static_cast<int>(g_Client.players().size()) + 1;
             t["address"] = g_Client.address();
+            t["fingerprint"] = g_Server.running() ? g_Server.secureIdentityFingerprint() : "";
             return t;
         };
         // ---- Server settings (Settings > Server) ----
@@ -8412,6 +8492,7 @@ int main(int argc, char** argv) {
         };
 
         installModSandbox(lua);   // before any mod runs: require / dofile only inside mods and lualib
+        basic_mapgen::installLuaApi(lua);
         // Online content for mods (remote.*): data only, from GitHub and approved sites
         std::unique_ptr<RemoteLua> remoteContent;
         {
@@ -8432,6 +8513,7 @@ int main(int argc, char** argv) {
             if (file.filename() == "init.lua" || isInsideInitFolder(file)) continue;
             runModFile(file);
         }
+        basic_mapgen::installSimpleMapgen(lua, true);
 
         // The player's own client mods (clientmods/), after the game's mods so they can use
         // its ui.* and sound.*. settings.txt: client_mods = false switches them all off.
@@ -8560,7 +8642,9 @@ int main(int argc, char** argv) {
         std::vector<fs::path> genModFiles;
         for (const auto& f : modFiles) if (f.filename() == "init.lua") genModFiles.push_back(f);
         for (const auto& f : modFiles) if (f.filename() != "init.lua" && !isInsideInitFolder(f)) genModFiles.push_back(f);
-        ChunkGenerator chunkGenerator(0, [genModFiles]() { return makeWorldGenLua(genModFiles); }, world.seed(), 2);
+        ChunkGenerator chunkGenerator(0, [genModFiles]() {
+    return makeWorldGenLua(genModFiles, g_ModStorage);
+        }, world.seed(), 2);
         world.setGenerator(&chunkGenerator);
         // The world's other dimensions use the same generator threads (Dimensions.h)
         g_DimWorlds.primary = &world;
