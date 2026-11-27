@@ -22,6 +22,13 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #define SOL_ALL_SAFETIES_ON 1
 #include <sol/sol.hpp>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#endif
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -2483,8 +2490,13 @@ bool saveSettings() {
         }
         out << "# Game settings. Edited from the Settings screen.\n";
         for (const auto& [k, v] : g_Settings) out << k << " = " << v << "\n";
-        if (!out) {
-            std::cerr << "[Settings] Could not finish writing " << file.string() << std::endl;
+        // Close explicitly: buffered data is flushed here, so a full disk or a failed write
+        // shows up in the stream state now, before the old file is replaced
+        out.close();
+        if (out.fail()) {
+            std::error_code rm;
+            fs::remove(tmp, rm);
+            std::cerr << "[Settings] Could not finish writing " << file.string() << " (the old settings are kept)" << std::endl;
             return false;
         }
     }
@@ -2496,35 +2508,100 @@ bool saveSettings() {
     return true;
 }
 
+// Reads the saved host key. On Linux/macOS a key file that others can read (made by an older
+// version, or copied) is tightened to owner-only first.
+static bool readHostKeyFile(const fs::path& file, std::string& secretKey, std::string& error) {
+#ifndef _WIN32
+    std::error_code pe;
+    fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, pe);
+#endif
+    std::ifstream in(file);
+    std::getline(in, secretKey);
+    if (!in && secretKey.empty()) {
+        error = "Could not read the host encryption key " + file.string();
+        return false;
+    }
+    return true;
+}
+
+// Writes the new key so that no one else can ever read it, not even for a moment: the file is
+// made owner-only (mode 0600, whatever the umask - a umask only removes permissions) BEFORE any
+// key byte goes in, written to a private temporary file, flushed to disk, then linked into place
+// without replacing anything. Whoever links first wins; a loser deletes its copy and uses the
+// winner's key, so the key is made once and every start (and every process) uses that one.
+// Returns 1 = written, 0 = someone else's key is there now, -1 = failed.
+static int writeNewHostKeyFile(const fs::path& file, const std::string& secretKey, std::string& error) {
+    const std::string text = secretKey + "\n";
+#ifndef _WIN32
+    const std::string tmp = file.string() + ".tmp." + std::to_string(static_cast<long>(::getpid()));
+    ::unlink(tmp.c_str());   // (a leftover of a crashed start with the same pid)
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) { error = "Could not create the host encryption key " + tmp + ": " + std::strerror(errno); return -1; }
+    ::fchmod(fd, 0600);   // (explicitly, in case the file system ignores the mode above)
+    size_t done = 0;
+    bool ok = true;
+    while (done < text.size()) {
+        const ssize_t n = ::write(fd, text.data() + done, text.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        done += static_cast<size_t>(n);
+    }
+    if (ok && ::fsync(fd) != 0) ok = false;
+    if (::close(fd) != 0) ok = false;
+    if (!ok) { error = "Could not save the host encryption key " + tmp + ": " + std::strerror(errno); ::unlink(tmp.c_str()); return -1; }
+    const int linked = ::link(tmp.c_str(), file.c_str());
+    const int linkErr = errno;
+    ::unlink(tmp.c_str());
+    if (linked == 0) return 1;
+    if (linkErr == EEXIST) return 0;
+    error = "Could not save the host encryption key " + file.string() + ": " + std::strerror(linkErr);
+    return -1;
+#else
+    // Windows: settings live in the user's own profile folder, which other accounts can't read
+    // by default. Written to a temporary file, then moved into place without replacing.
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) { error = "Could not write the host encryption key " + tmp.string(); return -1; }
+        out << text;
+        out.close();
+        if (out.fail()) {
+            std::error_code rm; fs::remove(tmp, rm);
+            error = "Could not save the host encryption key " + tmp.string();
+            return -1;
+        }
+    }
+    std::error_code ec;
+    if (fs::exists(file, ec)) { fs::remove(tmp, ec); return 0; }
+    fs::rename(tmp, file, ec);
+    if (ec) { std::error_code rm; fs::remove(tmp, rm); error = "Could not save the host encryption key " + file.string() + ": " + ec.message(); return -1; }
+    return 1;
+#endif
+}
+
 bool loadOrCreateHostSigningKey(std::string& publicKey, std::string& secretKey, std::string& error) {
     const fs::path file = settingsFile().parent_path() / "host_server_identity.key";
-    if (fs::exists(file)) {
-        std::ifstream in(file);
-        std::getline(in, secretKey);
-        if (!in && secretKey.empty()) {
-            error = "Could not read the host encryption key " + file.string();
-            return false;
-        }
+    auto useSaved = [&]() {
+        if (!readHostKeyFile(file, secretKey, error)) return false;
         if (!net::signingPublicKeyFromSecret(secretKey, publicKey)) {
             error = "The saved host encryption identity is invalid; restore host_server_identity.key or move it aside to create a new identity";
             return false;
         }
         return true;
-    }
-    if (!net::generateSigningKeyPair(publicKey, secretKey)) {
+    };
+    std::error_code ec;
+    if (fs::exists(file, ec)) return useSaved();   // made before: always reuse it
+    std::string newPublic, newSecret;
+    if (!net::generateSigningKeyPair(newPublic, newSecret)) {
         error = "Could not create the host encryption identity";
         return false;
     }
-    std::ofstream out(file, std::ios::trunc);
-    if (!out) {
-        error = "Could not write the host encryption key " + file.string();
-        return false;
-    }
-    out << secretKey << "\n";
-    if (!out) {
-        error = "Could not save the host encryption key " + file.string();
-        return false;
-    }
+    fs::create_directories(file.parent_path(), ec);
+    const int r = writeNewHostKeyFile(file, newSecret, error);
+    if (r < 0) return false;
+    if (r == 0) return useSaved();   // another start made it first: use that one
+    publicKey = newPublic;
+    secretKey = newSecret;
     std::cout << "[Server] Created an encryption identity (" << file.string()
               << "). Keep this file private and backed up." << std::endl;
     return true;
@@ -7714,8 +7791,15 @@ int main(int argc, char** argv) {
             }
             return std::make_tuple(true, std::string());
         };
-        engineTable["accept_server_identity"] = []() {
-            if (!g_Client.serverIdentityPending()) return false;
+        // engine.accept_server_identity(fingerprint) -> true, or false + why. The fingerprint is
+        // the one the player was shown and checked: the key is pinned only if the server being
+        // asked about still has exactly that identity (a server that answers with another key
+        // between the dialog and the click is refused, and the dialog shows the new fingerprint).
+        engineTable["accept_server_identity"] = [](sol::optional<std::string> shown) {
+            if (!g_Client.serverIdentityPending()) return std::make_tuple(false, std::string("There is no server identity to trust."));
+            if (!shown || shown->empty()) return std::make_tuple(false, std::string("Say which fingerprint you verified."));
+            if (*shown != g_Client.serverFingerprint())
+                return std::make_tuple(false, std::string("changed"));   // (the identity differs from what was shown)
             const std::string settingKey = "server_key." + g_Client.address();
             const auto existing = g_Settings.find(settingKey);
             const bool hadExisting = existing != g_Settings.end();
@@ -7724,10 +7808,10 @@ int main(int argc, char** argv) {
             if (!saveSettings()) {
                 if (hadExisting) g_Settings[settingKey] = oldValue;
                 else g_Settings.erase(settingKey);
-                return false;
+                return std::make_tuple(false, std::string("save"));
             }
-            if (!g_Client.acceptServerIdentity()) return false;
-            return true;
+            if (!g_Client.acceptServerIdentity()) return std::make_tuple(false, std::string("changed"));
+            return std::make_tuple(true, std::string());
         };
         engineTable["cancel_join"] = []() {
             if (g_Client.active()) g_Client.disconnect();

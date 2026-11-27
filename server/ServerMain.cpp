@@ -57,6 +57,13 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#endif
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -565,9 +572,92 @@ std::string loadOrCreateServerId(const fs::path& file) {
     return id;
 }
 
+// Writes the new key file so that nobody else can read it, not even for a moment, and so that
+// a failed write never leaves anything at the final path: the key goes into a private temporary
+// file (mode 0600 from the moment it exists, whatever the umask: a umask only removes
+// permissions), is flushed and closed with every step checked, and only then is it linked into
+// place without replacing anything. Whoever links first wins; the loser deletes its copy.
+// Returns 1 = published, 0 = another start published a key first, -1 = failed (+ why).
+int writeNewKeyFile(const fs::path& file, const std::string& secretKey, std::string& error) {
+    const std::string text = secretKey + "\n";
+#ifndef _WIN32
+    const std::string tmp = file.string() + ".tmp." + std::to_string(static_cast<long>(::getpid()));
+    ::unlink(tmp.c_str());   // (left by a crashed start with the same pid)
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) { error = "Could not create the server encryption key " + tmp + ": " + std::strerror(errno); return -1; }
+    ::fchmod(fd, 0600);   // (explicitly, for file systems that ignore the mode above)
+    bool ok = true;
+    for (size_t done = 0; done < text.size();) {
+        const ssize_t n = ::write(fd, text.data() + done, text.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        done += static_cast<size_t>(n);
+    }
+    if (ok && ::fsync(fd) != 0) ok = false;
+    if (::close(fd) != 0) ok = false;
+    if (!ok) { error = "Could not save the server encryption key " + tmp + ": " + std::strerror(errno); ::unlink(tmp.c_str()); return -1; }
+    const int linked = ::link(tmp.c_str(), file.c_str());
+    const int linkErr = errno;
+    ::unlink(tmp.c_str());
+    if (linked == 0) return 1;
+    if (linkErr == EEXIST) return 0;
+    error = "Could not save the server encryption key " + file.string() + ": " + std::strerror(linkErr);
+    return -1;
+#else
+    // Windows: the folder is the server owner's own; the file is written to a temporary name,
+    // flushed and closed (both checked), then moved into place without replacing anything
+    const fs::path tmp = file.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) { error = "Could not write the server encryption key " + tmp.string(); return -1; }
+        out << text;
+        out.flush();
+        if (out.fail()) { out.close(); std::error_code rm; fs::remove(tmp, rm); error = "Could not save the server encryption key " + tmp.string(); return -1; }
+        out.close();
+        if (out.fail()) { std::error_code rm; fs::remove(tmp, rm); error = "Could not save the server encryption key " + tmp.string(); return -1; }
+    }
+    std::error_code ec;
+    if (fs::exists(file, ec)) { fs::remove(tmp, ec); return 0; }
+    fs::rename(tmp, file, ec);
+    if (ec) { std::error_code rm; fs::remove(tmp, rm); error = "Could not save the server encryption key " + file.string() + ": " + ec.message(); return -1; }
+    return 1;
+#endif
+}
+
+// An existing key must be private. On Linux/macOS: a regular file (no symlink), owned by whoever
+// runs the server, with no permission for group or others. A file that is merely too open and is
+// ours is tightened to 0600 (and the server says so: copies others read before are not secret
+// any more). Anything else is refused, and the server does not start.
+bool keyFileIsPrivate(const fs::path& file, std::string& error) {
+#ifndef _WIN32
+    struct stat st {};
+    if (::lstat(file.c_str(), &st) != 0) { error = "Could not check the server encryption key " + file.string() + ": " + std::strerror(errno); return false; }
+    if (!S_ISREG(st.st_mode)) {
+        error = "The server encryption key " + file.string() + " must be a regular file, not a link or anything else";
+        return false;
+    }
+    if (st.st_uid != ::geteuid()) {
+        error = "The server encryption key " + file.string() + " belongs to another user; the server won't use a key someone else owns";
+        return false;
+    }
+    if ((st.st_mode & 077) != 0) {
+        if (::chmod(file.c_str(), 0600) != 0 || ::lstat(file.c_str(), &st) != 0 || (st.st_mode & 077) != 0) {
+            error = "The server encryption key " + file.string() + " can be read by other users and could not be made private; run: chmod 600 " + file.string();
+            return false;
+        }
+        std::cerr << "[Server] The encryption key " << file.string() << " could be read by other users. It is private now (mode 600); "
+                  << "if other people had access to this machine, move it aside to create a new identity." << std::endl;
+    }
+#else
+    (void)file; (void)error;
+#endif
+    return true;
+}
+
 bool loadOrCreateServerSigningKey(const fs::path& file, std::string& publicKey,
                                  std::string& secretKey, std::string& error) {
-    if (fs::exists(file)) {
+    auto useSaved = [&]() {
+        if (!keyFileIsPrivate(file, error)) return false;
         std::ifstream in(file);
         std::getline(in, secretKey);
         secretKey = trim(secretKey);
@@ -581,22 +671,21 @@ bool loadOrCreateServerSigningKey(const fs::path& file, std::string& publicKey,
             return false;
         }
         return true;
-    }
+    };
+    std::error_code ec;
+    if (fs::exists(file, ec) || fs::is_symlink(file, ec)) return useSaved();   // made before: always reused
 
-    if (!net::generateSigningKeyPair(publicKey, secretKey)) {
+    std::string newPublic, newSecret;
+    if (!net::generateSigningKeyPair(newPublic, newSecret)) {
         error = "Could not create the server encryption identity";
         return false;
     }
-    std::ofstream out(file, std::ios::trunc);
-    if (!out) {
-        error = "Could not write the server encryption key " + file.string();
-        return false;
-    }
-    out << secretKey << "\n";
-    if (!out) {
-        error = "Could not save the server encryption key " + file.string();
-        return false;
-    }
+    fs::create_directories(file.parent_path(), ec);
+    const int r = writeNewKeyFile(file, newSecret, error);
+    if (r < 0) return false;          // nothing was published; the server doesn't start
+    if (r == 0) return useSaved();    // another start published first: use that key
+    publicKey = newPublic;
+    secretKey = newSecret;
     std::cout << "[Server] Created an encryption identity (" << file.string()
               << "). Keep this file private and backed up." << std::endl;
     return true;

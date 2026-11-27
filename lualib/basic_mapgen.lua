@@ -16,12 +16,30 @@ function M.install(engine)
     local superflat_layers
 
     engine._basic_mapgen_biomes = biomes
+    local function saved_style()
+        if type(engine.get_storage) ~= "function" then return nil end
+        local value = engine.get_storage("world:mapgen_style")
+        if type(value) == "string" and value ~= "" then return value end
+        return nil
+    end
+
+    -- A world's style is chosen once and then never changes: chunks already made would no
+    -- longer fit the new ones. So a style SAVED with the world always wins. set_mapgen_style
+    -- gives the mod's choice for a world that has none yet (a new world); mods call it on
+    -- every load, so it must not overwrite what an existing world saved.
+    -- Returns true, and a second value naming the saved style when that one is used instead.
     engine.set_mapgen_style = function(style)
         if style ~= "v6" and style ~= "v7" and style ~= "superflat" then
             return false, "mapgen style must be 'v6', 'v7' or 'superflat'"
         end
         if generator_installed then
             return false, "the simple mapgen is already installed"
+        end
+        local saved = saved_style()
+        if saved then
+            mapgen_style = saved   -- (what the installer will use: they stay in agreement)
+            if saved ~= style then return true, saved end
+            return true
         end
         mapgen_style = style
 
@@ -253,11 +271,15 @@ function M.install(engine)
     end
 
     local function install_simple_mapgen()
-        local world_style = read_world_option("mapgen_style")
-        -- Prefer the saved world setting, while also supporting a style selected
-        -- directly in this Lua state.
-        if type(world_style) == "string" and world_style ~= "" then
+        -- The saved world setting has priority; otherwise the style the mod chose in this Lua
+        -- state, which is then saved so the world keeps it (and the generator's own Lua
+        -- state sees the same one).
+        local world_style = saved_style()
+        if world_style then
             mapgen_style = world_style
+        elseif mapgen_style and type(engine.set_storage) == "function" then
+            engine.set_storage("world:mapgen_style", mapgen_style)
+            world_style = mapgen_style
         end
         local world_superflat = world_style == "superflat" or mapgen_style == "superflat"
         if world_superflat then mapgen_style = "superflat" end

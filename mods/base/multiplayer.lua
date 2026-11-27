@@ -686,10 +686,15 @@ local function connecting_layout(L, W, H)
         return two_buttons(D, S,
             { label = "Cancel", action = cancel_connect },
             { label = "Trust and Connect", kind = "primary", action = function()
-                if not engine.accept_server_identity() then
-                    state.trust_error = "Could not save the trusted server key. Check settings.txt and try again."
-                else
+                -- trust only the fingerprint the player was shown (draw_connecting keeps it)
+                if state.trust_locked_until and ui.get_time() < state.trust_locked_until then return end
+                local ok, why = engine.accept_server_identity(state.trust_shown)
+                if ok then
                     state.trust_error = nil
+                elseif why == "changed" then
+                    state.trust_error = "The server's identity changed. Compare the new fingerprint."
+                else
+                    state.trust_error = "Could not save the trusted server key. Check settings.txt and try again."
                 end
             end })
     end
@@ -1034,6 +1039,18 @@ end
 local function draw_connecting(L, W, H, mx, my)
     local S, fs = L.S, L.fs
     local status = engine.get_connection_status()
+    -- what the player is shown is what a click on "Trust" approves: another identity arriving
+    -- meanwhile changes the fingerprint on screen, and must be looked at again
+    if status.trust_pending then
+        if state.trust_shown and state.trust_shown ~= status.fingerprint then
+            state.trust_error = "The server's identity changed. Compare the new fingerprint."
+            state.trust_locked_until = ui.get_time() + 1.5   -- (a click meant for the old one can't approve it)
+        end
+        state.trust_shown = status.fingerprint
+    else
+        state.trust_shown = nil
+        state.trust_locked_until = nil
+    end
     local D = connecting_layout(L, W, H)
     card(D.x, D.y, D.w, D.h, S)
     if status.trust_pending then
