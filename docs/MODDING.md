@@ -6,7 +6,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
 
 | Part | Read it when | What's in it |
 |---|---|---|
-| [Part 1: Learn](#part-1-learn) | you're new to BlockSmith modding | how mods run, a first mod step by step, hooks and chaining, blocks and metadata, multiplayer, debugging, client mods |
+| [Part 1: Learn](#part-1-learn) | you're new to BlockSmith modding | how mods run, a first mod step by step, hooks and chaining, blocks and metadata, multiplayer, debugging, client mods, the Lua API |
 | [Part 2: Cookbook](#part-2-cookbook) | you want to make something specific | 19 complete mods to copy: blocks, ores, lamps, food, tools, armour, items, commands, HUD, screens, weather, mobs, terrain, timers, a client mod |
 | [Part 3: Reference](#part-3-reference) | you need the details of a function | every table and function, the hooks, and an A–Z function index |
 
@@ -33,6 +33,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [L9. Debugging when something goes wrong](#l9-debugging-when-something-goes-wrong)
    - [L10. Client mods: scripts for your own game](#l10-client-mods-scripts-for-your-own-game)
    - [L11. Screens and menus: how BlockSmith UI works](#l11-screens-and-menus-how-blocksmith-ui-works)
+   - [L12. The Lua API: tables, functions and context](#l12-the-lua-api-tables-functions-and-context)
 2. [Part 2: Cookbook](#part-2-cookbook)
    - [C1. A decorative block with different faces](#c1-a-decorative-block-with-different-faces)
    - [C2. A glowing ore that generates underground](#c2-a-glowing-ore-that-generates-underground)
@@ -88,6 +89,7 @@ BlockSmith is a voxel engine. Everything that makes it a *game* is written in Lu
    - [21. Online content](#21-online-content)
    - [22. Dimensions](#22-dimensions)
    - [23. Glossary](#23-glossary)
+   - [24. Engine API map](#24-engine-api-map)
 
 ---
 
@@ -574,6 +576,118 @@ See [§14.6](#146-ui_kit-windows-drag-and-drop-and-the-kit-in-any-screen), the `
 3. **The in-game screen slot is shared** with the survival inventory and other mods, so chain every hook and only act while your screen is open. [C12](#c12-your-own-screen) shows it.
 
 The full list of drawing functions, input, keys and hooks is in [Reference §14](#14-ui-menus-and-screens).
+
+## L12. The Lua API: tables, functions and context
+
+The **Lua API** is the set of functions and values that the engine and loaded mods make
+available to Lua. It is not one giant module: BlockSmith exposes named tables such as
+`engine`, `world`, `ui`, `chat` and `sound`; game mods may add their own tables such as
+`survival` or `doors`; and the engine calls global hooks such as `on_update`.
+
+### Three kinds of interface
+
+| Kind | Example | Who calls it |
+|---|---|---|
+| **Function on an API table** | `engine.get_block_name(x, y, z)` | Your mod calls it to ask the engine to do something or return data. |
+| **Hook** | `function on_block_broken(...) ... end` | Your mod defines it; the engine calls it when that event happens. Save and call the previous hook when replacing one. |
+| **Object method** | `chunk:set_block(x, y, z, id)` or `region:get(x, y, z)` | The engine gives your code an object for a particular operation; the methods are valid only for that object and context. |
+
+These are different contracts. For example, `engine.register_item_use(name, fn)` registers
+a callback through an engine function, while `on_right_click_block` is a global hook shared
+by all game mods. `chunk:set_block` changes the chunk being generated; it is not the same
+operation as `engine.set_block` in a running world.
+
+### Native API namespaces
+
+Across the game and client-mod Lua states, the engine provides these families. The exact
+tables and functions available depend on the context; use the reference sections and the
+generated `lua_api.txt` for the game build you are running.
+
+| Table or interface | Use it for | Read next |
+|---|---|---|
+| `engine.*` | Core engine operations: content registration, block and player queries, world changes, storage, multiplayer, settings and game flow. | [Blocks](#3-blocks-and-items), [changing the world](#4-changing-the-world), [multiplayer](#17-multiplayer-and-servers) |
+| `world.*` | World-level utilities such as caves, regions and schematics. These still act on the authoritative world when they change it. | [Changing the world](#4-changing-the-world), [dimensions](#22-dimensions) |
+| `chunk:*` | Read or write the chunk buffer during `generate_chunk`; coordinates are local to that chunk. | [World generation](#5-world-generation) |
+| `ui.*` | Drawing, screen input and interface helpers in the player's game. | [UI](#14-ui-menus-and-screens) |
+| `hotbar.*` | Read and change the local player's hotbar and creative inventory. | [Hotbar](#15-hotbar) |
+| `chat.*` | Register chat commands and send chat messages. | [Chat commands](#8-chat-commands) |
+| `sky.*`, `clouds.*`, `fog.*`, `underwater.*` | Set the sky, weather presentation, fog and underwater appearance. | [Sky and weather](#9-sky-weather-fog-clouds-underwater) |
+| `sound.*` | Play and inspect sounds available to the game. | [Sound](#12-sound) |
+| `menu.*` | Read or change the selected game and menu state. | [Engine screens and settings](#18-engine-screens-and-settings) |
+| `client.*` | The separate, restricted API for client mods. It is not the game-mod `engine.*` API. | [Client mods](#20-client-mods) |
+
+Game mods can also publish their own global tables. Those are **mod APIs**, not engine APIs:
+`survival.register_food` exists only when the survival mod has loaded; `buckets.register`
+exists only when the buckets mod has loaded. Check the table before calling it, and declare a
+dependency in `mod.conf` when your mod requires it. The generated API reference lists the
+tables that actually loaded in that game.
+
+### One API, different execution contexts
+
+The same mod may be loaded in the player's game, on the authority (singleplayer, LAN host or
+dedicated server), and on background world-generation threads. Those contexts do not have
+the same job:
+
+| Context | Typical work | Important boundary |
+|---|---|---|
+| **Authority** | Validate player actions, change blocks, run game rules, save world data. | Only the authority should make a gameplay change that must happen once. Check `engine.is_authority()`. |
+| **Player's game** | Draw the HUD, play sounds, handle local input, show menus. | A display or inventory change here is local; it does not grant items or change the server's world. |
+| **World generator** | Fill a new chunk deterministically from the seed and coordinates. | Runs on worker threads with their own Lua state. Use `chunk:*`; do not rely on UI, sound, hotbar or runtime world calls. Check `engine.is_world_generator()`. |
+| **Client mod** | Read allowed nearby data and add local presentation or chat helpers. | It uses `client.*` in a sandbox and cannot make authoritative world changes. The server may restrict what it can read or send. |
+
+`engine.is_server()` answers whether this Lua state is the dedicated server. It is not a
+replacement for `engine.is_authority()`: the singleplayer game and a LAN host are authorities
+too. Use the narrowest check for the decision you are making.
+
+**A client call is not automatically a server call.** A joined player's `engine.set_block`
+cannot be used to bypass server checks. Use the request or message API intended for that
+action, then validate the request on the authority. For example, `engine.request_harvest`
+asks the server to process a harvest; `engine.send_to_server(channel, data)` delivers data to
+the server mods, where `on_mod_message` receives it. Treat every message as untrusted input:
+check the player, range, rate, item and current world state before changing anything.
+
+### Reading signatures and return values
+
+- **Square brackets mean optional arguments** in this guide:
+  `world.move_region(p1, p2, offset [, { seconds = 1.5 }])`. They are notation, not Lua
+  syntax. `...` in an example means other
+  arguments are passed through or omitted from the excerpt.
+- **Lua can return more than one value.** Capture each one explicitly:
+  `local ok, reason = engine.set_world_mod(world, id, enabled)`.
+- **`nil` usually means there is no value**, such as no block definition or no loaded player.
+  A function that can fail may return a reason as another value; check the function's entry
+  rather than treating every `nil` the same way.
+- **A successful setter may return a boolean.** Use it when the operation can be refused or
+  has a precondition; for example, `engine.set_waterlogged` reports whether it changed the
+  block.
+- **Coordinates are block coordinates** unless the function says otherwise. `x` and `z`
+  span the ground; `y` is up. Chunk methods use chunk-local `x` and `z`, while world
+  functions use world coordinates.
+- **Registration is usually load-time work.** Register blocks, callbacks and definitions at
+  the top level of your mod. Read or change a world only from a hook or a callback where a
+  world exists.
+
+### Find the exact API in your running build
+
+The function index in Part 3 is a navigable map, not a promise that every API exists in every
+game or Lua state. At startup, the engine writes `lua_api.txt` beside the game executable.
+It lists the native function tables, hooks defined by loaded mods, APIs those mods offer to
+one another, and registered blocks and fluids. Run `engine.write_api_reference()` to rewrite
+it after mods have loaded.
+
+When a call is missing:
+
+1. Check the spelling and table name in `lua_api.txt`.
+2. Check that the mod which provides a mod API is installed, enabled and loaded before yours.
+3. Check that the function is available in this context (game, authority, generator or client
+   mod).
+4. Check its return values and any required hook or registration order in its reference
+   section.
+
+If you are writing a library for other mods, publish a small, stable table and document its
+arguments, return values, side effects and required dependency. Keep engine APIs and optional
+mod APIs clearly separate so a game can replace a mod without pretending the engine provides
+its functions.
 
 ---
 
@@ -1932,8 +2046,11 @@ Type in the search box (in `MODDING.html`) or use your browser's find (Ctrl+F) t
 
 Every function and hook, by table, each linking to where it's explained. `lua_api.txt` (written by the engine at startup) lists what your build has.
 
-**engine** (139)  
+**engine** (140)
+
 [`engine.add_model`](#fn-engine-add_model) · [`engine.add_player_velocity`](#fn-engine-add_player_velocity) · [`engine.allow_firewall`](#fn-engine-allow_firewall) · [`engine.back_to_title`](#fn-engine-back_to_title) · [`engine.cancel_join`](#fn-engine-cancel_join) · [`engine.close_settings`](#fn-engine-close_settings) · [`engine.create_server_profile`](#fn-engine-create_server_profile) · [`engine.create_world`](#fn-engine-create_world) · [`engine.delete_server_profile`](#fn-engine-delete_server_profile) · [`engine.delete_world`](#fn-engine-delete_world) · [`engine.draw_text`](#fn-engine-draw_text) · [`engine.find_texture`](#fn-engine-find_texture) · [`engine.get_active_world`](#fn-engine-get_active_world) · [`engine.get_block_def`](#fn-engine-get_block_def) · [`engine.get_block_description`](#fn-engine-get_block_description) · [`engine.set_block_name_display`](#fn-engine-set_block_name_display) · [`engine.get_block_id`](#fn-engine-get_block_id) · [`engine.get_block_name`](#fn-engine-get_block_name) · [`engine.get_block_text`](#fn-engine-get_block_text) · [`engine.set_block_text`](#fn-engine-set_block_text) · [`engine.edit_block_text`](#fn-engine-edit_block_text) · [`engine.get_connection_status`](#fn-engine-get_connection_status) · [`engine.get_dig_progress`](#fn-engine-get_dig_progress) · [`engine.get_fluid`](#fn-engine-get_fluid) · [`engine.get_game_info`](#fn-engine-get_game_info) · [`engine.get_keybinds`](#fn-engine-get_keybinds) · [`engine.get_lan_games`](#fn-engine-get_lan_games) · [`engine.get_light`](#fn-engine-get_light) · [`engine.get_light_level`](#fn-engine-get_light_level) · [`engine.get_metadata`](#fn-engine-get_metadata) · [`engine.get_network_info`](#fn-engine-get_network_info) · [`engine.get_online_players`](#fn-engine-get_online_players) · [`engine.get_player_info`](#fn-engine-get_player_info) · [`engine.get_player_list`](#fn-engine-get_player_list) · [`engine.get_player_mode`](#fn-engine-get_player_mode) · [`engine.get_player_name`](#fn-engine-get_player_name) · [`engine.get_player_position`](#fn-engine-get_player_position) · [`engine.get_player_state`](#fn-engine-get_player_state) · [`engine.get_server_game_mode`](#fn-engine-get_server_game_mode) · [`engine.get_server_info`](#fn-engine-get_server_info) · [`engine.get_server_profile`](#fn-engine-get_server_profile) · [`engine.get_server_settings`](#fn-engine-get_server_settings) · [`engine.get_server_status`](#fn-engine-get_server_status) · [`engine.get_shared`](#fn-engine-get_shared) · [`engine.get_storage`](#fn-engine-get_storage) · [`engine.get_swing`](#fn-engine-get_swing) · [`engine.get_texture_pack`](#fn-engine-get_texture_pack) · [`engine.get_video_settings`](#fn-engine-get_video_settings) · [`engine.get_ui_setting`](#fn-engine-get_ui_setting) · [`engine.set_ui_setting`](#fn-engine-set_ui_setting) · [`engine.get_worlds`](#fn-engine-get_worlds) · [`engine.give_item`](#fn-engine-give_item) · [`engine.has_player_password`](#fn-engine-has_player_password) · [`engine.has_server_build`](#fn-engine-has_server_build) · [`engine.has_server_icon`](#fn-engine-has_server_icon) · [`engine.host_game`](#fn-engine-host_game) · [`engine.is_authority`](#fn-engine-is_authority) · [`engine.is_creative`](#fn-engine-is_creative) · [`engine.is_fluid_source`](#fn-engine-is_fluid_source) · [`engine.is_flying`](#fn-engine-is_flying) · [`engine.is_in_game`](#fn-engine-is_in_game) · [`engine.is_inventory_open`](#fn-engine-is_inventory_open) · [`engine.is_left_handed`](#fn-engine-is_left_handed) · [`engine.is_opaque`](#fn-engine-is_opaque) · [`engine.is_operator`](#fn-engine-is_operator) · [`engine.is_player_operator`](#fn-engine-is_player_operator) · [`engine.is_outdoors`](#fn-engine-is_outdoors) · [`engine.is_paused`](#fn-engine-is_paused) · [`engine.is_replaceable`](#fn-engine-is_replaceable) · [`engine.is_scanning_lan`](#fn-engine-is_scanning_lan) · [`engine.is_server`](#fn-engine-is_server) · [`engine.is_third_person`](#fn-engine-is_third_person) · [`engine.get_camera_mode`](#fn-engine-get_camera_mode) · [`engine.set_camera_mode`](#fn-engine-set_camera_mode) · [`engine.set_player_look`](#fn-engine-set_player_look) · [`engine.get_player_look`](#fn-engine-get_player_look) · [`engine.set_hud_visible`](#fn-engine-set_hud_visible) · [`engine.is_hud_visible`](#fn-engine-is_hud_visible) · [`engine.is_world_generator`](#fn-engine-is_world_generator) · [`engine.join_server`](#fn-engine-join_server) · [`engine.key_name`](#fn-engine-key_name) · [`engine.kick_player`](#fn-engine-kick_player) · [`engine.list_blocks`](#fn-engine-list_blocks) · [`engine.list_fluids`](#fn-engine-list_fluids) · [`engine.list_games`](#fn-engine-list_games) · [`engine.list_mods`](#fn-engine-list_mods) · [`engine.list_mods_for_game`](#fn-engine-list_mods_for_game) · [`engine.get_world_mods`](#fn-engine-get_world_mods) · [`engine.set_world_mod`](#fn-engine-set_world_mod) · [`engine.list_server_profiles`](#fn-engine-list_server_profiles) · [`engine.list_servers`](#fn-engine-list_servers) · [`engine.list_texture_packs`](#fn-engine-list_texture_packs) · [`engine.list_worlds`](#fn-engine-list_worlds) · [`engine.load_animations`](#fn-engine-load_animations) · [`engine.message_player`](#fn-engine-message_player) · [`engine.player_set_block`](#fn-engine-player_set_block) · [`engine.load_model`](#fn-engine-load_model) · [`engine.move_model`](#fn-engine-move_model) · [`engine.open_mods_folder`](#fn-engine-open_mods_folder) · [`engine.open_server_profile_folder`](#fn-engine-open_server_profile_folder) · [`engine.open_settings`](#fn-engine-open_settings) · [`engine.open_texture_packs_folder`](#fn-engine-open_texture_packs_folder) · [`engine.override_block`](#fn-engine-override_block) · [`engine.pause`](#fn-engine-pause) · [`engine.ping_server`](#fn-engine-ping_server) · [`engine.play_world`](#fn-engine-play_world) · [`engine.quit`](#fn-engine-quit) · [`engine.quit_to_menu`](#fn-engine-quit_to_menu) · [`engine.reload_mods`](#fn-engine-reload_mods) · [`engine.register_abm`](#fn-engine-register_abm) · [`engine.register_random_tick`](#fn-engine-register_random_tick) · [`engine.drop_item`](#fn-engine-drop_item) · [`engine.register_block`](#fn-engine-register_block) · [`engine.register_lbm`](#fn-engine-register_lbm) · [`engine.register_fluid`](#fn-engine-register_fluid) · [`engine.register_fluid_reaction`](#fn-engine-register_fluid_reaction) · [`engine.register_item_use`](#fn-engine-register_item_use) · [`engine.remove_model`](#fn-engine-remove_model) · [`engine.request_harvest`](#fn-engine-request_harvest) · [`engine.reset_keybinds`](#fn-engine-reset_keybinds) · [`engine.respawn_player`](#fn-engine-respawn_player) · [`engine.resume`](#fn-engine-resume) · [`engine.save_server_profile`](#fn-engine-save_server_profile) · [`engine.save_servers`](#fn-engine-save_servers) · [`engine.save_world`](#fn-engine-save_world) · [`engine.send_chat`](#fn-engine-send_chat) · [`engine.send_to_all`](#fn-engine-send_to_all) · [`engine.send_to_player`](#fn-engine-send_to_player) · [`engine.send_to_server`](#fn-engine-send_to_server) · [`engine.set_player_dimension`](#fn-engine-set_player_dimension) · [`engine.get_player_dimension`](#fn-engine-get_player_dimension) · [`engine.set_active_world`](#fn-engine-set_active_world) · [`engine.set_ambient_occlusion`](#fn-engine-set_ambient_occlusion) · [`engine.set_block`](#fn-engine-set_block) · [`engine.set_block_meta`](#fn-engine-set_block_meta) · [`engine.set_creative`](#fn-engine-set_creative) · [`engine.set_dig_crack_texture`](#fn-engine-set_dig_crack_texture) · [`engine.set_first_person_arm`](#fn-engine-set_first_person_arm) · [`engine.set_first_person_hand`](#fn-engine-set_first_person_hand) · [`engine.set_third_person_item`](#fn-engine-set_third_person_item) · [`engine.set_fly_allowed`](#fn-engine-set_fly_allowed) · [`engine.set_flying`](#fn-engine-set_flying) · [`engine.set_footstep_distance`](#fn-engine-set_footstep_distance) · [`engine.set_fov`](#fn-engine-set_fov) · [`engine.set_inventory_open`](#fn-engine-set_inventory_open) · [`engine.set_keybind`](#fn-engine-set_keybind) · [`engine.set_mod_enabled`](#fn-engine-set_mod_enabled) · [`engine.set_model_visible`](#fn-engine-set_model_visible) · [`engine.set_moon_texture`](#fn-engine-set_moon_texture) · [`engine.set_place_repeat`](#fn-engine-set_place_repeat) · [`engine.set_player_controls`](#fn-engine-set_player_controls) · [`engine.set_player_name`](#fn-engine-set_player_name) · [`engine.set_player_mode`](#fn-engine-set_player_mode) · [`engine.set_player_password`](#fn-engine-set_player_password) · [`engine.set_player_position`](#fn-engine-set_player_position) · [`engine.set_server_setting`](#fn-engine-set_server_setting) · [`engine.set_shared`](#fn-engine-set_shared) · [`engine.set_smooth_lighting`](#fn-engine-set_smooth_lighting) · [`engine.set_storage`](#fn-engine-set_storage) · [`engine.set_sun_texture`](#fn-engine-set_sun_texture) · [`engine.set_texture_pack`](#fn-engine-set_texture_pack) · [`engine.set_video_setting`](#fn-engine-set_video_setting) · [`engine.start_game`](#fn-engine-start_game) · [`engine.start_server_profile`](#fn-engine-start_server_profile) · [`engine.stop_hosting`](#fn-engine-stop_hosting) · [`engine.stop_server_profile`](#fn-engine-stop_server_profile) · [`engine.swing_hand`](#fn-engine-swing_hand) · [`engine.take_world_error`](#fn-engine-take_world_error) · [`engine.teleport_player`](#fn-engine-teleport_player) · [`engine.write_api_reference`](#fn-engine-write_api_reference)
+
+[`engine.register_biome`](#fn-engine-register_biome) · [`engine.set_mapgen_style`](#fn-engine-set_mapgen_style)
 
 **remote** (8)  
 [`remote.check_url`](#fn-remote-check_url) · [`remote.fetch`](#fn-remote-fetch) · [`remote.get_cached`](#fn-remote-get_cached) · [`remote.is_available`](#fn-remote-is_available) · [`remote.null`](#fn-remote-null) · [`remote.refresh`](#fn-remote-refresh) · [`remote.unwatch`](#fn-remote-unwatch) · [`remote.watch`](#fn-remote-watch)
@@ -2018,7 +2135,7 @@ Every function and hook, by table, each linking to where it's explained. `lua_ap
 **survival.inventory** (7)  
 [`survival.inventory.add`](#fn-survival-inventory-add) · [`survival.inventory.clear`](#fn-survival-inventory-clear) · [`survival.inventory.get`](#fn-survival-inventory-get) · [`survival.inventory.is_open`](#fn-survival-inventory-is_open) · [`survival.inventory.pick`](#fn-survival-inventory-pick) · [`survival.inventory.set`](#fn-survival-inventory-set) · [`survival.inventory.size`](#fn-survival-inventory-size)
 
-**buckets (mods/buckets)** (1)  
+**buckets (Craft & Ruin's buckets mod)** (1)
 [`buckets.register`](#fn-buckets-register)
 
 **leafdecay (mods/leafdecay)** (1)  
@@ -2537,6 +2654,65 @@ function generate_chunk(chunk, cx, cz) -- every new chunk (16 x 256 x 16)
 end
 ```
 
+<a id="fn-engine-register_biome"></a>
+
+### Simple Luanti-inspired mapgen
+
+Games can keep their custom `generate_chunk` for complete control, or explicitly select the
+simple biome mapgen for an easier, declarative setup. The simple layer offers `v6`- and
+`v7`-inspired terrain styles; these are BlockSmith implementations, not binary-compatible
+reproductions of Luanti's generators. Both use the registered biomes' heat and humidity points
+and lay down top, filler, stone and water blocks. The `v6` style makes gentler rolling terrain;
+`v7` adds broader height variation and ridges.
+
+<a id="fn-engine-set_mapgen_style"></a>**Selecting a style:** `engine.set_mapgen_style("v6")` or
+`engine.set_mapgen_style("v7")` opts into that simple generator. It returns `true`, or
+`false, error` for an unsupported style. Call it before generation begins.
+
+Select the simple style and register the biomes in a game mod:
+
+```lua
+local ok, err = engine.set_mapgen_style("v7") -- or "v6"
+if not ok then error(err) end
+
+local ok, err = engine.register_biome{
+    name = "example:temperate",
+    node_top = "grass",
+    node_filler = "dirt",
+    node_stone = "stone",
+    depth_filler = 3,
+    heat_point = 55,
+    humidity_point = 60,
+}
+if not ok then error(err) end
+
+engine.register_biome{
+    name = "example:dry",
+    node_top = "sand",
+    node_filler = "sand",
+    heat_point = 85,
+    humidity_point = 20,
+}
+```
+
+`name` and `node_top` are required. `node_filler` and `node_stone` default to `dirt` and
+`stone`; `depth_top` and `depth_filler` default to 1 and 3. `node_water` defaults to `water`
+and is placed when that block exists.
+`heat_point` and `humidity_point` are numbers from 0 to 100 (default 50); `y_min` and `y_max`
+limit where a biome can appear (default 0 to 255). The top, filler and stone block names must
+exist when the world is generated. `engine.register_biome` returns `true`, or `false, error`
+for an invalid definition.
+Keep the style selection and registrations in game mods loaded by both the game and server. If
+the engine cannot resolve a required block, it reports the problem and does not silently replace
+the selected mapgen.
+
+The simple mapgen does not add trees, ores or custom structures. Add a `generate_chunk` for those,
+or for complete control over terrain; see the example above and [chunk functions](#fn-chunk-get_block).
+A custom `generate_chunk` always takes precedence over the simple style. If neither a custom
+generator nor a simple style is configured, new overworld chunks remain empty; the engine does not
+silently create generic terrain. The simple mapgen uses `terrain_version = 1` unless your game
+sets a version itself.
+
 <a id="terrain-version"></a>**When you change the terrain: `terrain_version`.** Set a global number in your world generator, and raise it whenever the terrain it makes changes (heights, biomes, rivers...):
 
 ```lua
@@ -2575,7 +2751,7 @@ on the world list, and a dedicated server stops with the error in its console. S
 - `generate_chunk` runs on **background threads**, each with its own copy of your mod files.
 - <a id="fn-engine-is_world_generator"></a>On those threads only world-generation functions work. `engine.get_block_id` and math work. Drawing, chat, `engine.set_block` and the hotbar do nothing. `engine.is_world_generator()` returns true there, if a mod needs to know.
 - Don't rely on global variables changed elsewhere at runtime. Compute everything from the seed and the coordinates.
-- With no `generate_chunk`, the engine makes simple built-in terrain.
+- Use a custom `generate_chunk`, or explicitly select `engine.set_mapgen_style("v6")` / `"v7"` and register biomes. If neither is configured, new overworld chunks remain empty.
 - After your terrain, the engine carves caves unless you turn them off (see [Caves](#caves) below).
 
 ### Caves
@@ -2643,7 +2819,7 @@ engine.register_item_use("magic_wand", function(pointed)
 end)
 ```
 
-<a id="fn-engine-give_item"></a>`engine.give_item(name [, count])` adds items to the hotbar and returns false if they didn't fit. `mods/buckets` is a complete example.
+<a id="fn-engine-give_item"></a>`engine.give_item(name [, count])` adds items to the hotbar and returns false if they didn't fit. Craft & Ruin's [buckets mod](../games/craft_and_ruin/mods/buckets/init.lua) is a working example.
 
 Older hooks still work:
 - <a id="fn-hooks-on_right_click_block"></a>`on_right_click_block(x, y, z, block, held_item, sneaking, repeat)`: return true to stop placing. `sneaking` is true while the player holds Sneak; a block you can use, such as a door, should then let the held block be placed against it. `repeat` is true when the call comes from holding the button rather than a new click (see below).
@@ -2717,9 +2893,9 @@ engine.register_fluid_reaction{ fluid = "lava", touching = "water",
                                 source_becomes = "obsidian", flowing_becomes = "cobblestone" }
 ```
 
-<a id="fn-engine-get_fluid"></a><a id="fn-engine-is_fluid_source"></a><a id="fn-engine-list_fluids"></a>`engine.get_fluid(x, y, z)`, `engine.is_fluid_source(x, y, z)` and `engine.list_fluids()` read fluids. The full guide is **`docs/FLUIDS.md`**. `mods/lava` is a complete example.
+<a id="fn-engine-get_fluid"></a><a id="fn-engine-is_fluid_source"></a><a id="fn-engine-list_fluids"></a>`engine.get_fluid(x, y, z)`, `engine.is_fluid_source(x, y, z)` and `engine.list_fluids()` read fluids. The full guide is **`docs/FLUIDS.md`**. Craft & Ruin registers lava in [core_blocks/biome_blocks.lua](../games/craft_and_ruin/mods/core_blocks/biome_blocks.lua); see its [buckets mod](../games/craft_and_ruin/mods/buckets/init.lua) for a complete fluid-item integration.
 
-<a id="tanks"></a>### Liquids in tanks (like Tinkers' Construct)
+<a id="tanks"></a>### Tanks and liquid containers
 
 The engine draws blocks with <a id="fn-block-tank"></a>`pattern = "tank"` as a see-through box with liquid inside. The block's metadata says how full it is, from 0 (empty) to 16 (full). The liquid is drawn with the fluid block's own pictures, so a water tank looks like water and a lava tank like lava, and it rises and falls as the metadata changes:
 
@@ -2733,7 +2909,7 @@ engine.register_block("mymod:vat_water", 1, 1, 1, "vat.png", nil, {
         stream = false,                   -- true: a thin stream falls out of the bottom (a spout pouring)
         floor = 1,                        -- where the liquid starts, in pixels (default: the inset); 13 = a
                                           --   shallow mould near the top, like a casting table
-        shell = true,                     -- false: draw only the liquid, no box (the inside of a smeltery)
+        shell = true,                     -- false: draw only the liquid, no box
         fluid2 = nil,                     -- a second liquid layered on top of `fluid` (see below)
     },
     light = 13, light_color = "#ff9a40",  -- optional: a lava tank glows
@@ -2749,26 +2925,7 @@ The box's picture is cut to size like other non-cube blocks, and see-through pix
 
 For example, `engine.set_block_meta(x, y, z, "mymod:layer_gold__iron", 6 + 16 * 15)` puts gold up to 6/16, then iron up to the top. A container taller than one block uses one block per height, so any number of layers can be stacked. Each block shows the one or two that meet inside it.
 
-**The `tanks` mod** (`mods/tanks`) is a complete example:
-- **Capacity:** a tank holds 4 buckets (4000 mB) of one liquid.
-- **Buckets:** right-click a tank with a full bucket to pour it in, and with an empty bucket to take a bucket out. With an empty hand you see how much is in it.
-- **Spout:** under a tank, a spout pours it into the tank below, 250 mB at a time, while you watch the stream. Right-click the spout to start or stop it.
-- **Liquids:** lava tanks glow, and any fluid with a bucket gets tanks.
-- **For other mods:** <a id="fn-tanks-get"></a><a id="fn-tanks-set"></a><a id="fn-tanks-register_fluid"></a><a id="fn-tanks-start_pouring"></a>`tanks.get(x, y, z)` returns the fluid and mB, `tanks.set(x, y, z, fluid, mB)` changes it, `tanks.register_fluid(fluid, source_block [, light, light_color])` adds a liquid, and `tanks.start_pouring(x, y, z)` starts a spout.
-
-<a id="smeltery"></a>**The `smeltery` mod** (`mods/smeltery`) is a working smeltery like Tinkers' Construct's, built from these blocks:
-- **Building it:** a floor of Seared Bricks, and walls of Seared Bricks or Seared Glass around an empty space from 1×1 to 7×7, up to 8 high. A Smeltery Controller goes in a wall, and a lava tank in a wall (or a lava bucket on the controller) is the fuel.
-- **Melting:** right-click the controller with ore, ingots or metal blocks to put them in. Iron, gold and copper ores, ingots and blocks come with the mod, and ore gives 2 ingots. The metals melt into **layers**, stacked in the order they melted, and you can see them through Seared Glass.
-- **Alloying:** copper and gold make rose gold, 3 to 1.
-- **The controller's screen:** right-click it with an empty hand. It shows what's melting, the layers drawn to scale, and the fuel. Click a layer to move it to the bottom.
-- **Casting:** a Smeltery Drain in a wall, with a Faucet outside it, pours the bottom layer into a Casting Table (one ingot, 144 mB) or a Casting Basin (one block, 1296 mB) under the faucet. It cools solid and you right-click to take it. Sneak + right-click tips out a part-filled cast.
-- **How the layers are drawn:** the inside of the smeltery is filled with shell-less tank blocks, each with one liquid or two layers.
-- **For other mods:** <a id="fn-smeltery-add_melting"></a><a id="fn-smeltery-fill"></a><a id="fn-smeltery-insert"></a>
-  - `smeltery.add_melting(item, metal, mB, seconds)` makes another item meltable;
-  - `smeltery.fill(x, y, z, { {metal, mB}, ... } [, fuel])` sets what's inside;
-  - `smeltery.insert(x, y, z, item [, count])` puts items in to melt;
-  - `smeltery.open_screen(x, y, z)` opens the controller's screen.
-- **Where it runs:** singleplayer, or when you host a LAN game.
+**Engine API:** `engine.register_block` registers the tank shape, and `engine.set_block_meta(x, y, z, block, level)` sets its fill level from 0 to 16. The engine draws the tank; interactions such as filling, emptying, or pouring must be implemented by a game or mod.
 
 <a id="fn-buckets-register_target"></a>**Buckets on your own blocks:** the buckets mod passes clicks on other mods' blocks to them. `buckets.register_target(function(pointed, bucket_item, fluid) ... end)` is asked first: `fluid` is the bucket's fluid, or nil for an empty bucket, and returning true means you used the click. Helpers:
 - <a id="fn-buckets-swap_held"></a>`buckets.swap_held(pointed, new_item)` turns the held bucket into another item, so a full bucket becomes `buckets.EMPTY` and the other way round;
@@ -4183,13 +4340,16 @@ A world can be played three ways, and mods run the same in all of them: **single
 4. Join from the game: Multiplayer > + Add Server, with the address (`localhost` on the same PC; otherwise its IP, plus `:port` if it isn't 30000). Players outside your network need port 30000 (UDP) forwarded on the router.
 5. Make yourself the boss: type `op <your name>` in the server window. From then on you can use every command in chat too, with `/` in front.
 
+**Encrypted connections.** Gameplay and login packets use authenticated encryption. On a player's first connection, the game shows the server's fingerprint and asks before trusting it. Compare it with the server owner through a trusted channel before accepting; after acceptance the key is pinned for that address, and a different key is rejected. The dedicated server prints its fingerprint at startup; a game hosting a LAN world shows it in the pause menu. Keep the server's `server_identity.key` (or the host's `host_server_identity.key`) private and backed up. Replacing that key changes the fingerprint, so players must verify the new one and remove the old `server_key.<address>` pin from their local `settings.txt` before they can accept it.
+
 Command-line options: `--setup`, `--config <file>` (another settings file), `--game <folder>`, `--world <name>`, `--port <number>` (these three override `server.conf` for one run), `--list-games`, `--version`.
 
-**The server's files**, all next to `server.conf` unless it says otherwise. They're plain text: you can read and edit them with any editor (edit the lists while the server is stopped, or type `reload` after).
+**The server's files**, all next to `server.conf` unless it says otherwise. Most are plain text you can read and edit with any editor (edit lists while the server is stopped, or type `reload` after). The encryption key is private: do not share or edit it.
 
 | file | what's in it | changed by |
 |---|---|---|
 | `server.conf` | all the settings (below) | you; `motd`, `name`, `setworldspawn` |
+| `server_identity.key` | private signing key for encrypted multiplayer; keep it private and backed up | created once by the server |
 | `ops.txt` | operators, `Name \| level` | `op`, `deop` |
 | `whitelist.txt` | who may join while `whitelist = true` | `whitelist add/remove` |
 | `banned.txt`, `banned-ips.txt` | banned names and addresses, with the reason | `ban`, `unban`, `ban-ip`, `pardon-ip` |
@@ -4534,7 +4694,9 @@ end
 #### Functions for multiplayer menus
 
 - <a id="fn-engine-host_game"></a><a id="fn-engine-join_server"></a><a id="fn-engine-stop_hosting"></a>`engine.join_server`, `host_game`, `stop_hosting`
-- <a id="fn-engine-get_connection_status"></a><a id="fn-engine-get_network_info"></a><a id="fn-engine-get_player_list"></a>`engine.get_connection_status`, `get_network_info`, `get_player_list`
+- <a id="fn-engine-get_connection_status"></a>`engine.get_connection_status()` returns `{ state, address, error, trust_pending, identity_changed, fingerprint }`. `trust_pending` means a first-use server key needs player approval; `identity_changed` means the pinned key no longer matches. `fingerprint` is the server identity fingerprint to compare with the owner.
+- <a id="fn-engine-accept_server_identity"></a>`engine.accept_server_identity()` saves and accepts the pending server key for that address, then allows the connection to continue. It returns `false` if no key is pending or the settings could not be saved. Call it only after the player explicitly approves the displayed fingerprint; never approve automatically.
+- <a id="fn-engine-get_network_info"></a><a id="fn-engine-get_player_list"></a>`engine.get_network_info`, `get_player_list`
 - <a id="fn-engine-get_lan_games"></a><a id="fn-engine-get_server_status"></a><a id="fn-engine-ping_server"></a>`engine.ping_server`, `get_server_status`, `get_lan_games`
 - <a id="fn-engine-list_servers"></a><a id="fn-engine-save_servers"></a>`engine.list_servers`, `save_servers`: the saved server list, `{ { name, address, pinned }, ... }` (`servers.txt`). `pinned = true` keeps a server at the top of the Multiplayer list.
 - <a id="fn-engine-get_player_name"></a><a id="fn-engine-has_player_password"></a><a id="fn-engine-set_player_name"></a><a id="fn-engine-set_player_password"></a>`engine.get_player_name`, `set_player_name`, `set_player_password`, `has_player_password`
@@ -4953,3 +5115,49 @@ Hook: `on_portal_travel(player, from, to, kind)`. Breaking a frame block or port
 | **metadata** | The one extra number (0–255) every block in the world has, for its state. |
 | **operator** | A server admin. Operators can use commands such as `/gamemode` and `/op`. |
 | **shared value** | A text value the authority sets with `engine.set_shared` and every player's game receives. |
+
+## 24. Engine API map
+
+This section groups the engine's Lua functions by the job they do. It complements the
+[function index](#function-index), which is the alphabetical lookup, and the detailed chapters,
+which explain the actual arguments and behavior. Some rows name game-mod libraries; those
+are marked **mod API**, not built-in engine functions.
+
+| Task | Main interface | What it covers |
+|---|---|---|
+| Define blocks and items | `engine.register_block`, `engine.override_block`, `engine.get_block_id`, `engine.get_block_def`, `engine.list_blocks` | Register a block/item, adjust an existing definition, or inspect the registry. See [§3](#3-blocks-and-items). |
+| Read and change a world | `engine.get_block_name`, `engine.get_metadata`, `engine.set_block`, `engine.set_block_meta`, `world.*` | Query blocks and metadata, make edits, or operate on a region. Use the authority for persistent gameplay changes. See [§4](#4-changing-the-world). |
+| Add scheduled behavior | `engine.register_random_tick`, `engine.register_abm`, `engine.register_lbm` | Run callbacks for selected blocks over time or when saved blocks load. See [§4](#4-changing-the-world). |
+| React to item use | `engine.register_item_use` | Associate an item callback with a pointed block, item stack and optional fluid hit. See [§6](#6-items-that-do-things). |
+| Add fluids | `engine.register_fluid`, `engine.register_fluid_reaction`, `engine.get_fluid`, `engine.list_fluids` | Define flow behavior and reactions, then query fluid cells. See [§7](#7-fluids) and [docs/FLUIDS.md](./FLUIDS.md). |
+| Respond to player actions | Global hooks such as `on_right_click_block`, `on_block_placed`, `on_block_broken`, `can_edit_block` | Handle events and authorize edits. Hooks are globals, so chain the previous function. See [§16](#16-hooks-the-engine-calls). |
+| Add player-facing commands | `chat.register_command`, `chat.send`, `on_chat_command` | Register command help, parse commands and respond. See [§8](#8-chat-commands). |
+| Draw or play local effects | `ui.*`, `sky.*`, `clouds.*`, `fog.*`, `underwater.*`, `sound.*` | Render and present effects in a player's game. These are not a substitute for server-side game state. See [§9](#9-sky-weather-fog-clouds-underwater), [§12](#12-sound), and [§14](#14-ui-menus-and-screens). |
+| Work with players and modes | `engine.get_player_*`, `engine.set_player_*`, `engine.is_creative`, `engine.is_operator` | Query or control player state where permitted. Server-side actions and restrictions are covered in [§17](#17-multiplayer-and-servers). |
+| Send multiplayer data | `engine.send_to_player`, `engine.send_to_all`, `engine.send_to_server`, `engine.set_shared`, `engine.get_shared` | Transfer bounded data or replicate a shared value. Receivers must validate messages. See [§17](#17-multiplayer-and-servers). |
+| Save mod state | `engine.get_storage`, `engine.set_storage` | Store text with the world; use namespaced keys such as `"mymod:spawn"`. See [§8 Mods working together](#l8-mods-working-together-and-saving-data). |
+| Generate terrain | `engine.set_mapgen_style`, `engine.register_biome`, `set_world_seed`, `generate_chunk`, `chunk:*`, `get_grass_color`, `get_foliage_color` | Choose the simple v6/v7-inspired biome mapgen, or fill chunks directly with a custom generator. See [§5](#5-world-generation). |
+| Present HUD and inventory | `render_hud`, `hud.*` (**mod API**), `hotbar.*`, `creative.*` (**mod API**) | Draw the HUD, expose game HUD pieces, and work with slots and creative tabs. See [§14](#14-ui-menus-and-screens) and [§15](#15-hotbar). |
+| Define other worlds | `dimensions.register`, `dimensions.get`, `dimensions.list`, `portals.*` (**mod API**) | Register dimension rules and connect them with portals. See [§22](#22-dimensions). |
+| Build menus and screens | `menu.*`, `engine.open_settings`, `engine.list_worlds`, `engine.list_mods` | Read or control game menus, settings, worlds, mods and texture packs. These are game-side APIs. See [§18](#18-engine-screens-and-settings). |
+
+### API design checklist
+
+When adding an API to a mod, document:
+
+1. **Owner and availability:** which mod provides the table, whether it is optional, and the
+   dependency name to put in `mod.conf`.
+2. **Arguments:** accepted types, valid ranges, coordinate space and whether arguments may be
+   omitted.
+3. **Returns:** exact values on success, missing data and failure; include a reason string
+   when callers can recover.
+4. **Context:** whether it runs on a player's game, the authority, the dedicated server or a
+   generator thread.
+5. **Effects:** whether the call changes saved world state, sends network data, draws only
+   locally, or merely registers a callback.
+6. **Example:** a small call that works with the documented dependency and a guard for
+   optional APIs.
+
+For engine changes, update the function's Lua registration, the generated `lua_api.txt`
+behavior where relevant, and the matching reference section here. For a mod API, keep the
+table owned by that mod and do not describe it as a native `engine.*` function.

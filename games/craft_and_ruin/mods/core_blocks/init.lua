@@ -29,6 +29,50 @@ engine.register_block("stonebricks", 1.0, 1.0, 1.0, "textures/stone_brick.png", 
     behavior = "solid"
 })
 
+--Ores
+
+engine.register_block("ore_coal", 1.0, 1.0, 1.0, "textures/coal_ore.png", nil, {
+    description = "Coal Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("ore_iron", 1.0, 1.0, 1.0, "textures/iron_ore.png", nil, {
+    description = "Iron Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("ore_gold", 1.0, 1.0, 1.0, "textures/gold_ore.png", nil, {
+    description = "Gold Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("ore_diamond", 1.0, 1.0, 1.0, "textures/diamond_ore.png", nil, {
+    description = "Diamond Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("ore_copper", 1.0, 1.0, 1.0, "textures/copper_ore.png", nil, {
+    description = "Copper Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
+engine.register_block("ore_emerald", 1.0, 1.0, 1.0, "textures/emerald_ore.png", nil, {
+    description = "Emerald Ore",
+    transparent = false,
+    walkable = true,
+    behavior = "solid"
+})
+
 engine.register_block("dirt", 1.0, 1.0, 1.0, "textures/cw_dirt.png", nil, {
     description = "Dirt",
     transparent = false,

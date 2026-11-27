@@ -423,6 +423,21 @@ void ChunkMesh::generateMeshData(const ChunkData& data) {
         const float fx = static_cast<float>(x);
         const float fy = static_cast<float>(y);
         const float fz = static_cast<float>(z);
+        if (prop.name == "lily_pad") {
+            const float minX = fx + kPlantInset, maxX = fx + 1.0f - kPlantInset;
+            const float minZ = fz + kPlantInset, maxZ = fz + 1.0f - kPlantInset;
+            const float padY = fy + kWaterSurfaceY;
+            Vertex pad[4] = {
+                makeVertex(minX, padY, maxZ, 0.0f, 1.0f, style),
+                makeVertex(maxX, padY, maxZ, 1.0f, 1.0f, style),
+                makeVertex(maxX, padY, minZ, 1.0f, 0.0f, style),
+                makeVertex(minX, padY, minZ, 0.0f, 0.0f, style),
+            };
+            applyBiomeTint(pad, 4, prop.biomeTint);
+            lightCell(pad, 4, x, y, z);
+            pushDoubleSided(cpuOpaqueVertices, pad);
+            return;
+        }
         const float minX = fx + kPlantInset, maxX = fx + 1.0f - kPlantInset;
         const float minZ = fz + kPlantInset, maxZ = fz + 1.0f - kPlantInset;
         const float minY = fy, maxY = fy + 1.0f;

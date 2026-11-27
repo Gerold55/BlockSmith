@@ -3,7 +3,7 @@
 //
 // A fluid is two blocks - a source block and a flowing block - plus a few numbers that say
 // how it behaves. The engine registers plain water by default; games and mods add their own
-// from Lua with engine.register_fluid (see addFluidLuaApi below and docs in Fluids.cpp).
+// from Lua with engine.register_fluid (see addFluidLuaApi below and docs/FLUIDS.md).
 //
 // How fluid cells are stored (the same for every fluid):
 //   source  = the source block, metadata 0

@@ -1,6 +1,6 @@
 #pragma once
 #include "Dimensions.h"
-// Multiplayer networking (ENet, UDP).
+// Multiplayer networking (ENet, UDP; authenticated encryption for all connected-player packets).
 //
 //  GameServer - runs inside the host's game ("Host Game" in the pause menu). The host's
 //               World is the real one: it loads chunks around every player, streams them
@@ -33,14 +33,15 @@ typedef struct _ENetPacket ENetPacket;
 namespace net {
 
 constexpr uint16_t kDefaultPort      = 30000;
-constexpr uint32_t kProtocolVersion  = 10;   // 7: the server decides each player's game mode
+constexpr uint32_t kProtocolVersion  = 11;   // 7: the server decides each player's game mode
                                             // 8: passwords by per-server challenge-response (Auth.h)
                                             // 9: dimensions (S_DIMENSION, S_PLAYER_DIM), mod messages
                                             // 10: block text (signs: C/S_BLOCK_TEXT, chunks' TEXT section)
+                                            // 11: authenticated encrypted ENet sessions
 // The oldest server protocol this game can still play on. A newer game may join an older server
 // (it speaks the older protocol), never the other way round. Raise it when support for an old
 // protocol is dropped.
-constexpr uint32_t kMinProtocolVersion = 10;   // (a game without dimensions would be shown the wrong world)
+constexpr uint32_t kMinProtocolVersion = 11;   // plaintext multiplayer peers are not accepted
 constexpr int      kMaxClients       = 64;
 constexpr int      kMaxViewDistance  = 10;   // chunks the server will send around a player
 
@@ -106,6 +107,10 @@ constexpr uint16_t kLanPort = 30001;          // LAN games announce themselves o
 // It never leaves the player's PC: logins prove knowledge of it with a per-server
 // challenge-response (Auth.h), so no server receives anything it could replay elsewhere.
 std::string passwordToken(const std::string& password);
+bool generateSigningKeyPair(std::string& publicKeyHex, std::string& secretKeyHex);
+bool signingPublicKeyFromSecret(const std::string& secretKeyHex, std::string& publicKeyHex);
+bool validSigningKeyPair(const std::string& publicKeyHex, const std::string& secretKeyHex);
+std::string signingKeyFingerprint(const std::string& publicKeyHex);
 
 // What a joining player proved, handed to GameServer::canJoin (see Auth.h)
 struct AuthProof {
@@ -201,6 +206,8 @@ public:
     // start; it should stay the same across restarts (dedicated: server_id.txt).
     void setServerId(const std::string& id) { m_serverId = id; }
     const std::string& serverId() const { return m_serverId; }
+    bool setSecureIdentity(const std::string& publicKeyHex, const std::string& secretKeyHex);
+    std::string secureIdentityFingerprint() const;
     // A "/command" a player typed (without the slash). Reply with messagePlayer. Optional.
     std::function<void(const std::string& name, const std::string& command)> onCommand;
     // Tab in a player's chat: the text before their cursor ("/give Al" or "hello Bo") -> what
@@ -434,6 +441,8 @@ private:
     std::unordered_map<std::string, std::string> m_shared;
     std::string m_defaultMode = "survival";
     std::string m_serverId;       // this server's identity for password challenges (setServerId)
+    std::string m_signPublicKey;
+    std::string m_signSecretKey;
 
     glm::vec3 m_hostPos{0.0f};
     float m_hostYaw = 0.0f, m_hostPitch = 0.0f;
@@ -468,9 +477,15 @@ public:
     // now claims a different one, the game refuses to answer with the password.
     bool connect(World& world, const std::string& address, const std::string& playerName,
                  const std::string& gameFolder, int viewDistance, std::string& error,
-                 const std::string& passwordToken = "", const std::string& knownServerId = "");
+                 const std::string& passwordToken = "", const std::string& knownServerId = "",
+                 const std::string& knownServerKey = "");
     // The identity of the server we joined (to remember it for next time), "" before the challenge
     const std::string& serverId() const { return m_serverId; }
+    const std::string& serverPublicKeyHex() const { return m_serverKeyHex; }
+    const std::string& serverFingerprint() const { return m_serverFingerprint; }
+    bool serverIdentityPending() const { return m_serverIdentityPending; }
+    bool serverIdentityChanged() const { return m_serverIdentityChanged; }
+    bool acceptServerIdentity();
     // Leaves the server (no-op when not connected).
     void disconnect();
 
@@ -571,6 +586,7 @@ public:
 private:
     void handlePacket(const uint8_t* data, size_t size);
     void finish(const std::string& reason);
+    void sendHello();
     void sendEdits();
 
     std::vector<std::string> m_sharedChanges;
@@ -597,6 +613,8 @@ private:
     std::string m_name;
     std::string m_password;   // token, not the password (never sent)
     std::string m_knownServerId, m_serverId;
+    std::string m_knownServerKey, m_serverKeyHex, m_serverFingerprint;
+    bool m_serverIdentityPending = false, m_serverIdentityChanged = false;
     std::string m_game;
     int m_viewDistance = 8;
     double m_connectStarted = 0.0;

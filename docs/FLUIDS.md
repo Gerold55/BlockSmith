@@ -1,8 +1,9 @@
 # Fluids in BlockSmith
 
 Water, lava, molten metals, oil, honey: any fluid flows the same way Minecraft water does.
-The engine side lives in `Fluids.h` / `Fluids.cpp`. Mods add fluids from Lua.
-`mods/lava` is a complete example to copy.
+The engine API lives in `api/Fluids.h` / `api/Fluids.cpp`. Mods add fluids from Lua.
+Craft & Ruin registers lava in [core_blocks/biome_blocks.lua](../games/craft_and_ruin/mods/core_blocks/biome_blocks.lua);
+its [buckets mod](../games/craft_and_ruin/mods/buckets/init.lua) demonstrates using fluid APIs.
 
 ## Adding a fluid
 
@@ -50,7 +51,8 @@ Registering a fluid name again replaces its settings, so a game can retune `wate
 
 Items that act on fluids use `engine.register_item_use(item, fn)`. The `pointed.fluid`
 it receives is `{ x, y, z, name, block, source, falling, level }` for the first fluid the
-crosshair passes through. See `mods/buckets` for an example.
+crosshair passes through. See Craft & Ruin's [buckets mod](../games/craft_and_ruin/mods/buckets/init.lua)
+for a working example.
 
 ## Buckets
 

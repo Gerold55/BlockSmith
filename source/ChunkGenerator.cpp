@@ -140,12 +140,12 @@ void ChunkGenerator::workerLoop(int index) {
     try {
         if (m_factory) lua = m_factory();
     } catch (const std::exception& e) {
-        std::cerr << "[Generator " << index << "] Lua setup failed (using built-in terrain): " << e.what() << std::endl;
+        std::cerr << "[Generator " << index << "] Lua setup failed (chunks will be empty): " << e.what() << std::endl;
         lua.reset();
     }
 
     // The Lua had a world generator (the factory worked) but couldn't be rebuilt after a failed
-    // set_world_seed: jobs fail instead of quietly switching to the built-in terrain
+    // set_world_seed: jobs fail instead of quietly switching to empty chunks.
     bool generatorLost = false;
     std::string lastSeedError;
     bool seeded = false;          // luaSeed is what set_world_seed last ran with successfully

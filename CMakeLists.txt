@@ -41,6 +41,19 @@ if (NOT BLOCKSMITH_SERVER_ONLY)
 endif()
 find_package(glm CONFIG REQUIRED)
 find_package(sol2 CONFIG REQUIRED)
+find_package(unofficial-sodium CONFIG QUIET)
+if (TARGET unofficial-sodium::sodium)
+    set(BLOCKSMITH_SODIUM_TARGET unofficial-sodium::sodium)
+else()
+    find_path(SODIUM_INCLUDE_DIR sodium.h REQUIRED)
+    find_library(SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
+    add_library(blocksmith_sodium UNKNOWN IMPORTED)
+    set_target_properties(blocksmith_sodium PROPERTIES
+        IMPORTED_LOCATION "${SODIUM_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SODIUM_INCLUDE_DIR}"
+    )
+    set(BLOCKSMITH_SODIUM_TARGET blocksmith_sodium)
+endif()
 
 # vcpkg ships Lua as unofficial-lua, other platforms use CMake's FindLua
 find_package(unofficial-lua CONFIG QUIET)
@@ -182,7 +195,7 @@ add_executable(BlockSmith
     api/Fluids.h
     source/WeatherEffects.cpp
     source/WeatherEffects.h
-    source/Firewall.cpp
+    server/Firewall.cpp
     source/Audio.cpp
     source/Audio.h
     source/StbVorbis.cpp
@@ -222,6 +235,7 @@ target_link_libraries(BlockSmith PRIVATE
     unofficial::stb
     ${VOXEL_LUA_TARGET}
     enet
+    ${BLOCKSMITH_SODIUM_TARGET}
     OpenAL::OpenAL
 )
 
@@ -313,7 +327,7 @@ add_custom_target(blocksmith_buildinfo ALL
     VERBATIM)
 
 add_executable(BlockSmithServer
-    source/ServerMain.cpp
+    server/ServerMain.cpp
     api/Region.cpp
     source/Diagnostics.cpp
     source/ChunkGenerator.cpp
@@ -353,7 +367,26 @@ target_link_libraries(BlockSmithServer PRIVATE
     sol2::sol2
     ${VOXEL_LUA_TARGET}
     enet
+    ${BLOCKSMITH_SODIUM_TARGET}
 )
+
+if (WIN32 AND TARGET unofficial-sodium::sodium)
+    get_target_property(BLOCKSMITH_SODIUM_LIBRARY unofficial-sodium::sodium IMPORTED_LOCATION_RELEASE)
+    if (BLOCKSMITH_SODIUM_LIBRARY)
+        get_filename_component(BLOCKSMITH_SODIUM_LIB_DIR "${BLOCKSMITH_SODIUM_LIBRARY}" DIRECTORY)
+        get_filename_component(BLOCKSMITH_VCPKG_ROOT "${BLOCKSMITH_SODIUM_LIB_DIR}" DIRECTORY)
+        set(BLOCKSMITH_SODIUM_DLL "${BLOCKSMITH_VCPKG_ROOT}/bin/libsodium.dll")
+        if (EXISTS "${BLOCKSMITH_SODIUM_DLL}")
+            foreach(target BlockSmith BlockSmithServer)
+                if (TARGET ${target})
+                    add_custom_command(TARGET ${target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${BLOCKSMITH_SODIUM_DLL}" "$<TARGET_FILE_DIR:${target}>")
+                endif()
+            endforeach()
+        endif()
+    endif()
+endif()
 
 if (WIN32)
     target_link_libraries(BlockSmithServer PRIVATE ws2_32 winmm)

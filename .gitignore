@@ -2,5 +2,7 @@ build*
 settings.txt
 servers.txt
 logs*
+server_identity.key
+host_server_identity.key
 game_mods_craft_and_ruin.txt
 mods/mobs

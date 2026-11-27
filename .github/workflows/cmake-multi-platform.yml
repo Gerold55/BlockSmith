@@ -62,14 +62,14 @@ jobs:
       if: runner.os == 'Linux' && matrix.lua != 'vcpkg'
       uses: awalsh128/cache-apt-pkgs-action@v1
       with:
-        packages: libglfw3-dev libglm-dev sol2-dev nlohmann-json3-dev liblua5.4-dev libgl1-mesa-dev xorg-dev
+        packages: libglfw3-dev libglm-dev sol2-dev nlohmann-json3-dev liblua5.4-dev libsodium-dev libgl1-mesa-dev xorg-dev
         version: ${{ hashFiles('.github/workflows/**') }}
 
     - name: Install dependencies (Linux, vcpkg Lua)
       if: runner.os == 'Linux' && matrix.lua == 'vcpkg'
       uses: awalsh128/cache-apt-pkgs-action@v1
       with:
-        packages: libglfw3-dev libglm-dev sol2-dev nlohmann-json3-dev libgl1-mesa-dev xorg-dev
+        packages: libglfw3-dev libglm-dev sol2-dev nlohmann-json3-dev libsodium-dev libgl1-mesa-dev xorg-dev
         version: ${{ hashFiles('.github/workflows/**') }}
 
     - name: Cache vcpkg binaries (Windows)
@@ -86,7 +86,7 @@ jobs:
         VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
       run: |
         mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-        vcpkg install glfw3:x64-windows glm:x64-windows sol2:x64-windows nlohmann-json:x64-windows lua:x64-windows
+        vcpkg install glfw3:x64-windows glm:x64-windows sol2:x64-windows nlohmann-json:x64-windows lua:x64-windows libsodium:x64-windows
         echo "CMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
 
     - name: Cache Homebrew downloads (macOS)
@@ -102,7 +102,7 @@ jobs:
         HOMEBREW_NO_AUTO_UPDATE: 1
         HOMEBREW_NO_INSTALL_CLEANUP: 1
       run: |
-        brew install glfw glm sol2 nlohmann-json
+        brew install glfw glm sol2 nlohmann-json libsodium
         if [ "${{ matrix.lua }}" != "vcpkg" ]; then brew install lua; fi
 
     - name: Install Lua 5.4 via vcpkg (Linux/macOS)

@@ -55,8 +55,8 @@ local Theme = {
 
 local Title = "Game Menu"
 
--- Multiplayer: "Host Game" opens this world to other players (its label and the status
--- line below the buttons are updated every frame from engine.get_network_info()).
+-- Multiplayer: "Host Game" opens this world to other players (its label and status below
+-- the buttons, including its encryption fingerprint, come from engine.get_network_info()).
 local HostButton
 HostButton = { label = "Host Game", action = function()
     local info = engine.get_network_info()
@@ -94,7 +94,14 @@ local function update_network_buttons()
     QuitButton.label = "Quit to Title"
     if info.hosting then
         HostButton.label = "Stop Hosting"
-        return "Hosting on port " .. info.port .. " - " .. info.players .. " online. Friends join with your IP address.", false
+        local fingerprint = info.fingerprint or ""
+        if #fingerprint == 40 then
+            fingerprint = fingerprint:sub(1, 8) .. "-" .. fingerprint:sub(9, 16) .. "-" ..
+                          fingerprint:sub(17, 24) .. "-" .. fingerprint:sub(25, 32) .. "-" ..
+                          fingerprint:sub(33, 40)
+        end
+        return "Hosting on port " .. info.port .. " - " .. info.players .. " online. Friends join with your IP address.",
+               false, fingerprint ~= "" and ("Server fingerprint: " .. fingerprint) or nil
     end
     HostButton.label = "Host Game"
     if HostButton.error then return HostButton.error, true end
@@ -211,7 +218,7 @@ function render_pause_menu(W, H)
     local L = compute_layout(W, H)
     local mx, my = ui.get_mouse()
 
-    local status, is_error = update_network_buttons()
+    local status, is_error, fingerprint = update_network_buttons()
 
     rect(0, 0, W, H, C.dim)
     text_centered(Title, L.cx, L.titleY, L.fs, C.title, L.S)
@@ -225,6 +232,11 @@ function render_pause_menu(W, H)
         local last = L.items[#L.items]
         local color = is_error and { 1.0, 0.45, 0.40, 1.0 } or { 0.75, 0.75, 0.75, 1.0 }
         text_centered(status, L.cx, last.y + last.h + 10 * L.S, L.fs * 0.85, color, L.S)
+        if fingerprint then
+            text_centered(fingerprint, L.cx,
+                          last.y + last.h + 10 * L.S + text_height(L.fs * 0.85) + 4 * L.S,
+                          L.fs * 0.8, color, L.S)
+        end
     end
 end
 

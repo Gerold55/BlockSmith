@@ -228,8 +228,8 @@ public:
     void setGenerator(ChunkGenerator* generator) { m_generator = generator; }
     size_t generatingCount() const { return m_generating.size(); }
 
-    // Makes a brand-new chunk: the Lua world generator (generate_chunk) if `lua` has one,
-    // else the built-in terrain, then caves. Safe to call from any thread with its own lua.
+    // Makes a brand-new chunk with the configured Lua mapgen, then caves. If no mapgen is
+    // configured, the chunk remains empty. Safe to call from any thread with its own lua.
     // `dimension`: "" (the overworld: generate_chunk) or a registered dimension (its generator,
     // from dimensions.register; none = an empty chunk). caves: run the engine's cave carver.
     static void generateNewChunk(ChunkData& chunk, int cx, int cz, sol::state* lua, uint32_t seed,

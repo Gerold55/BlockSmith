@@ -18,15 +18,15 @@
 //                proves the player knows serverKey without sending it, and it can't be replayed
 //                (the nonce is single-use) or used on another server (serverId and serverKey differ).
 //
-// Handshake: C_HELLO (no secret) -> S_CHALLENGE { serverId, nonce, accountExists }
+// The transport authenticates the server and encrypts every application packet before this
+// login exchange begins. Within that protected session:
+//   C_HELLO -> S_CHALLENGE { serverId, nonce, accountExists }
 //            -> C_AUTH { response, registerKey } -> S_WELCOME or S_KICK.
 // registerKey (= serverKey) is only sent when the server has no account for the name yet.
 //
-// Limits (no public-key crypto here): the first registration sends that server's key once, and
-// the connection isn't encrypted, so someone watching it could take over that one account on
-// that one server - never others. Players' games remember each server's identity (per address)
-// and won't answer a server whose identity changed, which stops a different server answering at
-// a known address from collecting responses for it.
+// This password protocol is not itself a secure channel; it relies on Net.cpp's authenticated
+// ENet transport for confidentiality and integrity. Server identity keys are pinned per address
+// after the player explicitly verifies the first-connection fingerprint.
 
 #include "Sha256.h"
 #include <cstdint>

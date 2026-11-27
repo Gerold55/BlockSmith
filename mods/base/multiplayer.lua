@@ -8,7 +8,7 @@
 --              servers come first (the pin on a row, or Pin in the details, pins / unpins it)
 --   right    - the selected server: icon, address, whether it's online, players, ping,
 --              version, its description, who's playing; Join / Pin / Edit / Remove
---   dialogs  - Add / Edit Server, Direct Connect, Remove (to confirm) and Connecting
+--   dialogs  - Add / Edit Server, Direct Connect, Remove (to confirm), identity checks and Connecting
 --
 -- To play together, one player opens a world and clicks "Host Game" in the pause menu.
 -- Everyone else finds it under Local Network (same network) or adds its address. Everybody
@@ -35,7 +35,8 @@
 --                                             engine_version, engine_commit, engine_compare = "newer"|"older"|"same"|"" }
 --   engine.get_lan_games()                -> { { host, address, motd, players, max_players }, ... }
 --   engine.cancel_join()
---   engine.get_connection_status()        -> { state = "idle"|"connecting"|"joined", address, error }
+--   engine.get_connection_status()        -> { state, address, error, trust_pending, identity_changed, fingerprint }
+--   engine.accept_server_identity()       -- explicitly trust and pin the displayed first-use key
 --   engine.get_game_info()                -> { selected, loaded, title, can_play }
 --   engine.get_update_info()              -> { available, required, latest, download, ... } (a newer BlockSmith)
 --   engine.open_update_page()             -- its download page, in the player's browser
@@ -452,6 +453,7 @@ end
 
 local function join(address)
     if not address or address == "" then return end
+    state.trust_error = nil
     local ok, err = engine.join_server(address)
     if ok == false then state.message = err; return end
     state.message = nil
@@ -551,6 +553,7 @@ end
 
 local function cancel_connect()
     engine.cancel_join()
+    state.trust_error = nil
     state.dialog = nil
 end
 
@@ -677,9 +680,35 @@ end
 
 local function connecting_layout(L, W, H)
     local S = L.S
+    local status = engine.get_connection_status()
+    if status.trust_pending then
+        local D = dialog_box(L, W, H, 320, 188)
+        return two_buttons(D, S,
+            { label = "Cancel", action = cancel_connect },
+            { label = "Trust and Connect", kind = "primary", action = function()
+                -- trust only the fingerprint the player was shown (draw_connecting keeps it)
+                if state.trust_locked_until and ui.get_time() < state.trust_locked_until then return end
+                local ok, why = engine.accept_server_identity(state.trust_shown)
+                if ok then
+                    state.trust_error = nil
+                elseif why == "changed" then
+                    state.trust_error = "The server's identity changed. Compare the new fingerprint."
+                else
+                    state.trust_error = "Could not save the trusted server key. Check settings.txt and try again."
+                end
+            end })
+    end
     local D = dialog_box(L, W, H, 240, 110)
     D.cancel = { x = D.x + (D.w - 90 * S) / 2, y = D.y + D.h - 32 * S, w = 90 * S, h = 20 * S, label = "Cancel",
                  action = cancel_connect }
+    return D
+end
+
+local function identity_changed_layout(L, W, H)
+    local S = L.S
+    local D = dialog_box(L, W, H, 320, 176)
+    D.close = { x = D.x + (D.w - 100 * S) / 2, y = D.y + D.h - 32 * S, w = 100 * S, h = 20 * S,
+                label = "Close", action = function() state.dialog = nil end }
     return D
 end
 
@@ -1010,8 +1039,36 @@ end
 local function draw_connecting(L, W, H, mx, my)
     local S, fs = L.S, L.fs
     local status = engine.get_connection_status()
+    -- what the player is shown is what a click on "Trust" approves: another identity arriving
+    -- meanwhile changes the fingerprint on screen, and must be looked at again
+    if status.trust_pending then
+        if state.trust_shown and state.trust_shown ~= status.fingerprint then
+            state.trust_error = "The server's identity changed. Compare the new fingerprint."
+            state.trust_locked_until = ui.get_time() + 1.5   -- (a click meant for the old one can't approve it)
+        end
+        state.trust_shown = status.fingerprint
+    else
+        state.trust_shown = nil
+        state.trust_locked_until = nil
+    end
     local D = connecting_layout(L, W, H)
     card(D.x, D.y, D.w, D.h, S)
+    if status.trust_pending then
+        text_center("Verify server identity", D.x + D.w / 2, D.y + 12 * S, 16 * S, fs * 1.05, C.title, true, S)
+        text_center(fit("First connection. Compare this fingerprint with the server owner through a trusted channel.", D.iw, fs * 0.72),
+                    D.x + D.w / 2, D.y + 37 * S, 36 * S, fs * 0.72, C.detail, false, S)
+        text_center(fit(status.fingerprint or "", D.iw, fs * 0.92), D.x + D.w / 2, D.y + 82 * S,
+                    18 * S, fs * 0.92, C.title, true, S)
+        text_center("Do not trust it if the fingerprints differ.", D.x + D.w / 2, D.y + 108 * S,
+                    14 * S, fs * 0.68, C.error, false, S)
+        if state.trust_error then
+            text_center(fit(state.trust_error, D.iw, fs * 0.62), D.x + D.w / 2, D.y + 126 * S,
+                        20 * S, fs * 0.62, C.error, false, S)
+        end
+        button(D.left, mx, my, S, fs)
+        button(D.right, mx, my, S, fs)
+        return
+    end
     local line = status.state == "joined" and "Joining world" or "Connecting"
     text_center(line, D.x + D.w / 2, D.y + 14 * S, 14 * S, fs * 1.05, C.title, true, S)
     text_center(fit(status.address or "", D.iw, fs * 0.7), D.x + D.w / 2, D.y + 32 * S, 10 * S, fs * 0.7, C.detail, false, S)
@@ -1024,6 +1081,21 @@ local function draw_connecting(L, W, H, mx, my)
     local x0, x1 = math.max(bx, sx), math.min(bx + bw, sx + sw)
     rect(x0, by, x1 - x0, bh, C.accent)
     button(D.cancel, mx, my, S, fs)
+end
+
+local function draw_identity_changed(L, W, H, mx, my)
+    local S, fs = L.S, L.fs
+    local status = engine.get_connection_status()
+    local D = identity_changed_layout(L, W, H)
+    card(D.x, D.y, D.w, D.h, S)
+    text_center("Server identity changed", D.x + D.w / 2, D.y + 12 * S, 16 * S, fs * 1.05, C.error, true, S)
+    text_center(fit("Do not continue unless you verified this new fingerprint with the server owner.", D.iw, fs * 0.72),
+                D.x + D.w / 2, D.y + 38 * S, 34 * S, fs * 0.72, C.detail, false, S)
+    text_center(fit(status.fingerprint or "", D.iw, fs * 0.92), D.x + D.w / 2, D.y + 82 * S,
+                18 * S, fs * 0.92, C.title, true, S)
+    text_center(fit("To trust a replacement key, remove this server's saved key from settings.txt, then reconnect.", D.iw, fs * 0.66),
+                D.x + D.w / 2, D.y + 108 * S, 32 * S, fs * 0.66, C.detail, false, S)
+    button(D.close, mx, my, S, fs)
 end
 
 -- ===========================================================================
@@ -1040,6 +1112,8 @@ function on_multiplayer_opened()
     local status = engine.get_connection_status and engine.get_connection_status() or {}
     if status.state == "connecting" then
         state.dialog = "connecting"
+    elseif status.identity_changed then
+        state.dialog = "identity_changed"
     else
         state.dialog = nil
         state.message = status.error   -- e.g. "Lost connection to the server"
@@ -1053,8 +1127,12 @@ function render_multiplayer(W, H)
     if state.dialog == "connecting" then
         local status = engine.get_connection_status()
         if status.state == "idle" then          -- failed or cancelled: back, with the reason
-            state.dialog = nil
-            state.message = status.error
+            if status.identity_changed then
+                state.dialog = "identity_changed"
+            else
+                state.dialog = nil
+                state.message = status.error
+            end
         end
     end
     -- On the network tab, select the first game found
@@ -1070,6 +1148,7 @@ function render_multiplayer(W, H)
         rect(0, 0, W, H, C.dim)
         if state.dialog == "edit" or state.dialog == "direct" then draw_edit(L, W, H, mx, my)
         elseif state.dialog == "delete" then draw_delete(L, W, H, mx, my)
+        elseif state.dialog == "identity_changed" then draw_identity_changed(L, W, H, mx, my)
         elseif state.dialog == "connecting" then draw_connecting(L, W, H, mx, my) end
     end
 end
@@ -1097,7 +1176,15 @@ function handle_multiplayer_click(mx, my, W, H)
         if not click_button(D.left, mx, my) then click_button(D.right, mx, my) end
         return true
     elseif state.dialog == "connecting" then
-        click_button(connecting_layout(L, W, H).cancel, mx, my)
+        local D = connecting_layout(L, W, H)
+        if D.left then
+            if not click_button(D.left, mx, my) then click_button(D.right, mx, my) end
+        else
+            click_button(D.cancel, mx, my)
+        end
+        return true
+    elseif state.dialog == "identity_changed" then
+        click_button(identity_changed_layout(L, W, H).close, mx, my)
         return true
     end
 
@@ -1182,6 +1269,9 @@ function handle_multiplayer_key(key, action, mods)
 
     if state.dialog == "connecting" then
         if key == ui.keys.ESCAPE then cancel_connect() end
+        return true
+    elseif state.dialog == "identity_changed" then
+        if key == ui.keys.ESCAPE or enter then state.dialog = nil end
         return true
     end
     if state.dialog == "delete" then

@@ -1,5 +1,36 @@
 print("[Craft & Ruin] Registering biome block types...")
 
+engine.register_block("lily_pad", 1.0, 1.0, 1.0, "textures/cw_lily_pad.png", nil, {
+    description = "Lily Pad",
+    transparent = true,
+    cutout = true,
+    walkable = false,
+    selectable = true,
+    pattern = "plantlike",
+    inventory_image = "textures/cw_lily_pad.png",
+    tint = false
+})
+
+engine.register_block("mushroom_red", 1.0, 1.0, 1.0, "textures/cw_mushroom_red.png", nil, {
+    description = "Red Mushroom",
+    transparent = true,
+    cutout = true,
+    walkable = false,
+    selectable = true,
+    pattern = "plantlike",
+    tint = false
+})
+
+engine.register_block("mushroom_brown", 1.0, 1.0, 1.0, "textures/cw_mushroom_brown.png", nil, {
+    description = "Brown Mushroom",
+    transparent = true,
+    cutout = true,
+    walkable = false,
+    selectable = true,
+    pattern = "plantlike",
+    tint = false
+})
+
 -- Blocks for Craft & Ruin's biomes (terrain_gen/mapgen.lua places them): taiga and jungle trees,
 -- savanna acacias, snow and ice, badlands terracotta and red sand, and the volcanoes' basalt.
 -- `description` is the name players see: pointing at the block, in the inventory, and in
@@ -338,8 +369,8 @@ engine.register_block("volcanic_ash", 0.4, 0.4, 0.4, "textures/volcanic_ash.png"
 })
 
 -- --- Lava (the volcanoes' crater pools and rivers) ---
--- The lava mod (mods/lava) has the same lava. When it's not running in this world, Craft &
--- Ruin brings its own, so the volcanoes always have their lava. It glows by itself (the name).
+-- If another mod has already registered lava, keep it; otherwise Craft & Ruin provides its
+-- own so the volcanoes always have lava. It glows by itself (the name).
 if (engine.get_block_id("lava") or 0) == 0 then
     -- Lava Source
     engine.register_block("lava", 1.0, 1.0, 1.0, "textures/cr_lava.png", nil, {
