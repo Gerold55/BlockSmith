@@ -270,59 +270,50 @@ function M.install(engine)
         return layers, total
     end
 
-    local function install_simple_mapgen()
-        -- The saved world setting has priority; otherwise the style the mod chose in this Lua
-        -- state, which is then saved so the world keeps it (and the generator's own Lua
-        -- state sees the same one).
-        local world_style = saved_style()
-        if world_style then
-            mapgen_style = world_style
-        elseif mapgen_style and type(engine.set_storage) == "function" then
-            engine.set_storage("world:mapgen_style", mapgen_style)
-            world_style = mapgen_style
+    -- The style in force RIGHT NOW: the one saved with the world, else the mod's own choice.
+    -- Asked every time it matters, never remembered: the world's storage isn't known when the
+    -- mods load (or when the generator threads are made) - only once the world is opened - and
+    -- another world can be opened later in the same session.
+    local function current_style()
+        return saved_style() or mapgen_style
+    end
+    local function is_flat() return current_style() == "superflat" end
+
+    -- ---- superflat ----
+    local flat_key, flat_layers, flat_total, flat_error
+    -- layers, total (cached until the world's layer text changes), or nil + why
+    local function flat_state()
+        local key = tostring(read_world_option("mapgen_layers") or "")
+        if key ~= flat_key or (not flat_layers and not flat_error) then
+            flat_key = key
+            flat_layers, flat_total = selected_superflat_layers()
+            flat_error = (not flat_layers) and flat_total or nil
         end
-        local world_superflat = world_style == "superflat" or mapgen_style == "superflat"
-        if world_superflat then mapgen_style = "superflat" end
-        _G._basic_mapgen_disable_caves = false
-        if world_superflat then
-            local layers, total = selected_superflat_layers()
-            if not layers then return false, total end
-            _G.generate_chunk = function(chunk)
-                for lx = 0, 15 do
-                    for lz = 0, 15 do
-                        local y = 0
-                        for i = #layers, 1, -1 do
-                            local layer = layers[i]
-                            for _ = 1, layer.depth do
-                                chunk:set_block(lx, y, lz, layer.id)
-                                y = y + 1
-                            end
-                        end
+        if not flat_layers then return nil, flat_error end
+        return flat_layers, flat_total
+    end
+    local function generate_flat(chunk, layers)
+        for lx = 0, 15 do
+            for lz = 0, 15 do
+                local y = 0
+                for i = #layers, 1, -1 do
+                    local layer = layers[i]
+                    for _ = 1, layer.depth do
+                        chunk:set_block(lx, y, lz, layer.id)
+                        y = y + 1
                     end
                 end
             end
-            local surface = total - 1
-            _G.get_surface_height = function() return surface end
-            _G.get_biome = function() return "plains" end
-            _G._basic_mapgen_disable_caves = true
-            _G.terrain_version = _G.terrain_version or 1
-            generator_installed = true
-            return true
         end
-        if generator_installed then return true end
-        if type(_G.generate_chunk) == "function" and not world_superflat then
-            return false, "a custom generate_chunk already exists"
-        end
-        if not mapgen_style then
-            return false, "no simple mapgen style was selected"
-        end
-        if mapgen_style ~= "v6" and mapgen_style ~= "v7" then
-            return false, "unsupported simple mapgen style '" .. tostring(mapgen_style) .. "'"
-        end
-        if #biomes == 0 then
-            return false, "no biomes were registered"
-        end
+    end
 
+    -- ---- the simple biome generator (v6 / v7) ----
+    local biome_generator, biome_error
+    local function build_biome_generator()
+        if biome_generator or biome_error then return biome_generator, biome_error end
+        local style = current_style()
+        if style ~= "v6" and style ~= "v7" then return nil, nil end   -- (none chosen: nothing to make)
+        if #biomes == 0 then biome_error = "no biomes were registered"; return nil, biome_error end
         local bedrock = resolve_block("bedrock")
         for _, biome in ipairs(biomes) do
             biome.ids = {
@@ -331,34 +322,20 @@ function M.install(engine)
                 stone = resolve_block(biome.node_stone),
                 water = resolve_block(biome.node_water)
             }
-            if not biome.ids.top then
-                return false, "biome '" .. biome.name .. "' references missing node_top '" .. biome.node_top .. "'"
-            end
-            if not biome.ids.filler then
-                return false, "biome '" .. biome.name .. "' references missing node_filler '" .. biome.node_filler .. "'"
-            end
-            if not biome.ids.stone then
-                return false, "biome '" .. biome.name .. "' references missing node_stone '" .. biome.node_stone .. "'"
+            for _, field in ipairs({ "top", "filler", "stone" }) do
+                if not biome.ids[field] then
+                    biome_error = "biome '" .. biome.name .. "' references missing node_" .. field .. " '" .. biome["node_" .. field] .. "'"
+                    return nil, biome_error
+                end
             end
         end
-
-        local previous_seed_hook = _G.set_world_seed
-        _G.set_world_seed = function(seed)
-            world_seed = finite(seed) and seed or 0
-            if type(previous_seed_hook) == "function" then previous_seed_hook(seed) end
-        end
-        _G.get_biome = _G.get_biome or function(x, z)
-            local biome = choose_biome(floor(x), floor(z))
-            return biome and biome.name or "plains"
-        end
-        _G.generate_chunk = function(chunk, chunk_x, chunk_z)
+        biome_generator = function(chunk, chunk_x, chunk_z)
             for lx = 0, 15 do
                 for lz = 0, 15 do
                     local wx, wz = chunk_x * 16 + lx, chunk_z * 16 + lz
                     local height = surface_height(wx, wz)
                     local biome = choose_biome(wx, wz)
                     local ids = biome.ids
-
                     for y = 0, height do
                         local id
                         if y == 0 and bedrock then
@@ -372,15 +349,102 @@ function M.install(engine)
                         end
                         chunk:set_block(lx, y, lz, id)
                     end
-
                     if ids.water and height < 62 then
                         for y = height + 1, 62 do chunk:set_block(lx, y, lz, ids.water) end
                     end
                 end
             end
         end
-        _G.terrain_version = _G.terrain_version or 1
+        return biome_generator
+    end
+
+    -- Wraps a game hook so a superflat world answers it itself, and anything else goes to the
+    -- game's own (`fallback`: used when the game has none)
+    local function wrap_hook(name, flat_fn, fallback)
+        local original = _G[name]
+        if type(original) ~= "function" and not fallback then return end
+        _G[name] = function(...)
+            if is_flat() then return flat_fn(...) end
+            if type(original) == "function" then return original(...) end
+            return fallback(...)
+        end
+    end
+
+    -- The game's own terrain hooks decide on their noise: grass colours, cold weather. A flat
+    -- world has one climate. Wrapped once, and again after the first update (the weather mod
+    -- may load, and be hooked by the game's terrain mod, after this runs).
+    local wrapped_weather = setmetatable({}, { __mode = "k" })
+    local function wrap_weather()
+        if type(weather) ~= "table" or type(weather.is_cold) ~= "function" or wrapped_weather[weather.is_cold] then return end
+        local original = weather.is_cold
+        local function wrapper(...)
+            if is_flat() then return false end
+            return original(...)
+        end
+        wrapped_weather[wrapper] = true
+        weather.is_cold = wrapper
+    end
+
+    -- ONE generate_chunk, in every Lua state (the main thread's and each generator thread's),
+    -- that chooses what to do for each chunk: a superflat world is flat whatever the game's own
+    -- generator is, and a world of any other kind is generated by the game's, or by the chosen
+    -- simple biome mapgen. Choosing per chunk (instead of replacing generate_chunk once, when
+    -- the mods have loaded) is what keeps the world's saved style in charge: at that time the
+    -- world's storage isn't known yet, so the game's own generator used to win over superflat.
+    local function install_simple_mapgen()
+        if generator_installed then return true end
+        local custom = type(_G.generate_chunk) == "function" and _G.generate_chunk or nil
+        local mod_set_seed = _G.set_world_seed
+
+        _G.set_world_seed = function(seed)
+            world_seed = finite(seed) and seed or 0
+            if type(mod_set_seed) == "function" then return mod_set_seed(seed) end
+        end
+        wrap_hook("get_biome", function() return "plains" end, function(x, z)
+            if not build_biome_generator() then return "plains" end
+            local biome = choose_biome(floor(x), floor(z))
+            return biome and biome.name or "plains"
+        end)
+        wrap_hook("get_surface_height", function() local _, total = flat_state(); return (total or 1) - 1 end)
+        wrap_hook("get_terrain_height", function() local _, total = flat_state(); return (total or 1) - 1 end)
+        wrap_hook("get_grass_color", function() return 145, 189, 89 end)
+        wrap_hook("get_foliage_color", function() return 119, 171, 47 end)
+        wrap_weather()
+        do
+            local previous_update = _G.on_update
+            local again = false
+            _G.on_update = function(...)
+                if not again then again = true; wrap_weather() end
+                if type(previous_update) == "function" then return previous_update(...) end
+            end
+        end
+
+        _G.generate_chunk = function(chunk, chunk_x, chunk_z, ...)
+            if is_flat() then
+                local layers, why = flat_state()
+                if not layers then error(why, 0) end
+                _G._basic_mapgen_disable_caves = true   -- (a flat world stays flat: no caves)
+                if type(_G.get_surface_height) ~= "function" then
+                    _G.get_surface_height = function() local _, total = flat_state(); return (total or 1) - 1 end
+                end
+                return generate_flat(chunk, layers)
+            end
+            _G._basic_mapgen_disable_caves = false
+            if custom then return custom(chunk, chunk_x, chunk_z, ...) end
+            local generate, why = build_biome_generator()
+            if not generate then
+                if why then error(why, 0) end
+                return   -- (no generator and no style chosen: the chunk stays empty)
+            end
+            return generate(chunk, chunk_x, chunk_z)
+        end
+        -- (a game with its own generator keeps its own terrain_version, or none)
+        if not custom then _G.terrain_version = _G.terrain_version or 1 end
         generator_installed = true
+        -- What the main thread can tell about it now (the world isn't open yet, so a world's
+        -- saved style can't be known here): the game's own, the chosen style, or nothing
+        if custom then return false, "a custom generate_chunk already exists" end
+        if not mapgen_style then return false, "no simple mapgen style was selected" end
         return true
     end
 

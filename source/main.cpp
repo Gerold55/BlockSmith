@@ -29,6 +29,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include <cerrno>
 #include <cstring>
 #endif
+#include <atomic>
+#include <memory>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -264,6 +266,15 @@ sol::state* g_Lua = nullptr;   // the game's Lua, for engine code that needs to 
 // Mod storage (engine.get_storage / set_storage): text values saved with the world,
 // in saves/<world>/mod_storage.txt, so mods remember health, hunger, game mode...
 std::unordered_map<std::string, std::string> g_ModStorage;
+// What the world generator threads see of the world's mod storage (world:mapgen_style...): a copy
+// published whenever a world's storage is loaded (or cleared). The threads start before a world is
+// opened, so they can't be given the storage when they are made: they ask for the current copy
+// each time. (Atomic shared_ptr operations: the main thread publishes while threads read.)
+std::shared_ptr<const std::unordered_map<std::string, std::string>> g_WorldGenStorage =
+    std::make_shared<const std::unordered_map<std::string, std::string>>();
+void publishWorldGenStorage() {
+    std::atomic_store(&g_WorldGenStorage, std::make_shared<const std::unordered_map<std::string, std::string>>(g_ModStorage));
+}
 bool g_ModStorageDirty = false;
 uint8_t g_LastMoveKeys = 0;   // movement keys held this frame (after engine.set_player_controls)
 
@@ -1092,6 +1103,7 @@ bool openActiveWorld(World& world, Player& player) {
             if (tab != std::string::npos) g_ModStorage[unescapeStorage(line.substr(0, tab))] = unescapeStorage(line.substr(tab + 1));
         }
     }
+    publishWorldGenStorage();   // (the generator threads read the world's options from this)
     g_Dig = DigState{};
     g_DimWorlds.unloadAll();
     g_WorldDir = dir.string();
@@ -3007,7 +3019,7 @@ void installModSandbox(sol::state& lua) {
 }
 
 std::unique_ptr<sol::state> makeWorldGenLua(
-    const std::vector<fs::path>& modFiles, const std::unordered_map<std::string, std::string>& worldStorage) {
+    const std::vector<fs::path>& modFiles, [[maybe_unused]] const std::unordered_map<std::string, std::string>& worldStorage) {
     auto lua = std::make_unique<sol::state>();
     lua->open_libraries(sol::lib::base, sol::lib::package, sol::lib::math, sol::lib::string, sol::lib::table,
                         sol::lib::coroutine, sol::lib::utf8);
@@ -3032,9 +3044,12 @@ std::unique_ptr<sol::state> makeWorldGenLua(
     engine["get_block_name"] = [](sol::variadic_args) { return std::string("air"); };
     engine["is_server"] = []() { return false; };
     engine["is_world_generator"] = []() { return true; };
-    engine["get_storage"] = [worldStorage](const std::string& key, sol::this_state ts) -> sol::object {
-        const auto it = worldStorage.find(key);
-        if (it == worldStorage.end()) return sol::make_object(ts, sol::lua_nil);
+    // The world's storage as it is NOW (not as it was when this thread started: the world may be
+    // opened after the threads are made, and another world may be opened later)
+    engine["get_storage"] = [](const std::string& key, sol::this_state ts) -> sol::object {
+        const auto current = std::atomic_load(&g_WorldGenStorage);
+        const auto it = current->find(key);
+        if (it == current->end()) return sol::make_object(ts, sol::lua_nil);
         return sol::make_object(ts, it->second);
     };
     engine["set_storage"] = [](sol::variadic_args) {};
@@ -5073,6 +5088,7 @@ void resetForReload() {
     g_ModToOwnGame.clear();
     g_ModToOwnServer.clear();
     g_ModStorage.clear();
+    publishWorldGenStorage();
     g_ModStorageDirty = false;
     g_ModelInstances.clear();
     g_NextModelInstance = 1;
@@ -7583,6 +7599,7 @@ int main(int argc, char** argv) {
             // The hotbar belongs to that world (saved just above): nothing of it stays behind
             if (g_Hotbar) for (int i = 0; i < g_Hotbar->slotCount; ++i) g_Hotbar->setSlot(i, 0, 0);
             g_ModStorage.clear();       // (so does mod storage - the next world loads its own)
+            publishWorldGenStorage();
             g_ThirdPerson = false;
             g_ThirdPersonFront = false;
             g_Paused = false;
